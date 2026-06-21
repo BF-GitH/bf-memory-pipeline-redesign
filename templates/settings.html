@@ -612,6 +612,12 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             </button>
                         </div>
                         <div id="bf_mem_full_chat_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
+                        <!-- Embeddings / semantic-retrieval UI is intentionally HIDDEN: the tool-first
+                             design uses Claude's search_memory as the semantic layer, not vectors. The
+                             controls stay in the DOM (so bindings don't error) but are not shown or
+                             selectable, and semanticRetrieval defaults false — so it can't be enabled
+                             from settings. The vector code remains in the repo, dormant. -->
+                        <div class="bf-mem-embedding-hidden" style="display:none;" aria-hidden="true">
                         <label class="checkbox_label" style="margin-top:10px;" title="Match facts by MEANING (embeddings), not just keywords/graph. Requires a working embedding endpoint; no-ops safely if none is found.">
                             <input type="checkbox" id="bf_mem_semantic_enabled" />
                             <span>Semantic retrieval (embeddings) — experimental, off by default</span>
@@ -641,6 +647,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             </button>
                         </div>
                         <div id="bf_mem_test_embedding_result" class="bf-mem-hint" style="display:none;margin-top:6px;"></div>
+                        </div><!-- /.bf-mem-embedding-hidden -->
                     </div>
                 </div>
 
