@@ -30,6 +30,19 @@
 .bf-mem-ent-deferred { background: rgba(230,162,60,0.22); color: #e6a23c; }
 .bf-mem-ent-promote { font-size: 0.78em !important; padding: 1px 6px !important; }
 
+/* Review popup group headers */
+.bf-mem-review-group-header {
+    font-weight: bold;
+    font-size: 0.82em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.75;
+    margin: 10px 0 3px;
+    padding-bottom: 2px;
+    border-bottom: 1px solid rgba(128,128,128,0.25);
+}
+.bf-mem-review-group-header:first-child { margin-top: 0; }
+
 /* Settings Panel */
 .bf-mem-settings {
     padding: 5px;

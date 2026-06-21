@@ -122,7 +122,9 @@ export async function showReviewPopup(onAccept, onEdit) {
     const items = getPendingItems();
     if (items.length === 0) return;
 
-    const listHtml = items.map((item, idx) => {
+    // Render a single item's card (idx = its index in the ORIGINAL items[] so the edit/remove
+    // handlers, which key off data-idx, stay correct regardless of display order).
+    const itemHtml = (item, idx) => {
         // Contradiction items (atomic #7) are INFORMATIONAL: read-only, both values shown, only
         // a dismiss button — no editable inputs, so they never flow into the upsert path.
         if (item.action === 'conflict') {
@@ -150,6 +152,24 @@ export async function showReviewPopup(onAccept, onEdit) {
                 <span class="bf-mem-known">Known by: ${escapeHtml(knownBy)}</span>
                 <button class="bf-mem-remove-btn" data-idx="${idx}" title="Remove this update">X</button>
             </div>`;
+    };
+
+    // GROUP by action (NEW → UPD → DEL → CONFLICT) with a counted header per group, so a big batch
+    // reads as organized sections instead of a flat scroll. We pair each item with its ORIGINAL
+    // index first, then sort by group — indices are preserved so handlers stay correct.
+    const GROUP_ORDER = { add: 0, update: 1, delete: 2, conflict: 3 };
+    const GROUP_LABEL = { add: 'New facts', update: 'Updated facts', delete: 'Deletions', conflict: 'Conflicts' };
+    const indexed = items.map((item, idx) => ({ item, idx }));
+    indexed.sort((a, b) => (GROUP_ORDER[a.item.action] ?? 9) - (GROUP_ORDER[b.item.action] ?? 9));
+    let lastAction = null;
+    const listHtml = indexed.map(({ item, idx }) => {
+        let header = '';
+        if (item.action !== lastAction) {
+            lastAction = item.action;
+            const count = indexed.filter(x => x.item.action === item.action).length;
+            header = `<div class="bf-mem-review-group-header">${escapeHtml(GROUP_LABEL[item.action] || item.action)} (${count})</div>`;
+        }
+        return header + itemHtml(item, idx);
     }).join('');
 
     const html = `
