@@ -68,7 +68,7 @@
                             <div class="bf-mem-profile-row">
                                 <select id="bf_mem_agent1_profile" class="text_pole"></select>
                             </div>
-                            <small class="bf-mem-hint">Leave blank to use your default/active profile.</small>
+                            <small class="bf-mem-hint">Which AI does the Drafter's quick planning. Leave this blank and it just uses your normal AI. E.g. pick a cheaper, faster AI here to save money.</small>
                         </div>
                     </div>
                 </div>
@@ -78,7 +78,7 @@
                         <div class="bf-mem-field">
                             <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent1_context_val">5</span></label>
                             <input type="range" id="bf_mem_agent1_context" min="1" max="50" step="1" value="5" />
-                            <small class="bf-mem-hint">How many recent messages the Drafter sees when planning the reply.</small>
+                            <small class="bf-mem-hint">How many of your latest chat messages the planner reads before deciding what the reply needs. More messages = more background, but a bit slower. E.g. 5 means it looks at the last 5 messages.</small>
                         </div>
                     </div>
                 </div>
@@ -89,7 +89,7 @@
                             <input type="checkbox" id="bf_mem_scene_enabled" />
                             <span>Inject live scene card</span>
                         </label>
-                        <small class="bf-mem-hint">Always-on one-line block telling the Writer what is true RIGHT NOW (location, who's present, active goals, recent beats). The Drafter emits it each turn via a #Scene block — no extra LLM call. Injected above the facts every turn a scene exists.</small>
+                        <small class="bf-mem-hint">Adds a short "here's what's happening right now" line to the AI before it writes — where you are, who's in the room, what everyone wants, what just happened. It keeps the AI from forgetting the current moment, and it's free (no extra AI call). E.g. <i>Location: tavern | Present: Mira, you | Goal: find the thief</i>.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Current Scene (live)</label>
                             <div id="bf_mem_scene_view" class="bf-mem-fact-list">
@@ -107,7 +107,7 @@
                     </div>
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_draft_prompt" class="bf-mem-textarea" rows="12" placeholder="Drafter system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells the Drafter how to plan a reply and list needed facts.</small>
+                        <small class="bf-mem-hint">The instructions that tell the planner how to think up a reply and list which saved facts it needs. Only change this if you know what you're doing — the reset button puts it back.</small>
                         <details id="bf_mem_drafter_assembly" class="bf-mem-assembly">
                             <summary>What actually gets sent (assembly order)</summary>
                             <div class="bf-mem-assembly-body">
@@ -147,14 +147,14 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                             <input type="checkbox" id="bf_mem_finder_enabled" />
                             <span>Use the Librarian agent (STAGE 2 retrieval)</span>
                         </label>
-                        <small class="bf-mem-hint">After the Drafter picks branches from the memory menu, the Librarian reads the full facts under those branches and chooses the relevant subset to inject for the Writer. Off (or on any error) falls back to deterministic keyword retrieval.</small>
-                        <small class="bf-mem-hint">The Librarian always reads the last 2 messages plus the Drafter's branch picks — no context-window setting needed.</small>
+                        <small class="bf-mem-hint">Adds a helper AI that double-checks which saved facts are actually worth showing the AI, instead of just keyword-matching. Better picks, but it costs one more AI call. If it's off or hits an error, the extension falls back to simple keyword matching, so nothing breaks.</small>
+                        <small class="bf-mem-hint">No setting needed here — this helper always just reads the last 2 messages plus whatever topics the planner asked for.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Librarian Profile</label>
                             <div class="bf-mem-profile-row">
                                 <select id="bf_mem_agent4_profile" class="text_pole"></select>
                             </div>
-                            <small class="bf-mem-hint">Leave blank to reuse the Drafter's profile. A cheap/fast model works well here.</small>
+                            <small class="bf-mem-hint">Which AI does this fact-picking job. Leave blank and it reuses the Drafter's AI. A cheap, fast AI is plenty for this.</small>
                         </div>
                     </div>
                 </div>
@@ -167,7 +167,7 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                     </div>
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_finder_prompt" class="bf-mem-textarea" rows="10" placeholder="Librarian system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells the Librarian how to pick the relevant subset of candidate facts. Outputs Category/key identifiers only.</small>
+                        <small class="bf-mem-hint">The instructions that tell the fact-picking helper how to choose which facts matter. Advanced — leave it alone unless you know what you're doing; the reset button restores it.</small>
                         <details id="bf_mem_librarian_assembly" class="bf-mem-assembly">
                             <summary>What actually gets sent (assembly order)</summary>
                             <div class="bf-mem-assembly-body">
@@ -211,7 +211,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-pen-nib"></i> Writer (main model)</div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">The Writer is your MAIN model writing the reply — it always uses your default/active connection profile. There is no separate profile to set.</small>
+                        <small class="bf-mem-hint">The "Writer" is just your normal AI that writes the story reply. It always uses your usual AI, so there's nothing to pick here.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -220,12 +220,12 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                         <div class="bf-mem-field">
                             <label>Context Limit (trim chat) <span class="bf-mem-val" id="bf_mem_agent2_context_val">0</span></label>
                             <input type="range" id="bf_mem_agent2_context" min="0" max="50" step="1" value="0" />
-                            <small class="bf-mem-hint">Default 0 = off (main model sees full chat as ST sends it). Set &gt; 0 to HIDE older messages — the main model only sees the last N chat messages + your injected facts. Cleaner focus, lower token cost, but the facts must be good enough to replace the hidden history.</small>
+                            <small class="bf-mem-hint">How many recent messages the AI sees. <b>0 = off</b> (it sees the whole chat, the normal way). Set a number to show only the last few messages plus your saved facts — cheaper and more focused, but only worth it if your facts are good. E.g. set 10 to show just the last 10 messages.</small>
                         </div>
                         <div class="bf-mem-field" style="margin-top:10px;">
                             <label>Freeze injection (reuse facts) <span class="bf-mem-val" id="bf_mem_freeze_turns_val">0</span></label>
                             <input type="range" id="bf_mem_freeze_turns" min="0" max="20" step="1" value="0" />
-                            <small class="bf-mem-hint">Default 0 = off. When &gt; 0, a new turn REUSES the previous turn's retrieved facts instead of re-running the Drafter + Librarian — for up to N turns before a fresh pull. Cuts tokens/latency and keeps the injected block stable for prompt caching. Memory still updates every turn (the Scribe runs after each reply); only the injected facts may be up to N turns old.</small>
+                            <small class="bf-mem-hint">Reuses the same set of saved facts for several replies in a row instead of looking them up fresh every time. <b>0 = off</b> (look up fresh every reply). Saves time and money, and is gentler on the AI. E.g. set 3 to reuse the same facts for 3 replies. Your memory still keeps growing every turn — only the facts shown to the AI are held steady for a bit.</small>
                         </div>
                     </div>
                 </div>
@@ -236,12 +236,12 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_recall_tool_enabled" />
                             <span>Let the Writer search memory on demand (search_memory tool)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. When on, registers an optional <code>search_memory</code> tool the Writer can call mid-reply to pull a stored fact that wasn't already injected (read-only — never writes). Requires a tool-calling-capable main model; only active on the main generation path.</small>
+                        <small class="bf-mem-hint">Off by default. Lets the AI look something up in your memory itself, mid-reply, if it needs a fact it wasn't already handed — like checking a notebook. It only reads, never changes anything. Only works with AIs that can use tools (e.g. Claude). E.g. mid-scene the AI looks up "what's Mira afraid of?" on its own.</small>
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_write_tool_enabled" />
                             <span>Let the Writer pin a fact on demand (remember_fact tool)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. When on, registers an optional <code>remember_fact</code> tool the Writer can call mid-reply to PIN one durable fact directly into memory (add-only — never deletes; routes through the same write path as extraction). Requires a tool-calling-capable main model; only active on the main generation path.</small>
+                        <small class="bf-mem-hint">Off by default. Lets the AI jot down an important fact into memory itself, mid-reply, when something worth remembering happens. It only adds notes, never deletes them. Only works with AIs that can use tools (e.g. Claude). E.g. the AI saves "you gave Mira your ring" on its own.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -251,7 +251,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_pyramid_enabled" />
                             <span>Inject a Big Picture overview (story + relevant shelf summaries)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. When on, prepends a compact, token-capped overview to the Writer's context: the rolling story summary plus the SHORT per-shelf (category/aspect) summaries relevant to the current scene — a cheap zoom-out instead of hundreds of raw facts. The Writer still drills into specifics via the <code>search_memory</code> tool. Shelf summaries are built periodically during the reflection pass (only for changed buckets), so leaving this on adds no extra generation cost — only a small bounded prompt block.</small>
+                        <small class="bf-mem-hint">Off by default. Gives the AI a short "story so far" recap plus quick summaries of the topics in play, instead of dumping hundreds of separate facts — a bird's-eye view. It stays small so it won't cost much, and the AI can still dig into details when it needs to. E.g. "Chapter so far: you and Mira escaped the city and are now hiding in the woods."</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -261,7 +261,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_moment_echo_enabled" />
                             <span>Let one resonant past moment resurface when the present echoes it</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. When on, on the rare turn a couple's present moment echoes an earlier beat, prepends ONE tiny <code>[Echo: …]</code> line — a single past moment for the two characters present, cued by a reflection-authored callback link or the most-recent charged beat for that pair (never by shared place). Capped at one echo, token-clamped, and emits nothing on most turns. The full relationship history stays pull-only via the <code>search_memory</code> tool — this is just the one-line nudge.</small>
+                        <small class="bf-mem-hint">Off by default. Once in a while, when the current moment between two characters mirrors something emotional from their past, it slips in one tiny reminder of that earlier moment — for a "remember when..." feeling. It's just one short line, and only on rare fitting turns. E.g. <i>[Echo: the last time you held her hand was at the harbor.]</i></small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -271,7 +271,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_autolink_enabled" />
                             <span>Auto-connect a new fact to related existing facts</span>
                         </label>
-                        <small class="bf-mem-hint">On by default. When a fact is written, it is automatically linked to related existing facts — same subject, shared location/participants, or strong word overlap — so asking about any one surfaces the others. Fully deterministic and free (no LLM call). Links are added to the fact's relationship list (capped, never overwriting existing links).</small>
+                        <small class="bf-mem-hint">On by default. When a new fact is saved, it's automatically tied to related facts — same person, same place, or similar wording — so pulling up one brings its friends along. It's free (no AI call) and never erases existing links. E.g. saving "Mira fears fire" connects it to "Mira's house burned down."</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -281,25 +281,25 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_mmr_enabled" />
                             <span>Diversify injected facts (MMR)</span>
                         </label>
-                        <small class="bf-mem-hint">On by default. When choosing which overflow facts to inject, avoids stacking several near-duplicates — it balances importance against being different from what's already chosen, so the same token budget covers more ground. Deterministic (stable across swipes/regens). Turn off for pure importance/recency order.</small>
+                        <small class="bf-mem-hint">On by default. Stops the AI from being shown five facts that all say almost the same thing. It mixes in variety so the limited space covers more ground. E.g. instead of three "Mira likes tea" notes, you also get her job and her fear. Turn off to just go by importance.</small>
                         <div class="bf-mem-field">
-                            <label>MMR balance (relevance ↔ diversity) <span class="bf-mem-val" id="bf_mem_mmr_lambda_val">0.70</span></label>
+                            <label>Variety dial (focused ↔ varied) <span class="bf-mem-val" id="bf_mem_mmr_lambda_val">0.70</span></label>
                             <input type="range" id="bf_mem_mmr_lambda" min="0" max="100" step="5" value="70" />
                         </div>
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_confidence_ranking" />
                             <span>Rank uncertain facts lower</span>
                         </label>
-                        <small class="bf-mem-hint">On by default. Facts the Scribe marked low/medium confidence lose ground to solid facts when competing for scarce injection slots. Never affects a direct/exact match — only the ranking of overflow candidates. Turn off to ignore confidence in ranking.</small>
+                        <small class="bf-mem-hint">On by default. Facts the note-taker wasn't sure about get shown less often than solid, confirmed facts when space is tight. An exact match is always shown anyway. E.g. "Mira maybe has a brother" loses to "Mira is a blacksmith." Turn off to treat all facts equally.</small>
                         <div class="bf-mem-field">
                             <label>Confidence weight <span class="bf-mem-val" id="bf_mem_confidence_weight_val">0.30</span></label>
                             <input type="range" id="bf_mem_confidence_weight" min="0" max="100" step="5" value="30" />
                         </div>
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_temporal_grounding" />
-                            <span>Ground relative dates at extraction</span>
+                            <span>Turn "yesterday" into real dates</span>
                         </label>
-                        <small class="bf-mem-hint">On by default. Tells the Scribe to convert "yesterday"/"last week" into absolute dates (relative to when the message was sent) so time references still make sense much later. The message's send-time is shown to the Scribe in its data block, not baked into the cacheable system prompt.</small>
+                        <small class="bf-mem-hint">On by default. Turns vague time words into real dates when saving a fact, so they still make sense later. E.g. "Mira left yesterday" gets saved as the actual date, so 100 messages on the AI doesn't think it was literally yesterday.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -309,7 +309,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_scribe_trim_priors" />
                             <span>Don't re-send already-extracted messages to the Scribe</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. Saves input tokens: prior context messages the Scribe already extracted on an earlier turn aren't sent again (their facts are already stored). The new message being analysed and any not-yet-extracted context are always sent — no memory is lost. Turn on to cut Scribe cost on long chats.</small>
+                        <small class="bf-mem-hint">Off by default. Saves money: the note-taker won't re-read old messages it already pulled facts from. The newest messages are always read, so nothing gets missed. Turn on to lower costs on long chats.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -319,7 +319,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_bitemporal_enabled" />
                             <span>Track when a fact is true in the story world</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. When on, the Scribe may tag a fact with story-world validity — <code>| from:&lt;when&gt;</code> and <code>| until:&lt;when&gt;</code> (a free-form in-story date, age, or era) — recorded separately from when the fact was learned. When a state fact changes, the old value's story-world window is closed automatically. Keeps flashbacks and time-skips consistent. Purely additive: facts written without it are unaffected.</small>
+                        <small class="bf-mem-hint">Off by default. Lets memory track <i>when</i> a fact is true inside the story, not just when you learned it. Helps a lot with flashbacks and time-skips. E.g. it can note "Mira was a soldier <code>until</code> age 20, then became a baker," so the AI doesn't mix up past and present.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -329,17 +329,17 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_user_level_memory" />
                             <span>Share facts about you across every character</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. When on, facts whose subject is <strong>you</strong> (your persona / {{user}}) are also saved into one shared global store, and merged into every character's memory on read — so each character remembers the player without re-learning. Your character's own version of a fact always wins on conflict. Purely additive: when off, storage and retrieval are unchanged.</small>
+                        <small class="bf-mem-hint">Off by default. Facts about <strong>you</strong> (your persona) get shared with every character you chat with, so a brand-new character already knows the basics about you. E.g. once any character learns "you're afraid of heights," they all know it. If a character has its own version of a fact, that one wins.</small>
                         <div class="bf-mem-field">
                             <button type="button" id="bf_mem_clear_shared_user" class="menu_button" title="Permanently erase the cross-character shared store of facts about you. Does not touch any character's own memory.">Clear shared user memory</button>
                         </div>
-                        <small class="bf-mem-hint">Wipes the shared "facts about you" pool (IDB working copy + backup files). Each character's own memory is untouched. Cannot be undone.</small>
+                        <small class="bf-mem-hint">Permanently erases the shared "facts about you" pool. Each character's own memory stays safe. This can't be undone.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-timeline"></i> Sequence Depth Dice</div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">For tracked sequences (e.g. a character's location over time) the current step is always included. These set the chance of reaching further back in history. The furthest successful roll sets how far back to include — and every step in between is always included (no gaps).</small>
+                        <small class="bf-mem-hint">For things that change over time (like where a character has been), the AI always sees the latest step. These dials set the <i>chance</i> of also showing older steps, so sometimes it remembers more history, sometimes less. E.g. a 70% chance to also recall where Mira was one step ago. The furthest step it reaches back to fills in everything in between — no gaps.</small>
                         <div class="bf-mem-field">
                             <label>1 Step Back <span class="bf-mem-val" id="bf_mem_depth1_val">70%</span></label>
                             <input type="range" id="bf_mem_depth1" min="0" max="100" step="5" value="70" />
@@ -367,7 +367,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                     </div>
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_writer_format" class="bf-mem-textarea" rows="6" placeholder="Writer injection header/footer..."></textarea>
-                        <small class="bf-mem-hint">Template wrapping the facts injected into the main model's prompt. Use {draft} and {facts} placeholders.</small>
+                        <small class="bf-mem-hint">The little wrapper text placed around the saved facts before they're handed to the AI. Advanced — most people never touch this. <code>{facts}</code> gets replaced with the facts and <code>{draft}</code> with the planner's notes.</small>
                         <details id="bf_mem_writer_assembly" class="bf-mem-assembly">
                             <summary>What actually gets sent (assembly order)</summary>
                             <div class="bf-mem-assembly-body">
@@ -410,7 +410,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                                     <i class="fa-solid fa-arrows-rotate"></i>
                                 </button>
                             </div>
-                            <small class="bf-mem-hint">Leave blank to use your default/active profile. A cheap/fast model works well for extraction.</small>
+                            <small class="bf-mem-hint">Which AI does the note-taking after each reply. Leave blank to use your normal AI. A cheap, fast AI works great here and saves money.</small>
                         </div>
                     </div>
                 </div>
@@ -423,7 +423,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                     </div>
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Scribe system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells the Scribe how to extract and update facts.</small>
+                        <small class="bf-mem-hint">The instructions that tell the note-taker how to spot and save facts. Advanced — leave it as-is unless you know what you're doing; the reset button restores it.</small>
                         <details id="bf_mem_scribe_assembly" class="bf-mem-assembly">
                             <summary>What actually gets sent (assembly order)</summary>
                             <div class="bf-mem-assembly-body">
@@ -456,12 +456,12 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                         <div class="bf-mem-field">
                             <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">2</span></label>
                             <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="2" />
-                            <small class="bf-mem-hint">How many recent messages the Scribe sees for extraction. Default 2 = the latest user + AI exchange. Higher = more context, more tokens.</small>
+                            <small class="bf-mem-hint">How many recent messages the note-taker reads when saving facts. <b>2</b> = your last message and the AI's reply. Higher catches more but costs a little more. E.g. 2 is fine for most chats.</small>
                         </div>
                         <div class="bf-mem-field">
                             <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
                             <input type="range" id="bf_mem_review_interval" min="3" max="100" step="1" value="10" />
-                            <small class="bf-mem-hint">Messages between fact-review popups (review of the Scribe's extracted facts).</small>
+                            <small class="bf-mem-hint">How often a pop-up lets you check and fix the facts the note-taker saved. E.g. 10 means a review window every 10 messages. Higher = fewer interruptions.</small>
                         </div>
                     </div>
                 </div>
@@ -472,17 +472,17 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <input type="checkbox" id="bf_mem_charreg_enabled" />
                             <span>Detect new named characters</span>
                         </label>
-                        <small class="bf-mem-hint">Periodically scans stored facts for newly-seen proper names (no extra LLM call) and asks once — in a single batched popup — whether each is a <b>Recurring</b> character (gets its own memory subject, with its facts moved out of the shared one-off drawer), a one-off <b>NPC</b> (kept in the drawer), or <b>Later</b> (deferred to the next check).</small>
+                        <small class="bf-mem-hint">Watches for new names that show up in your story and asks you once what each one is: a <b>Recurring</b> character (gets its own memory file), a one-off <b>NPC</b> (a background extra), or <b>Later</b> (ask me next time). It's free (no AI call). E.g. when "Captain Vell" first appears, you tell it whether he matters.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Check Interval <span class="bf-mem-val" id="bf_mem_charcheck_interval_val">10</span></label>
                             <input type="range" id="bf_mem_charcheck_interval" min="2" max="50" step="1" value="10" />
-                            <small class="bf-mem-hint">Successful pipeline runs between detection checks. Higher = less frequent prompting.</small>
+                            <small class="bf-mem-hint">How many replies pass between checks for new names. E.g. 10 means it looks every 10 replies. Higher = it asks you less often.</small>
                         </div>
                         <label class="checkbox_label" style="margin-top:8px;">
                             <input type="checkbox" id="bf_mem_entity_resolution" />
                             <span>Merge entity name variants (experimental)</span>
                         </label>
-                        <small class="bf-mem-hint">CONSERVATIVE, deterministic (no LLM call): merges facts recorded under variant names for the same entity (e.g. "Bobby"/"Robert"/"Rob") into one canonical subject, re-keying the loser's facts and keeping the old name as a searchable alias. Merges ONLY on a strong signal (exact alias match, or very high name similarity), never touches you or the active character, and logs every merge. <b>Default OFF</b> — false merges are the main risk. Runs on the Check Interval above.</small>
+                        <small class="bf-mem-hint">Off by default. Joins together different names for the same person so their facts live in one place. E.g. "Bobby," "Robert," and "Rob" become one character. It's careful and only merges on a strong match, and never touches you or your main character — but it can occasionally guess wrong, which is why it's off by default.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Known Characters (live)</label>
                             <div id="bf_mem_charreg_list" class="bf-mem-fact-list">
@@ -506,21 +506,21 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <input type="checkbox" id="bf_mem_reflection_enabled" />
                             <span>Enable periodic reflection pass</span>
                         </label>
-                        <small class="bf-mem-hint">Every N turns, runs a maintenance pass that DEDUPES the fact database (merging near-duplicate facts) and makes ONE extra LLM call (reusing the Scribe's profile) to write higher-order observation facts. Conservative + cost-aware — it runs infrequently, off the critical path, and never blocks the reply.</small>
+                        <small class="bf-mem-hint">Every so often, memory tidies itself up: it merges duplicate notes and writes a few bigger-picture insights about what's going on. It costs one extra AI call when it runs, but it's rare and never slows down your reply. E.g. from many small notes it might conclude "Mira is starting to trust you."</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Re-evaluation Interval <span class="bf-mem-val" id="bf_mem_reflection_interval_val">12</span></label>
                             <input type="range" id="bf_mem_reflection_interval" min="4" max="100" step="1" value="12" />
-                            <small class="bf-mem-hint">Successful pipeline runs between reflection passes. Higher = cheaper, less frequent maintenance.</small>
+                            <small class="bf-mem-hint">How many replies pass between these tidy-up runs. E.g. 12 means it tidies up every 12 replies. Higher = cheaper and less often.</small>
                         </div>
                         <label class="checkbox_label" style="margin-top:8px;">
                             <input type="checkbox" id="bf_mem_idle_consolidation" />
                             <span>Also consolidate after idle time</span>
                         </label>
-                        <small class="bf-mem-hint">In ADDITION to the turn-based cadence above, run the same reflection/dedupe pass once you have been idle (no new messages) for the delay below. Lets heavy maintenance happen during quiet time. Never runs during generation; shares all the safety guards of the periodic pass. OFF by default.</small>
+                        <small class="bf-mem-hint">Off by default. Also runs that same tidy-up when you step away for a while, so the cleanup happens during quiet time instead of while you're chatting. It never runs in the middle of writing a reply. Set the wait time below.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Idle delay (seconds) <span class="bf-mem-val" id="bf_mem_idle_consolidation_ms_val">120</span></label>
                             <input type="range" id="bf_mem_idle_consolidation_ms" min="30" max="1800" step="10" value="120" />
-                            <small class="bf-mem-hint">Quiet time before the idle consolidation fires. Range 30s–30min.</small>
+                            <small class="bf-mem-hint">How long you have to be away before that quiet-time tidy-up kicks in. E.g. 120 means it waits 2 minutes of no activity. Range: 30 seconds to 30 minutes.</small>
                         </div>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Current Reflection (live)</label>
@@ -539,7 +539,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                     </div>
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_reflection_prompt" class="bf-mem-textarea" rows="10" placeholder="Re-evaluation / consolidation system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells the reflection pass how to synthesize observations during periodic re-evaluation.</small>
+                        <small class="bf-mem-hint">The instructions for the tidy-up run — how it should write its bigger-picture insights. Advanced; the reset button restores it.</small>
                     </div>
                 </div>
             </div>
@@ -549,7 +549,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profiles</div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Each agent can use its own connection profile — set them per agent in the Drafter and Scribe tabs. Leave a profile blank to fall back to your default/active profile. The Writer always uses your default/active profile.</small>
+                        <small class="bf-mem-hint">Each background helper can use its own AI — set those in the Drafter and Scribe tabs. Leave one blank and it uses your normal AI. The Writer (your main story AI) always uses your normal AI. E.g. give the helpers a cheap AI and keep your best AI for the actual story.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -572,7 +572,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                         <i class="fa-solid fa-bookmark"></i> Database Profiles
                     </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Save and load database snapshots. Use these to share facts across characters or restore previous states.</small>
+                        <small class="bf-mem-hint">Save a copy of your whole memory, or load an old one back. Handy to share facts between characters or undo a mess. E.g. save a snapshot before a big risky scene so you can roll back.</small>
                         <div class="bf-mem-profile-row" style="margin-top: 6px;">
                             <select id="bf_mem_db_profile_select" class="text_pole">
                                 <option value="">-- No profile loaded --</option>
@@ -603,7 +603,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                                     <i class="fa-solid fa-link-slash"></i> Unlink current
                                 </button>
                             </div>
-                            <small class="bf-mem-hint">Chats auto-link when opened. Manage to add/remove links. "Unlink current" detaches this chat so it won't auto-relink.</small>
+                            <small class="bf-mem-hint">Which chats share this saved memory. Chats hook up automatically when you open them. Use "Manage" to add or remove chats, or "Unlink current" to disconnect this chat so it stops re-linking on its own.</small>
                         </div>
                     </div>
                 </div>
@@ -614,7 +614,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                         <i class="fa-solid fa-arrows-rotate"></i> Process Existing Chat
                     </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Already have a chat going? Run the Scribe on every message to backfill facts. Slow and uses tokens per message.</small>
+                        <small class="bf-mem-hint">Got a long chat from before you turned this on? This reads back through every message and fills in the facts it missed. It's slow and costs money per message, but you only do it once. E.g. catch up memory on a 300-message story.</small>
                         <label class="checkbox_label" style="margin-top:6px;">
                             <input type="checkbox" id="bf_mem_skip_processed" checked />
                             <span>Skip messages already processed</span>
@@ -690,7 +690,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                                 <input type="text" id="bf_mem_graph_key" class="text_pole" placeholder="Category/key or key (e.g. People/Mira)…" style="flex:1;" />
                                 <button id="bf_mem_graph_btn" class="menu_button" title="Show this fact's linked neighbors"><i class="fa-solid fa-diagram-project"></i> Show links</button>
                             </div>
-                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">Shows the fact, its relationship-ref links (primary/secondary), and one-hop scope-graph neighbors (place⇄event⇄people). Click any neighbor to walk the graph.</small>
+                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">Pick one fact and see everything connected to it — the same person, place, or event. Click any connected fact to hop to its connections. E.g. start at "Mira" and see her home, her job, and who she knows.</small>
                             <div id="bf_mem_graph_result" class="bf-mem-graph-result"></div>
                         </details>
 
@@ -702,7 +702,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                                 <button id="bf_mem_entities_refresh" class="menu_button" title="Refresh the entity list"><i class="fa-solid fa-rotate"></i> Refresh</button>
                                 <span id="bf_mem_entities_summary" class="bf-mem-log-count"></span>
                             </div>
-                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">Entities the memory pipeline is tracking this chat. <b>Named</b> = first-class recurring subject; <b>NPC</b> = pooled background; <b>deferred</b> = undecided. Promote an NPC to make it a recurring subject (re-keys its facts under its own name).</small>
+                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">The people and things memory is tracking in this chat. <b>Named</b> = a main recurring character; <b>NPC</b> = a background extra; <b>deferred</b> = not decided yet. "Promote" an NPC to turn it into a full character with its own memory. E.g. promote "the innkeeper" once he becomes important.</small>
                             <div id="bf_mem_entities_list" class="bf-mem-entities-list"></div>
                         </details>
 
@@ -713,11 +713,11 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <summary style="cursor:pointer;font-weight:bold;">
                                 <i class="fa-solid fa-tags"></i> Add your own label
                             </summary>
-                            <small class="bf-mem-hint">Add custom categories (Layer 1) and aspects/leaves (Layer 2) on top of the built-in taxonomy. Global across chats. Built-ins can't be removed.</small>
+                            <small class="bf-mem-hint">Make your own folders for facts on top of the built-in ones, so things get filed your way. They work across all your chats. The built-in ones stay. E.g. add a "Factions" folder for a political story.</small>
 
                             <!-- Add a Layer-2 leaf -->
                             <div class="bf-mem-field" style="margin-top:6px;">
-                                <label>New aspect (Layer 2 leaf)</label>
+                                <label>New sub-folder (inside a category)</label>
                                 <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
                                     <select id="bf_mem_addleaf_category" class="text_pole" style="flex:0 0 auto;min-width:120px;"></select>
                                     <input type="text" id="bf_mem_addleaf_subarea" class="text_pole" placeholder="Sub-area (optional)" style="flex:1 1 120px;min-width:100px;" />
@@ -730,7 +730,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
 
                             <!-- Add a Layer-1 category -->
                             <div class="bf-mem-field" style="margin-top:6px;">
-                                <label>New category (Layer 1)</label>
+                                <label>New top-level folder (category)</label>
                                 <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
                                     <input type="text" id="bf_mem_addcat_name" class="text_pole" placeholder="Category name, e.g. Factions" style="flex:1 1 160px;min-width:120px;" />
                                     <button id="bf_mem_addcat_btn" class="menu_button" style="flex:0 0 auto;">
@@ -742,7 +742,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <!-- AI: scan homeless facts and propose new labels (manual, on-demand) -->
                             <div class="bf-mem-field" style="margin-top:8px;">
                                 <label>Let AI suggest labels</label>
-                                <small class="bf-mem-hint">Scans facts that never found a specific home and proposes new labels for them. One LLM call (uses the Scribe profile); you approve each suggestion before anything is added. Manual only — no per-turn cost.</small>
+                                <small class="bf-mem-hint">Looks at facts that never got a good folder and suggests new folders for them. You approve each suggestion before anything is added, so it can't surprise you. It only runs when you click — one AI call, no ongoing cost.</small>
                                 <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px;">
                                     <button id="bf_mem_suggest_labels_btn" class="menu_button" style="flex:0 0 auto;">
                                         <i class="fa-solid fa-wand-magic-sparkles"></i> Suggest new labels (AI)
@@ -780,7 +780,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                         <i class="fa-solid fa-flask"></i> Last Generated Facts
                     </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Everything the Scribe extracted in the most recent run, BEFORE dedup / cancellation guards.</small>
+                        <small class="bf-mem-hint">The raw list of facts the note-taker pulled out on the last reply — before duplicates and rejects were cleaned out. This is the "first draft" of its notes.</small>
                         <div id="bf_mem_generated_list" class="bf-mem-fact-list">
                             <div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see what the Scribe extracts.</div>
                         </div>
@@ -795,7 +795,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                         <i class="fa-solid fa-database"></i> Last Inserted Facts
                     </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Facts that actually landed in the database (after dedup / review edits / cancellation guards).</small>
+                        <small class="bf-mem-hint">The facts that actually got saved into memory, after duplicates and rejects were removed and any review edits applied. This is what really stuck.</small>
                         <div id="bf_mem_inserted_list" class="bf-mem-fact-list">
                             <div class="bf-mem-summary-empty">No pipeline runs yet.</div>
                         </div>
@@ -810,7 +810,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-syringe"></i> Injected Last Turn</div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">The facts the Writer was actually given on the last reply, with a rough token cost. This is what the AI saw — distinct from "Last Inserted" (what the Scribe saved to the database).</small>
+                        <small class="bf-mem-hint">The facts the AI was actually shown for the last reply, plus a rough cost. This is what the AI <i>read</i> — different from "Last Inserted," which is what got <i>saved</i> to memory.</small>
                         <div id="bf_mem_injection_view" class="bf-mem-fact-list">
                             <div class="bf-mem-summary-empty">Nothing injected yet. After a reply, the facts the Writer was given appear here.</div>
                         </div>
@@ -819,7 +819,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-coins"></i> Last Run</div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">What the whole chat would have cost vs. what the extension actually sent (trimmed chat + facts + agent calls).</small>
+                        <small class="bf-mem-hint">Shows what sending the whole chat <i>would</i> have cost versus what this extension actually sent (shorter chat + facts + helper calls). A quick way to see if it's saving you money.</small>
                         <div id="bf_mem_tokens_lastrun"><div class="bf-mem-summary-empty">No generations yet. Send a message — token comparison appears after the first pipeline run.</div></div>
                     </div>
                 </div>
@@ -829,7 +829,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                         <button id="bf_mem_tokens_reset" class="bf-mem-reset-btn menu_button" title="Reset session totals"><i class="fa-solid fa-rotate-left"></i></button>
                     </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Running totals across every generation since this chat was opened.</small>
+                        <small class="bf-mem-hint">Adds up the cost across every reply since you opened this chat, so you can see the running total. Use the reset button to start counting fresh.</small>
                         <div id="bf_mem_tokens_session"><div class="bf-mem-summary-empty">No generations yet this session.</div></div>
                     </div>
                 </div>
@@ -915,7 +915,7 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                                 <span id="bf_mem_tool_activity_summary" class="bf-mem-log-count"></span>
                             </div>
                             <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">
-                                Each turn the main model can call <code>search_memory</code> (recall) and <code>remember_fact</code> (pin). This lists those calls so you can confirm the tool-driven memory is firing. A high per-turn count is flagged so a runaway tool loop is visible.
+                                Shows when the AI looked things up (<code>search_memory</code>) or saved a note (<code>remember_fact</code>) on its own each turn. A nice way to confirm the AI really is using its memory. If it does this way too many times in one turn, that gets flagged so you can spot a runaway loop.
                             </small>
                             <div id="bf_mem_tool_activity" class="bf-mem-tool-activity"></div>
                         </details>
