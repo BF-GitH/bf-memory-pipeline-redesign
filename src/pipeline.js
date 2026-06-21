@@ -370,7 +370,10 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
 function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, finderTokens, reflectionTokens, agent1Skipped }) {
     try {
         const duration = Date.now() - startTime;
-        const agent1Ok = !!(draftResult && !draftResult.error && draftResult.draft);
+        // When Agent 1 was intentionally skipped (hybrid/tool-only), it is neither "ok" nor "failed"
+        // — use null ("not applicable") so any consumer reading !agent1Ok alone can't misread a
+        // deliberate skip as a degraded run. (agent1Ran already excludes the skip from the run tally.)
+        const agent1Ok = agent1Skipped ? null : !!(draftResult && !draftResult.error && draftResult.draft);
         // Hybrid/tool-only mode intentionally skips the Drafter — treat that as "skipped", NOT a
         // failed run. Without this, an empty (but errorless) draft shape reads as agent1Ran && !ok
         // and would flag every hybrid turn as failed in the summary/log level.
@@ -952,10 +955,20 @@ async function runPipelineInline(data) {
             const s = getScene();
             scenePresent = Array.isArray(s?.present) ? s.present.map(x => String(x ?? '').trim()).filter(Boolean) : [];
         } catch { scenePresent = []; }
-        draftResult = { draft: '', branches: [], focus: scenePresent, neededFacts: [], nextHint: [], scene: null, raw: '' };
-        addDebugLog('info', `Hybrid mode: skipped Agent 1 Draft LLM call — anchoring on speculative facts${scenePresent.length ? ` + present-character anchors (${scenePresent.join(', ')})` : ''}; main model recalls via search_memory`, {
+        // FOCUS FALLBACK (honest about the limit): without Agent 1 there is no fresh #SCENE parse, so
+        // getScene().present is whatever a PRIOR push-mode turn (or none) left — it can be stale or
+        // empty and will miss a newly-arrived character. This is a best-effort floor, NOT a guarantee:
+        // when no present list is available we fall back to the active character (always "present" in
+        // a 1:1 RP) so at least the lead's identity anchors still fire. The main model covers any gap
+        // by pulling via search_memory. Full present-character tracking needs a scene extractor
+        // (push mode, or a future cheap parser).
+        const focusList = scenePresent.length
+            ? scenePresent
+            : (charName && charName !== '(unknown)' ? [charName] : []);
+        draftResult = { draft: '', branches: [], focus: focusList, neededFacts: [], nextHint: [], scene: null, raw: '' };
+        addDebugLog('info', `Hybrid mode: skipped Agent 1 Draft LLM call — anchoring on speculative facts${focusList.length ? ` + anchors for (${focusList.join(', ')})${scenePresent.length ? '' : ' [active-char fallback; scene not parsed in hybrid]'}` : ''}; main model recalls via search_memory`, {
             subsystem: 'agent1', event: 'agent1.run', reason: 'SKIPPED_HYBRID',
-            data: { agent: 'agent1', mode: memoryMode, skipped: true, focus: scenePresent },
+            data: { agent: 'agent1', mode: memoryMode, skipped: true, focus: focusList, sceneStale: !scenePresent.length },
         });
     } else if (!draftResult || draftResult.error) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`, {

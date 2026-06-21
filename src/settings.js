@@ -540,7 +540,10 @@ function validateSettings(s) {
     s.finderTargetFacts = Math.floor(clamp(s.finderTargetFacts, 0, 30, 12));
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
-    if (typeof s.enableWriterWriteTool !== 'boolean') s.enableWriterWriteTool = false;
+    // Coercion matches the tool-first DEFAULT (true): an absent key (older saved settings) resolves
+    // to ON, consistent with DEFAULT_SETTINGS, instead of contradicting it. Users who explicitly
+    // saved `false` keep it (an explicit boolean passes this guard untouched).
+    if (typeof s.enableWriterWriteTool !== 'boolean') s.enableWriterWriteTool = true;
     // Tool-first redesign — memory mode (how memory reaches the main model):
     //   'hybrid'    (default) light no-LLM anchor each turn + the model pulls deeper via search_memory
     //   'tool-only' minimal anchor; the model drives ALL recall through the tool

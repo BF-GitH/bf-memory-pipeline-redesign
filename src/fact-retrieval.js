@@ -1056,7 +1056,15 @@ function collectRelationshipRefCandidates(index, databases, seeds, alreadyFound)
     const emitted = new Set();
     for (const seed of seeds) {
         if (seed.tier !== 'primary' || !seed.fact?.relationships) continue;
-        const refs = seed.fact.relationships.primary || [];
+        // Follow BOTH primary (high-precision: shared location / shared member) AND secondary
+        // (same-subject / token-overlap) auto-link refs. autoLinkFact writes the bulk of character-
+        // centric links into `secondary`, and expandLinks (the finder path) already reads both — this
+        // collector previously read only `primary`, silently orphaning same-subject associations from
+        // recall graph traversal (the dominant expansion path in hybrid/tool-only mode).
+        const refs = [
+            ...(seed.fact.relationships.primary || []),
+            ...(seed.fact.relationships.secondary || []),
+        ];
         if (refs.length === 0) continue;
         const seedId = `ref:${seed.category}:${seed.fact.key}`;
         // Resolve this seed's refs through the same index matcher the push path uses.
@@ -1151,7 +1159,9 @@ function gatherExpansionCandidates(databases, index, results, alreadyFound, maxD
         const admittedThisHop = [];
         // 1) Sequence-track continuity admitted FIRST and EXEMPT from the per-seed cap (continuity is
         //    mandatory) — but still counts against the shared total. Dedupe across sources by id.
-        for (const c of trackCands) { const r = admit(c, { perSeedCapped: false, demote }); if (r) admittedThisHop.push(r); }
+        //    NEVER demote track steps, even on deeper hops: demoting them to tertiary would let the
+        //    downstream MAX_TERTIARY cap evict mandatory continuity (defeats the per-seed exemption).
+        for (const c of trackCands) { const r = admit(c, { perSeedCapped: false, demote: false }); if (r) admittedThisHop.push(r); }
         // 2) Link + scene + relationship-ref candidates, ranked by salience, under the per-seed cap.
         //    Salience DESCENDING (importance + recency + use) — no connectedness term. Stable sort
         //    keeps source order on ties, so the pass is fully deterministic.
@@ -1619,26 +1629,36 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     // EXACT-HANDLE lookup: the pushed gist shows `Category/key` handles, so the Writer may pass
     // one back to pull the full record. resolveExactKeys validates against the real store (a
     // hallucinated handle matches nothing), is active-only, and is case/punctuation tolerant.
-    if (q.indexOf('/') >= 0) {
+    const isHandleQuery = q.indexOf('/') >= 0;
+    if (isHandleQuery) {
         for (const r of resolveExactKeys(databases, [q])) push(r, 'primary');
     }
-    // KEYWORD search over the prebuilt index (same matcher as the push path).
-    for (const r of searchFactsIndexed(index, databases, [q])) push(r, 'primary');
+    // PRECISION PULL: when the query is a Category/key handle that RESOLVED, the model asked for a
+    // SPECIFIC record — return just that, skipping keyword/fuzzy/graph so a targeted pull can't
+    // balloon into the fact's whole 2-hop neighborhood (an exact handle should stay exact).
+    const handleResolved = isHandleQuery && directResults.length > 0;
+    if (!handleResolved) {
+        // KEYWORD search over the prebuilt index (same matcher as the push path).
+        for (const r of searchFactsIndexed(index, databases, [q])) push(r, 'primary');
 
-    // FUZZY/ALIAS fallback (Layer B): trigram-match the query against active facts so typos and
-    // morphology ("apartments"→"apartment") still resolve when the keyword path missed. Admits as
-    // secondary; never duplicates an exact/keyword hit. Mutates directResults + seen in place.
-    fuzzyFallback(databases, [q], directResults, seen);
+        // FUZZY/ALIAS fallback (Layer B): trigram-match the query against active facts so typos and
+        // morphology ("apartments"→"apartment") still resolve when the keyword path missed. Admits as
+        // secondary; never duplicates an exact/keyword hit. Mutates directResults + seen in place.
+        fuzzyFallback(databases, [q], directResults, seen);
 
-    // BOUNDED GRAPH EXPANSION (Spiderweb): one-hop place⇄event⇄people / relationship-ref / sequence
-    // continuity seeded from whatever the query already surfaced — so searching a place returns who
-    // and what is linked to it. Rebuild the dedupe ledger first (fuzzy may have appended), matching
-    // retrieveFacts' ordering. Shares the same per-seed + total cap, salience-ranked admitter.
-    const alreadyFound = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
-    // MULTI-HOP for recall (depth 2): the model's explicit query deserves a deeper walk than the
-    // always-on push path (depth 1) — so a query about a place can reach place -> guard -> faction.
-    // Still bounded by the same MAX_EXPANSION_TOTAL / per-seed caps; deeper hops demote to tertiary.
-    gatherExpansionCandidates(databases, index, directResults, alreadyFound, 2);
+        // BOUNDED GRAPH EXPANSION (Spiderweb): place⇄event⇄people / relationship-ref / sequence
+        // continuity seeded from whatever the query already surfaced — so searching a place returns
+        // who and what is linked to it. Rebuild the dedupe ledger first (fuzzy may have appended).
+        // MULTI-HOP for recall (depth 2): the model's explicit query deserves a deeper walk than the
+        // always-on push path (depth 1) — place -> guard -> faction. Still bounded by the same
+        // MAX_EXPANSION_TOTAL / per-seed caps; deeper hops demote to tertiary.
+        const alreadyFound = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
+        gatherExpansionCandidates(databases, index, directResults, alreadyFound, 2);
+        // Keep the fuzzy/keyword dedupe ledger (`seen`) in sync with graph-admitted facts so the two
+        // ledgers can't diverge if this cascade is ever extended (defensive — `seen` is otherwise
+        // unused past this point).
+        for (const r of directResults) seen.add(`${r.category}:${r.fact.key}`);
+    }
 
     // Optional category filter (case-insensitive, on the stored category name).
     let candidates = directResults;
@@ -1652,10 +1672,17 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     } : null;
     candidates = candidates.filter(c => isFactVisible(c.fact, names));
 
-    // DETERMINISTIC salience ranking (cold facts deprioritized) — same scorer the push path
-    // uses to fill scarce slots — then hard-cap.
+    // TIER-FIRST, then salience. Direct hits (primary: exact/keyword) must rank above 1-hop
+    // (secondary) and 2-hop (tertiary) graph-expanded facts, so a tight `limit` never drops the
+    // actual match in favor of a distant linked fact of equal salience. Within a tier, rank by the
+    // same deterministic salience scorer the push path uses (cold facts deprioritized). Then hard-cap.
     const now = Date.now();
-    candidates.sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+    const TIER_RANK = { primary: 0, secondary: 1, tertiary: 2 };
+    candidates.sort((a, b) => {
+        const tr = (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3);
+        if (tr !== 0) return tr;
+        return retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now);
+    });
     const capped = candidates.slice(0, cap);
 
     addDebugLog('debug', `search_memory recall: "${q.slice(0, 60)}"${catFilter ? ` [cat=${catFilter}]` : ''} → ${capped.length}/${candidates.length} fact(s) (exact+keyword+fuzzy+graph)`, {
@@ -1670,12 +1697,19 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     }
 
     // NO MATCH — return an ACTIONABLE hint (not a dead end) so the model re-queries productively
-    // instead of giving up or hallucinating. List the categories that actually exist (capped) so it
-    // can narrow, and remind it of the broader angles (names, Category/key handles, scene:/with:).
-    const presentCats = Object.keys(databases).filter(cat => (databases[cat]?.facts?.length > 0));
-    const hint = presentCats.length
-        ? ` Try a broader or different keyword, a character or place name, a "Category/key" handle, or one of the categories present in memory: ${presentCats.slice(0, 12).join(', ')}${presentCats.length > 12 ? ', …' : ''}. You can also recall a scene (scene:) or a relationship history (with:).`
-        : ' Memory is nearly empty, so there may be nothing to recall yet.';
+    // instead of giving up or hallucinating. When a category filter is set, do NOT list the other
+    // categories present (it both ignores the filter the model chose and could leak spoiler category
+    // names like "HiddenVillain"); instead suggest dropping the filter. With no filter, list the
+    // categories that actually exist (capped) so it can narrow, plus the broader angles.
+    let hint;
+    if (catFilter) {
+        hint = ` No facts in category "${category}" matched. Try without the category filter, a different keyword, or a "Category/key" handle.`;
+    } else {
+        const presentCats = Object.keys(databases).filter(cat => (databases[cat]?.facts?.length > 0));
+        hint = presentCats.length
+            ? ` Try a broader or different keyword, a character or place name, a "Category/key" handle, or one of the categories present in memory: ${presentCats.slice(0, 12).join(', ')}${presentCats.length > 12 ? ', …' : ''}. You can also recall a scene (scene:) or a relationship history (with:).`
+            : ' Memory is nearly empty, so there may be nothing to recall yet.';
+    }
     return { text: `No stored facts match "${q}"${catFilter ? ` in category "${category}"` : ''}.${hint}`, count: 0 };
 }
 

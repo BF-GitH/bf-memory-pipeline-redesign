@@ -25,9 +25,23 @@ Because the recall tool is now the model's primary path to memory, `searchMemory
 
 The graph expansion (`gatherExpansionCandidates`) was generalized from one hop to a **bounded breadth-first walk** (`maxDepth`, clamped 1–3). The always-on push path stays at depth 1 (byte-identical); the explicit recall path walks **depth 2**, so a query can reach two links out (place → guard → faction). All hops share the same `MAX_EXPANSION_TOTAL` / per-seed caps, and deeper hops demote to tertiary so closer facts always win scarce slots.
 
-Verified end-to-end in a real SillyTavern 1.18 instance: keyword, fuzzy-typo, one-hop graph (a place query surfacing a linked person with no shared text), and the no-match hint all pass. The deeper multi-hop walk is bounded + code-verified; its clean isolation test needs event-fact data (deferred).
+Verified end-to-end in a real SillyTavern 1.18 instance: keyword, fuzzy-typo, one-hop graph (a place query surfacing a linked person with no shared text), the no-match hint, **and the two-hop walk** (a query reaching place → event → person → that person's other event → a second place at depth 2, while the depth-1 push path correctly stops at one hop) all pass.
 
 _Files:_ [src/fact-retrieval.js](src/fact-retrieval.js)
+
+### Fixed — hardening pass from an adversarial review + edge-case testing
+
+A full adversarial audit of the branch plus E2E edge-case testing surfaced eight issues; the real ones are fixed (each re-verified live in ST 1.18):
+
+- **Graph traversal now follows `secondary` relationship refs**, not just `primary`. `autoLinkFact` writes most character-centric (same-subject / token-overlap) links into `secondary`, which the BFS recall path silently ignored — orphaning the dominant link set from the now-primary recall path.
+- **Sequence-track continuity is never demoted** on deeper hops, so the per-seed-cap exemption isn't undone by the downstream tertiary cap evicting mandatory continuity.
+- **Exact `Category/key` handle pulls stay exact** — a resolved handle returns just that record instead of ballooning into its whole 2-hop neighborhood.
+- **Recall ranks tier-first** (direct hits → 1-hop → 2-hop), then salience — so a tight `limit` can't drop the actual match for a distant linked fact.
+- **The no-match hint respects the category filter** — it no longer lists (and potentially spoils) other categories when the model scoped the search.
+- **Hybrid focus has an honest active-character fallback** when the scene wasn't parsed this turn (no Agent 1), and the "guarantee" wording was softened to match reality.
+- **`logRunSummary` reports a skipped Drafter as N/A**, not failed; **settings coercion for `enableWriterWriteTool` matches its new `true` default**.
+
+_Files:_ [src/fact-retrieval.js](src/fact-retrieval.js), [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js)
 
 ## [0.42.1] - 2026-05-31
 
