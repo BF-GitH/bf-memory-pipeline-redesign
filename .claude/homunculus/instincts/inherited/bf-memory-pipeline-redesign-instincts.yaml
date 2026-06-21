@@ -1,0 +1,498 @@
+# Instincts generated from https://github.com/BF-GitH/bf-memory-pipeline-redesign
+# Generated: 2026-06-21T17:33:08.726Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: bf-memory-pipeline-redesign-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat, fix, docs
+
+## Evidence
+
+- 13 commits analyzed
+- Detected conventional commit pattern
+- Examples: feat(tool-first): default remember_fact ON + proactive memory tool prompts, fix(tool-first): don't report skipped Drafter as a failed run in logRunSummary
+
+---
+id: bf-memory-pipeline-redesign-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Commit Length
+
+## Action
+
+Write moderate-length commit messages (~73 characters)
+
+## Evidence
+
+- Average commit message length: 73 chars
+- Based on 13 commits
+
+---
+id: bf-memory-pipeline-redesign-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: bf-memory-pipeline-redesign-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: bf-memory-pipeline-redesign-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: bf-memory-pipeline-redesign-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: bf-memory-pipeline-redesign-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~21x per month
+- Files: 
+
+---
+id: bf-memory-pipeline-redesign-workflow-feature-development-ui-backend-coordination
+trigger: "when doing feature development ui backend coordination"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Workflow Feature Development Ui Backend Coordination
+
+## Action
+
+Follow the feature-development-ui-backend-coordination workflow:
+1. Implement backend logic in src/*.js (e.g., src/settings.js, src/pipeline.js, src/agent-writer.js, src/fact-retrieval.js)
+2. Update or create UI components/templates in templates/settings.html
+3. Update or create related CSS in style.css
+4. Update manifest.json if needed (for versioning or feature flags)
+5. Document the change in CHANGELOG.md
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: src/settings.js, src/pipeline.js, src/agent-writer.js
+
+---
+id: bf-memory-pipeline-redesign-workflow-hardening-bugfix-multi-file
+trigger: "when doing hardening bugfix multi file"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Workflow Hardening Bugfix Multi File
+
+## Action
+
+Follow the hardening-bugfix-multi-file workflow:
+1. Identify edge cases or bugs from review/testing
+2. Update logic in relevant backend files (e.g., src/agent-writer.js, src/pipeline.js, src/settings.js, src/profiler.js, src/review-popup.js)
+3. Update UI logic if needed (e.g., src/review-popup.js, templates/settings.html)
+4. Update documentation in CHANGELOG.md if significant
+5. Re-verify end-to-end in the target environment
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/agent-writer.js, src/pipeline.js, src/settings.js
+
+---
+id: bf-memory-pipeline-redesign-workflow-ui-panel-or-popup-enhancement
+trigger: "when doing ui panel or popup enhancement"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Workflow Ui Panel Or Popup Enhancement
+
+## Action
+
+Follow the ui-panel-or-popup-enhancement workflow:
+1. Implement or update UI logic in src/settings.js or src/review-popup.js
+2. Update templates/settings.html for new panel markup
+3. Add or modify style.css for visual changes
+4. Update backend logic if needed to support new data (e.g., src/agent-writer.js, src/fact-retrieval.js)
+5. Document the change in CHANGELOG.md
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/settings.js, src/review-popup.js, templates/settings.html
+
+---
+id: bf-memory-pipeline-redesign-instinct-file-naming
+trigger: "When creating a new file in the codebase"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct File Naming
+
+## Action
+
+Name the file using camelCase (e.g., agentWriter.js)
+
+## Evidence
+
+- Pattern in files: src/agent-writer.js, src/settings.js
+
+---
+id: bf-memory-pipeline-redesign-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in src/*.js functions
+
+---
+id: bf-memory-pipeline-redesign-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Class Naming
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in src/*.js classes
+
+---
+id: bf-memory-pipeline-redesign-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in src/*.js constants
+
+---
+id: bf-memory-pipeline-redesign-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Import Style
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in src/*.js imports
+
+---
+id: bf-memory-pipeline-redesign-instinct-export-style
+trigger: "When exporting functions or classes"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in src/*.js exports
+
+---
+id: bf-memory-pipeline-redesign-instinct-try-catch-errors
+trigger: "When handling errors in code"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Try Catch Errors
+
+## Action
+
+Use try-catch blocks for error handling
+
+## Evidence
+
+- Pattern in src/*.js error handling
+
+---
+id: bf-memory-pipeline-redesign-instinct-test-location
+trigger: "When adding tests for new features or bugfixes"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Test Location
+
+## Action
+
+Place tests in a separate test directory, not mixed with src/
+
+## Evidence
+
+- Architecture pattern: testLocation is 'separate'
+
+---
+id: bf-memory-pipeline-redesign-instinct-test-after-feature
+trigger: "When implementing a new feature"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Test After Feature
+
+## Action
+
+Add corresponding tests immediately after feature implementation
+
+## Evidence
+
+- Workflow 'feature-development' commit sequence: Add feature implementation → Add tests for feature
+
+---
+id: bf-memory-pipeline-redesign-instinct-commit-format
+trigger: "When making a git commit"
+confidence: 0.95
+domain: git
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Commit Format
+
+## Action
+
+Use conventional commit format: <type>(<scope>): <description>
+
+## Evidence
+
+- Seen in commits: 'feat(tool-first): default remember_fact ON + proactive memory tool prompts', 'fix(tool-first): don't report skipped Drafter as a failed run in logRunSummary'
+
+---
+id: bf-memory-pipeline-redesign-instinct-commit-type-prefixes
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Commit Type Prefixes
+
+## Action
+
+Use one of the allowed prefixes: feat, fix, docs
+
+## Evidence
+
+- Pattern in commit prefixes: feat, fix, docs
+
+---
+id: bf-memory-pipeline-redesign-instinct-feature-ui-backend
+trigger: "When adding a new feature that changes both backend and UI"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Feature Ui Backend
+
+## Action
+
+Implement backend logic in src/*.js, update/create UI in templates/settings.html, update style.css, update manifest.json if needed, and document in CHANGELOG.md
+
+## Evidence
+
+- Workflow: feature-development-ui-backend-coordination
+- Example commits and files: src/settings.js, templates/settings.html, style.css, manifest.json, CHANGELOG.md
+
+---
+id: bf-memory-pipeline-redesign-instinct-hardening-bugfix
+trigger: "When fixing bugs or hardening the codebase after review/testing"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Hardening Bugfix
+
+## Action
+
+Identify edge cases/bugs, update relevant backend files, update UI logic if needed, update documentation in CHANGELOG.md if significant, and re-verify end-to-end
+
+## Evidence
+
+- Workflow: hardening-bugfix-multi-file
+- Example files: src/agent-writer.js, src/pipeline.js, src/settings.js, src/profiler.js, src/review-popup.js, CHANGELOG.md
+
+---
+id: bf-memory-pipeline-redesign-instinct-ui-panel-enhancement
+trigger: "When adding or enhancing a UI panel or popup"
+confidence: 0.88
+domain: workflow
+source: repo-analysis
+source_repo: BF-GitH/bf-memory-pipeline-redesign
+---
+
+# Bf Memory Pipeline Redesign Instinct Ui Panel Enhancement
+
+## Action
+
+Implement/update UI logic in src/settings.js or src/review-popup.js, update templates/settings.html, modify style.css, update backend logic if needed, and document in CHANGELOG.md
+
+## Evidence
+
+- Workflow: ui-panel-or-popup-enhancement
+- Example files: src/settings.js, src/review-popup.js, templates/settings.html, style.css, CHANGELOG.md
+
