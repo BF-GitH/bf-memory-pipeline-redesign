@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.50.1] - 2026-06-21
+
+### Added / Changed — diagnostics + embeddings retired from the UI
+
+- **"Copy Diagnostics" button** (Debug tab): one click bundles the complete extension state — settings, the full debug log (inputs/outputs/events), the entire fact database **including each fact's relationships (the graph/web)**, token usage (per-run + session), the last injected memory context, last generated/inserted, scene, entities, and pending review — into one JSON, downloaded as a file **and** copied to the clipboard (with a select-all fallback). For easy support sharing. No API keys included.
+- **Embeddings/semantic recall retired from the default path:** `semanticRetrieval` now defaults **off** (in defaults and all presets), and every embedding control is **hidden from the settings UI** (semantic toggle, "Embed all facts", embedding source/model, test button). Claude's `search_memory` is the semantic layer now. The vector code remains in-repo but dormant and not user-selectable.
+
 ## [0.50.0] - 2026-06-21
 
 ### Added — Phases 2–4: observability, Claude tuning, graph + entity UI

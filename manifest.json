@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "BF-GitH",
-  "version": "0.50.0",
+  "version": "0.50.1",
   "homePage": "https://github.com/BF-GitH/bf-memory-pipeline",
   "auto_update": false
 }
