@@ -1095,69 +1095,87 @@ function collectRelationshipRefCandidates(index, databases, seeds, alreadyFound)
  * @param {Array<{fact: Object, category: string, tier: string}>} results - mutated in place
  * @param {Set<string>} alreadyFound - `category:key` ids already in results (mutated)
  */
-function gatherExpansionCandidates(databases, index, results, alreadyFound) {
-    // SNAPSHOT seeds up front so this is exactly one hop (added facts aren't re-expanded).
-    const seeds = results.slice();
+function gatherExpansionCandidates(databases, index, results, alreadyFound, maxDepth = 1) {
     const now = Date.now();
 
-    // Gather from all expansions (each returns attributed candidates; none pushes).
-    const linkCands = collectLinkCandidates(databases, seeds, alreadyFound);
-    const refCands = collectRelationshipRefCandidates(index, databases, seeds, alreadyFound);
-    const trackCands = expandSequenceTracks(databases, seeds, alreadyFound);
-    // In-scene strand (Spiderweb 2): same-scene facts, attributed to their scene seedId so the
-    // per-seed cap below prevents a big scene from flooding the tier.
-    const sceneCands = collectSceneCandidates(index, seeds, alreadyFound);
-
-    // Sequence-track continuity is admitted FIRST and EXEMPT from the per-seed cap (continuity is
-    // mandatory) — but still counts against the shared total. Dedupe across sources by id.
+    // SHARED admission ledger across ALL hops. The per-seed cap, the total cap, and the dedupe set
+    // are GLOBAL, so bounded multi-hop traversal can never exceed the same bounds the one-hop pass
+    // used — it just fills those bounded slots with deeper-but-linked facts when a shallow hop left
+    // room. (Spiderweb multi-hop, exposed through search_memory: place -> guard -> faction.)
     const claimed = new Set();      // ids already admitted this pass
     const perSeed = new Map();      // seedId -> count admitted under the per-seed cap
     let admittedTotal = 0;
     let cappedBySeed = 0;           // how many candidates a per-seed cap blocked (debug)
     const seedContrib = new Map();  // seedId -> count (debug: how much each hub contributed)
+    const fromCounts = { link: 0, scene: 0, ref: 0, track: 0 };
 
-    const admit = (c, { perSeedCapped }) => {
-        if (admittedTotal >= MAX_EXPANSION_TOTAL) return false;
+    // admit() returns the PUSHED row (so a multi-hop frontier can re-seed from it) or null if blocked.
+    const admit = (c, { perSeedCapped, demote }) => {
+        if (admittedTotal >= MAX_EXPANSION_TOTAL) return null;
         const id = `${c.category}:${c.fact.key}`;
-        if (alreadyFound.has(id) || claimed.has(id)) return false;
+        if (alreadyFound.has(id) || claimed.has(id)) return null;
         if (perSeedCapped) {
             const used = perSeed.get(c.seedId) || 0;
-            if (used >= MAX_EXPANSION_PER_SEED) { cappedBySeed++; return false; }
+            if (used >= MAX_EXPANSION_PER_SEED) { cappedBySeed++; return null; }
             perSeed.set(c.seedId, used + 1);
         }
         claimed.add(id);
         alreadyFound.add(id);
-        results.push({ fact: c.fact, category: c.category, tier: c.tier, via: c.via });
+        // Deeper hops are demoted to tertiary — the further we walk from the query, the less certain
+        // the relevance, so they fill scarce slots only after closer facts.
+        const row = { fact: c.fact, category: c.category, tier: demote ? 'tertiary' : c.tier, via: c.via };
+        results.push(row);
         admittedTotal++;
         seedContrib.set(c.seedId, (seedContrib.get(c.seedId) || 0) + 1);
-        return true;
+        return row;
     };
 
-    // 1) Track continuity (exempt from per-seed cap, counts toward total).
-    for (const c of trackCands) admit(c, { perSeedCapped: false });
+    // BOUNDED BFS over hops. Hop 0 seeds = the query's direct hits (snapshot of `results`). Each
+    // hop's freshly admitted facts become the next hop's seeds. Depth clamped 1..3; depth 1 is
+    // byte-identical to the original one-hop pass (the default — the push path keeps one hop).
+    const depth = Math.max(1, Math.min(3, Math.floor(Number(maxDepth)) || 1));
+    let frontier = results.slice();
+    for (let hop = 0; hop < depth && frontier.length && admittedTotal < MAX_EXPANSION_TOTAL; hop++) {
+        const seeds = frontier;
+        const demote = hop >= 1; // hop 0 keeps source tier; deeper hops demote to tertiary
+        // Gather from all expansions (each returns attributed candidates; none pushes).
+        const linkCands = collectLinkCandidates(databases, seeds, alreadyFound);
+        const refCands = collectRelationshipRefCandidates(index, databases, seeds, alreadyFound);
+        const trackCands = expandSequenceTracks(databases, seeds, alreadyFound);
+        // In-scene strand (Spiderweb 2): same-scene facts, attributed to their scene seedId so the
+        // per-seed cap prevents a big scene from flooding the tier.
+        const sceneCands = collectSceneCandidates(index, seeds, alreadyFound);
+        fromCounts.link += linkCands.length; fromCounts.ref += refCands.length;
+        fromCounts.track += trackCands.length; fromCounts.scene += sceneCands.length;
 
-    // 2) Link + scene + relationship-ref candidates, ranked by salience, under the per-seed cap.
-    //    Salience DESCENDING (importance + recency + use) — no connectedness term. Stable sort keeps
-    //    source order on ties, so the pass is fully deterministic. Same-scene facts ride the SAME
-    //    per-seed cap (scene seedId), so a big scene can't flood the tier.
-    const ranked = [...linkCands, ...sceneCands, ...refCands].sort(
-        (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
-    for (const c of ranked) {
-        if (admittedTotal >= MAX_EXPANSION_TOTAL) break;
-        admit(c, { perSeedCapped: true });
+        const admittedThisHop = [];
+        // 1) Sequence-track continuity admitted FIRST and EXEMPT from the per-seed cap (continuity is
+        //    mandatory) — but still counts against the shared total. Dedupe across sources by id.
+        for (const c of trackCands) { const r = admit(c, { perSeedCapped: false, demote }); if (r) admittedThisHop.push(r); }
+        // 2) Link + scene + relationship-ref candidates, ranked by salience, under the per-seed cap.
+        //    Salience DESCENDING (importance + recency + use) — no connectedness term. Stable sort
+        //    keeps source order on ties, so the pass is fully deterministic.
+        const ranked = [...linkCands, ...sceneCands, ...refCands].sort(
+            (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+        for (const c of ranked) {
+            if (admittedTotal >= MAX_EXPANSION_TOTAL) break;
+            const r = admit(c, { perSeedCapped: true, demote }); if (r) admittedThisHop.push(r);
+        }
+        frontier = admittedThisHop; // next hop walks out from what we just found
     }
 
     if (admittedTotal > 0 || cappedBySeed > 0) {
         // Find the biggest single-seed contribution to surface the anti-hub cap working.
         let topSeed = null, topN = 0;
         for (const [sid, n] of seedContrib) if (n > topN) { topN = n; topSeed = sid; }
-        addDebugLog('info', `Unified expansion: admitted ${admittedTotal}/${MAX_EXPANSION_TOTAL} (per-seed cap ${MAX_EXPANSION_PER_SEED} blocked ${cappedBySeed}; top seed "${topSeed}" contributed ${topN})`, {
+        addDebugLog('info', `Unified expansion: admitted ${admittedTotal}/${MAX_EXPANSION_TOTAL} across ${depth} hop(s) (per-seed cap ${MAX_EXPANSION_PER_SEED} blocked ${cappedBySeed}; top seed "${topSeed}" contributed ${topN})`, {
             subsystem: 'retrieval', event: 'retrieval.indexed',
             data: {
                 admitted: admittedTotal, total_cap: MAX_EXPANSION_TOTAL,
                 per_seed_cap: MAX_EXPANSION_PER_SEED, capped_by_seed: cappedBySeed,
+                maxDepth: depth,
                 top_seed: topSeed, top_seed_contrib: topN,
-                from: { link: linkCands.length, scene: sceneCands.length, ref: refCands.length, track: trackCands.length },
+                from: fromCounts,
             },
         });
     }
@@ -1617,7 +1635,10 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     // and what is linked to it. Rebuild the dedupe ledger first (fuzzy may have appended), matching
     // retrieveFacts' ordering. Shares the same per-seed + total cap, salience-ranked admitter.
     const alreadyFound = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
-    gatherExpansionCandidates(databases, index, directResults, alreadyFound);
+    // MULTI-HOP for recall (depth 2): the model's explicit query deserves a deeper walk than the
+    // always-on push path (depth 1) — so a query about a place can reach place -> guard -> faction.
+    // Still bounded by the same MAX_EXPANSION_TOTAL / per-seed caps; deeper hops demote to tertiary.
+    gatherExpansionCandidates(databases, index, directResults, alreadyFound, 2);
 
     // Optional category filter (case-insensitive, on the stored category name).
     let candidates = directResults;

@@ -19,6 +19,16 @@ The headline of the tool-first redesign. Memory recall is moving from a determin
 
 _Files:_ [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html), [src/agent-writer.js](src/agent-writer.js)
 
+### Added — stronger `search_memory` recall + bounded multi-hop graph
+
+Because the recall tool is now the model's primary path to memory, `searchMemoryForRecall` was upgraded from keyword-only to the **same cascade the push path uses**: exact handle → keyword → fuzzy/alias trigram (typos/morphology) → bounded graph expansion. On no match it returns an **actionable hint** listing the categories actually present so the model re-queries productively instead of giving up.
+
+The graph expansion (`gatherExpansionCandidates`) was generalized from one hop to a **bounded breadth-first walk** (`maxDepth`, clamped 1–3). The always-on push path stays at depth 1 (byte-identical); the explicit recall path walks **depth 2**, so a query can reach two links out (place → guard → faction). All hops share the same `MAX_EXPANSION_TOTAL` / per-seed caps, and deeper hops demote to tertiary so closer facts always win scarce slots.
+
+Verified end-to-end in a real SillyTavern 1.18 instance: keyword, fuzzy-typo, one-hop graph (a place query surfacing a linked person with no shared text), and the no-match hint all pass. The deeper multi-hop walk is bounded + code-verified; its clean isolation test needs event-fact data (deferred).
+
+_Files:_ [src/fact-retrieval.js](src/fact-retrieval.js)
+
 ## [0.42.1] - 2026-05-31
 
 ### Changed — replaced the dead "Embedding profile" dropdown with working source + model inputs (H16)
