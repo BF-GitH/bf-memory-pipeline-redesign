@@ -195,6 +195,17 @@ const DEFAULT_SETTINGS = {
     // loop never runs on the quiet/agent paths); no-ops otherwise. Existing users keep their saved
     // value. Synced alongside the recall tool wherever syncWriterRecallTool is synced (index.js + toggle).
     enableWriterWriteTool: true,
+    // Tool-first redesign — MEMORY MODE: how stored memory reaches the main (reply) model.
+    //   'hybrid'    (DEFAULT) each turn injects a cheap, no-LLM anchor (speculative facts +
+    //               present-character anchors + scene block); the main model pulls everything
+    //               deeper on demand via the search_memory tool. The blocking Agent 1 (Draft) LLM
+    //               call is SKIPPED — this is the primary latency win.
+    //   'tool-only' minimal anchor; recall is driven almost entirely by the model's tool calls.
+    //   'push'      classic behavior — Agent 1 drafts the reply + picks fact branches every turn
+    //               (an extra blocking LLM call). Choose this if your main model can't call tools.
+    // Default 'hybrid' is tuned for tool-calling models (e.g. Claude via the Claude Code CLI
+    // connection profile). Existing users keep whatever value is saved in their settings.
+    memoryMode: 'hybrid',
     // Summary pyramid — optional "Big Picture" injection (hierarchical zoom-out). When ON, the
     // Writer gets a compact block = the rolling reflection story summary + the SHORT shelf
     // (category/aspect-bucket) summaries relevant to the current scene focus, hard token-capped.
@@ -530,6 +541,13 @@ function validateSettings(s) {
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
     if (typeof s.enableWriterWriteTool !== 'boolean') s.enableWriterWriteTool = false;
+    // Tool-first redesign — memory mode (how memory reaches the main model):
+    //   'hybrid'    (default) light no-LLM anchor each turn + the model pulls deeper via search_memory
+    //   'tool-only' minimal anchor; the model drives ALL recall through the tool
+    //   'push'      classic behavior — Agent 1 (Draft) runs to plan + pick branches each turn
+    // Anything absent/garbage coerces to 'hybrid'. 'hybrid'/'tool-only' DROP the blocking Agent 1
+    // LLM call from the reply-critical path (the latency win); 'push' restores it.
+    if (s.memoryMode !== 'push' && s.memoryMode !== 'tool-only' && s.memoryMode !== 'hybrid') s.memoryMode = 'hybrid';
     if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
     // Temporal grounding defaults ON (free, deterministic): absent/invalid => true (back-compat).
     if (typeof s.temporalGrounding !== 'boolean') s.temporalGrounding = true;
@@ -4749,6 +4767,18 @@ export async function initSettings() {
         saveSettings();
         // Re-sync registration to the new state (cycle-safe lazy import).
         import('./agent-writer.js').then(m => m.syncWriterWriteTool?.()).catch(() => {});
+    });
+
+    // Tool-first redesign — RECALL STRATEGY (memoryMode). Chooses how stored memory reaches the
+    // main model: 'hybrid' (default) and 'tool-only' skip the blocking Drafter LLM call and let the
+    // model pull facts via search_memory; 'push' restores the classic always-plan Drafter. Pure
+    // setting (no registration side-effect) — the pipeline reads it per turn.
+    $('#bf_mem_memory_mode').val(extensionSettings.memoryMode || 'hybrid').on('change', function () {
+        const before = extensionSettings.memoryMode || 'hybrid';
+        const next = $(this).val();
+        extensionSettings.memoryMode = next;
+        addDebugLog('info', `Recall strategy (memory mode) → ${next}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryMode' }, before, after: next });
+        saveSettings();
     });
 
     // Summary pyramid "Big Picture" injection toggle. Default OFF. Gates ONLY whether the

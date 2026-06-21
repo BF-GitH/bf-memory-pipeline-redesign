@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.43.0-alpha.1] - 2026-06-21
+
+### Added — Tool-first redesign: Claude drives memory (faster replies + on-demand recall)
+
+The headline of the tool-first redesign. Memory recall is moving from a deterministic, always-on push to a **tool-driven** model where the main reply model (e.g. Claude via the Claude Code CLI connection profile) recalls and pins facts itself through `search_memory` / `remember_fact`. This alpha lands the core path:
+
+- **New "Recall strategy" setting (`memoryMode`), default `hybrid`.** Three modes:
+  - **Hybrid** (default) — each turn injects a cheap, no-LLM anchor (speculative keyword facts + present-character anchors + the scene block); the model pulls everything deeper on demand via `search_memory`. **The blocking Agent 1 (Drafter) LLM call is skipped** — the primary latency win.
+  - **Tool-only** — minimal anchor; recall is driven almost entirely by the model's tool calls.
+  - **Push** — classic behavior restored: the Drafter plans the reply + picks fact branches every turn (an extra blocking LLM call). For main models that can't call tools.
+- **Faster replies in Hybrid/Tool-only:** dropping the Drafter removes a full per-turn LLM round-trip from the reply-critical path; the per-turn `summarizeKeys`/menu store walks (only consumed by the Drafter) are skipped too.
+- **Anchors still fire without the Drafter:** in hybrid/tool-only, `focus` is derived from the scene card's present characters, so the guaranteed present-character anchor facts are still injected (no LLM).
+- **`remember_fact` now defaults ON** and both tool descriptions were rewritten to prompt Claude to search proactively before replying and pin lasting facts as they're established (shipped in alpha groundwork).
+- **UI:** a "Recall strategy" selector at the top of the settings panel (separate from the existing cost/recall "Memory mode" preset), with a hint explaining the tool-calling requirement.
+
+**Known tradeoff (alpha):** in hybrid/tool-only the Drafter no longer parses the scene each turn, so the scene card only updates on turns that run in Push mode (or via future cheap scene-tracking). The injected scene persists from the last parse. The background Scribe (Agent 3) still extracts post-reply as a safety net. Requires a tool-calling main model; with a non-tool model, use **Push**.
+
+_Files:_ [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html), [src/agent-writer.js](src/agent-writer.js)
+
 ## [0.42.1] - 2026-05-31
 
 ### Changed — replaced the dead "Embedding profile" dropdown with working source + model inputs (H16)

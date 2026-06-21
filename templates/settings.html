@@ -31,6 +31,19 @@
                 Picks sensible defaults for cost vs. recall. Fine-tune anything in the tabs below — that switches this to “Custom”.
             </small>
 
+            <!-- Tool-first redesign — RECALL STRATEGY (how stored memory reaches the main model). -->
+            <div class="bf-mem-preset-bar" style="display:flex;align-items:center;gap:8px;margin:6px 0 4px;">
+                <label for="bf_mem_memory_mode" style="font-weight:bold;white-space:nowrap;">Recall strategy</label>
+                <select id="bf_mem_memory_mode" class="text_pole" style="flex:1;">
+                    <option value="hybrid">Hybrid — fast: light anchor + model recalls on demand (recommended)</option>
+                    <option value="tool-only">Tool-only — model drives all recall via search_memory</option>
+                    <option value="push">Push (classic) — Drafter plans every turn (no tool calling needed)</option>
+                </select>
+            </div>
+            <small class="bf-mem-hint" style="display:block;margin:-2px 0 10px;">
+                <b>Hybrid</b>/<b>Tool-only</b> skip the blocking Drafter LLM call for faster replies — the main model (e.g. Claude via the Claude Code CLI profile) pulls deeper facts itself through the <code>search_memory</code> tool, so they need a tool-calling main model. <b>Push</b> restores the classic always-plan behavior for models that can’t call tools.
+            </small>
+
             <!-- Tabs (chronological order each turn: Drafter → Librarian → Writer → Scribe) -->
             <div class="bf-mem-tabs" role="tablist">
                 <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_agent1" tabindex="0">Drafter</button>

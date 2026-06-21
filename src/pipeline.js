@@ -869,13 +869,23 @@ async function runPipelineInline(data) {
     // TO RE-ENABLE: restore `const wantFinder = settings.useFinderAgent !== false;`.
     // ============================================================================================
     const wantFinder = false; // HARD-DISABLED — see the note above (was: settings.useFinderAgent !== false)
-    const factInventory = wantFinder ? '' : summarizeKeys(databases);
+    // MEMORY MODE (tool-first redesign): 'hybrid' (default) and 'tool-only' DROP the blocking Agent 1
+    // (Draft) LLM call from the reply-critical path — the main model (e.g. Claude via the Claude Code
+    // CLI connection profile) pulls deeper memory on demand through the search_memory tool, so the
+    // reply only needs a cheap, no-LLM anchor (speculative facts + present-character anchors + the
+    // scene block). 'push' preserves classic behavior: Agent 1 drafts the reply + picks branches.
+    const memoryMode = (settings.memoryMode === 'push' || settings.memoryMode === 'tool-only')
+        ? settings.memoryMode : 'hybrid';
+    const runAgent1 = memoryMode === 'push';
+    // Agent 1's fact inventory + Stage-1 menu are consumed ONLY by the Draft prompt (and the
+    // deterministic fallback's delta keywords come from Agent 1's neededFacts). In hybrid/tool-only
+    // mode Agent 1 never runs, so skip building them — that also avoids a full-store key walk
+    // (summarizeKeys) and a menu aggregate every turn.
+    const factInventory = (runAgent1 && !wantFinder) ? summarizeKeys(databases) : '';
     // STAGE 1 menu: compact Category×aspect map (counts, NO values) Agent 1 picks branches from.
-    // Counts come from the index aggregate, not a full-fact walk.
-    const factMenu = summarizeMenuIndexed(index);
-    // NOTE: the Finder is hard-disabled (wantFinder=false above), so the inventory is ALWAYS
-    // included for Agent 1. The old `wantFinder ? 'skipped (finder on)' : …` branch was dead
-    // (unreachable while wantFinder is const-false) and misleadingly implied a "finder on" state.
+    // Counts come from the index aggregate, not a full-fact walk. Built only when Agent 1 runs.
+    const factMenu = runAgent1 ? summarizeMenuIndexed(index) : '';
+    addDebugLog('info', `Memory mode: ${memoryMode}${runAgent1 ? '' : ' — Agent 1 Draft skipped (tool-driven recall)'}`);
     addDebugLog('info', `Fact inventory for Agent 1: ${factInventory ? factInventory.split('\n').length + ' keys' : 'empty'}; menu: ${factMenu ? factMenu.split('\n').length + ' categories' : 'empty'}`);
 
     const agent1Start = Date.now();
@@ -883,11 +893,18 @@ async function runPipelineInline(data) {
         isInternalCall = true;
         const promises = [];
 
-        // Agent 1: Draft + STAGE 1 menu picker (returns #Branches)
-        promises.push(
-            runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId, factInventory, factMenu)
-                .catch(err => ({ draft: '', branches: [], neededFacts: [], raw: '', error: err.message })),
-        );
+        // Agent 1: Draft + STAGE 1 menu picker (returns #Branches) — PUSH mode only. In hybrid/
+        // tool-only mode we SKIP this blocking Draft LLM call entirely (the latency win) and let
+        // the main model drive recall on demand via search_memory; promise resolves to null so the
+        // empty-draft path below seeds a no-LLM anchor.
+        if (runAgent1) {
+            promises.push(
+                runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId, factInventory, factMenu)
+                    .catch(err => ({ draft: '', branches: [], neededFacts: [], raw: '', error: err.message })),
+            );
+        } else {
+            promises.push(Promise.resolve(null));
+        }
 
         // Speculative retrieval: start fact lookup with context keywords NOW (no LLM wait)
         promises.push(
@@ -896,9 +913,10 @@ async function runPipelineInline(data) {
         );
 
         [draftResult, speculativeRetrieval] = await Promise.all(promises);
-        // Agent 1 + speculative retrieval run in PARALLEL (single Promise.all), so the reply
-        // waited the wall-clock of the slower of the two. Record that shared parallel wall-clock
-        // for both — we can't separate them without changing the await structure (out of scope).
+        // Agent 1 (when run) + speculative retrieval run in PARALLEL (single Promise.all), so the
+        // reply waited the wall-clock of the slower of the two. Record that shared parallel
+        // wall-clock for both. In hybrid/tool-only mode Agent 1 is skipped, so this measures just
+        // the speculative-retrieval time — the dropped Draft LLM call is the latency win.
         stageMs.agent1Ms = Date.now() - agent1Start;
         stageMs.speculativeRetrievalMs = stageMs.agent1Ms;
     } catch (error) {
@@ -921,7 +939,22 @@ async function runPipelineInline(data) {
     // GRACEFUL DEGRADATION: if Agent 1 errored (e.g. provider returned empty completion
     // even after retry), don't abort the whole pipeline — the writer can still inject
     // the retrieved facts with no draft. Memory > nothing.
-    if (!draftResult || draftResult.error) {
+    if (!runAgent1) {
+        // HYBRID / TOOL-ONLY: Agent 1 was intentionally not run. Seed an empty draft shape (no
+        // "what happens next" direction — the main model writes freely) and derive `focus` from the
+        // current scene's present characters so the guaranteed present-character anchors below still
+        // fire (cheap, no LLM). Everything deeper is pulled by the model via search_memory.
+        let scenePresent = [];
+        try {
+            const s = getScene();
+            scenePresent = Array.isArray(s?.present) ? s.present.map(x => String(x ?? '').trim()).filter(Boolean) : [];
+        } catch { scenePresent = []; }
+        draftResult = { draft: '', branches: [], focus: scenePresent, neededFacts: [], nextHint: [], scene: null, raw: '' };
+        addDebugLog('info', `Hybrid mode: skipped Agent 1 Draft LLM call — anchoring on speculative facts${scenePresent.length ? ` + present-character anchors (${scenePresent.join(', ')})` : ''}; main model recalls via search_memory`, {
+            subsystem: 'agent1', event: 'agent1.run', reason: 'SKIPPED_HYBRID',
+            data: { agent: 'agent1', mode: memoryMode, skipped: true, focus: scenePresent },
+        });
+    } else if (!draftResult || draftResult.error) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`, {
             subsystem: 'agent1', event: 'agent1.run', reason: 'ERROR',
             data: { agent: 'agent1', profileId: agent1ProfileId || null, success: false, error: draftResult?.error || 'no result', durationMs: Date.now() - agent1Start },
