@@ -282,8 +282,11 @@ const DEFAULT_SETTINGS = {
     // none respond — safe to enable on any backend (retrieval just stays keyword-only).
     // C4/A3 default flip: semantic (vector) retrieval ON for fresh installs. GRACEFULLY no-ops when
     // no embedding endpoint responds (callEmbeddingAPI → null → keyword/trigram retrieval), so it is
-    // safe to default-on: it only adds recall when an embedding model is actually configured.
-    semanticRetrieval: true,
+    // TOOL-FIRST DEFAULT: OFF. Embeddings / semantic recall are NOT part of the tool-first path —
+    // Claude drives recall via search_memory, which is the intended "semantic" layer. The vector
+    // code remains in the repo but is dormant by default; turn this ON only if you deliberately
+    // configure an embedding model. (It no-ops anyway when no embedding endpoint responds.)
+    semanticRetrieval: false,
     embeddingProfile: '',                       // CMRS profile for embeddings (blank = reuse Agent 1's)
     embeddingSource: '',                        // ST vector source for embeddings (blank = derive from the active chat source, e.g. 'openrouter')
     embeddingModel: 'text-embedding-3-small',   // embedding model (auto-prefixed per source; openrouter → openai/text-embedding-3-small)
@@ -4657,7 +4660,7 @@ const PRESETS = {
     // consolidate less often.
     cheap: {
         useFinderAgent: false,
-        semanticRetrieval: true,
+        semanticRetrieval: false,
         agent2ContextMessages: 10,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
@@ -4670,7 +4673,7 @@ const PRESETS = {
     // trim, overview + recall tool on, default caps.
     balanced: {
         useFinderAgent: true,
-        semanticRetrieval: true,
+        semanticRetrieval: false,
         agent2ContextMessages: 10,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
@@ -4683,7 +4686,7 @@ const PRESETS = {
     // consolidation. The most expensive option.
     maxrecall: {
         useFinderAgent: true,
-        semanticRetrieval: true,
+        semanticRetrieval: false,
         agent2ContextMessages: 0,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
