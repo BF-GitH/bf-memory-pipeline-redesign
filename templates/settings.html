@@ -671,6 +671,18 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <div id="bf_mem_graph_result" class="bf-mem-graph-result"></div>
                         </details>
 
+                        <!-- Recurring characters: the entity registry (named / NPC / deferred). Lets you
+                             see who memory is tracking and promote a recurring NPC to a first-class subject. -->
+                        <details class="bf-mem-entities-wrap" style="margin:8px 0;">
+                            <summary style="cursor:pointer;font-weight:bold;">👥 Recurring characters — entity registry</summary>
+                            <div class="bf-mem-debug-actions" style="margin:4px 0;">
+                                <button id="bf_mem_entities_refresh" class="menu_button" title="Refresh the entity list"><i class="fa-solid fa-rotate"></i> Refresh</button>
+                                <span id="bf_mem_entities_summary" class="bf-mem-log-count"></span>
+                            </div>
+                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">Entities the memory pipeline is tracking this chat. <b>Named</b> = first-class recurring subject; <b>NPC</b> = pooled background; <b>deferred</b> = undecided. Promote an NPC to make it a recurring subject (re-keys its facts under its own name).</small>
+                            <div id="bf_mem_entities_list" class="bf-mem-entities-list"></div>
+                        </details>
+
                         <div id="bf_mem_db_list" class="bf-mem-db-list"></div>
 
                         <!-- Add your own taxonomy labels (user overlay, global across chats) -->

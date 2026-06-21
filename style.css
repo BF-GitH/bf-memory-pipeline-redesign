@@ -20,6 +20,16 @@
 .bf-mem-graph-link { text-decoration: none; }
 .bf-mem-graph-link:hover { text-decoration: underline; }
 
+/* Recurring-characters entity panel */
+.bf-mem-entities-list { max-height: 240px; overflow-y: auto; font-size: 0.9em; }
+.bf-mem-ent-row { padding: 3px 0; line-height: 1.5; border-bottom: 1px solid rgba(128,128,128,0.12); }
+.bf-mem-ent-name { font-weight: bold; }
+.bf-mem-ent-badge { display: inline-block; border-radius: 4px; padding: 0 5px; font-size: 0.78em; font-weight: bold; margin: 0 4px; }
+.bf-mem-ent-named { background: rgba(80,180,120,0.25); color: #6edb95; }
+.bf-mem-ent-npc { background: rgba(128,128,128,0.22); color: #b8b8b8; }
+.bf-mem-ent-deferred { background: rgba(230,162,60,0.22); color: #e6a23c; }
+.bf-mem-ent-promote { font-size: 0.78em !important; padding: 1px 6px !important; }
+
 /* Settings Panel */
 .bf-mem-settings {
     padding: 5px;

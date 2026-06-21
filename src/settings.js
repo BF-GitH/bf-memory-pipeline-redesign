@@ -1132,6 +1132,48 @@ async function renderGraphView(keyQuery) {
     }
 }
 
+/**
+ * "Recurring characters" entity panel (Phase 4). Lists the entity registry for this chat (named /
+ * NPC / deferred) and lets the user PROMOTE an NPC/deferred entity to a first-class recurring
+ * subject (re-keys its facts under its own name via promoteEntity). Lazy-imports agent-entities.js.
+ */
+async function renderEntityPanel() {
+    const el = document.getElementById('bf_mem_entities_list');
+    if (!el) return;
+    const sumEl = document.getElementById('bf_mem_entities_summary');
+    const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    try {
+        const ent = await import('./agent-entities.js');
+        const entities = ent.getEntities() || {};
+        const names = Object.keys(entities);
+        if (!names.length) {
+            el.innerHTML = '<div class="bf-mem-hint" style="opacity:.7;">No entities tracked yet this chat. As characters recur, they appear here.</div>';
+            if (sumEl) sumEl.textContent = '';
+            return;
+        }
+        const badge = st => `<span class="bf-mem-ent-badge bf-mem-ent-${esc(st)}">${esc(st)}</span>`;
+        el.innerHTML = names.sort().map(name => {
+            const e = entities[name] || {};
+            const st = e.status || 'deferred';
+            const canPromote = st !== 'named';
+            return `<div class="bf-mem-ent-row"><span class="bf-mem-ent-name">${esc(name)}</span> ${badge(st)}`
+                + (Array.isArray(e.aliases) && e.aliases.length ? ` <span class="bf-mem-dim">aka ${esc(e.aliases.join(', '))}</span>` : '')
+                + (canPromote ? ` <button class="menu_button bf-mem-ent-promote" data-name="${esc(name)}" title="Promote to a first-class recurring subject (re-keys its facts)">Mark recurring</button>` : '')
+                + `</div>`;
+        }).join('');
+        if (sumEl) sumEl.textContent = `${names.length} entit${names.length === 1 ? 'y' : 'ies'}`;
+        el.querySelectorAll('.bf-mem-ent-promote').forEach(b => b.addEventListener('click', async () => {
+            const nm = b.getAttribute('data-name');
+            b.disabled = true; b.textContent = 'Promoting…';
+            try { const r = await ent.promoteEntity(nm); b.textContent = `Promoted (${r?.moved || 0} facts)`; }
+            catch { b.textContent = 'Failed'; }
+            setTimeout(() => renderEntityPanel(), 900);
+        }));
+    } catch (e) {
+        el.innerHTML = `<div class="bf-mem-hint">Entity panel error: ${esc(String(e).slice(0, 140))}</div>`;
+    }
+}
+
 // --- Debug-log filter state (client-side over the in-memory ring buffer) ---
 // Level checkboxes default to fail+pass+info; debug/verbose opt-in. The verbose level is
 // further gated by the debugVerbose SETTING (capture-side) — when off, verbose entries
@@ -5581,6 +5623,10 @@ export async function initSettings() {
     // Graph view (Database tab): show a fact's linked neighbors; Enter or button triggers it.
     $('#bf_mem_graph_btn').on('click', () => renderGraphView($('#bf_mem_graph_key').val()));
     $('#bf_mem_graph_key').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); renderGraphView($('#bf_mem_graph_key').val()); } });
+
+    // Recurring-characters entity panel (Database tab): manual refresh + initial paint.
+    $('#bf_mem_entities_refresh').on('click', () => renderEntityPanel());
+    renderEntityPanel();
 
     $('#bf_mem_clear_log').on('click', () => {
         debugLog = [];
