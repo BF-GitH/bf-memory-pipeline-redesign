@@ -1,8 +1,11 @@
 # Changelog
 
-## [0.43.0-alpha.2] - 2026-06-21
+## [0.50.0] - 2026-06-21
 
 ### Added — Phases 2–4: observability, Claude tuning, graph + entity UI
+
+> Version jumped to 0.50.0 to clearly mark the tool-first redesign (Phases 1–4) as the
+> current main release — distinct from the pre-redesign 0.42.x line.
 
 Built on the tool-first core (alpha.1), all verified end-to-end in a real SillyTavern 1.18 instance driven through a browser.
 
