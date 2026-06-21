@@ -36,6 +36,55 @@ export function getCurrentProfileId() {
 }
 
 /**
+ * Heuristic: is the given connection profile (or the active one) a Claude/Anthropic profile?
+ * The tool-first defaults (hybrid recall + the search_memory/remember_fact tools) are tuned for a
+ * tool-calling model like Claude via the Claude Code CLI profile. ST stores the chat-completion
+ * source / model under different keys across versions, so we scan the profile's own string fields
+ * case-insensitively for "claude" / "anthropic" rather than depend on one schema key.
+ * @param {object} [profile] - a connection profile object; defaults to the active profile
+ * @returns {boolean}
+ */
+export function isClaudeProfile(profile) {
+    try {
+        let p = profile;
+        if (!p) {
+            const id = getCurrentProfileId();
+            p = getConnectionProfiles().find(x => x && x.id === id) || null;
+        }
+        if (!p || typeof p !== 'object') return false;
+        for (const v of Object.values(p)) {
+            if (typeof v === 'string' && /claude|anthropic/i.test(v)) return true;
+        }
+        return false;
+    } catch { return false; }
+}
+
+/**
+ * Profile-aware defaults (tool-first redesign), log-only. We DON'T override the user's explicit
+ * choices — auto-rewriting settings on profile detection would be surprising. Instead we surface a
+ * one-line Debug confirmation of whether the ACTIVE profile is the tuned (Claude/Anthropic) path,
+ * so a user on a non-tool-calling profile can see WHY hybrid recall isn't firing (the tools only
+ * activate on a tool-calling main model). Returns the detection result for callers that want it.
+ * @param {object} settings
+ * @returns {{isClaude: boolean, profileId: string|null}}
+ */
+export function detectProfileForToolFirst(settings) {
+    const profileId = getCurrentProfileId();
+    const isClaude = isClaudeProfile();
+    const mode = settings?.memoryMode || 'hybrid';
+    if (isClaude) {
+        addDebugLog('info', `Active connection profile looks like Claude/Anthropic — tool-first memory (mode="${mode}", search_memory/remember_fact) is the tuned path here`, {
+            subsystem: 'settings', event: 'profile.detected', data: { profileId, isClaude: true, memoryMode: mode },
+        });
+    } else if (mode !== 'push') {
+        addDebugLog('info', `Memory mode "${mode}" relies on the main model calling tools; the active profile isn't recognized as a known tool-calling (Claude) profile — if recall isn't firing, the model may not support tools (switch Recall strategy to "Push").`, {
+            subsystem: 'settings', event: 'profile.detected', data: { profileId, isClaude: false, memoryMode: mode },
+        });
+    }
+    return { isClaude, profileId };
+}
+
+/**
  * Get the Agent 1 (Draft Planner) profile ID from settings, or null if not configured.
  * This does NOT switch any profile - just returns the ID for use with CMRS.
  * @param {object} settings - Extension settings

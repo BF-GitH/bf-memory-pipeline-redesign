@@ -354,6 +354,17 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
             subsystem: 'cache', event: 'cache.eligibility',
             data: { agent, systemPromptStable, systemPromptTokens: sysTokens, personaChanged, note: 'server-side cache HITS are not observable from the extension; this is prefix-stability only' },
         });
+        // CACHE-DRIFT GUARD (tool-first): if the static system prompt CHANGED between calls for the
+        // same agent (prevHash existed and differs) WITHOUT a legitimate persona change, per-turn
+        // variable data has likely leaked into the system block — which breaks server-side prompt
+        // caching for that agent. Surface it at info level so a future edit that introduces such a
+        // leak is caught early. The fix is always: keep per-turn data in the USER message.
+        if (prevHash !== undefined && !systemPromptStable && !personaChanged) {
+            addDebugLog('info', `Cache drift [${agent}]: system prompt changed between calls — variable per-turn data may have leaked into the static system block (hurts prompt-cache hits). Keep variable data in the USER message.`, {
+                subsystem: 'cache', event: 'cache.drift', reason: 'SYSTEM_PROMPT_CHANGED',
+                data: { agent, systemPromptTokens: sysTokens },
+            });
+        }
     } catch { /* logging must never break the call */ }
 
     // ── Bounded retry under a WALL-CLOCK budget + real abort ──────────────────

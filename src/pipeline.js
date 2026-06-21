@@ -10,7 +10,7 @@ import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
 import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveAspect, deriveScope, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage, getRelationshipMomentThread } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
-import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
+import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId, detectProfileForToolFirst } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, setLastInjection, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid, isTriviallyEmptyForExtraction } from './settings.js';
 import { detectAndRecord, showEntityPopup, runEntityResolution } from './agent-entities.js';
@@ -28,6 +28,7 @@ let lastInjection = null; // cached injection text for the FIRST generation (sce
 // the stale draft (facts are safe to reuse; the draft is not). Kept fast: no agent re-run.
 let lastInjectionNoDraft = null;
 let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETION_PROMPT_READY
+let profileDetectionLogged = false; // tool-first: log Claude-profile detection once per session
 // A2/B5 — FROZEN INJECTION (opt-in, settings.injectionFreezeTurns; default 0 = off). Counts
 // CONSECUTIVE genuine-new-turns that REUSED the cached injection instead of re-running the agents.
 // 0 while disabled / right after a full run; incremented on each frozen turn; reset to 0 on a full
@@ -883,6 +884,13 @@ async function runPipelineInline(data) {
     const memoryMode = (settings.memoryMode === 'push' || settings.memoryMode === 'tool-only')
         ? settings.memoryMode : 'hybrid';
     const runAgent1 = memoryMode === 'push';
+    // PROFILE-AWARE detection (tool-first), once per session: log whether the active connection
+    // profile is the tuned Claude/Anthropic tool-calling path — so if hybrid/tool-only recall isn't
+    // firing, the Debug log explains why (the tools only activate on a tool-calling main model).
+    if (!profileDetectionLogged) {
+        profileDetectionLogged = true;
+        try { detectProfileForToolFirst(settings); } catch { /* detection is best-effort */ }
+    }
     // Agent 1's fact inventory + Stage-1 menu are consumed ONLY by the Draft prompt (and the
     // deterministic fallback's delta keywords come from Agent 1's neededFacts). In hybrid/tool-only
     // mode Agent 1 never runs, so skip building them — that also avoids a full-store key walk
