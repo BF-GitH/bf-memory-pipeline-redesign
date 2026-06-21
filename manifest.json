@@ -1,0 +1,12 @@
+{
+  "display_name": "BF's Memory Pipeline",
+  "loading_order": 150,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "BF-GitH",
+  "version": "0.42.1",
+  "homePage": "https://github.com/BF-GitH/bf-memory-pipeline",
+  "auto_update": false
+}

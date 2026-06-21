@@ -1,0 +1,905 @@
+/* BF Memory Pipeline - Styles */
+
+/* Settings Panel */
+.bf-mem-settings {
+    padding: 5px;
+}
+
+/* Status Bar */
+.bf-mem-status-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 10px;
+    background: var(--SmartThemeBlurTintColor, #1a1a2e);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 6px;
+}
+
+.bf-mem-status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #666;
+    flex-shrink: 0;
+}
+
+.bf-mem-status-dot.active { background: #4caf50; }
+.bf-mem-status-dot.running { background: #ff9800; animation: bf-mem-pulse 1s infinite; }
+.bf-mem-status-dot.error { background: #f44336; }
+
+@keyframes bf-mem-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+/* Tabs */
+.bf-mem-tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 12px;
+    border-bottom: 2px solid var(--SmartThemeBorderColor, #444);
+    padding-bottom: 0;
+    /* Mobile: allow horizontal scroll if tabs don't fit on narrow viewports
+       (e.g. 360px wide phones with 1.2x accessibility zoom).
+       Tabs visually wrap onto a second row instead of clipping off-screen. */
+    flex-wrap: wrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.bf-mem-tab {
+    padding: 6px 14px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    color: var(--SmartThemeBodyColor, #aaa);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all 0.15s;
+    flex: 0 1 auto;
+    min-height: 36px; /* touch target — Material guideline minimum */
+}
+
+.bf-mem-tab:hover {
+    background: var(--SmartThemeBlurTintColor, #252540);
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-tab.active {
+    background: var(--SmartThemeBlurTintColor, #1a1a2e);
+    border-color: var(--SmartThemeBorderColor, #444);
+    color: var(--SmartThemeBodyColor, #fff);
+    font-weight: 600;
+}
+
+.bf-mem-tabpanel {
+    animation: bf-mem-fadein 0.15s ease;
+}
+
+@keyframes bf-mem-fadein {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* Sections */
+.bf-mem-section {
+    margin-bottom: 12px;
+    border: 1px solid var(--SmartThemeBorderColor, #3a3a4a);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.bf-mem-section-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--SmartThemeBlurTintColor, #1e1e30);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--SmartThemeBodyColor, #ddd);
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #3a3a4a);
+}
+
+.bf-mem-section-header i {
+    color: #888;
+    font-size: 12px;
+}
+
+.bf-mem-section-body {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* Fields */
+.bf-mem-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.bf-mem-field label {
+    font-size: 12px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    display: flex;
+    justify-content: space-between;
+}
+
+.bf-mem-val {
+    font-weight: bold;
+    color: #7bb3ff;
+}
+
+.bf-mem-hint {
+    font-size: 11px;
+    color: #777;
+    line-height: 1.3;
+}
+
+.bf-mem-reset-btn {
+    margin-left: auto;
+    padding: 2px 8px !important;
+    font-size: 11px !important;
+}
+
+/* Profile row */
+.bf-mem-profile-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.bf-mem-profile-row select {
+    flex: 1;
+}
+
+/* Textareas for prompts */
+.bf-mem-textarea {
+    width: 100%;
+    min-height: 120px;
+    background: var(--SmartThemeBlurTintColor, #111);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 4px;
+    color: var(--SmartThemeBodyColor, #eee);
+    padding: 8px;
+    font-family: monospace;
+    font-size: 11px;
+    line-height: 1.4;
+    resize: vertical;
+}
+
+/* Read-only "Final prompt assembly" preview boxes (prompt transparency) */
+.bf-mem-assembly {
+    margin-top: 8px;
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 4px;
+    background: var(--SmartThemeBlurTintColor, #161616);
+}
+
+.bf-mem-assembly > summary {
+    cursor: pointer;
+    padding: 6px 8px;
+    font-size: 11px;
+    font-weight: bold;
+    color: var(--SmartThemeBodyColor, #cfe3ff);
+    list-style: revert;
+    user-select: none;
+}
+
+.bf-mem-assembly > summary::marker {
+    color: #7bb3ff;
+}
+
+.bf-mem-assembly[open] > summary {
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+}
+
+.bf-mem-assembly-body {
+    padding: 8px;
+}
+
+.bf-mem-assembly-body p {
+    margin: 0 0 6px 0;
+    font-size: 11px;
+    color: #999;
+    line-height: 1.4;
+}
+
+.bf-mem-assembly pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--SmartThemeBodyColor, #dcdcdc);
+    background: var(--SmartThemeBlurTintColor, #111);
+    border: 1px solid var(--SmartThemeBorderColor, #333);
+    border-radius: 4px;
+    padding: 8px;
+}
+
+.bf-mem-assembly .bf-mem-asm-label {
+    color: #7bb3ff;
+    font-weight: bold;
+}
+
+.bf-mem-assembly .bf-mem-asm-ph {
+    color: #c0a060;
+}
+
+/* Sliders */
+.bf-mem-section input[type="range"] {
+    width: 100%;
+    cursor: pointer;
+    accent-color: #7bb3ff;
+}
+
+/* Database Tab */
+.bf-mem-db-stats {
+    font-size: 13px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    margin-bottom: 8px;
+}
+
+.bf-mem-db-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 300px;
+    overflow-y: auto;
+    margin-bottom: 10px;
+}
+
+.bf-mem-db-card {
+    border: 1px solid var(--SmartThemeBorderColor, #3a3a4a);
+    border-radius: 5px;
+    padding: 8px 10px;
+    background: var(--SmartThemeBlurTintColor, #1a1a2e);
+}
+
+.bf-mem-db-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.bf-mem-db-card-name {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-db-card-count {
+    font-size: 11px;
+    color: #888;
+    background: var(--SmartThemeBorderColor, #333);
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+.bf-mem-db-card-meta {
+    font-size: 11px;
+    color: #777;
+    margin-bottom: 6px;
+}
+
+/* User-added (overlay) taxonomy marker — distinguishes custom labels from built-ins. */
+.bf-mem-custom-chip {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--SmartThemeQuoteColor, #6cae75);
+    border: 1px solid var(--SmartThemeQuoteColor, #6cae75);
+    border-radius: 3px;
+    padding: 0 4px;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+
+.bf-mem-db-card-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.bf-mem-db-card-actions .menu_button {
+    padding: 3px 8px !important;
+    font-size: 11px !important;
+}
+
+.bf-mem-db-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.bf-mem-empty {
+    color: #777;
+    font-size: 12px;
+    padding: 10px;
+    text-align: center;
+}
+
+/* Database Browser Popup */
+.bf-mem-db-browser {
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+.bf-mem-db-section {
+    margin-bottom: 15px;
+}
+
+.bf-mem-db-section h4 {
+    margin: 0 0 5px;
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-db-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+
+.bf-mem-db-table th,
+.bf-mem-db-table td {
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    padding: 4px 8px;
+    text-align: left;
+}
+
+.bf-mem-db-table th {
+    background: var(--SmartThemeBlurTintColor, #333);
+    font-weight: bold;
+    font-size: 10px;
+    text-transform: uppercase;
+}
+
+/* Debug Log */
+.bf-mem-debug-actions {
+    display: flex;
+    gap: 6px;
+    margin: 6px 0;
+}
+
+.bf-mem-debug-log {
+    max-height: 350px;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    padding: 8px;
+    background: #0a0a14;
+    border: 1px solid var(--SmartThemeBorderColor, #333);
+    border-radius: 4px;
+    min-height: 100px;
+}
+
+.bf-mem-debug-entry {
+    padding: 2px 0;
+    border-bottom: 1px solid #1a1a2a;
+}
+
+.bf-mem-debug-entry.info { color: #aaa; }
+.bf-mem-debug-entry.pass { color: #4caf50; }
+.bf-mem-debug-entry.fail { color: #f44336; }
+.bf-mem-debug-entry.debug { color: #6a8caf; }
+.bf-mem-debug-entry.verbose { color: #777; }
+.bf-mem-log-time { color: #555; }
+.bf-mem-log-sub { color: #7bb3ff; opacity: 0.8; }
+
+/* Debug filter toolbar */
+.bf-mem-debug-filters {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 0;
+}
+.bf-mem-debug-levels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    align-items: center;
+}
+.bf-mem-debug-levels .checkbox_label {
+    font-family: monospace;
+    font-size: 11px;
+}
+.bf-mem-debug-filter-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.bf-mem-debug-filter-row #bf_mem_log_subsystem { flex: 0 0 auto; }
+.bf-mem-debug-filter-row #bf_mem_log_search { flex: 1 1 140px; min-width: 120px; }
+.bf-mem-disabled { opacity: 0.4; }
+.bf-mem-lv-fail { color: #f44336; }
+.bf-mem-lv-pass { color: #4caf50; }
+.bf-mem-lv-info { color: #aaa; }
+.bf-mem-lv-debug { color: #6a8caf; }
+.bf-mem-lv-verbose { color: #777; }
+.bf-mem-log-count {
+    margin-left: auto;
+    align-self: center;
+    font-size: 11px;
+    color: #888;
+}
+
+/* "Why not?" probe */
+.bf-mem-debug-probe {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: 6px 0;
+}
+.bf-mem-debug-probe #bf_mem_probe_key { flex: 1 1 160px; min-width: 120px; }
+.bf-mem-probe-result {
+    flex: 1 1 100%;
+    font-family: monospace;
+    font-size: 11px;
+    color: #aaa;
+    word-break: break-word;
+}
+.bf-mem-probe-reason { font-weight: bold; }
+.bf-mem-probe-reason.found { color: #4caf50; }
+.bf-mem-probe-reason.missing { color: #f0a020; }
+.bf-mem-probe-detail { color: #888; }
+
+/* Run grouping */
+.bf-mem-run-group {
+    border-left: 3px solid #444;
+    margin: 4px 0;
+    background: rgba(255, 255, 255, 0.02);
+}
+.bf-mem-run-group.pass { border-left-color: #4caf50; }
+.bf-mem-run-group.fail { border-left-color: #f44336; }
+.bf-mem-run-group.ungrouped { border-left-color: #6a6a6a; }
+.bf-mem-run-group > summary {
+    cursor: pointer;
+    padding: 4px 6px;
+    font-weight: bold;
+    color: #cfd8e0;
+    user-select: none;
+}
+.bf-mem-run-group > summary:hover { background: rgba(255, 255, 255, 0.04); }
+.bf-mem-run-count { font-weight: normal; color: #888; }
+.bf-mem-run-body { padding: 0 6px 4px 12px; }
+.bf-mem-fact-diff .bf-mem-diff-before { color: #f44336; }
+.bf-mem-fact-diff .bf-mem-diff-after { color: #4caf50; }
+
+/* Review Popup */
+#bf_mem_review_overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 10000;
+    /* Anchor to TOP with safe-area padding; flex still centers HORIZONTALLY.
+       align-items:flex-start keeps the popup reachable when the soft keyboard
+       shrinks the visual viewport — center-aligned content would slide above
+       the visible area with no way to scroll the fixed overlay. */
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: max(16px, env(safe-area-inset-top, 16px)) 8px max(16px, env(safe-area-inset-bottom, 16px));
+    overflow-y: auto;            /* fallback scroll if popup taller than viewport */
+    overscroll-behavior: contain;
+}
+
+.bf-mem-review-popup {
+    background: var(--SmartThemeBlurTintColor, #1a1a2e);
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 10px;
+    padding: 20px;
+    max-width: 700px;
+    width: 90%;
+    /* Prefer JS-set --bf-mem-vv-h (visualViewport.height - 32px); fall back to
+       dynamic viewport units (shrinks with iOS keyboard) then static vh. */
+    max-height: var(--bf-mem-vv-h, min(80dvh, 80vh));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    color: var(--SmartThemeBodyColor, #eee);
+    margin: auto 0;              /* vertically centers ONLY when there's slack */
+}
+
+/* Desktop: restore true vertical centering when there's plenty of room
+   and no on-screen keyboard is likely (hover = mouse). */
+@media (hover: hover) and (min-height: 700px) {
+    #bf_mem_review_overlay { align-items: center; }
+}
+
+.bf-mem-review-popup h3 { margin: 0 0 10px; }
+.bf-mem-review-popup p { margin: 0 0 15px; color: #aaa; font-size: 13px; }
+
+.bf-mem-review-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 15px;
+    max-height: 50vh;
+    overflow-y: auto;
+}
+
+.bf-mem-review-item {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    grid-template-rows: auto auto;
+    gap: 4px 8px;
+    padding: 8px;
+    border-radius: 5px;
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    position: relative;
+}
+
+.bf-mem-review-item.bf-mem-add { border-left: 3px solid #4caf50; }
+.bf-mem-review-item.bf-mem-update { border-left: 3px solid #ff9800; }
+.bf-mem-review-item.bf-mem-delete { border-left: 3px solid #f44336; }
+.bf-mem-review-item.bf-mem-conflict { border-left: 3px solid #9c27b0; }
+.bf-mem-conflict-values { font-size: 12px; opacity: 0.9; word-break: break-word; }
+
+.bf-mem-action-badge {
+    font-size: 10px;
+    font-weight: bold;
+    padding: 2px 6px;
+    border-radius: 3px;
+    align-self: center;
+}
+
+.bf-mem-add .bf-mem-action-badge { background: #4caf50; color: #fff; }
+.bf-mem-update .bf-mem-action-badge { background: #ff9800; color: #fff; }
+.bf-mem-delete .bf-mem-action-badge { background: #f44336; color: #fff; }
+.bf-mem-badge-conflict { background: #9c27b0; color: #fff; }
+
+.bf-mem-category {
+    font-weight: bold;
+    align-self: center;
+    color: var(--SmartThemeBodyColor, #ddd);
+}
+
+.bf-mem-key {
+    grid-column: 3;
+    background: var(--SmartThemeBlurTintColor, #222);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+    color: var(--SmartThemeBodyColor, #eee);
+    padding: 4px 6px;
+    font-size: 12px;
+}
+
+.bf-mem-value {
+    grid-column: 1 / -1;
+    background: var(--SmartThemeBlurTintColor, #222);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+    color: var(--SmartThemeBodyColor, #eee);
+    padding: 4px 6px;
+    font-size: 12px;
+    resize: vertical;
+    min-height: 40px;
+}
+
+.bf-mem-known {
+    grid-column: 1 / -1;
+    font-size: 11px;
+    color: #888;
+}
+
+.bf-mem-remove-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: none;
+    border: none;
+    color: #f44336;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+}
+
+.bf-mem-review-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+/* Summary Tab (Debug Light) */
+.bf-mem-summary {
+    padding: 10px;
+    background: var(--SmartThemeBlurTintColor, #0a0a14);
+    border: 1px solid var(--SmartThemeBorderColor, #333);
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--SmartThemeBodyColor, #ccc);
+}
+
+.bf-mem-summary h3 {
+    margin: 0 0 8px;
+    font-size: 14px;
+    color: var(--SmartThemeBodyColor, #eee);
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+    padding-bottom: 6px;
+}
+
+.bf-mem-summary h4 {
+    margin: 10px 0 4px;
+    font-size: 12px;
+    color: #7bb3ff;
+}
+
+.bf-mem-summary p {
+    margin: 0 0 4px;
+    color: #999;
+}
+
+.bf-mem-summary-item {
+    padding: 2px 0 2px 12px;
+    border-left: 2px solid var(--SmartThemeBorderColor, #444);
+    margin: 2px 0;
+}
+
+.bf-mem-summary-item strong {
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-summary-item em {
+    color: #999;
+    font-style: italic;
+}
+
+.bf-mem-summary-empty {
+    color: #666;
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+}
+
+/* Linked Chats */
+.bf-mem-linked-chats-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.bf-mem-linked-display {
+    flex: 1;
+    font-size: 11px;
+    color: #999;
+    background: var(--SmartThemeBlurTintColor, #111);
+    border: 1px solid var(--SmartThemeBorderColor, #333);
+    border-radius: 4px;
+    padding: 5px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.bf-mem-linked-popup h4 {
+    margin: 0 0 8px;
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-linked-popup p {
+    margin: 0 0 10px;
+    font-size: 12px;
+    color: #999;
+}
+
+.bf-mem-linked-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.bf-mem-linked-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: var(--SmartThemeBlurTintColor, #1a1a2e);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 4px;
+}
+
+.bf-mem-linked-name {
+    font-size: 12px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.bf-mem-linked-remove {
+    padding: 2px 6px !important;
+    font-size: 11px !important;
+    color: #f44336 !important;
+}
+
+/* Per-message Agent 3 icon (next to .mes_edit) */
+.bf_mem_msg_icon {
+    color: #888;            /* grey by default = not processed */
+    opacity: 0.6;
+    transition: color 0.2s, opacity 0.2s;
+}
+.bf_mem_msg_icon:hover {
+    opacity: 1;
+}
+.bf_mem_msg_icon.bf_mem_msg_icon_processed {
+    color: #4caf50;         /* green = processed */
+    opacity: 0.9;
+}
+.bf_mem_msg_icon.bf_mem_msg_icon_loading {
+    color: #7bb3ff;         /* blue while running */
+    animation: bf-mem-pulse 1s infinite;
+    pointer-events: none;
+}
+
+/* Mobile: prevent pull-to-refresh from accidentally firing when user scrolls
+   up inside an internal scroll container that's already at the top.
+   Without this, scrolling DB list / debug log / review popup at the top of
+   their range reloads the entire page and loses in-progress edits. */
+.bf-mem-settings [class*="bf-mem-"][style*="overflow"],
+.bf-mem-db-list,
+.bf-mem-review-list,
+.bf-mem-debug-log,
+.bf-mem-summary,
+.bf-mem-db-browser,
+.bf-mem-linked-popup {
+    overscroll-behavior: contain;
+}
+
+/* Token comparison tab */
+.bf-mem-tok-save { color: #4caf50; font-weight: 600; }  /* saved input */
+.bf-mem-tok-cost { color: #ff9800; font-weight: 600; }  /* output / agent overhead */
+.bf-mem-tok-bad  { color: #f44336; font-weight: 600; }  /* net input positive = costing more */
+
+/* Spiderweb / Memory Web visualization (Database tab "View Web") */
+.bf-mem-fact-links {
+    font-size: 12px;
+    color: #9ec5ff;
+    margin-top: 2px;
+    word-break: break-word;
+}
+.bf-mem-web-wrap { display: flex; flex-direction: column; gap: 6px; }
+.bf-mem-web-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; }
+.bf-mem-web-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.bf-mem-web-dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.4); }
+.bf-mem-web-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+/* The map STAGE: fixed box, overflow hidden — navigation is by pan/zoom, not scrollbars. */
+.bf-mem-web-stage {
+    width: 100%;
+    height: 68vh;
+    overflow: hidden;
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 6px;
+    background: var(--SmartThemeBlurTintColor, #14141f);
+    touch-action: none;            /* let us handle pan/zoom gestures */
+    overscroll-behavior: contain;
+}
+.bf-mem-web-svg { display: block; width: 100%; height: 100%; cursor: grab; }
+/* Labels: hubs always; the rest reveal on hover/focus to keep the map readable. */
+.bf-web-label { fill: var(--SmartThemeBodyColor, #ddd); pointer-events: none; user-select: none; }
+.bf-web-label:not(.hub) { display: none; }
+.bf-web-node:hover .bf-web-label,
+.bf-web-node.focus .bf-web-label { display: initial; }
+.bf-web-node { cursor: pointer; }
+.bf-web-node circle { transition: opacity 0.12s; }
+/* Focus mode: dim the rest, highlight the picked node + its links/neighbours. */
+.bf-web-node.dim { opacity: 0.12; }
+.bf-web-edge.dim { opacity: 0.05; }
+.bf-web-edge.focus { stroke: #ffd479 !important; stroke-width: 2.4 !important; opacity: 1; }
+.bf-web-node.focus circle { stroke: #ffd479; stroke-width: 2.5; }
+
+/* Last Generated / Last Inserted fact lists (renderFactList in settings.js).
+   These classes were referenced by the renderer but never styled, so the
+   tabs rendered as unstyled plain text. Theme-variable aware, low-risk. */
+.bf-mem-fact-header {
+    font-size: 12px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    padding: 4px 0 6px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+}
+
+.bf-mem-fact-row {
+    padding: 6px 8px;
+    margin: 4px 0;
+    background: var(--SmartThemeBlurTintColor, #14141f);
+    border: 1px solid var(--SmartThemeBorderColor, #333);
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.bf-mem-fact-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 5px;
+    word-break: break-word;
+}
+
+.bf-mem-fact-cat {
+    font-weight: bold;
+    color: #7bb3ff;
+}
+
+.bf-mem-fact-key {
+    background: var(--SmartThemeBlurTintColor, #222);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+    color: var(--SmartThemeBodyColor, #eee);
+    padding: 1px 5px;
+    font-size: 11px;
+}
+
+.bf-mem-fact-val {
+    color: var(--SmartThemeBodyColor, #ddd);
+}
+
+.bf-mem-fact-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin-top: 4px;
+    font-size: 11px;
+    color: #888;
+}
+
+.bf-mem-fact-source {
+    font-style: italic;
+    color: #888;
+}
+
+/* Chips for knownBy (@name) and tags (#tag), shared with renderReflection. */
+.bf-mem-chip {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 10px;
+    background: var(--SmartThemeBlurTintColor, #222);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    color: #9ec5ff;
+}
+
+.bf-mem-chip-tag {
+    color: #b6d97a;
+}
+
+/* Status badges (NEW / UPDATED / SKIPPED) — status is lowercased by the renderer. */
+.bf-mem-fact-status {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #fff;
+}
+
+.bf-mem-fact-status-new { background: #4caf50; }
+.bf-mem-fact-status-updated { background: #ff9800; }
+.bf-mem-fact-status-skipped { background: #607d8b; }
+
+/* Injection viewer rows (renderInjectionViewer in settings.js). */
+.bf-mem-fact-item {
+    padding: 4px 8px;
+    margin: 3px 0;
+    background: var(--SmartThemeBlurTintColor, #14141f);
+    border: 1px solid var(--SmartThemeBorderColor, #333);
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.5;
+    word-break: break-word;
+}

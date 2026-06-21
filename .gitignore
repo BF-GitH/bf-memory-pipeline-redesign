@@ -1,0 +1,23 @@
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+
+# Claude Code worktrees, agent transcripts, and other harness state
+.claude/
+
+# Local scratch / notes (transient, never committed)
+.tmpcheck/
+previoues convo.txt
+
+# Research artifacts (third-party ST extension source files downloaded
+# transiently by research agents for pattern lookup — should never be committed)
+mb_*.js
+mb_*.json
+mem.js
+msgsum.js
+rm_*.js
+rpg_*.js
+sp_*.js
+spp_*.js
+vec.js

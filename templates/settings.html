@@ -1,0 +1,850 @@
+<div id="bf_memory_settings" class="bf-mem-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>BF's Memory Pipeline</b>
+            <small id="bf_mem_version" class="bf-mem-version" title="Installed version — confirm before testing" style="opacity:0.7;margin-left:6px;font-weight:normal;">v?.?.?</small>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+
+            <!-- Status Bar -->
+            <div class="bf-mem-status-bar">
+                <div class="bf-mem-status-dot" id="bf_mem_status_dot"></div>
+                <span id="bf_mem_status_text">Disabled</span>
+                <label class="checkbox_label" style="margin-left: auto;">
+                    <input type="checkbox" id="bf_mem_enabled" />
+                    <span>Enable</span>
+                </label>
+            </div>
+
+            <!-- C1: Usability preset — one choice maps onto the many token/retrieval knobs below. -->
+            <div class="bf-mem-preset-bar" style="display:flex;align-items:center;gap:8px;margin:6px 0 10px;">
+                <label for="bf_mem_preset" style="font-weight:bold;white-space:nowrap;">Memory mode</label>
+                <select id="bf_mem_preset" class="text_pole" style="flex:1;">
+                    <option value="cheap">Cheap — fewest tokens</option>
+                    <option value="balanced">Balanced — recommended</option>
+                    <option value="maxrecall">Max Recall — best memory, costs more</option>
+                    <option value="custom">Custom — your own settings (Advanced tabs)</option>
+                </select>
+            </div>
+            <small class="bf-mem-hint" style="display:block;margin:-4px 0 10px;">
+                Picks sensible defaults for cost vs. recall. Fine-tune anything in the tabs below — that switches this to “Custom”.
+            </small>
+
+            <!-- Tabs (chronological order each turn: Drafter → Librarian → Writer → Scribe) -->
+            <div class="bf-mem-tabs" role="tablist">
+                <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_agent1" tabindex="0">Drafter</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent4" tabindex="-1" style="display:none;">Librarian</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent2" tabindex="-1">Writer</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent3" tabindex="-1">Scribe</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_general" tabindex="-1">General</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_generated" tabindex="-1">Last Generated</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_inserted" tabindex="-1">Last Inserted</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_tokens" tabindex="-1">Tokens</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
+            </div>
+
+            <!-- Tab: Drafter (plans the reply + picks memory branches) -->
+            <div id="bf_mem_tab_agent1" role="tabpanel" class="bf-mem-tabpanel">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profile</div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Drafter Profile</label>
+                            <div class="bf-mem-profile-row">
+                                <select id="bf_mem_agent1_profile" class="text_pole"></select>
+                            </div>
+                            <small class="bf-mem-hint">Leave blank to use your default/active profile.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context</div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent1_context_val">5</span></label>
+                            <input type="range" id="bf_mem_agent1_context" min="1" max="50" step="1" value="5" />
+                            <small class="bf-mem-hint">How many recent messages the Drafter sees when planning the reply.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-clapperboard"></i> Scene Card</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_scene_enabled" />
+                            <span>Inject live scene card</span>
+                        </label>
+                        <small class="bf-mem-hint">Always-on one-line block telling the Writer what is true RIGHT NOW (location, who's present, active goals, recent beats). The Drafter emits it each turn via a #Scene block — no extra LLM call. Injected above the facts every turn a scene exists.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Current Scene (live)</label>
+                            <div id="bf_mem_scene_view" class="bf-mem-fact-list">
+                                <div class="bf-mem-summary-empty">No scene yet. It updates each turn once the pipeline runs.</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Drafter Prompt
+                        <button id="bf_mem_reset_draft_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_draft_prompt" class="bf-mem-textarea" rows="12" placeholder="Drafter system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the Drafter how to plan a reply and list needed facts.</small>
+                        <details id="bf_mem_drafter_assembly" class="bf-mem-assembly">
+                            <summary>What actually gets sent (assembly order)</summary>
+                            <div class="bf-mem-assembly-body">
+                                <p>The prompt field above is only the <b>SYSTEM</b> message. At runtime a <b>USER</b> message is built and appended from live data. The full call looks like:</p>
+<pre><span class="bf-mem-asm-label">[SYSTEM]</span> your Drafter prompt above
+
+<span class="bf-mem-asm-label">[USER]</span>
+## Character Info
+<span class="bf-mem-asm-ph">{character card}</span>
+
+## User Persona
+<span class="bf-mem-asm-ph">{your persona}</span>
+
+## Memory Menu (pick #Branches from these — Category or Category/aspect)
+<span class="bf-mem-asm-ph">{live Category × aspect menu w/ counts}</span>
+
+## Existing Fact Keys (for #Needed_Facts fallback — exact Category/key)
+<span class="bf-mem-asm-ph">{compact key inventory — always included (deterministic retrieval active)}</span>
+
+## Recent Chat
+<span class="bf-mem-asm-ph">{last N messages — "Context Messages" above}</span>
+
+Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, and #Scene: sections.</pre>
+                                <p>Each <code>##</code> section is omitted if its data is empty.</p>
+                            </div>
+                        </details>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Librarian (fetches the relevant facts for the Writer) -->
+            <div id="bf_mem_tab_agent4" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-magnifying-glass"></i> Librarian</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_finder_enabled" />
+                            <span>Use the Librarian agent (STAGE 2 retrieval)</span>
+                        </label>
+                        <small class="bf-mem-hint">After the Drafter picks branches from the memory menu, the Librarian reads the full facts under those branches and chooses the relevant subset to inject for the Writer. Off (or on any error) falls back to deterministic keyword retrieval.</small>
+                        <small class="bf-mem-hint">The Librarian always reads the last 2 messages plus the Drafter's branch picks — no context-window setting needed.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Librarian Profile</label>
+                            <div class="bf-mem-profile-row">
+                                <select id="bf_mem_agent4_profile" class="text_pole"></select>
+                            </div>
+                            <small class="bf-mem-hint">Leave blank to reuse the Drafter's profile. A cheap/fast model works well here.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Librarian Prompt
+                        <button id="bf_mem_reset_finder_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_finder_prompt" class="bf-mem-textarea" rows="10" placeholder="Librarian system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the Librarian how to pick the relevant subset of candidate facts. Outputs Category/key identifiers only.</small>
+                        <details id="bf_mem_librarian_assembly" class="bf-mem-assembly">
+                            <summary>What actually gets sent (assembly order)</summary>
+                            <div class="bf-mem-assembly-body">
+                                <p>The prompt field above is only the <b>SYSTEM</b> message. At runtime a <b>USER</b> message is built from the Drafter's draft, recent chat, and the candidate facts under the picked branches. The full call looks like:</p>
+<pre><span class="bf-mem-asm-label">[SYSTEM]</span> your Librarian prompt above
+
+<span class="bf-mem-asm-label">[USER]</span>
+## Character Info
+<span class="bf-mem-asm-ph">{character card}</span>
+
+## User Persona
+<span class="bf-mem-asm-ph">{your persona}</span>
+
+## Scene Direction (draft of next reply)
+<span class="bf-mem-asm-ph">{the Drafter's #Draft}</span>
+
+## Recent Chat
+<span class="bf-mem-asm-ph">{last 2 messages}</span>
+
+## Candidate Facts (choose from these, by Category/key)
+<span class="bf-mem-asm-ph">{full facts under the Drafter's picked branches + all Unsorted, as Category/key = value}</span>
+
+Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Category/key identifiers.</pre>
+                                <p>Each <code>##</code> section is omitted if its data is empty.</p>
+                            </div>
+                        </details>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Writer (the main model that writes the reply) -->
+            <div id="bf_mem_tab_agent2" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-pen-nib"></i> Writer (main model)</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">The Writer is your MAIN model writing the reply — it always uses your default/active connection profile. There is no separate profile to set.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context</div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Context Limit (trim chat) <span class="bf-mem-val" id="bf_mem_agent2_context_val">0</span></label>
+                            <input type="range" id="bf_mem_agent2_context" min="0" max="50" step="1" value="0" />
+                            <small class="bf-mem-hint">Default 0 = off (main model sees full chat as ST sends it). Set &gt; 0 to HIDE older messages — the main model only sees the last N chat messages + your injected facts. Cleaner focus, lower token cost, but the facts must be good enough to replace the hidden history.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:10px;">
+                            <label>Freeze injection (reuse facts) <span class="bf-mem-val" id="bf_mem_freeze_turns_val">0</span></label>
+                            <input type="range" id="bf_mem_freeze_turns" min="0" max="20" step="1" value="0" />
+                            <small class="bf-mem-hint">Default 0 = off. When &gt; 0, a new turn REUSES the previous turn's retrieved facts instead of re-running the Drafter + Librarian — for up to N turns before a fresh pull. Cuts tokens/latency and keeps the injected block stable for prompt caching. Memory still updates every turn (the Scribe runs after each reply); only the injected facts may be up to N turns old.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-magnifying-glass"></i> Recall Tool (pull-detail)</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_recall_tool_enabled" />
+                            <span>Let the Writer search memory on demand (search_memory tool)</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, registers an optional <code>search_memory</code> tool the Writer can call mid-reply to pull a stored fact that wasn't already injected (read-only — never writes). Requires a tool-calling-capable main model; only active on the main generation path.</small>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_write_tool_enabled" />
+                            <span>Let the Writer pin a fact on demand (remember_fact tool)</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, registers an optional <code>remember_fact</code> tool the Writer can call mid-reply to PIN one durable fact directly into memory (add-only — never deletes; routes through the same write path as extraction). Requires a tool-calling-capable main model; only active on the main generation path.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-layer-group"></i> Big Picture (summary pyramid)</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_pyramid_enabled" />
+                            <span>Inject a Big Picture overview (story + relevant shelf summaries)</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, prepends a compact, token-capped overview to the Writer's context: the rolling story summary plus the SHORT per-shelf (category/aspect) summaries relevant to the current scene — a cheap zoom-out instead of hundreds of raw facts. The Writer still drills into specifics via the <code>search_memory</code> tool. Shelf summaries are built periodically during the reflection pass (only for changed buckets), so leaving this on adds no extra generation cost — only a small bounded prompt block.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-heart-pulse"></i> Moment echo (relationship resonance)</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_moment_echo_enabled" />
+                            <span>Let one resonant past moment resurface when the present echoes it</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, on the rare turn a couple's present moment echoes an earlier beat, prepends ONE tiny <code>[Echo: …]</code> line — a single past moment for the two characters present, cued by a reflection-authored callback link or the most-recent charged beat for that pair (never by shared place). Capped at one echo, token-clamped, and emits nothing on most turns. The full relationship history stays pull-only via the <code>search_memory</code> tool — this is just the one-line nudge.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-diagram-project"></i> Automatic associative linking</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_autolink_enabled" />
+                            <span>Auto-connect a new fact to related existing facts</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. When a fact is written, it is automatically linked to related existing facts — same subject, shared location/participants, or strong word overlap — so asking about any one surfaces the others. Fully deterministic and free (no LLM call). Links are added to the fact's relationship list (capped, never overwriting existing links).</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-wand-magic-sparkles"></i> Retrieval &amp; extraction enhancements</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_mmr_enabled" />
+                            <span>Diversify injected facts (MMR)</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. When choosing which overflow facts to inject, avoids stacking several near-duplicates — it balances importance against being different from what's already chosen, so the same token budget covers more ground. Deterministic (stable across swipes/regens). Turn off for pure importance/recency order.</small>
+                        <div class="bf-mem-field">
+                            <label>MMR balance (relevance ↔ diversity) <span class="bf-mem-val" id="bf_mem_mmr_lambda_val">0.70</span></label>
+                            <input type="range" id="bf_mem_mmr_lambda" min="0" max="100" step="5" value="70" />
+                        </div>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_confidence_ranking" />
+                            <span>Rank uncertain facts lower</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. Facts the Scribe marked low/medium confidence lose ground to solid facts when competing for scarce injection slots. Never affects a direct/exact match — only the ranking of overflow candidates. Turn off to ignore confidence in ranking.</small>
+                        <div class="bf-mem-field">
+                            <label>Confidence weight <span class="bf-mem-val" id="bf_mem_confidence_weight_val">0.30</span></label>
+                            <input type="range" id="bf_mem_confidence_weight" min="0" max="100" step="5" value="30" />
+                        </div>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_temporal_grounding" />
+                            <span>Ground relative dates at extraction</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. Tells the Scribe to convert "yesterday"/"last week" into absolute dates (relative to when the message was sent) so time references still make sense much later. The message's send-time is shown to the Scribe in its data block, not baked into the cacheable system prompt.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-scissors"></i> Trim Already-Extracted Context</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_scribe_trim_priors" />
+                            <span>Don't re-send already-extracted messages to the Scribe</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. Saves input tokens: prior context messages the Scribe already extracted on an earlier turn aren't sent again (their facts are already stored). The new message being analysed and any not-yet-extracted context are always sent — no memory is lost. Turn on to cut Scribe cost on long chats.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-clock-rotate-left"></i> Bi-temporal fact validity</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_bitemporal_enabled" />
+                            <span>Track when a fact is true in the story world</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, the Scribe may tag a fact with story-world validity — <code>| from:&lt;when&gt;</code> and <code>| until:&lt;when&gt;</code> (a free-form in-story date, age, or era) — recorded separately from when the fact was learned. When a state fact changes, the old value's story-world window is closed automatically. Keeps flashbacks and time-skips consistent. Purely additive: facts written without it are unaffected.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-user-group"></i> User-level shared memory</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_user_level_memory" />
+                            <span>Share facts about you across every character</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, facts whose subject is <strong>you</strong> (your persona / {{user}}) are also saved into one shared global store, and merged into every character's memory on read — so each character remembers the player without re-learning. Your character's own version of a fact always wins on conflict. Purely additive: when off, storage and retrieval are unchanged.</small>
+                        <div class="bf-mem-field">
+                            <button type="button" id="bf_mem_clear_shared_user" class="menu_button" title="Permanently erase the cross-character shared store of facts about you. Does not touch any character's own memory.">Clear shared user memory</button>
+                        </div>
+                        <small class="bf-mem-hint">Wipes the shared "facts about you" pool (IDB working copy + backup files). Each character's own memory is untouched. Cannot be undone.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-timeline"></i> Sequence Depth Dice</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">For tracked sequences (e.g. a character's location over time) the current step is always included. These set the chance of reaching further back in history. The furthest successful roll sets how far back to include — and every step in between is always included (no gaps).</small>
+                        <div class="bf-mem-field">
+                            <label>1 Step Back <span class="bf-mem-val" id="bf_mem_depth1_val">70%</span></label>
+                            <input type="range" id="bf_mem_depth1" min="0" max="100" step="5" value="70" />
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>2 Steps Back <span class="bf-mem-val" id="bf_mem_depth2_val">50%</span></label>
+                            <input type="range" id="bf_mem_depth2" min="0" max="100" step="5" value="50" />
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>3 Steps Back <span class="bf-mem-val" id="bf_mem_depth3_val">25%</span></label>
+                            <input type="range" id="bf_mem_depth3" min="0" max="100" step="5" value="25" />
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>4 Steps Back <span class="bf-mem-val" id="bf_mem_depth4_val">10%</span></label>
+                            <input type="range" id="bf_mem_depth4" min="0" max="100" step="5" value="10" />
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Writer Injection Format
+                        <button id="bf_mem_reset_writer_format" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_writer_format" class="bf-mem-textarea" rows="6" placeholder="Writer injection header/footer..."></textarea>
+                        <small class="bf-mem-hint">Template wrapping the facts injected into the main model's prompt. Use {draft} and {facts} placeholders.</small>
+                        <details id="bf_mem_writer_assembly" class="bf-mem-assembly">
+                            <summary>What actually gets sent (assembly order)</summary>
+                            <div class="bf-mem-assembly-body">
+                                <p>Unlike the other agents, the Writer prompt is NOT replaced. The template above is <b>INJECTED</b> as a system message into your main model's existing context (right before the last user message). That context ALREADY contains:</p>
+<pre><span class="bf-mem-asm-ph">{SillyTavern active system prompt}</span>
+<span class="bf-mem-asm-ph">{character card}</span>
+<span class="bf-mem-asm-ph">{your persona}</span>
+<span class="bf-mem-asm-ph">{full chat history}</span>   (or last N msgs if "Context Limit" &gt; 0)</pre>
+                                <p>and we ADD the injected block below (built from the template above, filling {facts} and {draft}). The scene card, when "Inject live scene card" is on, is prepended ABOVE the template:</p>
+<pre><span class="bf-mem-asm-label">[INJECTED system message]</span>
+[Scene] Location: … | Present: … | Goal: … | Recently: …   <span class="bf-mem-asm-ph">(scene card, only if enabled)</span>
+
+<span class="bf-mem-asm-ph">{your Writer Injection Format template above, with:}</span>
+  {facts}  → <span class="bf-mem-asm-ph">the deterministic/semantic retrieval's chosen facts</span>
+  {draft}  → <span class="bf-mem-asm-ph">the Drafter's #Draft (scene direction)</span></pre>
+                            </div>
+                        </details>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Scribe (writes/updates facts into memory after each reply) -->
+            <div id="bf_mem_tab_agent3" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profile</div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Scribe Profile</label>
+                            <div class="bf-mem-profile-row">
+                                <select id="bf_mem_agent3_profile" class="text_pole"></select>
+                                <button id="bf_mem_refresh_profiles" class="menu_button" title="Refresh profiles">
+                                    <i class="fa-solid fa-arrows-rotate"></i>
+                                </button>
+                            </div>
+                            <small class="bf-mem-hint">Leave blank to use your default/active profile. A cheap/fast model works well for extraction.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Scribe Prompt
+                        <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Scribe system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the Scribe how to extract and update facts.</small>
+                        <details id="bf_mem_scribe_assembly" class="bf-mem-assembly">
+                            <summary>What actually gets sent (assembly order)</summary>
+                            <div class="bf-mem-assembly-body">
+                                <p>The prompt field above is only the <b>SYSTEM</b> message ({{user}}/{{char}} macros resolved). At runtime a <b>USER</b> message is built from the live data and the messages to analyze. The full call looks like:</p>
+<pre><span class="bf-mem-asm-label">[SYSTEM]</span> your Scribe prompt above
+
+<span class="bf-mem-asm-label">[USER]</span>
+## Character Info ({{char}})
+<span class="bf-mem-asm-ph">{character card}</span>
+
+## User Persona ({{user}})
+<span class="bf-mem-asm-ph">{your persona}</span>
+
+## Existing Databases
+<span class="bf-mem-asm-ph">{full DB summary — every active fact as Category/key = value}</span>
+
+## Messages to Analyze
+[USER:{{user}}] <span class="bf-mem-asm-ph">{the user message}</span>
+[CHAR:{{char}}] <span class="bf-mem-asm-ph">{the AI reply}</span>
+
+Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
+                                <p>Each <code>##</code> section is omitted if its data is empty. "Context Messages" above sets how many recent messages appear in the analyzed block.</p>
+                            </div>
+                        </details>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context &amp; Review</div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">2</span></label>
+                            <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="2" />
+                            <small class="bf-mem-hint">How many recent messages the Scribe sees for extraction. Default 2 = the latest user + AI exchange. Higher = more context, more tokens.</small>
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
+                            <input type="range" id="bf_mem_review_interval" min="3" max="100" step="1" value="10" />
+                            <small class="bf-mem-hint">Messages between fact-review popups (review of the Scribe's extracted facts).</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-users"></i> Character Registry</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_charreg_enabled" />
+                            <span>Detect new named characters</span>
+                        </label>
+                        <small class="bf-mem-hint">Periodically scans stored facts for newly-seen proper names (no extra LLM call) and asks once — in a single batched popup — whether each is a <b>Recurring</b> character (gets its own memory subject, with its facts moved out of the shared one-off drawer), a one-off <b>NPC</b> (kept in the drawer), or <b>Later</b> (deferred to the next check).</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Check Interval <span class="bf-mem-val" id="bf_mem_charcheck_interval_val">10</span></label>
+                            <input type="range" id="bf_mem_charcheck_interval" min="2" max="50" step="1" value="10" />
+                            <small class="bf-mem-hint">Successful pipeline runs between detection checks. Higher = less frequent prompting.</small>
+                        </div>
+                        <label class="checkbox_label" style="margin-top:8px;">
+                            <input type="checkbox" id="bf_mem_entity_resolution" />
+                            <span>Merge entity name variants (experimental)</span>
+                        </label>
+                        <small class="bf-mem-hint">CONSERVATIVE, deterministic (no LLM call): merges facts recorded under variant names for the same entity (e.g. "Bobby"/"Robert"/"Rob") into one canonical subject, re-keying the loser's facts and keeping the old name as a searchable alias. Merges ONLY on a strong signal (exact alias match, or very high name similarity), never touches you or the active character, and logs every merge. <b>Default OFF</b> — false merges are the main risk. Runs on the Check Interval above.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Known Characters (live)</label>
+                            <div id="bf_mem_charreg_list" class="bf-mem-fact-list">
+                                <div class="bf-mem-summary-empty">No characters tracked yet. They are discovered automatically as facts accumulate.</div>
+                            </div>
+                            <div class="bf-mem-db-actions" style="margin-top:6px;">
+                                <button id="bf_mem_charreg_scan" class="menu_button" title="Scan the fact store now and prompt for any new names">
+                                    <i class="fa-solid fa-magnifying-glass"></i> Scan now
+                                </button>
+                                <button id="bf_mem_entity_merge_now" class="menu_button" title="Run the conservative entity-merge pass now (requires the toggle above)">
+                                    <i class="fa-solid fa-code-merge"></i> Merge variants now
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-lightbulb"></i> Re-evaluation / Reflection</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_reflection_enabled" />
+                            <span>Enable periodic reflection pass</span>
+                        </label>
+                        <small class="bf-mem-hint">Every N turns, runs a maintenance pass that DEDUPES the fact database (merging near-duplicate facts) and makes ONE extra LLM call (reusing the Scribe's profile) to write higher-order observation facts. Conservative + cost-aware — it runs infrequently, off the critical path, and never blocks the reply.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Re-evaluation Interval <span class="bf-mem-val" id="bf_mem_reflection_interval_val">12</span></label>
+                            <input type="range" id="bf_mem_reflection_interval" min="4" max="100" step="1" value="12" />
+                            <small class="bf-mem-hint">Successful pipeline runs between reflection passes. Higher = cheaper, less frequent maintenance.</small>
+                        </div>
+                        <label class="checkbox_label" style="margin-top:8px;">
+                            <input type="checkbox" id="bf_mem_idle_consolidation" />
+                            <span>Also consolidate after idle time</span>
+                        </label>
+                        <small class="bf-mem-hint">In ADDITION to the turn-based cadence above, run the same reflection/dedupe pass once you have been idle (no new messages) for the delay below. Lets heavy maintenance happen during quiet time. Never runs during generation; shares all the safety guards of the periodic pass. OFF by default.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Idle delay (seconds) <span class="bf-mem-val" id="bf_mem_idle_consolidation_ms_val">120</span></label>
+                            <input type="range" id="bf_mem_idle_consolidation_ms" min="30" max="1800" step="10" value="120" />
+                            <small class="bf-mem-hint">Quiet time before the idle consolidation fires. Range 30s–30min.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Current Reflection (live)</label>
+                            <div id="bf_mem_reflection_view" class="bf-mem-fact-list">
+                                <div class="bf-mem-summary-empty">No reflection yet. It is generated periodically once the pipeline has run several turns.</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Re-evaluation Prompt
+                        <button id="bf_mem_reset_reflection_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_reflection_prompt" class="bf-mem-textarea" rows="10" placeholder="Re-evaluation / consolidation system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the reflection pass how to synthesize observations during periodic re-evaluation.</small>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: General -->
+            <div id="bf_mem_tab_general" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profiles</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Each agent can use its own connection profile — set them per agent in the Drafter and Scribe tabs. Leave a profile blank to fall back to your default/active profile. The Writer always uses your default/active profile.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-gear"></i> General</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_toast" />
+                            <span>Show toast notifications</span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Database -->
+            <div id="bf_mem_tab_database" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+
+                <!-- DB Profiles -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-bookmark"></i> Database Profiles
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Save and load database snapshots. Use these to share facts across characters or restore previous states.</small>
+                        <div class="bf-mem-profile-row" style="margin-top: 6px;">
+                            <select id="bf_mem_db_profile_select" class="text_pole">
+                                <option value="">-- No profile loaded --</option>
+                            </select>
+                        </div>
+                        <div class="bf-mem-db-actions" style="margin-top: 6px;">
+                            <button id="bf_mem_db_profile_load" class="menu_button">
+                                <i class="fa-solid fa-upload"></i> Load
+                            </button>
+                            <button id="bf_mem_db_profile_save" class="menu_button">
+                                <i class="fa-solid fa-floppy-disk"></i> Save Current
+                            </button>
+                            <button id="bf_mem_db_profile_save_new" class="menu_button">
+                                <i class="fa-solid fa-plus"></i> Save As New
+                            </button>
+                            <button id="bf_mem_db_profile_delete" class="menu_button redWarningBG">
+                                <i class="fa-solid fa-trash"></i>
+                            </button>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top: 8px;">
+                            <label>Linked Chats</label>
+                            <div class="bf-mem-linked-chats-row">
+                                <span id="bf_mem_db_linked_chats" class="bf-mem-linked-display">(none)</span>
+                                <button id="bf_mem_db_linked_manage" class="menu_button" title="Manage linked chats">
+                                    <i class="fa-solid fa-pen-to-square"></i> Manage
+                                </button>
+                                <button id="bf_mem_db_unlink_current" class="menu_button" title="Unlink the current chat from its profile (stops auto-relink)">
+                                    <i class="fa-solid fa-link-slash"></i> Unlink current
+                                </button>
+                            </div>
+                            <small class="bf-mem-hint">Chats auto-link when opened. Manage to add/remove links. "Unlink current" detaches this chat so it won't auto-relink.</small>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Run the Scribe on full chat -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-arrows-rotate"></i> Process Existing Chat
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Already have a chat going? Run the Scribe on every message to backfill facts. Slow and uses tokens per message.</small>
+                        <label class="checkbox_label" style="margin-top:6px;">
+                            <input type="checkbox" id="bf_mem_skip_processed" checked />
+                            <span>Skip messages already processed</span>
+                        </label>
+                        <div class="bf-mem-db-actions" style="margin-top:6px;">
+                            <button id="bf_mem_run_full_chat" class="menu_button">
+                                <i class="fa-solid fa-play"></i> Run the Scribe on full chat
+                            </button>
+                            <button id="bf_mem_run_full_chat_cancel" class="menu_button redWarningBG" style="display:none;">
+                                <i class="fa-solid fa-stop"></i> Cancel
+                            </button>
+                        </div>
+                        <div id="bf_mem_full_chat_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
+                        <label class="checkbox_label" style="margin-top:10px;" title="Match facts by MEANING (embeddings), not just keywords/graph. Requires a working embedding endpoint; no-ops safely if none is found.">
+                            <input type="checkbox" id="bf_mem_semantic_enabled" />
+                            <span>Semantic retrieval (embeddings) — experimental, off by default</span>
+                        </label>
+                        <div class="bf-mem-db-actions" style="margin-top:6px;">
+                            <button id="bf_mem_embed_all" class="menu_button" title="Vectorize all stored facts for semantic retrieval (requires Semantic retrieval enabled + a working embedding endpoint)">
+                                <i class="fa-solid fa-vector-square"></i> Embed all facts (semantic)
+                            </button>
+                        </div>
+                        <div id="bf_mem_embed_all_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
+                        <!-- Embedding provider: on ST 1.18 embeddings go through ST's vector store
+                             (/api/vector/*), which embeds with a SOURCE + MODEL — not a connection
+                             profile. Leave source blank to auto-derive from your active chat provider. -->
+                        <div class="bf-mem-field" style="margin-top:10px;">
+                            <label for="bf_mem_embedding_source">Embedding source</label>
+                            <input type="text" id="bf_mem_embedding_source" class="text_pole" style="width:100%;" placeholder="auto (from your chat provider, e.g. openrouter)" />
+                            <small class="bf-mem-hint">SillyTavern vector source for embeddings. Blank = auto-detect from your active chat connection (e.g. <code>openrouter</code>, <code>openai</code>). Override only if your embeddings live elsewhere.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label for="bf_mem_embedding_model">Embedding model</label>
+                            <input type="text" id="bf_mem_embedding_model" class="text_pole" style="width:100%;" placeholder="text-embedding-3-small" />
+                            <small class="bf-mem-hint">Embedding model name. For OpenRouter the <code>openai/</code> prefix is added automatically (so <code>text-embedding-3-small</code> works). Click Test to confirm.</small>
+                        </div>
+                        <div class="bf-mem-db-actions" style="margin-top:6px;">
+                            <button id="bf_mem_test_embedding" class="menu_button" title="Send a tiny probe to the selected embedding endpoint and report whether it works + the vector size.">
+                                <i class="fa-solid fa-plug-circle-check"></i> Test embedding endpoint
+                            </button>
+                        </div>
+                        <div id="bf_mem_test_embedding_result" class="bf-mem-hint" style="display:none;margin-top:6px;"></div>
+                    </div>
+                </div>
+
+                <!-- Current Databases -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-database"></i> Fact Databases
+                        <button id="bf_mem_refresh_db" class="bf-mem-reset-btn menu_button" title="Refresh">
+                            <i class="fa-solid fa-arrows-rotate"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <div id="bf_mem_db_stats" class="bf-mem-db-stats">Loading...</div>
+                        <div class="bf-mem-field" style="margin:6px 0;">
+                            <input type="text" id="bf_mem_db_search" class="text_pole" placeholder="Search facts across all categories (key / value / note)…" style="width:100%;" />
+                        </div>
+                        <div id="bf_mem_db_search_results" class="bf-mem-fact-list" style="display:none;"></div>
+                        <div id="bf_mem_db_list" class="bf-mem-db-list"></div>
+
+                        <!-- Add your own taxonomy labels (user overlay, global across chats) -->
+                        <details class="bf-mem-addlabel" style="margin-top:8px;">
+                            <summary style="cursor:pointer;font-weight:bold;">
+                                <i class="fa-solid fa-tags"></i> Add your own label
+                            </summary>
+                            <small class="bf-mem-hint">Add custom categories (Layer 1) and aspects/leaves (Layer 2) on top of the built-in taxonomy. Global across chats. Built-ins can't be removed.</small>
+
+                            <!-- Add a Layer-2 leaf -->
+                            <div class="bf-mem-field" style="margin-top:6px;">
+                                <label>New aspect (Layer 2 leaf)</label>
+                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                                    <select id="bf_mem_addleaf_category" class="text_pole" style="flex:0 0 auto;min-width:120px;"></select>
+                                    <input type="text" id="bf_mem_addleaf_subarea" class="text_pole" placeholder="Sub-area (optional)" style="flex:1 1 120px;min-width:100px;" />
+                                    <input type="text" id="bf_mem_addleaf_name" class="text_pole" placeholder="Leaf name, e.g. bioluminescence" style="flex:1 1 160px;min-width:120px;" />
+                                    <button id="bf_mem_addleaf_btn" class="menu_button" style="flex:0 0 auto;">
+                                        <i class="fa-solid fa-plus"></i> Add aspect
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Add a Layer-1 category -->
+                            <div class="bf-mem-field" style="margin-top:6px;">
+                                <label>New category (Layer 1)</label>
+                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                                    <input type="text" id="bf_mem_addcat_name" class="text_pole" placeholder="Category name, e.g. Factions" style="flex:1 1 160px;min-width:120px;" />
+                                    <button id="bf_mem_addcat_btn" class="menu_button" style="flex:0 0 auto;">
+                                        <i class="fa-solid fa-plus"></i> Add category
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- AI: scan homeless facts and propose new labels (manual, on-demand) -->
+                            <div class="bf-mem-field" style="margin-top:8px;">
+                                <label>Let AI suggest labels</label>
+                                <small class="bf-mem-hint">Scans facts that never found a specific home and proposes new labels for them. One LLM call (uses the Scribe profile); you approve each suggestion before anything is added. Manual only — no per-turn cost.</small>
+                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px;">
+                                    <button id="bf_mem_suggest_labels_btn" class="menu_button" style="flex:0 0 auto;">
+                                        <i class="fa-solid fa-wand-magic-sparkles"></i> Suggest new labels (AI)
+                                    </button>
+                                </div>
+                            </div>
+                        </details>
+
+                        <div class="bf-mem-db-actions">
+                            <button id="bf_mem_browse_db" class="menu_button">
+                                <i class="fa-solid fa-eye"></i> View All Facts
+                            </button>
+                            <button id="bf_mem_view_web" class="menu_button" title="Visualize the fact graph — every fact as a dot, every link (primary/secondary/tertiary) as a line.">
+                                <i class="fa-solid fa-circle-nodes"></i> View Web
+                            </button>
+                            <button id="bf_mem_export_db" class="menu_button">
+                                <i class="fa-solid fa-download"></i> Export
+                            </button>
+                            <button id="bf_mem_import_db" class="menu_button">
+                                <i class="fa-solid fa-upload"></i> Import
+                            </button>
+                            <input type="file" id="bf_mem_import_file" accept="application/json,.json" style="display:none;" />
+                            <button id="bf_mem_clear_db" class="menu_button redWarningBG">
+                                <i class="fa-solid fa-trash"></i> Clear All
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Last Generated Facts -->
+            <div id="bf_mem_tab_generated" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-flask"></i> Last Generated Facts
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Everything the Scribe extracted in the most recent run, BEFORE dedup / cancellation guards.</small>
+                        <div id="bf_mem_generated_list" class="bf-mem-fact-list">
+                            <div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see what the Scribe extracts.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Last Inserted Facts -->
+            <div id="bf_mem_tab_inserted" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-database"></i> Last Inserted Facts
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Facts that actually landed in the database (after dedup / review edits / cancellation guards).</small>
+                        <div id="bf_mem_inserted_list" class="bf-mem-fact-list">
+                            <div class="bf-mem-summary-empty">No pipeline runs yet.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Tokens -->
+            <div id="bf_mem_tab_tokens" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div id="bf_mem_tokens_banner" class="bf-mem-hint" style="display:none;padding:8px 10px;border-left:3px solid #ff9800;border-radius:4px;margin-bottom:8px;"></div>
+                <!-- A4: Injection Viewer — what the Writer was actually given last turn. -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-syringe"></i> Injected Last Turn</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">The facts the Writer was actually given on the last reply, with a rough token cost. This is what the AI saw — distinct from "Last Inserted" (what the Scribe saved to the database).</small>
+                        <div id="bf_mem_injection_view" class="bf-mem-fact-list">
+                            <div class="bf-mem-summary-empty">Nothing injected yet. After a reply, the facts the Writer was given appear here.</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-coins"></i> Last Run</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">What the whole chat would have cost vs. what the extension actually sent (trimmed chat + facts + agent calls).</small>
+                        <div id="bf_mem_tokens_lastrun"><div class="bf-mem-summary-empty">No generations yet. Send a message — token comparison appears after the first pipeline run.</div></div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-chart-column"></i> This Session
+                        <button id="bf_mem_tokens_reset" class="bf-mem-reset-btn menu_button" title="Reset session totals"><i class="fa-solid fa-rotate-left"></i></button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Running totals across every generation since this chat was opened.</small>
+                        <div id="bf_mem_tokens_session"><div class="bf-mem-summary-empty">No generations yet this session.</div></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Debug -->
+            <div id="bf_mem_tab_debug" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-bug"></i> Debug Log
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_debug" />
+                            <span>Enable debug logging</span>
+                        </label>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_debug_verbose" />
+                            <span>Verbose logging (RAM only, heavy) &mdash; captures raw prompts/replies</span>
+                        </label>
+
+                        <!-- Filter toolbar: client-side over the in-memory ring buffer -->
+                        <div class="bf-mem-debug-filters">
+                            <div class="bf-mem-debug-levels">
+                                <label class="checkbox_label"><input type="checkbox" class="bf-mem-log-level" value="fail" checked /><span class="bf-mem-lv-fail">fail</span></label>
+                                <label class="checkbox_label"><input type="checkbox" class="bf-mem-log-level" value="pass" checked /><span class="bf-mem-lv-pass">pass</span></label>
+                                <label class="checkbox_label"><input type="checkbox" class="bf-mem-log-level" value="info" checked /><span class="bf-mem-lv-info">info</span></label>
+                                <label class="checkbox_label"><input type="checkbox" class="bf-mem-log-level" value="debug" /><span class="bf-mem-lv-debug">debug</span></label>
+                                <label class="checkbox_label" id="bf_mem_log_level_verbose_wrap"><input type="checkbox" class="bf-mem-log-level" value="verbose" /><span class="bf-mem-lv-verbose">verbose</span></label>
+                            </div>
+                            <div class="bf-mem-debug-filter-row">
+                                <select id="bf_mem_log_subsystem" class="text_pole">
+                                    <option value="">All subsystems</option>
+                                    <option value="pipeline">pipeline</option>
+                                    <option value="agent1">Drafter</option>
+                                    <option value="agent3">Scribe</option>
+                                    <option value="finder">Librarian</option>
+                                    <option value="retrieval">retrieval</option>
+                                    <option value="db">db</option>
+                                    <option value="entity">entity</option>
+                                    <option value="reflection">reflection</option>
+                                    <option value="settings">settings</option>
+                                    <option value="import">import</option>
+                                    <option value="cache">cache</option>
+                                </select>
+                                <input type="search" id="bf_mem_log_search" class="text_pole" placeholder="Search runId / text&hellip;" />
+                            </div>
+                        </div>
+
+                        <div class="bf-mem-debug-actions">
+                            <button id="bf_mem_clear_log" class="menu_button">
+                                <i class="fa-solid fa-eraser"></i> Clear
+                            </button>
+                            <button id="bf_mem_copy_log" class="menu_button">
+                                <i class="fa-solid fa-copy"></i> Copy
+                            </button>
+                            <button id="bf_mem_export_json" class="menu_button">
+                                <i class="fa-solid fa-file-code"></i> Export JSON
+                            </button>
+                            <span id="bf_mem_log_count" class="bf-mem-log-count"></span>
+                        </div>
+
+                        <!-- "Why not fact X?" retrieval probe -->
+                        <div class="bf-mem-debug-probe">
+                            <input type="text" id="bf_mem_probe_key" class="text_pole" placeholder="Category/key or key&hellip;" />
+                            <button id="bf_mem_probe_btn" class="menu_button" title="Explain why a fact was / wasn't retrieved">
+                                <i class="fa-solid fa-magnifying-glass"></i> Why not?
+                            </button>
+                            <div id="bf_mem_probe_result" class="bf-mem-probe-result"></div>
+                        </div>
+
+                        <div id="bf_mem_debug_log" class="bf-mem-debug-log"></div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
