@@ -367,11 +367,14 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
  * @param {boolean} [a.cancelled]
  * @param {{NEW?:number,UPDATED?:number,SKIPPED?:number,EVICTED?:number}} [a.facts] count override
  */
-function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, finderTokens, reflectionTokens }) {
+function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, finderTokens, reflectionTokens, agent1Skipped }) {
     try {
         const duration = Date.now() - startTime;
         const agent1Ok = !!(draftResult && !draftResult.error && draftResult.draft);
-        const agent1Ran = !!draftResult;
+        // Hybrid/tool-only mode intentionally skips the Drafter — treat that as "skipped", NOT a
+        // failed run. Without this, an empty (but errorless) draft shape reads as agent1Ran && !ok
+        // and would flag every hybrid turn as failed in the summary/log level.
+        const agent1Ran = !!draftResult && !agent1Skipped;
         const agent3Ran = !!memoryResult;
         const agent3Ok = agent3Ran && !memoryResult?.error;
         const updates = Array.isArray(memoryResult?.updates) ? memoryResult.updates : [];
@@ -1290,7 +1293,7 @@ async function runPipelineInline(data) {
         // Agent 3 no longer runs here, so memoryResult is null on the blocking path —
         // its tokens are recorded separately via addAgent3Tokens on MESSAGE_RECEIVED.
         recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, finderTokens });
-        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, finderTokens });
+        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, finderTokens, agent1Skipped: !runAgent1 });
         hideWorkingIndicator();
         updateStatus('idle');
         // Cancelled inline: no post-reply work will run for this turn — disarm + clear ambient.
@@ -1423,7 +1426,7 @@ async function runPipelineInline(data) {
     recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null, finderTokens });
     // FIX #10: consolidated per-run summary (after token recording — values in scope).
     // Thread the per-stage breakdown so ONE summary line carries the full timing picture.
-    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, finderTokens });
+    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, finderTokens, agent1Skipped: !runAgent1 });
 
     // OBSERVABILITY: one concise per-stage timing line (debug level) for the slowness hunt.
     // Pure log — emitting it changes no state and runs after the blocking work is recorded.
