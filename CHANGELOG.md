@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.43.0-alpha.2] - 2026-06-21
+
+### Added — Phases 2–4: observability, Claude tuning, graph + entity UI
+
+Built on the tool-first core (alpha.1), all verified end-to-end in a real SillyTavern 1.18 instance driven through a browser.
+
+**Phase 4 — usability & observability**
+- **"What Claude did" panel** (Debug tab): a per-turn list of the main model's `search_memory` recalls (query → result count) and `remember_fact` pins, grouped by turn. Auto-refreshes on each tool call. The trust panel — you can *see* the tool-driven memory working.
+- **Graph view** (Database tab): enter a `Category/key` and see the fact's linked neighbors — relationship-ref links (primary/secondary) and one-hop scope-graph neighbors (place⇄event⇄people). Neighbors are clickable to walk the graph. The "true graphline memory" made visible.
+- **Recurring-characters panel** (Database tab): lists the entity registry (named / NPC / deferred) with status badges and a "Mark recurring" button that promotes an NPC to a first-class subject.
+- **Grouped review popup**: extraction review now groups changes into counted New / Updated / Deletions / Conflicts sections instead of a flat list (original indices preserved so edit/remove still work).
+
+**Phase 2 — Claude tuning + speed**
+- **Per-turn tool-call soft cap (8)**: a turn exceeding it is flagged in the panel so a runaway tool loop is visible.
+- **Claude-profile detection**: recognizes a Claude/Anthropic active connection profile and logs (once/session) that tool-first is the tuned path — or, on a non-tool profile in hybrid/tool-only mode, hints that recall may not fire (switch to Push).
+- **Cache-drift guard**: when an agent's static system prompt changes between calls without a persona change, it's logged (variable per-turn data likely leaked into the system block, hurting prompt-cache hits).
+
+**Phase 3 — graph integration**
+- **`remember_fact` auto-links** pinned facts into the spiderweb (mirroring Scribe) so model-pinned facts join the graph instead of being islands — combined with the alpha.1 fix that made traversal follow `secondary` refs, pinned facts are now reachable by recall.
+
+_Files:_ [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html), [style.css](style.css), [src/profiler.js](src/profiler.js), [src/pipeline.js](src/pipeline.js), [src/llm-call.js](src/llm-call.js), [src/agent-writer.js](src/agent-writer.js), [src/review-popup.js](src/review-popup.js)
+
 ## [0.43.0-alpha.1] - 2026-06-21
 
 ### Added — Tool-first redesign: Claude drives memory (faster replies + on-demand recall)
