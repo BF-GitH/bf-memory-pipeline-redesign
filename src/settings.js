@@ -1066,6 +1066,72 @@ function renderToolActivity() {
     if (summaryEl) summaryEl.textContent = `${turns.length} turn(s) · ${totalSearch} recall, ${totalWrite} pin`;
 }
 
+/**
+ * Graph view (Phase 4 — "true graphline memory" visibility). Resolves a fact by Category/key (or
+ * bare key) and shows its linked neighbors: relationship-ref links (primary/secondary, the same
+ * refs recall traversal follows) + one-hop scope-graph neighbors (place⇄event⇄people via expandLinks).
+ * Neighbors are clickable to walk the graph. Read-only; lazy-imports the heavy db modules.
+ * @param {string} keyQuery
+ */
+async function renderGraphView(keyQuery) {
+    const el = document.getElementById('bf_mem_graph_result');
+    if (!el) return;
+    const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const q = String(keyQuery ?? '').trim();
+    if (!q) { el.innerHTML = '<div class="bf-mem-hint">Enter a Category/key or key.</div>'; return; }
+    el.innerHTML = '<div class="bf-mem-hint">Loading…</div>';
+    try {
+        const db = await import('./database.js');
+        const fr = await import('./fact-retrieval.js');
+        const databases = await db.getAllDatabases();
+        const norm = s => String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+        const slash = q.indexOf('/');
+        const wantCat = slash >= 0 ? norm(q.slice(0, slash)) : null;
+        const wantKey = norm(slash >= 0 ? q.slice(slash + 1) : q);
+        let target = null, targetCat = null;
+        for (const [cat, cdb] of Object.entries(databases)) {
+            if (wantCat && norm(cat) !== wantCat) continue;
+            for (const f of (cdb.facts || [])) { if (norm(f.key) === wantKey) { target = f; targetCat = cat; break; } }
+            if (target) break;
+        }
+        if (!target) { el.innerHTML = `<div class="bf-mem-hint">No fact found for "<code>${esc(q)}</code>".</div>`; return; }
+        const resolveRef = (ref) => {
+            const rk = norm(ref);
+            for (const [cat, cdb] of Object.entries(databases)) for (const f of (cdb.facts || [])) if (norm(f.key) === rk) return { cat, fact: f };
+            return null;
+        };
+        const rels = target.relationships || {};
+        const primary = (rels.primary || []).map(resolveRef).filter(Boolean);
+        const secondary = (rels.secondary || []).map(resolveRef).filter(Boolean);
+        // One-hop scope graph via the same exported helper recall uses (mutates the array in place).
+        const seedRow = [{ fact: target, category: targetCat, tier: 'primary' }];
+        const seen = new Set([`${targetCat}:${target.key}`]);
+        try { fr.expandLinks(databases, seedRow, seen); } catch { /* best-effort */ }
+        const scopeNeighbors = seedRow.slice(1).map(r => ({ cat: r.category, fact: r.fact }));
+        const factLine = (cat, f) => `<a href="#" class="bf-mem-graph-link" data-key="${esc(cat)}/${esc(f.key)}"><code>${esc(cat)}/${esc(f.key)}</code></a> ${esc(String(f.value || f.note || '').slice(0, 80))}`;
+        const section = (title, list) => list.length
+            ? `<div class="bf-mem-graph-section"><div class="bf-mem-graph-title">${title} (${list.length})</div>${list.map(n => `<div class="bf-mem-graph-row">↳ ${factLine(n.cat, n.fact)}</div>`).join('')}</div>`
+            : '';
+        let html = `<div class="bf-mem-graph-node"><b>${esc(targetCat)}/${esc(target.key)}</b>: ${esc(String(target.value || '').slice(0, 160))}</div>`;
+        html += section('Primary links', primary);
+        html += section('Secondary links', secondary);
+        html += section('Scope-graph neighbors (1 hop)', scopeNeighbors);
+        if (!primary.length && !secondary.length && !scopeNeighbors.length) {
+            html += '<div class="bf-mem-hint">No links yet — this fact is an island. Auto-linking connects facts that share a subject, location, or participants.</div>';
+        }
+        el.innerHTML = html;
+        el.querySelectorAll('.bf-mem-graph-link').forEach(a => a.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            const k = a.getAttribute('data-key');
+            const inp = document.getElementById('bf_mem_graph_key');
+            if (inp) inp.value = k;
+            renderGraphView(k);
+        }));
+    } catch (e) {
+        el.innerHTML = `<div class="bf-mem-hint">Graph view error: ${esc(String(e).slice(0, 140))}</div>`;
+    }
+}
+
 // --- Debug-log filter state (client-side over the in-memory ring buffer) ---
 // Level checkboxes default to fail+pass+info; debug/verbose opt-in. The verbose level is
 // further gated by the debugVerbose SETTING (capture-side) — when off, verbose entries
@@ -5511,6 +5577,10 @@ export async function initSettings() {
     // It also auto-refreshes from addDebugLog on each tool-call event.
     $('#bf_mem_tool_activity_refresh').on('click', () => renderToolActivity());
     renderToolActivity();
+
+    // Graph view (Database tab): show a fact's linked neighbors; Enter or button triggers it.
+    $('#bf_mem_graph_btn').on('click', () => renderGraphView($('#bf_mem_graph_key').val()));
+    $('#bf_mem_graph_key').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); renderGraphView($('#bf_mem_graph_key').val()); } });
 
     $('#bf_mem_clear_log').on('click', () => {
         debugLog = [];

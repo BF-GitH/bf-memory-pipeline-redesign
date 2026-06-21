@@ -658,6 +658,19 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <input type="text" id="bf_mem_db_search" class="text_pole" placeholder="Search facts across all categories (key / value / note)…" style="width:100%;" />
                         </div>
                         <div id="bf_mem_db_search_results" class="bf-mem-fact-list" style="display:none;"></div>
+
+                        <!-- Graph view (Spiderweb): pick a fact -> see its linked neighbors (the "true
+                             graphline memory"). Reuses the same relationship + scope-graph links recall walks. -->
+                        <details class="bf-mem-graph-wrap" style="margin:8px 0;">
+                            <summary style="cursor:pointer;font-weight:bold;">🕸️ Graph view — a fact and its linked neighbors</summary>
+                            <div class="bf-mem-field" style="display:flex;gap:6px;margin:6px 0;">
+                                <input type="text" id="bf_mem_graph_key" class="text_pole" placeholder="Category/key or key (e.g. People/Mira)…" style="flex:1;" />
+                                <button id="bf_mem_graph_btn" class="menu_button" title="Show this fact's linked neighbors"><i class="fa-solid fa-diagram-project"></i> Show links</button>
+                            </div>
+                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">Shows the fact, its relationship-ref links (primary/secondary), and one-hop scope-graph neighbors (place⇄event⇄people). Click any neighbor to walk the graph.</small>
+                            <div id="bf_mem_graph_result" class="bf-mem-graph-result"></div>
+                        </details>
+
                         <div id="bf_mem_db_list" class="bf-mem-db-list"></div>
 
                         <!-- Add your own taxonomy labels (user overlay, global across chats) -->
