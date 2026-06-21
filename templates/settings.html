@@ -200,6 +200,14 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
 
             <!-- Tab: Writer (the main model that writes the reply) -->
             <div id="bf_mem_tab_agent2" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <details class="bf-mem-eli5">
+                    <summary>🧠 What is the Writer? — click for a simple explanation + example</summary>
+                    <div class="bf-mem-eli5-body">
+                        <p><b>In plain words:</b> the “Writer” is just <b>your main AI writing the reply</b>. These settings only change <b>what it sees</b> while it writes — how much of the chat history, plus the memory facts the extension hands it.</p>
+                        <p><b>Example:</b> you’re 200 messages into a story. Instead of making the AI re-read all 200, you can show it just the last few messages <i>plus</i> the key facts (“Kael is a blacksmith, allergic to peanuts”). Same memory, fewer tokens, sharper focus.</p>
+                        <p><b>Just want it to work?</b> Leave everything at its default — only touch these to save tokens or fine-tune.</p>
+                    </div>
+                </details>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-pen-nib"></i> Writer (main model)</div>
                     <div class="bf-mem-section-body">
@@ -383,6 +391,14 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
 
             <!-- Tab: Scribe (writes/updates facts into memory after each reply) -->
             <div id="bf_mem_tab_agent3" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <details class="bf-mem-eli5">
+                    <summary>📝 What is the Scribe? — click for a simple explanation + example</summary>
+                    <div class="bf-mem-eli5-body">
+                        <p><b>In plain words:</b> the “Scribe” is the <b>note-taker</b>. After each reply, it reads what just happened and <b>saves the important facts into memory</b> — automatically, in the background. It runs <i>after</i> the reply, so it never slows down your message.</p>
+                        <p><b>Example:</b> Mira says “I promise I’ll guard the forge tonight.” The Scribe quietly writes a note — <i>Events/forge-watch = “Mira promised to guard the forge tonight”</i> — so 50 messages later the AI still knows about the promise.</p>
+                        <p><b>Just want it to work?</b> Leave the defaults. These settings only change <i>how</i> it takes notes (e.g. which model does it, or asking you to review before saving).</p>
+                    </div>
+                </details>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profile</div>
                     <div class="bf-mem-section-body">
