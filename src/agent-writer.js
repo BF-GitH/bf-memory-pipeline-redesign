@@ -684,7 +684,8 @@ async function rememberFactAction({ key, value, category, subject, importance, a
         const cat = String(category ?? '').trim() || 'Unsorted';
 
         // Lazy import to dodge the static import cycle (database.js is heavy + pulls settings).
-        const { getDatabase, createEmptyDatabase, upsertFact, saveDatabase, clampImportance } = await import('./database.js');
+        const { getDatabase, createEmptyDatabase, upsertFact, saveDatabase, clampImportance,
+            getAllDatabases, buildMemoryIndex, autoLinkFact, findFactMatch } = await import('./database.js');
 
         // Get-or-create the category DB in the active per-character store. getDatabase reads through
         // getAllDatabases() (the same active store the recall tool searches).
@@ -711,6 +712,23 @@ async function rememberFactAction({ key, value, category, subject, importance, a
         // ADD-ONLY upsert: exact-key / normalized-variant merge is fine (idempotent re-pin updates
         // the value in place), but nothing is ever removed. Then persist the touched category DB.
         upsertFact(db, factToWrite);
+
+        // AUTO-LINK into the spiderweb, exactly like Scribe-written facts (agent-memory.js applyUpdates).
+        // Without this, model-pinned facts were ISLANDS — never connected to related facts, so the
+        // graph expansion the recall tool relies on could never reach them from a neighbor. Gated by
+        // enableAutoLinking (free + deterministic, default ON). Best-effort: never block the write.
+        try {
+            if (getSettingsSafe()?.enableAutoLinking !== false) {
+                const linkIndex = buildMemoryIndex(await getAllDatabases());
+                const stored = findFactMatch(db, factToWrite.key);
+                if (stored) autoLinkFact(linkIndex, stored, cat, 'writer:remember_fact');
+            }
+        } catch (linkErr) {
+            await rememberToolLog('debug', `Writer write: auto-link skipped (${linkErr?.message || linkErr})`, {
+                subsystem: 'writer', event: 'tool.remember_fact', reason: 'AUTOLINK_SKIPPED',
+            });
+        }
+
         await saveDatabase(db);
 
         await rememberToolLog('info', `Writer write: remember_fact "${cat}/${factKey}" = "${factValue.slice(0, 80)}"`, {

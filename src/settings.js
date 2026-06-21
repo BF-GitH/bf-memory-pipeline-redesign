@@ -1000,6 +1000,9 @@ export function addDebugLog(type, message, opts = {}) {
     logFileDirty = true;
     void flushDebugLogFile(false); // throttled; async fire-and-forget (errors swallowed)
     renderDebugLog();
+    // Tool-first redesign: refresh the "What Claude did" panel on tool-call events so memory
+    // recalls/writes appear live. Cheap (scans the small ring buffer); guarded inside.
+    if (entry.event === 'tool.search_memory' || entry.event === 'tool.remember_fact') renderToolActivity();
 
     if (extensionSettings?.debugMode) {
         const tag = level.toUpperCase();
@@ -1007,6 +1010,60 @@ export function addDebugLog(type, message, opts = {}) {
         const rid = runId ? ` [${runId}]` : '';
         console.log(`[BFMemory] [${tag}]${rid}${sub} ${message}`);
     }
+}
+
+// Per-turn tool-call count beyond which a turn is flagged as a possible runaway tool loop (Phase 2
+// observability). Soft — purely visual; nothing is blocked.
+const TOOL_ACTIVITY_SOFTCAP = 8;
+
+/**
+ * "What Claude did" panel (tool-first redesign). Scans the in-memory debug ring buffer for the
+ * main model's memory tool calls (`search_memory` recall + `remember_fact` pin), groups them by
+ * runId (one turn), and renders the most recent turns so the user can SEE the tool-driven memory
+ * working. A high per-turn call count is flagged. Pure read of `debugLog`; safe to call anytime.
+ */
+function renderToolActivity() {
+    const el = document.getElementById('bf_mem_tool_activity');
+    if (!el) return; // panel not in DOM (older template / tab not built) — no-op
+    const summaryEl = document.getElementById('bf_mem_tool_activity_summary');
+    const calls = debugLog.filter(e => e.event === 'tool.search_memory' || e.event === 'tool.remember_fact');
+    if (calls.length === 0) {
+        el.innerHTML = '<div class="bf-mem-hint" style="opacity:.7;">No memory tool calls recorded yet. When the main model calls <code>search_memory</code> / <code>remember_fact</code>, they appear here.</div>';
+        if (summaryEl) summaryEl.textContent = '';
+        return;
+    }
+    const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    // Group by runId (a turn), preserving the newest-first order of the buffer.
+    const groups = new Map(); // runId -> { rid, search: [], write: [] }
+    for (const e of calls) {
+        const rid = e.runId || '(no turn id)';
+        if (!groups.has(rid)) groups.set(rid, { rid, search: [], write: [] });
+        const g = groups.get(rid);
+        (e.event === 'tool.search_memory' ? g.search : g.write).push(e);
+    }
+    const turns = [...groups.values()].slice(0, 12); // most recent 12 turns
+    let totalSearch = 0, totalWrite = 0;
+    const html = turns.map(g => {
+        const n = g.search.length + g.write.length;
+        totalSearch += g.search.length; totalWrite += g.write.length;
+        const hot = n > TOOL_ACTIVITY_SOFTCAP;
+        const rows = [];
+        for (const e of g.search) {
+            const d = e.data || {};
+            const cnt = d.resultCount != null ? d.resultCount : '?';
+            rows.push(`<div class="bf-mem-tool-row"><span class="bf-mem-tool-badge bf-mem-tool-search">recall</span> <code>${esc(d.query || '')}</code>${d.category ? ` <span class="bf-mem-dim">[${esc(d.category)}]</span>` : ''}${d.with ? ` <span class="bf-mem-dim">with ${esc(d.with)}</span>` : ''} → <b>${esc(cnt)}</b> fact(s)</div>`);
+        }
+        for (const e of g.write) {
+            const d = e.data || {};
+            rows.push(`<div class="bf-mem-tool-row"><span class="bf-mem-tool-badge bf-mem-tool-write">pin</span> <code>${esc(d.category)}/${esc(d.key)}</code> = ${esc(String(d.value || '').slice(0, 80))}</div>`);
+        }
+        return `<details class="bf-mem-tool-turn" open>`
+            + `<summary>Turn <code>${esc(g.rid)}</code> — ${g.search.length} recall, ${g.write.length} pin`
+            + (hot ? ` <span class="bf-mem-tool-warn" title="High tool-call count this turn — possible runaway loop">⚠ ${n} calls</span>` : '')
+            + `</summary>${rows.join('')}</details>`;
+    }).join('');
+    el.innerHTML = html;
+    if (summaryEl) summaryEl.textContent = `${turns.length} turn(s) · ${totalSearch} recall, ${totalWrite} pin`;
 }
 
 // --- Debug-log filter state (client-side over the in-memory ring buffer) ---
@@ -5449,6 +5506,11 @@ export async function initSettings() {
     $(document).on('change', '.bf-mem-log-level', () => renderDebugLog());
     $('#bf_mem_log_subsystem').on('change', () => renderDebugLog());
     $('#bf_mem_log_search').on('input', () => renderDebugLog());
+
+    // "What Claude did" tool-activity panel (tool-first redesign): manual refresh + initial paint.
+    // It also auto-refreshes from addDebugLog on each tool-call event.
+    $('#bf_mem_tool_activity_refresh').on('click', () => renderToolActivity());
+    renderToolActivity();
 
     $('#bf_mem_clear_log').on('click', () => {
         debugLog = [];

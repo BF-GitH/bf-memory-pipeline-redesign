@@ -853,6 +853,22 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <div id="bf_mem_probe_result" class="bf-mem-probe-result"></div>
                         </div>
 
+                        <!-- "What Claude did" — per-turn tool-call activity (search_memory / remember_fact).
+                             The tool-first redesign's trust panel: see the model actively recall + pin memory. -->
+                        <details class="bf-mem-tool-activity-wrap" open>
+                            <summary style="cursor:pointer;font-weight:bold;margin:8px 0 4px;">🔧 What Claude did — memory tool calls per turn</summary>
+                            <div class="bf-mem-debug-actions" style="margin:4px 0;">
+                                <button id="bf_mem_tool_activity_refresh" class="menu_button" title="Refresh the tool-call activity list">
+                                    <i class="fa-solid fa-rotate"></i> Refresh
+                                </button>
+                                <span id="bf_mem_tool_activity_summary" class="bf-mem-log-count"></span>
+                            </div>
+                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">
+                                Each turn the main model can call <code>search_memory</code> (recall) and <code>remember_fact</code> (pin). This lists those calls so you can confirm the tool-driven memory is firing. A high per-turn count is flagged so a runaway tool loop is visible.
+                            </small>
+                            <div id="bf_mem_tool_activity" class="bf-mem-tool-activity"></div>
+                        </details>
+
                         <div id="bf_mem_debug_log" class="bf-mem-debug-log"></div>
                     </div>
                 </div>
