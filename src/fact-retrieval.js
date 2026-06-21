@@ -1581,21 +1581,46 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
 
     const index = await getMemoryIndex();
 
-    // Collect candidates by identity (exact Category/key handle) AND by keyword, deduped.
-    const byId = new Map(); // `category:key` -> { fact, category }
-    const add = (r) => { if (r && r.fact) byId.set(`${r.category}:${r.fact.key}`, { fact: r.fact, category: r.category }); };
+    // FULL-CASCADE CANDIDATE COLLECTION (tool-first strengthening). The recall tool is now the
+    // model's PRIMARY way to reach memory (hybrid/tool-only modes), so a weak or oblique query must
+    // still hit. We route it through the SAME cascade the push path (retrieveFacts) uses instead of
+    // keyword-only: exact handle → keyword index → fuzzy/alias trigram (typos/morphology) → bounded
+    // one-hop graph expansion (place⇄event⇄people, relationship refs, sequence tracks). The graph
+    // hop is what makes a query about a PLACE surface the people/events linked to it. All of these
+    // are the existing deterministic, capped helpers — no new matching logic, no embeddings.
+    const directResults = [];
+    const seen = new Set();
+    const push = (r, tier) => {
+        if (!r || !r.fact) return;
+        const id = `${r.category}:${r.fact.key}`;
+        if (seen.has(id)) return;
+        seen.add(id);
+        directResults.push({ fact: r.fact, category: r.category, tier: tier || r.tier || 'primary', via: r.via });
+    };
 
     // EXACT-HANDLE lookup: the pushed gist shows `Category/key` handles, so the Writer may pass
     // one back to pull the full record. resolveExactKeys validates against the real store (a
     // hallucinated handle matches nothing), is active-only, and is case/punctuation tolerant.
     if (q.indexOf('/') >= 0) {
-        for (const r of resolveExactKeys(databases, [q])) add(r);
+        for (const r of resolveExactKeys(databases, [q])) push(r, 'primary');
     }
     // KEYWORD search over the prebuilt index (same matcher as the push path).
-    for (const r of searchFactsIndexed(index, databases, [q])) add(r);
+    for (const r of searchFactsIndexed(index, databases, [q])) push(r, 'primary');
+
+    // FUZZY/ALIAS fallback (Layer B): trigram-match the query against active facts so typos and
+    // morphology ("apartments"→"apartment") still resolve when the keyword path missed. Admits as
+    // secondary; never duplicates an exact/keyword hit. Mutates directResults + seen in place.
+    fuzzyFallback(databases, [q], directResults, seen);
+
+    // BOUNDED GRAPH EXPANSION (Spiderweb): one-hop place⇄event⇄people / relationship-ref / sequence
+    // continuity seeded from whatever the query already surfaced — so searching a place returns who
+    // and what is linked to it. Rebuild the dedupe ledger first (fuzzy may have appended), matching
+    // retrieveFacts' ordering. Shares the same per-seed + total cap, salience-ranked admitter.
+    const alreadyFound = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
+    gatherExpansionCandidates(databases, index, directResults, alreadyFound);
 
     // Optional category filter (case-insensitive, on the stored category name).
-    let candidates = [...byId.values()];
+    let candidates = directResults;
     if (catFilter) candidates = candidates.filter(c => String(c.category).toLowerCase() === catFilter);
 
     // Honor knownBy visibility exactly like normal retrieval (precompute names once).
@@ -1612,12 +1637,25 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     candidates.sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
     const capped = candidates.slice(0, cap);
 
-    // Reuse the push formatter so the recalled lines look identical to the injected gist.
-    const text = capped.length
-        ? formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })))
-        : `No stored facts match "${q}"${catFilter ? ` in category "${category}"` : ''}.`;
+    addDebugLog('debug', `search_memory recall: "${q.slice(0, 60)}"${catFilter ? ` [cat=${catFilter}]` : ''} → ${capped.length}/${candidates.length} fact(s) (exact+keyword+fuzzy+graph)`, {
+        subsystem: 'retrieval', event: 'recall.search',
+        data: { query: q.slice(0, 60), category: catFilter || null, returned: capped.length, totalCandidates: candidates.length },
+    });
 
-    return { text, count: capped.length };
+    if (capped.length) {
+        // Reuse the push formatter so the recalled lines look identical to the injected gist.
+        const text = formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })));
+        return { text, count: capped.length };
+    }
+
+    // NO MATCH — return an ACTIONABLE hint (not a dead end) so the model re-queries productively
+    // instead of giving up or hallucinating. List the categories that actually exist (capped) so it
+    // can narrow, and remind it of the broader angles (names, Category/key handles, scene:/with:).
+    const presentCats = Object.keys(databases).filter(cat => (databases[cat]?.facts?.length > 0));
+    const hint = presentCats.length
+        ? ` Try a broader or different keyword, a character or place name, a "Category/key" handle, or one of the categories present in memory: ${presentCats.slice(0, 12).join(', ')}${presentCats.length > 12 ? ', …' : ''}. You can also recall a scene (scene:) or a relationship history (with:).`
+        : ' Memory is nearly empty, so there may be nothing to recall yet.';
+    return { text: `No stored facts match "${q}"${catFilter ? ` in category "${category}"` : ''}.${hint}`, count: 0 };
 }
 
 /**
