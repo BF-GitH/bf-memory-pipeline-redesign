@@ -1220,8 +1220,20 @@ async function copyDiagnostics() {
                     entities: Object.keys(entities || {}).length,
                     logEntries: debugLog.length,
                 },
+                // Honesty note: this is EVERYTHING the extension itself holds. The model's full
+                // assembled prompt (chat history + persona + ST's own additions) is built by
+                // SillyTavern, not this extension, so it is not captured here — but the memory block
+                // this extension injected IS (see `lastInjection`).
+                note: 'Complete extension state. The model\'s full ST-assembled prompt is outside this extension; the memory block it injected is in lastInjection.',
             },
             settings: extensionSettings,   // all extension settings (no API keys)
+            tokens: {                      // "tokens used" — per-run breakdown + session totals
+                lastRun: lastRunTokens,
+                session: sessionTokens,
+            },
+            lastInjection,                 // the memory CONTEXT block injected into the writer last turn (facts + approx tokens)
+            lastGenerated,                 // the Scribe's extracted updates last turn (agent OUTPUT)
+            lastInserted,                  // what was actually written to the DB last turn
             scene,
             entities,                      // recurring-characters registry
             reviewPending: review,
