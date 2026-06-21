@@ -1180,6 +1180,88 @@ async function renderEntityPanel() {
     }
 }
 
+/**
+ * "Copy Diagnostics" (Debug tab). Bundles EVERYTHING needed to debug the extension into one JSON
+ * blob — settings, the full debug log (inputs/outputs/events), the entire fact database INCLUDING
+ * each fact's relationships (the graph/web), the current scene, the entity registry, and any pending
+ * review — then downloads it as a file AND copies it to the clipboard so the user can paste it for
+ * support. Best-effort throughout: a failure in any one section is captured inline, never aborts the
+ * export. NOTE: this contains roleplay content (facts/logs); it does NOT include API keys (those
+ * live in ST connection profiles, not this extension's settings).
+ */
+async function copyDiagnostics() {
+    let payload;
+    try {
+        const ctx = getContext();
+        let databases = {}, scene = null, entities = {}, review = null, extVersion = null;
+        try { const m = await (await fetch(new URL('../manifest.json', import.meta.url))).json(); extVersion = m.version; } catch { /* version best-effort */ }
+        try { const dbm = await import('./database.js'); databases = await dbm.getAllDatabases(); } catch (e) { databases = { __error: String(e?.message || e) }; }
+        try { scene = getScene(); } catch { /* none */ }
+        try { const ent = await import('./agent-entities.js'); entities = ent.getEntities() || {}; } catch { /* none */ }
+        try { review = (ctx.chatMetadata || ctx.chat_metadata || {}).bf_mem_review || null; } catch { /* none */ }
+        let factCount = 0, linkCount = 0;
+        for (const cdb of Object.values(databases || {})) {
+            for (const f of (cdb?.facts || [])) {
+                factCount++;
+                const r = f.relationships || {};
+                linkCount += (r.primary?.length || 0) + (r.secondary?.length || 0) + (r.tertiary?.length || 0);
+            }
+        }
+        const diag = {
+            meta: {
+                exported: new Date().toISOString(),
+                extensionVersion: extVersion,
+                stVersion: ctx?.version ?? null,
+                character: (() => { try { return ctx.characters?.[ctx.characterId]?.name ?? null; } catch { return null; } })(),
+                chatId: (() => { try { return ctx.chatId ?? ctx.getCurrentChatId?.() ?? null; } catch { return null; } })(),
+                counts: {
+                    categories: Object.keys(databases || {}).length,
+                    facts: factCount, links: linkCount,
+                    entities: Object.keys(entities || {}).length,
+                    logEntries: debugLog.length,
+                },
+            },
+            settings: extensionSettings,   // all extension settings (no API keys)
+            scene,
+            entities,                      // recurring-characters registry
+            reviewPending: review,
+            databases,                     // facts INCLUDE their relationships = the graph/web
+            debugLog,                      // all inputs/outputs/events (newest-first ring buffer)
+        };
+        payload = JSON.stringify(diag, null, 2);
+    } catch (e) {
+        payload = JSON.stringify({ error: 'diagnostics build failed: ' + String(e?.message || e) }, null, 2);
+    }
+    // Download as a file (mirrors Export JSON) AND copy to clipboard.
+    let chatId = 'diag';
+    try { chatId = String(getContext().chatId ?? 'diag'); } catch { /* none */ }
+    try {
+        const blob = new Blob([payload], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = `bf-mem-diagnostics-${chatId}-${Date.now()}.json`;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch { /* download best-effort */ }
+    try {
+        await navigator.clipboard.writeText(payload);
+        try { toastr.success(`Diagnostics copied + downloaded (${Math.round(payload.length / 1024)} KB)`, 'BF Memory'); } catch { /* toast best-effort */ }
+    } catch {
+        // Clipboard blocked (common for large payloads / mobile) — show a select-all textarea overlay.
+        try {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px;';
+            const card = document.createElement('div');
+            card.style.cssText = 'background:var(--SmartThemeBlurTintColor,#1a1a2e);padding:16px;border-radius:8px;max-width:720px;width:100%;max-height:80vh;display:flex;flex-direction:column;gap:8px;';
+            const title = document.createElement('div'); title.textContent = 'Copy diagnostics'; title.style.cssText = 'font-weight:bold;color:#7bb3ff;';
+            const hint = document.createElement('div'); hint.textContent = 'Clipboard was blocked. Ctrl+A / long-press in the box, then Copy. (It was also downloaded as a file.)'; hint.style.cssText = 'font-size:12px;opacity:0.7;';
+            const ta = document.createElement('textarea'); ta.value = payload; ta.style.cssText = 'width:100%;flex:1;min-height:320px;font-family:monospace;font-size:11px;';
+            const close = document.createElement('button'); close.textContent = 'Close'; close.className = 'menu_button'; close.onclick = () => overlay.remove();
+            card.append(title, hint, ta, close); overlay.appendChild(card); document.body.appendChild(overlay);
+            ta.focus(); ta.select();
+        } catch { /* file download already succeeded */ }
+    }
+}
+
 // --- Debug-log filter state (client-side over the in-memory ring buffer) ---
 // Level checkboxes default to fail+pass+info; debug/verbose opt-in. The verbose level is
 // further gated by the debugVerbose SETTING (capture-side) — when off, verbose entries
@@ -5652,6 +5734,9 @@ export async function initSettings() {
 
     // Export the full RAM ring buffer as machine-readable JSON. Mirrors the Copy button's
     // clipboard-with-mobile-fallback pattern, plus a file download.
+    // Copy Diagnostics: bundle settings + logs + database (facts+links) + scene + entities to clipboard/file.
+    $('#bf_mem_copy_all').on('click', () => copyDiagnostics());
+
     $('#bf_mem_export_json').on('click', async () => {
         const json = exportLogsJSON();
         let chatId = 'log';
