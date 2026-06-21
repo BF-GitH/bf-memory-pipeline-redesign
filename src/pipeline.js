@@ -10,7 +10,7 @@ import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
 import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveAspect, deriveScope, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage, getRelationshipMomentThread } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
-import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
+import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId, detectProfileForToolFirst } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, setLastInjection, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid, isTriviallyEmptyForExtraction } from './settings.js';
 import { detectAndRecord, showEntityPopup, runEntityResolution } from './agent-entities.js';
@@ -28,6 +28,7 @@ let lastInjection = null; // cached injection text for the FIRST generation (sce
 // the stale draft (facts are safe to reuse; the draft is not). Kept fast: no agent re-run.
 let lastInjectionNoDraft = null;
 let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETION_PROMPT_READY
+let profileDetectionLogged = false; // tool-first: log Claude-profile detection once per session
 // A2/B5 — FROZEN INJECTION (opt-in, settings.injectionFreezeTurns; default 0 = off). Counts
 // CONSECUTIVE genuine-new-turns that REUSED the cached injection instead of re-running the agents.
 // 0 while disabled / right after a full run; incremented on each frozen turn; reset to 0 on a full
@@ -367,11 +368,17 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
  * @param {boolean} [a.cancelled]
  * @param {{NEW?:number,UPDATED?:number,SKIPPED?:number,EVICTED?:number}} [a.facts] count override
  */
-function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, finderTokens, reflectionTokens }) {
+function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, finderTokens, reflectionTokens, agent1Skipped }) {
     try {
         const duration = Date.now() - startTime;
-        const agent1Ok = !!(draftResult && !draftResult.error && draftResult.draft);
-        const agent1Ran = !!draftResult;
+        // When Agent 1 was intentionally skipped (hybrid/tool-only), it is neither "ok" nor "failed"
+        // — use null ("not applicable") so any consumer reading !agent1Ok alone can't misread a
+        // deliberate skip as a degraded run. (agent1Ran already excludes the skip from the run tally.)
+        const agent1Ok = agent1Skipped ? null : !!(draftResult && !draftResult.error && draftResult.draft);
+        // Hybrid/tool-only mode intentionally skips the Drafter — treat that as "skipped", NOT a
+        // failed run. Without this, an empty (but errorless) draft shape reads as agent1Ran && !ok
+        // and would flag every hybrid turn as failed in the summary/log level.
+        const agent1Ran = !!draftResult && !agent1Skipped;
         const agent3Ran = !!memoryResult;
         const agent3Ok = agent3Ran && !memoryResult?.error;
         const updates = Array.isArray(memoryResult?.updates) ? memoryResult.updates : [];
@@ -869,13 +876,30 @@ async function runPipelineInline(data) {
     // TO RE-ENABLE: restore `const wantFinder = settings.useFinderAgent !== false;`.
     // ============================================================================================
     const wantFinder = false; // HARD-DISABLED — see the note above (was: settings.useFinderAgent !== false)
-    const factInventory = wantFinder ? '' : summarizeKeys(databases);
+    // MEMORY MODE (tool-first redesign): 'hybrid' (default) and 'tool-only' DROP the blocking Agent 1
+    // (Draft) LLM call from the reply-critical path — the main model (e.g. Claude via the Claude Code
+    // CLI connection profile) pulls deeper memory on demand through the search_memory tool, so the
+    // reply only needs a cheap, no-LLM anchor (speculative facts + present-character anchors + the
+    // scene block). 'push' preserves classic behavior: Agent 1 drafts the reply + picks branches.
+    const memoryMode = (settings.memoryMode === 'push' || settings.memoryMode === 'tool-only')
+        ? settings.memoryMode : 'hybrid';
+    const runAgent1 = memoryMode === 'push';
+    // PROFILE-AWARE detection (tool-first), once per session: log whether the active connection
+    // profile is the tuned Claude/Anthropic tool-calling path — so if hybrid/tool-only recall isn't
+    // firing, the Debug log explains why (the tools only activate on a tool-calling main model).
+    if (!profileDetectionLogged) {
+        profileDetectionLogged = true;
+        try { detectProfileForToolFirst(settings); } catch { /* detection is best-effort */ }
+    }
+    // Agent 1's fact inventory + Stage-1 menu are consumed ONLY by the Draft prompt (and the
+    // deterministic fallback's delta keywords come from Agent 1's neededFacts). In hybrid/tool-only
+    // mode Agent 1 never runs, so skip building them — that also avoids a full-store key walk
+    // (summarizeKeys) and a menu aggregate every turn.
+    const factInventory = (runAgent1 && !wantFinder) ? summarizeKeys(databases) : '';
     // STAGE 1 menu: compact Category×aspect map (counts, NO values) Agent 1 picks branches from.
-    // Counts come from the index aggregate, not a full-fact walk.
-    const factMenu = summarizeMenuIndexed(index);
-    // NOTE: the Finder is hard-disabled (wantFinder=false above), so the inventory is ALWAYS
-    // included for Agent 1. The old `wantFinder ? 'skipped (finder on)' : …` branch was dead
-    // (unreachable while wantFinder is const-false) and misleadingly implied a "finder on" state.
+    // Counts come from the index aggregate, not a full-fact walk. Built only when Agent 1 runs.
+    const factMenu = runAgent1 ? summarizeMenuIndexed(index) : '';
+    addDebugLog('info', `Memory mode: ${memoryMode}${runAgent1 ? '' : ' — Agent 1 Draft skipped (tool-driven recall)'}`);
     addDebugLog('info', `Fact inventory for Agent 1: ${factInventory ? factInventory.split('\n').length + ' keys' : 'empty'}; menu: ${factMenu ? factMenu.split('\n').length + ' categories' : 'empty'}`);
 
     const agent1Start = Date.now();
@@ -883,11 +907,18 @@ async function runPipelineInline(data) {
         isInternalCall = true;
         const promises = [];
 
-        // Agent 1: Draft + STAGE 1 menu picker (returns #Branches)
-        promises.push(
-            runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId, factInventory, factMenu)
-                .catch(err => ({ draft: '', branches: [], neededFacts: [], raw: '', error: err.message })),
-        );
+        // Agent 1: Draft + STAGE 1 menu picker (returns #Branches) — PUSH mode only. In hybrid/
+        // tool-only mode we SKIP this blocking Draft LLM call entirely (the latency win) and let
+        // the main model drive recall on demand via search_memory; promise resolves to null so the
+        // empty-draft path below seeds a no-LLM anchor.
+        if (runAgent1) {
+            promises.push(
+                runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId, factInventory, factMenu)
+                    .catch(err => ({ draft: '', branches: [], neededFacts: [], raw: '', error: err.message })),
+            );
+        } else {
+            promises.push(Promise.resolve(null));
+        }
 
         // Speculative retrieval: start fact lookup with context keywords NOW (no LLM wait)
         promises.push(
@@ -896,9 +927,10 @@ async function runPipelineInline(data) {
         );
 
         [draftResult, speculativeRetrieval] = await Promise.all(promises);
-        // Agent 1 + speculative retrieval run in PARALLEL (single Promise.all), so the reply
-        // waited the wall-clock of the slower of the two. Record that shared parallel wall-clock
-        // for both — we can't separate them without changing the await structure (out of scope).
+        // Agent 1 (when run) + speculative retrieval run in PARALLEL (single Promise.all), so the
+        // reply waited the wall-clock of the slower of the two. Record that shared parallel
+        // wall-clock for both. In hybrid/tool-only mode Agent 1 is skipped, so this measures just
+        // the speculative-retrieval time — the dropped Draft LLM call is the latency win.
         stageMs.agent1Ms = Date.now() - agent1Start;
         stageMs.speculativeRetrievalMs = stageMs.agent1Ms;
     } catch (error) {
@@ -921,7 +953,32 @@ async function runPipelineInline(data) {
     // GRACEFUL DEGRADATION: if Agent 1 errored (e.g. provider returned empty completion
     // even after retry), don't abort the whole pipeline — the writer can still inject
     // the retrieved facts with no draft. Memory > nothing.
-    if (!draftResult || draftResult.error) {
+    if (!runAgent1) {
+        // HYBRID / TOOL-ONLY: Agent 1 was intentionally not run. Seed an empty draft shape (no
+        // "what happens next" direction — the main model writes freely) and derive `focus` from the
+        // current scene's present characters so the guaranteed present-character anchors below still
+        // fire (cheap, no LLM). Everything deeper is pulled by the model via search_memory.
+        let scenePresent = [];
+        try {
+            const s = getScene();
+            scenePresent = Array.isArray(s?.present) ? s.present.map(x => String(x ?? '').trim()).filter(Boolean) : [];
+        } catch { scenePresent = []; }
+        // FOCUS FALLBACK (honest about the limit): without Agent 1 there is no fresh #SCENE parse, so
+        // getScene().present is whatever a PRIOR push-mode turn (or none) left — it can be stale or
+        // empty and will miss a newly-arrived character. This is a best-effort floor, NOT a guarantee:
+        // when no present list is available we fall back to the active character (always "present" in
+        // a 1:1 RP) so at least the lead's identity anchors still fire. The main model covers any gap
+        // by pulling via search_memory. Full present-character tracking needs a scene extractor
+        // (push mode, or a future cheap parser).
+        const focusList = scenePresent.length
+            ? scenePresent
+            : (charName && charName !== '(unknown)' ? [charName] : []);
+        draftResult = { draft: '', branches: [], focus: focusList, neededFacts: [], nextHint: [], scene: null, raw: '' };
+        addDebugLog('info', `Hybrid mode: skipped Agent 1 Draft LLM call — anchoring on speculative facts${focusList.length ? ` + anchors for (${focusList.join(', ')})${scenePresent.length ? '' : ' [active-char fallback; scene not parsed in hybrid]'}` : ''}; main model recalls via search_memory`, {
+            subsystem: 'agent1', event: 'agent1.run', reason: 'SKIPPED_HYBRID',
+            data: { agent: 'agent1', mode: memoryMode, skipped: true, focus: focusList, sceneStale: !scenePresent.length },
+        });
+    } else if (!draftResult || draftResult.error) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`, {
             subsystem: 'agent1', event: 'agent1.run', reason: 'ERROR',
             data: { agent: 'agent1', profileId: agent1ProfileId || null, success: false, error: draftResult?.error || 'no result', durationMs: Date.now() - agent1Start },
@@ -1257,7 +1314,7 @@ async function runPipelineInline(data) {
         // Agent 3 no longer runs here, so memoryResult is null on the blocking path —
         // its tokens are recorded separately via addAgent3Tokens on MESSAGE_RECEIVED.
         recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, finderTokens });
-        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, finderTokens });
+        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, finderTokens, agent1Skipped: !runAgent1 });
         hideWorkingIndicator();
         updateStatus('idle');
         // Cancelled inline: no post-reply work will run for this turn — disarm + clear ambient.
@@ -1390,7 +1447,7 @@ async function runPipelineInline(data) {
     recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null, finderTokens });
     // FIX #10: consolidated per-run summary (after token recording — values in scope).
     // Thread the per-stage breakdown so ONE summary line carries the full timing picture.
-    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, finderTokens });
+    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, finderTokens, agent1Skipped: !runAgent1 });
 
     // OBSERVABILITY: one concise per-stage timing line (debug level) for the slowness hunt.
     // Pure log — emitting it changes no state and runs after the blocking work is recorded.

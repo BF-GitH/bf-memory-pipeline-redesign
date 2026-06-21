@@ -189,10 +189,23 @@ const DEFAULT_SETTINGS = {
     // Optional WRITE tool (`remember_fact`, Letta core_memory_append analogue): lets the MAIN model
     // PIN one fact directly into the active store mid-reply via an ST function-tool, complementing
     // the read-only search_memory pull tool above. ADD-ONLY (never deletes); routes through the same
-    // upsertFact/saveDatabase path as extraction. Default OFF — opt-in, and requires a tool-calling
-    // main model (ST's tool loop never runs on the quiet/agent paths). Synced alongside the recall
-    // tool wherever syncWriterRecallTool is synced (index.js init + settings toggle).
-    enableWriterWriteTool: false,
+    // upsertFact/saveDatabase path as extraction. Tool-first default flip: ON for fresh installs so
+    // the main model (e.g. Claude) can PIN durable facts on demand, complementing the read-only
+    // recall tool and the background Scribe extraction. Requires a tool-calling main model (ST's tool
+    // loop never runs on the quiet/agent paths); no-ops otherwise. Existing users keep their saved
+    // value. Synced alongside the recall tool wherever syncWriterRecallTool is synced (index.js + toggle).
+    enableWriterWriteTool: true,
+    // Tool-first redesign — MEMORY MODE: how stored memory reaches the main (reply) model.
+    //   'hybrid'    (DEFAULT) each turn injects a cheap, no-LLM anchor (speculative facts +
+    //               present-character anchors + scene block); the main model pulls everything
+    //               deeper on demand via the search_memory tool. The blocking Agent 1 (Draft) LLM
+    //               call is SKIPPED — this is the primary latency win.
+    //   'tool-only' minimal anchor; recall is driven almost entirely by the model's tool calls.
+    //   'push'      classic behavior — Agent 1 drafts the reply + picks fact branches every turn
+    //               (an extra blocking LLM call). Choose this if your main model can't call tools.
+    // Default 'hybrid' is tuned for tool-calling models (e.g. Claude via the Claude Code CLI
+    // connection profile). Existing users keep whatever value is saved in their settings.
+    memoryMode: 'hybrid',
     // Summary pyramid — optional "Big Picture" injection (hierarchical zoom-out). When ON, the
     // Writer gets a compact block = the rolling reflection story summary + the SHORT shelf
     // (category/aspect-bucket) summaries relevant to the current scene focus, hard token-capped.
@@ -527,7 +540,17 @@ function validateSettings(s) {
     s.finderTargetFacts = Math.floor(clamp(s.finderTargetFacts, 0, 30, 12));
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
-    if (typeof s.enableWriterWriteTool !== 'boolean') s.enableWriterWriteTool = false;
+    // Coercion matches the tool-first DEFAULT (true): an absent key (older saved settings) resolves
+    // to ON, consistent with DEFAULT_SETTINGS, instead of contradicting it. Users who explicitly
+    // saved `false` keep it (an explicit boolean passes this guard untouched).
+    if (typeof s.enableWriterWriteTool !== 'boolean') s.enableWriterWriteTool = true;
+    // Tool-first redesign — memory mode (how memory reaches the main model):
+    //   'hybrid'    (default) light no-LLM anchor each turn + the model pulls deeper via search_memory
+    //   'tool-only' minimal anchor; the model drives ALL recall through the tool
+    //   'push'      classic behavior — Agent 1 (Draft) runs to plan + pick branches each turn
+    // Anything absent/garbage coerces to 'hybrid'. 'hybrid'/'tool-only' DROP the blocking Agent 1
+    // LLM call from the reply-critical path (the latency win); 'push' restores it.
+    if (s.memoryMode !== 'push' && s.memoryMode !== 'tool-only' && s.memoryMode !== 'hybrid') s.memoryMode = 'hybrid';
     if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
     // Temporal grounding defaults ON (free, deterministic): absent/invalid => true (back-compat).
     if (typeof s.temporalGrounding !== 'boolean') s.temporalGrounding = true;
@@ -977,12 +1000,183 @@ export function addDebugLog(type, message, opts = {}) {
     logFileDirty = true;
     void flushDebugLogFile(false); // throttled; async fire-and-forget (errors swallowed)
     renderDebugLog();
+    // Tool-first redesign: refresh the "What Claude did" panel on tool-call events so memory
+    // recalls/writes appear live. Cheap (scans the small ring buffer); guarded inside.
+    if (entry.event === 'tool.search_memory' || entry.event === 'tool.remember_fact') renderToolActivity();
 
     if (extensionSettings?.debugMode) {
         const tag = level.toUpperCase();
         const sub = subsystem !== 'settings' ? ` ${subsystem}` : '';
         const rid = runId ? ` [${runId}]` : '';
         console.log(`[BFMemory] [${tag}]${rid}${sub} ${message}`);
+    }
+}
+
+// Per-turn tool-call count beyond which a turn is flagged as a possible runaway tool loop (Phase 2
+// observability). Soft — purely visual; nothing is blocked.
+const TOOL_ACTIVITY_SOFTCAP = 8;
+
+// Monotonic token guarding the async graph-view render against a race: a rapid second click starts
+// a new render; only the LATEST may paint, so an earlier slow resolve can't overwrite a newer node.
+let graphViewToken = 0;
+
+/**
+ * "What Claude did" panel (tool-first redesign). Scans the in-memory debug ring buffer for the
+ * main model's memory tool calls (`search_memory` recall + `remember_fact` pin), groups them by
+ * runId (one turn), and renders the most recent turns so the user can SEE the tool-driven memory
+ * working. A high per-turn call count is flagged. Pure read of `debugLog`; safe to call anytime.
+ */
+function renderToolActivity() {
+    const el = document.getElementById('bf_mem_tool_activity');
+    if (!el) return; // panel not in DOM (older template / tab not built) — no-op
+    const summaryEl = document.getElementById('bf_mem_tool_activity_summary');
+    const calls = debugLog.filter(e => e.event === 'tool.search_memory' || e.event === 'tool.remember_fact');
+    if (calls.length === 0) {
+        el.innerHTML = '<div class="bf-mem-hint" style="opacity:.7;">No memory tool calls recorded yet. When the main model calls <code>search_memory</code> / <code>remember_fact</code>, they appear here.</div>';
+        if (summaryEl) summaryEl.textContent = '';
+        return;
+    }
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    // Group by runId (a turn), preserving the newest-first order of the buffer.
+    const groups = new Map(); // runId -> { rid, search: [], write: [] }
+    for (const e of calls) {
+        const rid = e.runId || '(no turn id)';
+        if (!groups.has(rid)) groups.set(rid, { rid, search: [], write: [] });
+        const g = groups.get(rid);
+        (e.event === 'tool.search_memory' ? g.search : g.write).push(e);
+    }
+    const turns = [...groups.values()].slice(0, 12); // most recent 12 turns
+    let totalSearch = 0, totalWrite = 0;
+    const html = turns.map(g => {
+        const n = g.search.length + g.write.length;
+        totalSearch += g.search.length; totalWrite += g.write.length;
+        const hot = n > TOOL_ACTIVITY_SOFTCAP;
+        const rows = [];
+        for (const e of g.search) {
+            const d = e.data || {};
+            const cnt = d.resultCount != null ? d.resultCount : '?';
+            rows.push(`<div class="bf-mem-tool-row"><span class="bf-mem-tool-badge bf-mem-tool-search">recall</span> <code>${esc(d.query || '')}</code>${d.category ? ` <span class="bf-mem-dim">[${esc(d.category)}]</span>` : ''}${d.with ? ` <span class="bf-mem-dim">with ${esc(d.with)}</span>` : ''} → <b>${esc(cnt)}</b> fact(s)</div>`);
+        }
+        for (const e of g.write) {
+            const d = e.data || {};
+            rows.push(`<div class="bf-mem-tool-row"><span class="bf-mem-tool-badge bf-mem-tool-write">pin</span> <code>${esc(d.category)}/${esc(d.key)}</code> = ${esc(String(d.value || '').slice(0, 80))}</div>`);
+        }
+        return `<details class="bf-mem-tool-turn" open>`
+            + `<summary>Turn <code>${esc(g.rid)}</code> — ${g.search.length} recall, ${g.write.length} pin`
+            + (hot ? ` <span class="bf-mem-tool-warn" title="High tool-call count this turn — possible runaway loop">⚠ ${n} calls</span>` : '')
+            + `</summary>${rows.join('')}</details>`;
+    }).join('');
+    el.innerHTML = html;
+    if (summaryEl) summaryEl.textContent = `${turns.length} turn(s) · ${totalSearch} recall, ${totalWrite} pin`;
+}
+
+/**
+ * Graph view (Phase 4 — "true graphline memory" visibility). Resolves a fact by Category/key (or
+ * bare key) and shows its linked neighbors: relationship-ref links (primary/secondary, the same
+ * refs recall traversal follows) + one-hop scope-graph neighbors (place⇄event⇄people via expandLinks).
+ * Neighbors are clickable to walk the graph. Read-only; lazy-imports the heavy db modules.
+ * @param {string} keyQuery
+ */
+async function renderGraphView(keyQuery) {
+    const el = document.getElementById('bf_mem_graph_result');
+    if (!el) return;
+    const myToken = ++graphViewToken; // this render's claim; a newer render supersedes it
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const q = String(keyQuery ?? '').trim();
+    if (!q) { el.innerHTML = '<div class="bf-mem-hint">Enter a Category/key or key.</div>'; return; }
+    el.innerHTML = '<div class="bf-mem-hint">Loading…</div>';
+    try {
+        const db = await import('./database.js');
+        const fr = await import('./fact-retrieval.js');
+        const databases = await db.getAllDatabases();
+        const norm = s => String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+        const slash = q.indexOf('/');
+        const wantCat = slash >= 0 ? norm(q.slice(0, slash)) : null;
+        const wantKey = norm(slash >= 0 ? q.slice(slash + 1) : q);
+        let target = null, targetCat = null;
+        for (const [cat, cdb] of Object.entries(databases)) {
+            if (wantCat && norm(cat) !== wantCat) continue;
+            for (const f of (cdb.facts || [])) { if (norm(f.key) === wantKey) { target = f; targetCat = cat; break; } }
+            if (target) break;
+        }
+        if (!target) { el.innerHTML = `<div class="bf-mem-hint">No fact found for "<code>${esc(q)}</code>".</div>`; return; }
+        const resolveRef = (ref) => {
+            const rk = norm(ref);
+            for (const [cat, cdb] of Object.entries(databases)) for (const f of (cdb.facts || [])) if (norm(f.key) === rk) return { cat, fact: f };
+            return null;
+        };
+        const rels = target.relationships || {};
+        const primary = (rels.primary || []).map(resolveRef).filter(Boolean);
+        const secondary = (rels.secondary || []).map(resolveRef).filter(Boolean);
+        // One-hop scope graph via the same exported helper recall uses (mutates the array in place).
+        const seedRow = [{ fact: target, category: targetCat, tier: 'primary' }];
+        const seen = new Set([`${targetCat}:${target.key}`]);
+        try { fr.expandLinks(databases, seedRow, seen); } catch { /* best-effort */ }
+        const scopeNeighbors = seedRow.slice(1).map(r => ({ cat: r.category, fact: r.fact }));
+        const factLine = (cat, f) => `<a href="#" class="bf-mem-graph-link" data-key="${esc(cat)}/${esc(f.key)}"><code>${esc(cat)}/${esc(f.key)}</code></a> ${esc(String(f.value || f.note || '').slice(0, 80))}`;
+        const section = (title, list) => list.length
+            ? `<div class="bf-mem-graph-section"><div class="bf-mem-graph-title">${title} (${list.length})</div>${list.map(n => `<div class="bf-mem-graph-row">↳ ${factLine(n.cat, n.fact)}</div>`).join('')}</div>`
+            : '';
+        let html = `<div class="bf-mem-graph-node"><b>${esc(targetCat)}/${esc(target.key)}</b>: ${esc(String(target.value || '').slice(0, 160))}</div>`;
+        html += section('Primary links', primary);
+        html += section('Secondary links', secondary);
+        html += section('Scope-graph neighbors (1 hop)', scopeNeighbors);
+        if (!primary.length && !secondary.length && !scopeNeighbors.length) {
+            html += '<div class="bf-mem-hint">No links yet — this fact is an island. Auto-linking connects facts that share a subject, location, or participants.</div>';
+        }
+        if (myToken !== graphViewToken) return; // a newer render started while we awaited — let it win
+        el.innerHTML = html;
+        el.querySelectorAll('.bf-mem-graph-link').forEach(a => a.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            const k = a.getAttribute('data-key');
+            const inp = document.getElementById('bf_mem_graph_key');
+            if (inp) inp.value = k;
+            renderGraphView(k);
+        }));
+    } catch (e) {
+        el.innerHTML = `<div class="bf-mem-hint">Graph view error: ${esc(String(e).slice(0, 140))}</div>`;
+    }
+}
+
+/**
+ * "Recurring characters" entity panel (Phase 4). Lists the entity registry for this chat (named /
+ * NPC / deferred) and lets the user PROMOTE an NPC/deferred entity to a first-class recurring
+ * subject (re-keys its facts under its own name via promoteEntity). Lazy-imports agent-entities.js.
+ */
+async function renderEntityPanel() {
+    const el = document.getElementById('bf_mem_entities_list');
+    if (!el) return;
+    const sumEl = document.getElementById('bf_mem_entities_summary');
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    try {
+        const ent = await import('./agent-entities.js');
+        const entities = ent.getEntities() || {};
+        const names = Object.keys(entities);
+        if (!names.length) {
+            el.innerHTML = '<div class="bf-mem-hint" style="opacity:.7;">No entities tracked yet this chat. As characters recur, they appear here.</div>';
+            if (sumEl) sumEl.textContent = '';
+            return;
+        }
+        const badge = st => `<span class="bf-mem-ent-badge bf-mem-ent-${esc(st)}">${esc(st)}</span>`;
+        el.innerHTML = names.sort().map(name => {
+            const e = entities[name] || {};
+            const st = e.status || 'deferred';
+            const canPromote = st !== 'named';
+            return `<div class="bf-mem-ent-row"><span class="bf-mem-ent-name">${esc(name)}</span> ${badge(st)}`
+                + (Array.isArray(e.aliases) && e.aliases.length ? ` <span class="bf-mem-dim">aka ${esc(e.aliases.join(', '))}</span>` : '')
+                + (canPromote ? ` <button class="menu_button bf-mem-ent-promote" data-name="${esc(name)}" title="Promote to a first-class recurring subject (re-keys its facts)">Mark recurring</button>` : '')
+                + `</div>`;
+        }).join('');
+        if (sumEl) sumEl.textContent = `${names.length} entit${names.length === 1 ? 'y' : 'ies'}`;
+        el.querySelectorAll('.bf-mem-ent-promote').forEach(b => b.addEventListener('click', async () => {
+            const nm = b.getAttribute('data-name');
+            b.disabled = true; b.textContent = 'Promoting…';
+            try { const r = await ent.promoteEntity(nm); b.textContent = `Promoted (${r?.moved || 0} facts)`; }
+            catch { b.textContent = 'Failed'; }
+            setTimeout(() => renderEntityPanel(), 900);
+        }));
+    } catch (e) {
+        el.innerHTML = `<div class="bf-mem-hint">Entity panel error: ${esc(String(e).slice(0, 140))}</div>`;
     }
 }
 
@@ -4749,6 +4943,18 @@ export async function initSettings() {
         import('./agent-writer.js').then(m => m.syncWriterWriteTool?.()).catch(() => {});
     });
 
+    // Tool-first redesign — RECALL STRATEGY (memoryMode). Chooses how stored memory reaches the
+    // main model: 'hybrid' (default) and 'tool-only' skip the blocking Drafter LLM call and let the
+    // model pull facts via search_memory; 'push' restores the classic always-plan Drafter. Pure
+    // setting (no registration side-effect) — the pipeline reads it per turn.
+    $('#bf_mem_memory_mode').val(extensionSettings.memoryMode || 'hybrid').on('change', function () {
+        const before = extensionSettings.memoryMode || 'hybrid';
+        const next = $(this).val();
+        extensionSettings.memoryMode = next;
+        addDebugLog('info', `Recall strategy (memory mode) → ${next}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryMode' }, before, after: next });
+        saveSettings();
+    });
+
     // Summary pyramid "Big Picture" injection toggle. Default OFF. Gates ONLY whether the
     // story+shelf summaries are injected into the Writer's context — shelf summaries are
     // still generated on the reflection cadence regardless. No registration side-effect.
@@ -5414,6 +5620,19 @@ export async function initSettings() {
     $(document).on('change', '.bf-mem-log-level', () => renderDebugLog());
     $('#bf_mem_log_subsystem').on('change', () => renderDebugLog());
     $('#bf_mem_log_search').on('input', () => renderDebugLog());
+
+    // "What Claude did" tool-activity panel (tool-first redesign): manual refresh + initial paint.
+    // It also auto-refreshes from addDebugLog on each tool-call event.
+    $('#bf_mem_tool_activity_refresh').on('click', () => renderToolActivity());
+    renderToolActivity();
+
+    // Graph view (Database tab): show a fact's linked neighbors; Enter or button triggers it.
+    $('#bf_mem_graph_btn').on('click', () => renderGraphView($('#bf_mem_graph_key').val()));
+    $('#bf_mem_graph_key').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); renderGraphView($('#bf_mem_graph_key').val()); } });
+
+    // Recurring-characters entity panel (Database tab): manual refresh + initial paint.
+    $('#bf_mem_entities_refresh').on('click', () => renderEntityPanel());
+    renderEntityPanel();
 
     $('#bf_mem_clear_log').on('click', () => {
         debugLog = [];

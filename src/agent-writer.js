@@ -533,7 +533,12 @@ export function registerWriterRecallTool() {
         api.register({
             name: RECALL_TOOL_NAME,
             displayName: 'Search Memory',
-            description: 'Search long-term memory for stored facts that are NOT already in your context. '
+            description: 'ALWAYS search memory BEFORE you reply whenever the user message or the scene references '
+                + 'anyone, anywhere, or anything that may have been established earlier — a person, place, prior event, '
+                + 'promise, preference, relationship, or any detail you are not certain is already in your context. '
+                + 'Searching is cheap and read-only, so search liberally: prefer over-searching to contradicting an '
+                + 'established fact, and call it again with different keywords if the first query misses. '
+                + 'Search long-term memory for stored facts that are NOT already in your context. '
                 + 'Pass a keyword query; optionally narrow by category, or pass an exact "Category/key" handle '
                 + '(as shown in the established-facts list) to pull that full record. To RECAP a whole scene, '
                 + 'pass the scene number or name in "scene" (or just ask in the query, e.g. "recap the market '
@@ -679,7 +684,8 @@ async function rememberFactAction({ key, value, category, subject, importance, a
         const cat = String(category ?? '').trim() || 'Unsorted';
 
         // Lazy import to dodge the static import cycle (database.js is heavy + pulls settings).
-        const { getDatabase, createEmptyDatabase, upsertFact, saveDatabase, clampImportance } = await import('./database.js');
+        const { getDatabase, createEmptyDatabase, upsertFact, saveDatabase, clampImportance,
+            getAllDatabases, buildMemoryIndex, autoLinkFact, findFactMatch } = await import('./database.js');
 
         // Get-or-create the category DB in the active per-character store. getDatabase reads through
         // getAllDatabases() (the same active store the recall tool searches).
@@ -705,7 +711,31 @@ async function rememberFactAction({ key, value, category, subject, importance, a
 
         // ADD-ONLY upsert: exact-key / normalized-variant merge is fine (idempotent re-pin updates
         // the value in place), but nothing is ever removed. Then persist the touched category DB.
+        // AUTO-LINK into the spiderweb, exactly like Scribe-written facts (agent-memory.js applyUpdates):
+        // build the link index from the PRE-write state, then upsert, then link the stored fact to
+        // related existing facts. Without this, model-pinned facts were ISLANDS the recall graph could
+        // never reach. Gated by enableAutoLinking (default ON). Best-effort with a HARD guarantee that
+        // a link failure NEVER blocks the save below (the fact must still persist), and the failure
+        // logging is itself wrapped so a logging error can't skip saveDatabase either.
+        let linkIndex = null;
+        try {
+            if (getSettingsSafe()?.enableAutoLinking !== false) linkIndex = buildMemoryIndex(await getAllDatabases());
+        } catch { linkIndex = null; }
+
+        // ADD-ONLY upsert: exact-key / normalized-variant merge is fine (idempotent re-pin updates
+        // the value in place), but nothing is ever removed.
         upsertFact(db, factToWrite);
+
+        if (linkIndex) {
+            try {
+                const stored = findFactMatch(db, factToWrite.key);
+                if (stored) autoLinkFact(linkIndex, stored, cat, 'writer:remember_fact');
+            } catch (linkErr) {
+                try { void rememberToolLog('debug', `Writer write: auto-link skipped (${linkErr?.message || linkErr})`, { subsystem: 'writer', event: 'tool.remember_fact', reason: 'AUTOLINK_SKIPPED' }); } catch { /* never block the save */ }
+            }
+        }
+
+        // Persist the touched category DB. This MUST run even if auto-linking above failed.
         await saveDatabase(db);
 
         await rememberToolLog('info', `Writer write: remember_fact "${cat}/${factKey}" = "${factValue.slice(0, 80)}"`, {
@@ -761,7 +791,10 @@ export function registerWriterWriteTool() {
         api.register({
             name: WRITE_TOOL_NAME,
             displayName: 'Remember Fact',
-            description: 'Pin ONE durable fact into long-term memory so it is remembered in future replies. '
+            description: 'Proactively pin important new facts the moment the story establishes them — do not wait '
+                + 'to be asked. Whenever a lasting detail appears (a name, a relationship, a vow, a location, a trait, '
+                + 'or a meaningful change), call this so it survives into future replies. '
+                + 'Pin ONE durable fact into long-term memory so it is remembered in future replies. '
                 + 'Use this for a stable, important detail the story just established that should persist — '
                 + 'a name, a relationship, a vow, a location, a lasting trait or change. Pass a short stable '
                 + '"key" (e.g. "eye_color", "home_town") and the "value". Optionally set "category" (e.g. People, '

@@ -1056,7 +1056,15 @@ function collectRelationshipRefCandidates(index, databases, seeds, alreadyFound)
     const emitted = new Set();
     for (const seed of seeds) {
         if (seed.tier !== 'primary' || !seed.fact?.relationships) continue;
-        const refs = seed.fact.relationships.primary || [];
+        // Follow BOTH primary (high-precision: shared location / shared member) AND secondary
+        // (same-subject / token-overlap) auto-link refs. autoLinkFact writes the bulk of character-
+        // centric links into `secondary`, and expandLinks (the finder path) already reads both — this
+        // collector previously read only `primary`, silently orphaning same-subject associations from
+        // recall graph traversal (the dominant expansion path in hybrid/tool-only mode).
+        const refs = [
+            ...(seed.fact.relationships.primary || []),
+            ...(seed.fact.relationships.secondary || []),
+        ];
         if (refs.length === 0) continue;
         const seedId = `ref:${seed.category}:${seed.fact.key}`;
         // Resolve this seed's refs through the same index matcher the push path uses.
@@ -1095,69 +1103,89 @@ function collectRelationshipRefCandidates(index, databases, seeds, alreadyFound)
  * @param {Array<{fact: Object, category: string, tier: string}>} results - mutated in place
  * @param {Set<string>} alreadyFound - `category:key` ids already in results (mutated)
  */
-function gatherExpansionCandidates(databases, index, results, alreadyFound) {
-    // SNAPSHOT seeds up front so this is exactly one hop (added facts aren't re-expanded).
-    const seeds = results.slice();
+function gatherExpansionCandidates(databases, index, results, alreadyFound, maxDepth = 1) {
     const now = Date.now();
 
-    // Gather from all expansions (each returns attributed candidates; none pushes).
-    const linkCands = collectLinkCandidates(databases, seeds, alreadyFound);
-    const refCands = collectRelationshipRefCandidates(index, databases, seeds, alreadyFound);
-    const trackCands = expandSequenceTracks(databases, seeds, alreadyFound);
-    // In-scene strand (Spiderweb 2): same-scene facts, attributed to their scene seedId so the
-    // per-seed cap below prevents a big scene from flooding the tier.
-    const sceneCands = collectSceneCandidates(index, seeds, alreadyFound);
-
-    // Sequence-track continuity is admitted FIRST and EXEMPT from the per-seed cap (continuity is
-    // mandatory) — but still counts against the shared total. Dedupe across sources by id.
+    // SHARED admission ledger across ALL hops. The per-seed cap, the total cap, and the dedupe set
+    // are GLOBAL, so bounded multi-hop traversal can never exceed the same bounds the one-hop pass
+    // used — it just fills those bounded slots with deeper-but-linked facts when a shallow hop left
+    // room. (Spiderweb multi-hop, exposed through search_memory: place -> guard -> faction.)
     const claimed = new Set();      // ids already admitted this pass
     const perSeed = new Map();      // seedId -> count admitted under the per-seed cap
     let admittedTotal = 0;
     let cappedBySeed = 0;           // how many candidates a per-seed cap blocked (debug)
     const seedContrib = new Map();  // seedId -> count (debug: how much each hub contributed)
+    const fromCounts = { link: 0, scene: 0, ref: 0, track: 0 };
 
-    const admit = (c, { perSeedCapped }) => {
-        if (admittedTotal >= MAX_EXPANSION_TOTAL) return false;
+    // admit() returns the PUSHED row (so a multi-hop frontier can re-seed from it) or null if blocked.
+    const admit = (c, { perSeedCapped, demote }) => {
+        if (admittedTotal >= MAX_EXPANSION_TOTAL) return null;
         const id = `${c.category}:${c.fact.key}`;
-        if (alreadyFound.has(id) || claimed.has(id)) return false;
+        if (alreadyFound.has(id) || claimed.has(id)) return null;
         if (perSeedCapped) {
             const used = perSeed.get(c.seedId) || 0;
-            if (used >= MAX_EXPANSION_PER_SEED) { cappedBySeed++; return false; }
+            if (used >= MAX_EXPANSION_PER_SEED) { cappedBySeed++; return null; }
             perSeed.set(c.seedId, used + 1);
         }
         claimed.add(id);
         alreadyFound.add(id);
-        results.push({ fact: c.fact, category: c.category, tier: c.tier, via: c.via });
+        // Deeper hops are demoted to tertiary — the further we walk from the query, the less certain
+        // the relevance, so they fill scarce slots only after closer facts.
+        const row = { fact: c.fact, category: c.category, tier: demote ? 'tertiary' : c.tier, via: c.via };
+        results.push(row);
         admittedTotal++;
         seedContrib.set(c.seedId, (seedContrib.get(c.seedId) || 0) + 1);
-        return true;
+        return row;
     };
 
-    // 1) Track continuity (exempt from per-seed cap, counts toward total).
-    for (const c of trackCands) admit(c, { perSeedCapped: false });
+    // BOUNDED BFS over hops. Hop 0 seeds = the query's direct hits (snapshot of `results`). Each
+    // hop's freshly admitted facts become the next hop's seeds. Depth clamped 1..3; depth 1 is
+    // byte-identical to the original one-hop pass (the default — the push path keeps one hop).
+    const depth = Math.max(1, Math.min(3, Math.floor(Number(maxDepth)) || 1));
+    let frontier = results.slice();
+    for (let hop = 0; hop < depth && frontier.length && admittedTotal < MAX_EXPANSION_TOTAL; hop++) {
+        const seeds = frontier;
+        const demote = hop >= 1; // hop 0 keeps source tier; deeper hops demote to tertiary
+        // Gather from all expansions (each returns attributed candidates; none pushes).
+        const linkCands = collectLinkCandidates(databases, seeds, alreadyFound);
+        const refCands = collectRelationshipRefCandidates(index, databases, seeds, alreadyFound);
+        const trackCands = expandSequenceTracks(databases, seeds, alreadyFound);
+        // In-scene strand (Spiderweb 2): same-scene facts, attributed to their scene seedId so the
+        // per-seed cap prevents a big scene from flooding the tier.
+        const sceneCands = collectSceneCandidates(index, seeds, alreadyFound);
+        fromCounts.link += linkCands.length; fromCounts.ref += refCands.length;
+        fromCounts.track += trackCands.length; fromCounts.scene += sceneCands.length;
 
-    // 2) Link + scene + relationship-ref candidates, ranked by salience, under the per-seed cap.
-    //    Salience DESCENDING (importance + recency + use) — no connectedness term. Stable sort keeps
-    //    source order on ties, so the pass is fully deterministic. Same-scene facts ride the SAME
-    //    per-seed cap (scene seedId), so a big scene can't flood the tier.
-    const ranked = [...linkCands, ...sceneCands, ...refCands].sort(
-        (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
-    for (const c of ranked) {
-        if (admittedTotal >= MAX_EXPANSION_TOTAL) break;
-        admit(c, { perSeedCapped: true });
+        const admittedThisHop = [];
+        // 1) Sequence-track continuity admitted FIRST and EXEMPT from the per-seed cap (continuity is
+        //    mandatory) — but still counts against the shared total. Dedupe across sources by id.
+        //    NEVER demote track steps, even on deeper hops: demoting them to tertiary would let the
+        //    downstream MAX_TERTIARY cap evict mandatory continuity (defeats the per-seed exemption).
+        for (const c of trackCands) { const r = admit(c, { perSeedCapped: false, demote: false }); if (r) admittedThisHop.push(r); }
+        // 2) Link + scene + relationship-ref candidates, ranked by salience, under the per-seed cap.
+        //    Salience DESCENDING (importance + recency + use) — no connectedness term. Stable sort
+        //    keeps source order on ties, so the pass is fully deterministic.
+        const ranked = [...linkCands, ...sceneCands, ...refCands].sort(
+            (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+        for (const c of ranked) {
+            if (admittedTotal >= MAX_EXPANSION_TOTAL) break;
+            const r = admit(c, { perSeedCapped: true, demote }); if (r) admittedThisHop.push(r);
+        }
+        frontier = admittedThisHop; // next hop walks out from what we just found
     }
 
     if (admittedTotal > 0 || cappedBySeed > 0) {
         // Find the biggest single-seed contribution to surface the anti-hub cap working.
         let topSeed = null, topN = 0;
         for (const [sid, n] of seedContrib) if (n > topN) { topN = n; topSeed = sid; }
-        addDebugLog('info', `Unified expansion: admitted ${admittedTotal}/${MAX_EXPANSION_TOTAL} (per-seed cap ${MAX_EXPANSION_PER_SEED} blocked ${cappedBySeed}; top seed "${topSeed}" contributed ${topN})`, {
+        addDebugLog('info', `Unified expansion: admitted ${admittedTotal}/${MAX_EXPANSION_TOTAL} across ${depth} hop(s) (per-seed cap ${MAX_EXPANSION_PER_SEED} blocked ${cappedBySeed}; top seed "${topSeed}" contributed ${topN})`, {
             subsystem: 'retrieval', event: 'retrieval.indexed',
             data: {
                 admitted: admittedTotal, total_cap: MAX_EXPANSION_TOTAL,
                 per_seed_cap: MAX_EXPANSION_PER_SEED, capped_by_seed: cappedBySeed,
+                maxDepth: depth,
                 top_seed: topSeed, top_seed_contrib: topN,
-                from: { link: linkCands.length, scene: sceneCands.length, ref: refCands.length, track: trackCands.length },
+                from: fromCounts,
             },
         });
     }
@@ -1581,21 +1609,59 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
 
     const index = await getMemoryIndex();
 
-    // Collect candidates by identity (exact Category/key handle) AND by keyword, deduped.
-    const byId = new Map(); // `category:key` -> { fact, category }
-    const add = (r) => { if (r && r.fact) byId.set(`${r.category}:${r.fact.key}`, { fact: r.fact, category: r.category }); };
+    // FULL-CASCADE CANDIDATE COLLECTION (tool-first strengthening). The recall tool is now the
+    // model's PRIMARY way to reach memory (hybrid/tool-only modes), so a weak or oblique query must
+    // still hit. We route it through the SAME cascade the push path (retrieveFacts) uses instead of
+    // keyword-only: exact handle → keyword index → fuzzy/alias trigram (typos/morphology) → bounded
+    // one-hop graph expansion (place⇄event⇄people, relationship refs, sequence tracks). The graph
+    // hop is what makes a query about a PLACE surface the people/events linked to it. All of these
+    // are the existing deterministic, capped helpers — no new matching logic, no embeddings.
+    const directResults = [];
+    const seen = new Set();
+    const push = (r, tier) => {
+        if (!r || !r.fact) return;
+        const id = `${r.category}:${r.fact.key}`;
+        if (seen.has(id)) return;
+        seen.add(id);
+        directResults.push({ fact: r.fact, category: r.category, tier: tier || r.tier || 'primary', via: r.via });
+    };
 
     // EXACT-HANDLE lookup: the pushed gist shows `Category/key` handles, so the Writer may pass
     // one back to pull the full record. resolveExactKeys validates against the real store (a
     // hallucinated handle matches nothing), is active-only, and is case/punctuation tolerant.
-    if (q.indexOf('/') >= 0) {
-        for (const r of resolveExactKeys(databases, [q])) add(r);
+    const isHandleQuery = q.indexOf('/') >= 0;
+    if (isHandleQuery) {
+        for (const r of resolveExactKeys(databases, [q])) push(r, 'primary');
     }
-    // KEYWORD search over the prebuilt index (same matcher as the push path).
-    for (const r of searchFactsIndexed(index, databases, [q])) add(r);
+    // PRECISION PULL: when the query is a Category/key handle that RESOLVED, the model asked for a
+    // SPECIFIC record — return just that, skipping keyword/fuzzy/graph so a targeted pull can't
+    // balloon into the fact's whole 2-hop neighborhood (an exact handle should stay exact).
+    const handleResolved = isHandleQuery && directResults.length > 0;
+    if (!handleResolved) {
+        // KEYWORD search over the prebuilt index (same matcher as the push path).
+        for (const r of searchFactsIndexed(index, databases, [q])) push(r, 'primary');
+
+        // FUZZY/ALIAS fallback (Layer B): trigram-match the query against active facts so typos and
+        // morphology ("apartments"→"apartment") still resolve when the keyword path missed. Admits as
+        // secondary; never duplicates an exact/keyword hit. Mutates directResults + seen in place.
+        fuzzyFallback(databases, [q], directResults, seen);
+
+        // BOUNDED GRAPH EXPANSION (Spiderweb): place⇄event⇄people / relationship-ref / sequence
+        // continuity seeded from whatever the query already surfaced — so searching a place returns
+        // who and what is linked to it. Rebuild the dedupe ledger first (fuzzy may have appended).
+        // MULTI-HOP for recall (depth 2): the model's explicit query deserves a deeper walk than the
+        // always-on push path (depth 1) — place -> guard -> faction. Still bounded by the same
+        // MAX_EXPANSION_TOTAL / per-seed caps; deeper hops demote to tertiary.
+        const alreadyFound = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
+        gatherExpansionCandidates(databases, index, directResults, alreadyFound, 2);
+        // Keep the fuzzy/keyword dedupe ledger (`seen`) in sync with graph-admitted facts so the two
+        // ledgers can't diverge if this cascade is ever extended (defensive — `seen` is otherwise
+        // unused past this point).
+        for (const r of directResults) seen.add(`${r.category}:${r.fact.key}`);
+    }
 
     // Optional category filter (case-insensitive, on the stored category name).
-    let candidates = [...byId.values()];
+    let candidates = directResults;
     if (catFilter) candidates = candidates.filter(c => String(c.category).toLowerCase() === catFilter);
 
     // Honor knownBy visibility exactly like normal retrieval (precompute names once).
@@ -1606,18 +1672,45 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     } : null;
     candidates = candidates.filter(c => isFactVisible(c.fact, names));
 
-    // DETERMINISTIC salience ranking (cold facts deprioritized) — same scorer the push path
-    // uses to fill scarce slots — then hard-cap.
+    // TIER-FIRST, then salience. Direct hits (primary: exact/keyword) must rank above 1-hop
+    // (secondary) and 2-hop (tertiary) graph-expanded facts, so a tight `limit` never drops the
+    // actual match in favor of a distant linked fact of equal salience. Within a tier, rank by the
+    // same deterministic salience scorer the push path uses (cold facts deprioritized). Then hard-cap.
     const now = Date.now();
-    candidates.sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+    const TIER_RANK = { primary: 0, secondary: 1, tertiary: 2 };
+    candidates.sort((a, b) => {
+        const tr = (TIER_RANK[a.tier] ?? 3) - (TIER_RANK[b.tier] ?? 3);
+        if (tr !== 0) return tr;
+        return retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now);
+    });
     const capped = candidates.slice(0, cap);
 
-    // Reuse the push formatter so the recalled lines look identical to the injected gist.
-    const text = capped.length
-        ? formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })))
-        : `No stored facts match "${q}"${catFilter ? ` in category "${category}"` : ''}.`;
+    addDebugLog('debug', `search_memory recall: "${q.slice(0, 60)}"${catFilter ? ` [cat=${catFilter}]` : ''} → ${capped.length}/${candidates.length} fact(s) (exact+keyword+fuzzy+graph)`, {
+        subsystem: 'retrieval', event: 'recall.search',
+        data: { query: q.slice(0, 60), category: catFilter || null, returned: capped.length, totalCandidates: candidates.length },
+    });
 
-    return { text, count: capped.length };
+    if (capped.length) {
+        // Reuse the push formatter so the recalled lines look identical to the injected gist.
+        const text = formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })));
+        return { text, count: capped.length };
+    }
+
+    // NO MATCH — return an ACTIONABLE hint (not a dead end) so the model re-queries productively
+    // instead of giving up or hallucinating. When a category filter is set, do NOT list the other
+    // categories present (it both ignores the filter the model chose and could leak spoiler category
+    // names like "HiddenVillain"); instead suggest dropping the filter. With no filter, list the
+    // categories that actually exist (capped) so it can narrow, plus the broader angles.
+    let hint;
+    if (catFilter) {
+        hint = ` No facts in category "${category}" matched. Try without the category filter, a different keyword, or a "Category/key" handle.`;
+    } else {
+        const presentCats = Object.keys(databases).filter(cat => (databases[cat]?.facts?.length > 0));
+        hint = presentCats.length
+            ? ` Try a broader or different keyword, a character or place name, a "Category/key" handle, or one of the categories present in memory: ${presentCats.slice(0, 12).join(', ')}${presentCats.length > 12 ? ', …' : ''}. You can also recall a scene (scene:) or a relationship history (with:).`
+            : ' Memory is nearly empty, so there may be nothing to recall yet.';
+    }
+    return { text: `No stored facts match "${q}"${catFilter ? ` in category "${category}"` : ''}.${hint}`, count: 0 };
 }
 
 /**

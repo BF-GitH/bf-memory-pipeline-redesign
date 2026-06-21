@@ -31,6 +31,19 @@
                 Picks sensible defaults for cost vs. recall. Fine-tune anything in the tabs below — that switches this to “Custom”.
             </small>
 
+            <!-- Tool-first redesign — RECALL STRATEGY (how stored memory reaches the main model). -->
+            <div class="bf-mem-preset-bar" style="display:flex;align-items:center;gap:8px;margin:6px 0 4px;">
+                <label for="bf_mem_memory_mode" style="font-weight:bold;white-space:nowrap;">Recall strategy</label>
+                <select id="bf_mem_memory_mode" class="text_pole" style="flex:1;">
+                    <option value="hybrid">Hybrid — fast: light anchor + model recalls on demand (recommended)</option>
+                    <option value="tool-only">Tool-only — model drives all recall via search_memory</option>
+                    <option value="push">Push (classic) — Drafter plans every turn (no tool calling needed)</option>
+                </select>
+            </div>
+            <small class="bf-mem-hint" style="display:block;margin:-2px 0 10px;">
+                <b>Hybrid</b>/<b>Tool-only</b> skip the blocking Drafter LLM call for faster replies — the main model (e.g. Claude via the Claude Code CLI profile) pulls deeper facts itself through the <code>search_memory</code> tool, so they need a tool-calling main model. <b>Push</b> restores the classic always-plan behavior for models that can’t call tools.
+            </small>
+
             <!-- Tabs (chronological order each turn: Drafter → Librarian → Writer → Scribe) -->
             <div class="bf-mem-tabs" role="tablist">
                 <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_agent1" tabindex="0">Drafter</button>
@@ -645,6 +658,31 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <input type="text" id="bf_mem_db_search" class="text_pole" placeholder="Search facts across all categories (key / value / note)…" style="width:100%;" />
                         </div>
                         <div id="bf_mem_db_search_results" class="bf-mem-fact-list" style="display:none;"></div>
+
+                        <!-- Graph view (Spiderweb): pick a fact -> see its linked neighbors (the "true
+                             graphline memory"). Reuses the same relationship + scope-graph links recall walks. -->
+                        <details class="bf-mem-graph-wrap" style="margin:8px 0;">
+                            <summary style="cursor:pointer;font-weight:bold;">🕸️ Graph view — a fact and its linked neighbors</summary>
+                            <div class="bf-mem-field" style="display:flex;gap:6px;margin:6px 0;">
+                                <input type="text" id="bf_mem_graph_key" class="text_pole" placeholder="Category/key or key (e.g. People/Mira)…" style="flex:1;" />
+                                <button id="bf_mem_graph_btn" class="menu_button" title="Show this fact's linked neighbors"><i class="fa-solid fa-diagram-project"></i> Show links</button>
+                            </div>
+                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">Shows the fact, its relationship-ref links (primary/secondary), and one-hop scope-graph neighbors (place⇄event⇄people). Click any neighbor to walk the graph.</small>
+                            <div id="bf_mem_graph_result" class="bf-mem-graph-result"></div>
+                        </details>
+
+                        <!-- Recurring characters: the entity registry (named / NPC / deferred). Lets you
+                             see who memory is tracking and promote a recurring NPC to a first-class subject. -->
+                        <details class="bf-mem-entities-wrap" style="margin:8px 0;">
+                            <summary style="cursor:pointer;font-weight:bold;">👥 Recurring characters — entity registry</summary>
+                            <div class="bf-mem-debug-actions" style="margin:4px 0;">
+                                <button id="bf_mem_entities_refresh" class="menu_button" title="Refresh the entity list"><i class="fa-solid fa-rotate"></i> Refresh</button>
+                                <span id="bf_mem_entities_summary" class="bf-mem-log-count"></span>
+                            </div>
+                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">Entities the memory pipeline is tracking this chat. <b>Named</b> = first-class recurring subject; <b>NPC</b> = pooled background; <b>deferred</b> = undecided. Promote an NPC to make it a recurring subject (re-keys its facts under its own name).</small>
+                            <div id="bf_mem_entities_list" class="bf-mem-entities-list"></div>
+                        </details>
+
                         <div id="bf_mem_db_list" class="bf-mem-db-list"></div>
 
                         <!-- Add your own taxonomy labels (user overlay, global across chats) -->
@@ -839,6 +877,22 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             </button>
                             <div id="bf_mem_probe_result" class="bf-mem-probe-result"></div>
                         </div>
+
+                        <!-- "What Claude did" — per-turn tool-call activity (search_memory / remember_fact).
+                             The tool-first redesign's trust panel: see the model actively recall + pin memory. -->
+                        <details class="bf-mem-tool-activity-wrap" open>
+                            <summary style="cursor:pointer;font-weight:bold;margin:8px 0 4px;">🔧 What Claude did — memory tool calls per turn</summary>
+                            <div class="bf-mem-debug-actions" style="margin:4px 0;">
+                                <button id="bf_mem_tool_activity_refresh" class="menu_button" title="Refresh the tool-call activity list">
+                                    <i class="fa-solid fa-rotate"></i> Refresh
+                                </button>
+                                <span id="bf_mem_tool_activity_summary" class="bf-mem-log-count"></span>
+                            </div>
+                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">
+                                Each turn the main model can call <code>search_memory</code> (recall) and <code>remember_fact</code> (pin). This lists those calls so you can confirm the tool-driven memory is firing. A high per-turn count is flagged so a runaway tool loop is visible.
+                            </small>
+                            <div id="bf_mem_tool_activity" class="bf-mem-tool-activity"></div>
+                        </details>
 
                         <div id="bf_mem_debug_log" class="bf-mem-debug-log"></div>
                     </div>

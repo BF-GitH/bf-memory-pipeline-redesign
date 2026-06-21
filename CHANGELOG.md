@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.43.0-alpha.2] - 2026-06-21
+
+### Added — Phases 2–4: observability, Claude tuning, graph + entity UI
+
+Built on the tool-first core (alpha.1), all verified end-to-end in a real SillyTavern 1.18 instance driven through a browser.
+
+**Phase 4 — usability & observability**
+- **"What Claude did" panel** (Debug tab): a per-turn list of the main model's `search_memory` recalls (query → result count) and `remember_fact` pins, grouped by turn. Auto-refreshes on each tool call. The trust panel — you can *see* the tool-driven memory working.
+- **Graph view** (Database tab): enter a `Category/key` and see the fact's linked neighbors — relationship-ref links (primary/secondary) and one-hop scope-graph neighbors (place⇄event⇄people). Neighbors are clickable to walk the graph. The "true graphline memory" made visible.
+- **Recurring-characters panel** (Database tab): lists the entity registry (named / NPC / deferred) with status badges and a "Mark recurring" button that promotes an NPC to a first-class subject.
+- **Grouped review popup**: extraction review now groups changes into counted New / Updated / Deletions / Conflicts sections instead of a flat list (original indices preserved so edit/remove still work).
+
+**Phase 2 — Claude tuning + speed**
+- **Per-turn tool-call soft cap (8)**: a turn exceeding it is flagged in the panel so a runaway tool loop is visible.
+- **Claude-profile detection**: recognizes a Claude/Anthropic active connection profile and logs (once/session) that tool-first is the tuned path — or, on a non-tool profile in hybrid/tool-only mode, hints that recall may not fire (switch to Push).
+- **Cache-drift guard**: when an agent's static system prompt changes between calls without a persona change, it's logged (variable per-turn data likely leaked into the system block, hurting prompt-cache hits).
+
+**Phase 3 — graph integration**
+- **`remember_fact` auto-links** pinned facts into the spiderweb (mirroring Scribe) so model-pinned facts join the graph instead of being islands — combined with the alpha.1 fix that made traversal follow `secondary` refs, pinned facts are now reachable by recall.
+
+_Files:_ [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html), [style.css](style.css), [src/profiler.js](src/profiler.js), [src/pipeline.js](src/pipeline.js), [src/llm-call.js](src/llm-call.js), [src/agent-writer.js](src/agent-writer.js), [src/review-popup.js](src/review-popup.js)
+
+## [0.43.0-alpha.1] - 2026-06-21
+
+### Added — Tool-first redesign: Claude drives memory (faster replies + on-demand recall)
+
+The headline of the tool-first redesign. Memory recall is moving from a deterministic, always-on push to a **tool-driven** model where the main reply model (e.g. Claude via the Claude Code CLI connection profile) recalls and pins facts itself through `search_memory` / `remember_fact`. This alpha lands the core path:
+
+- **New "Recall strategy" setting (`memoryMode`), default `hybrid`.** Three modes:
+  - **Hybrid** (default) — each turn injects a cheap, no-LLM anchor (speculative keyword facts + present-character anchors + the scene block); the model pulls everything deeper on demand via `search_memory`. **The blocking Agent 1 (Drafter) LLM call is skipped** — the primary latency win.
+  - **Tool-only** — minimal anchor; recall is driven almost entirely by the model's tool calls.
+  - **Push** — classic behavior restored: the Drafter plans the reply + picks fact branches every turn (an extra blocking LLM call). For main models that can't call tools.
+- **Faster replies in Hybrid/Tool-only:** dropping the Drafter removes a full per-turn LLM round-trip from the reply-critical path; the per-turn `summarizeKeys`/menu store walks (only consumed by the Drafter) are skipped too.
+- **Anchors still fire without the Drafter:** in hybrid/tool-only, `focus` is derived from the scene card's present characters, so the guaranteed present-character anchor facts are still injected (no LLM).
+- **`remember_fact` now defaults ON** and both tool descriptions were rewritten to prompt Claude to search proactively before replying and pin lasting facts as they're established (shipped in alpha groundwork).
+- **UI:** a "Recall strategy" selector at the top of the settings panel (separate from the existing cost/recall "Memory mode" preset), with a hint explaining the tool-calling requirement.
+
+**Known tradeoff (alpha):** in hybrid/tool-only the Drafter no longer parses the scene each turn, so the scene card only updates on turns that run in Push mode (or via future cheap scene-tracking). The injected scene persists from the last parse. The background Scribe (Agent 3) still extracts post-reply as a safety net. Requires a tool-calling main model; with a non-tool model, use **Push**.
+
+_Files:_ [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html), [src/agent-writer.js](src/agent-writer.js)
+
+### Added — stronger `search_memory` recall + bounded multi-hop graph
+
+Because the recall tool is now the model's primary path to memory, `searchMemoryForRecall` was upgraded from keyword-only to the **same cascade the push path uses**: exact handle → keyword → fuzzy/alias trigram (typos/morphology) → bounded graph expansion. On no match it returns an **actionable hint** listing the categories actually present so the model re-queries productively instead of giving up.
+
+The graph expansion (`gatherExpansionCandidates`) was generalized from one hop to a **bounded breadth-first walk** (`maxDepth`, clamped 1–3). The always-on push path stays at depth 1 (byte-identical); the explicit recall path walks **depth 2**, so a query can reach two links out (place → guard → faction). All hops share the same `MAX_EXPANSION_TOTAL` / per-seed caps, and deeper hops demote to tertiary so closer facts always win scarce slots.
+
+Verified end-to-end in a real SillyTavern 1.18 instance: keyword, fuzzy-typo, one-hop graph (a place query surfacing a linked person with no shared text), the no-match hint, **and the two-hop walk** (a query reaching place → event → person → that person's other event → a second place at depth 2, while the depth-1 push path correctly stops at one hop) all pass.
+
+_Files:_ [src/fact-retrieval.js](src/fact-retrieval.js)
+
+### Fixed — hardening pass from an adversarial review + edge-case testing
+
+A full adversarial audit of the branch plus E2E edge-case testing surfaced eight issues; the real ones are fixed (each re-verified live in ST 1.18):
+
+- **Graph traversal now follows `secondary` relationship refs**, not just `primary`. `autoLinkFact` writes most character-centric (same-subject / token-overlap) links into `secondary`, which the BFS recall path silently ignored — orphaning the dominant link set from the now-primary recall path.
+- **Sequence-track continuity is never demoted** on deeper hops, so the per-seed-cap exemption isn't undone by the downstream tertiary cap evicting mandatory continuity.
+- **Exact `Category/key` handle pulls stay exact** — a resolved handle returns just that record instead of ballooning into its whole 2-hop neighborhood.
+- **Recall ranks tier-first** (direct hits → 1-hop → 2-hop), then salience — so a tight `limit` can't drop the actual match for a distant linked fact.
+- **The no-match hint respects the category filter** — it no longer lists (and potentially spoils) other categories when the model scoped the search.
+- **Hybrid focus has an honest active-character fallback** when the scene wasn't parsed this turn (no Agent 1), and the "guarantee" wording was softened to match reality.
+- **`logRunSummary` reports a skipped Drafter as N/A**, not failed; **settings coercion for `enableWriterWriteTool` matches its new `true` default**.
+
+_Files:_ [src/fact-retrieval.js](src/fact-retrieval.js), [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js)
+
 ## [0.42.1] - 2026-05-31
 
 ### Changed — replaced the dead "Embedding profile" dropdown with working source + model inputs (H16)
