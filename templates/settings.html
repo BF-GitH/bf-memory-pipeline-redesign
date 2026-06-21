@@ -17,23 +17,9 @@
                 </label>
             </div>
 
-            <!-- C1: Usability preset — one choice maps onto the many token/retrieval knobs below. -->
-            <div class="bf-mem-preset-bar" style="display:flex;align-items:center;gap:8px;margin:6px 0 10px;">
-                <label for="bf_mem_preset" style="font-weight:bold;white-space:nowrap;">Memory mode</label>
-                <select id="bf_mem_preset" class="text_pole" style="flex:1;">
-                    <option value="cheap">Cheap — fewest tokens</option>
-                    <option value="balanced">Balanced — recommended</option>
-                    <option value="maxrecall">Max Recall — best memory, costs more</option>
-                    <option value="custom">Custom — your own settings (Advanced tabs)</option>
-                </select>
-            </div>
-            <small class="bf-mem-hint" style="display:block;margin:-4px 0 10px;">
-                Picks sensible defaults for cost vs. recall. Fine-tune anything in the tabs below — that switches this to “Custom”.
-            </small>
-
-            <!-- Tool-first redesign — RECALL STRATEGY (how stored memory reaches the main model). -->
+            <!-- PRIMARY control — MEMORY MODE (how stored memory reaches the main model). -->
             <div class="bf-mem-preset-bar" style="display:flex;align-items:center;gap:8px;margin:6px 0 4px;">
-                <label for="bf_mem_memory_mode" style="font-weight:bold;white-space:nowrap;">Recall strategy</label>
+                <label for="bf_mem_memory_mode" style="font-weight:bold;white-space:nowrap;">Memory mode</label>
                 <select id="bf_mem_memory_mode" class="text_pole" style="flex:1;">
                     <option value="hybrid">Hybrid — fast: light anchor + model recalls on demand (recommended)</option>
                     <option value="tool-only">Tool-only — model drives all recall via search_memory</option>
@@ -41,7 +27,21 @@
                 </select>
             </div>
             <small class="bf-mem-hint" style="display:block;margin:-2px 0 10px;">
-                <b>Hybrid</b>/<b>Tool-only</b> skip the blocking Drafter LLM call for faster replies — the main model (e.g. Claude via the Claude Code CLI profile) pulls deeper facts itself through the <code>search_memory</code> tool, so they need a tool-calling main model. <b>Push</b> restores the classic always-plan behavior for models that can’t call tools.
+                <b>How</b> memory reaches the model. <b>Hybrid</b>/<b>Tool-only</b> skip the blocking Drafter for faster replies — the model (e.g. Claude via the Claude Code CLI profile) pulls facts itself through the <code>search_memory</code> tool, so they need a tool-calling model. <b>Push</b> restores the classic always-plan behavior for models that can’t call tools.
+            </small>
+
+            <!-- SECONDARY control — cost/recall-depth preset (maps onto the token/retrieval knobs below). -->
+            <div class="bf-mem-preset-bar" style="display:flex;align-items:center;gap:8px;margin:6px 0 4px;">
+                <label for="bf_mem_preset" style="font-weight:bold;white-space:nowrap;">Cost preset</label>
+                <select id="bf_mem_preset" class="text_pole" style="flex:1;">
+                    <option value="cheap">Cheap — fewest tokens</option>
+                    <option value="balanced">Balanced — recommended</option>
+                    <option value="maxrecall">Max Recall — best memory, costs more</option>
+                    <option value="custom">Custom — your own settings (Advanced tabs)</option>
+                </select>
+            </div>
+            <small class="bf-mem-hint" style="display:block;margin:-2px 0 10px;">
+                <b>How much</b> to spend on recall depth (injection budget, present-character anchors, reflection cadence). Fine-tune anything in the tabs below — that switches this to “Custom”.
             </small>
 
             <!-- Tabs (chronological order each turn: Drafter → Librarian → Writer → Scribe) -->
