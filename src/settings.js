@@ -189,10 +189,12 @@ const DEFAULT_SETTINGS = {
     // Optional WRITE tool (`remember_fact`, Letta core_memory_append analogue): lets the MAIN model
     // PIN one fact directly into the active store mid-reply via an ST function-tool, complementing
     // the read-only search_memory pull tool above. ADD-ONLY (never deletes); routes through the same
-    // upsertFact/saveDatabase path as extraction. Default OFF — opt-in, and requires a tool-calling
-    // main model (ST's tool loop never runs on the quiet/agent paths). Synced alongside the recall
-    // tool wherever syncWriterRecallTool is synced (index.js init + settings toggle).
-    enableWriterWriteTool: false,
+    // upsertFact/saveDatabase path as extraction. Tool-first default flip: ON for fresh installs so
+    // the main model (e.g. Claude) can PIN durable facts on demand, complementing the read-only
+    // recall tool and the background Scribe extraction. Requires a tool-calling main model (ST's tool
+    // loop never runs on the quiet/agent paths); no-ops otherwise. Existing users keep their saved
+    // value. Synced alongside the recall tool wherever syncWriterRecallTool is synced (index.js + toggle).
+    enableWriterWriteTool: true,
     // Summary pyramid — optional "Big Picture" injection (hierarchical zoom-out). When ON, the
     // Writer gets a compact block = the rolling reflection story summary + the SHORT shelf
     // (category/aspect-bucket) summaries relevant to the current scene focus, hard token-capped.

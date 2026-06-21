@@ -533,7 +533,12 @@ export function registerWriterRecallTool() {
         api.register({
             name: RECALL_TOOL_NAME,
             displayName: 'Search Memory',
-            description: 'Search long-term memory for stored facts that are NOT already in your context. '
+            description: 'ALWAYS search memory BEFORE you reply whenever the user message or the scene references '
+                + 'anyone, anywhere, or anything that may have been established earlier — a person, place, prior event, '
+                + 'promise, preference, relationship, or any detail you are not certain is already in your context. '
+                + 'Searching is cheap and read-only, so search liberally: prefer over-searching to contradicting an '
+                + 'established fact, and call it again with different keywords if the first query misses. '
+                + 'Search long-term memory for stored facts that are NOT already in your context. '
                 + 'Pass a keyword query; optionally narrow by category, or pass an exact "Category/key" handle '
                 + '(as shown in the established-facts list) to pull that full record. To RECAP a whole scene, '
                 + 'pass the scene number or name in "scene" (or just ask in the query, e.g. "recap the market '
@@ -761,7 +766,10 @@ export function registerWriterWriteTool() {
         api.register({
             name: WRITE_TOOL_NAME,
             displayName: 'Remember Fact',
-            description: 'Pin ONE durable fact into long-term memory so it is remembered in future replies. '
+            description: 'Proactively pin important new facts the moment the story establishes them — do not wait '
+                + 'to be asked. Whenever a lasting detail appears (a name, a relationship, a vow, a location, a trait, '
+                + 'or a meaningful change), call this so it survives into future replies. '
+                + 'Pin ONE durable fact into long-term memory so it is remembered in future replies. '
                 + 'Use this for a stable, important detail the story just established that should persist — '
                 + 'a name, a relationship, a vow, a location, a lasting trait or change. Pass a short stable '
                 + '"key" (e.g. "eye_color", "home_town") and the "value". Optionally set "category" (e.g. People, '
