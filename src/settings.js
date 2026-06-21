@@ -1016,6 +1016,10 @@ export function addDebugLog(type, message, opts = {}) {
 // observability). Soft — purely visual; nothing is blocked.
 const TOOL_ACTIVITY_SOFTCAP = 8;
 
+// Monotonic token guarding the async graph-view render against a race: a rapid second click starts
+// a new render; only the LATEST may paint, so an earlier slow resolve can't overwrite a newer node.
+let graphViewToken = 0;
+
 /**
  * "What Claude did" panel (tool-first redesign). Scans the in-memory debug ring buffer for the
  * main model's memory tool calls (`search_memory` recall + `remember_fact` pin), groups them by
@@ -1032,7 +1036,7 @@ function renderToolActivity() {
         if (summaryEl) summaryEl.textContent = '';
         return;
     }
-    const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     // Group by runId (a turn), preserving the newest-first order of the buffer.
     const groups = new Map(); // runId -> { rid, search: [], write: [] }
     for (const e of calls) {
@@ -1076,7 +1080,8 @@ function renderToolActivity() {
 async function renderGraphView(keyQuery) {
     const el = document.getElementById('bf_mem_graph_result');
     if (!el) return;
-    const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const myToken = ++graphViewToken; // this render's claim; a newer render supersedes it
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const q = String(keyQuery ?? '').trim();
     if (!q) { el.innerHTML = '<div class="bf-mem-hint">Enter a Category/key or key.</div>'; return; }
     el.innerHTML = '<div class="bf-mem-hint">Loading…</div>';
@@ -1119,6 +1124,7 @@ async function renderGraphView(keyQuery) {
         if (!primary.length && !secondary.length && !scopeNeighbors.length) {
             html += '<div class="bf-mem-hint">No links yet — this fact is an island. Auto-linking connects facts that share a subject, location, or participants.</div>';
         }
+        if (myToken !== graphViewToken) return; // a newer render started while we awaited — let it win
         el.innerHTML = html;
         el.querySelectorAll('.bf-mem-graph-link').forEach(a => a.addEventListener('click', (ev) => {
             ev.preventDefault();
@@ -1141,7 +1147,7 @@ async function renderEntityPanel() {
     const el = document.getElementById('bf_mem_entities_list');
     if (!el) return;
     const sumEl = document.getElementById('bf_mem_entities_summary');
-    const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     try {
         const ent = await import('./agent-entities.js');
         const entities = ent.getEntities() || {};

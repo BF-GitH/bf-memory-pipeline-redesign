@@ -711,24 +711,31 @@ async function rememberFactAction({ key, value, category, subject, importance, a
 
         // ADD-ONLY upsert: exact-key / normalized-variant merge is fine (idempotent re-pin updates
         // the value in place), but nothing is ever removed. Then persist the touched category DB.
+        // AUTO-LINK into the spiderweb, exactly like Scribe-written facts (agent-memory.js applyUpdates):
+        // build the link index from the PRE-write state, then upsert, then link the stored fact to
+        // related existing facts. Without this, model-pinned facts were ISLANDS the recall graph could
+        // never reach. Gated by enableAutoLinking (default ON). Best-effort with a HARD guarantee that
+        // a link failure NEVER blocks the save below (the fact must still persist), and the failure
+        // logging is itself wrapped so a logging error can't skip saveDatabase either.
+        let linkIndex = null;
+        try {
+            if (getSettingsSafe()?.enableAutoLinking !== false) linkIndex = buildMemoryIndex(await getAllDatabases());
+        } catch { linkIndex = null; }
+
+        // ADD-ONLY upsert: exact-key / normalized-variant merge is fine (idempotent re-pin updates
+        // the value in place), but nothing is ever removed.
         upsertFact(db, factToWrite);
 
-        // AUTO-LINK into the spiderweb, exactly like Scribe-written facts (agent-memory.js applyUpdates).
-        // Without this, model-pinned facts were ISLANDS — never connected to related facts, so the
-        // graph expansion the recall tool relies on could never reach them from a neighbor. Gated by
-        // enableAutoLinking (free + deterministic, default ON). Best-effort: never block the write.
-        try {
-            if (getSettingsSafe()?.enableAutoLinking !== false) {
-                const linkIndex = buildMemoryIndex(await getAllDatabases());
+        if (linkIndex) {
+            try {
                 const stored = findFactMatch(db, factToWrite.key);
                 if (stored) autoLinkFact(linkIndex, stored, cat, 'writer:remember_fact');
+            } catch (linkErr) {
+                try { void rememberToolLog('debug', `Writer write: auto-link skipped (${linkErr?.message || linkErr})`, { subsystem: 'writer', event: 'tool.remember_fact', reason: 'AUTOLINK_SKIPPED' }); } catch { /* never block the save */ }
             }
-        } catch (linkErr) {
-            await rememberToolLog('debug', `Writer write: auto-link skipped (${linkErr?.message || linkErr})`, {
-                subsystem: 'writer', event: 'tool.remember_fact', reason: 'AUTOLINK_SKIPPED',
-            });
         }
 
+        // Persist the touched category DB. This MUST run even if auto-linking above failed.
         await saveDatabase(db);
 
         await rememberToolLog('info', `Writer write: remember_fact "${cat}/${factKey}" = "${factValue.slice(0, 80)}"`, {

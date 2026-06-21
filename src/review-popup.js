@@ -159,17 +159,21 @@ export async function showReviewPopup(onAccept, onEdit) {
     // index first, then sort by group — indices are preserved so handlers stay correct.
     const GROUP_ORDER = { add: 0, update: 1, delete: 2, conflict: 3 };
     const GROUP_LABEL = { add: 'New facts', update: 'Updated facts', delete: 'Deletions', conflict: 'Conflicts' };
-    const indexed = items.map((item, idx) => ({ item, idx }));
-    indexed.sort((a, b) => (GROUP_ORDER[a.item.action] ?? 9) - (GROUP_ORDER[b.item.action] ?? 9));
-    let lastAction = null;
-    const listHtml = indexed.map(({ item, idx }) => {
-        let header = '';
-        if (item.action !== lastAction) {
-            lastAction = item.action;
-            const count = indexed.filter(x => x.item.action === item.action).length;
-            header = `<div class="bf-mem-review-group-header">${escapeHtml(GROUP_LABEL[item.action] || item.action)} (${count})</div>`;
-        }
-        return header + itemHtml(item, idx);
+    // Bucket into a Map keyed by action so each group's header is emitted EXACTLY once — robust to a
+    // non-stable Array.sort and to unknown/future action types (which would otherwise interleave and
+    // emit duplicate headers). Group display order follows GROUP_ORDER; unknown actions fall to the
+    // end in first-seen order. Each item keeps its ORIGINAL index so edit/remove handlers stay correct.
+    const groups = new Map(); // action -> [{item, idx}, ...]
+    items.forEach((item, idx) => {
+        const a = item.action;
+        if (!groups.has(a)) groups.set(a, []);
+        groups.get(a).push({ item, idx });
+    });
+    const orderedActions = [...groups.keys()].sort((a, b) => (GROUP_ORDER[a] ?? 9) - (GROUP_ORDER[b] ?? 9));
+    const listHtml = orderedActions.map(action => {
+        const recs = groups.get(action);
+        const header = `<div class="bf-mem-review-group-header">${escapeHtml(GROUP_LABEL[action] || action)} (${recs.length})</div>`;
+        return header + recs.map(({ item, idx }) => itemHtml(item, idx)).join('');
     }).join('');
 
     const html = `

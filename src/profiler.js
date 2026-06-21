@@ -52,8 +52,17 @@ export function isClaudeProfile(profile) {
             p = getConnectionProfiles().find(x => x && x.id === id) || null;
         }
         if (!p || typeof p !== 'object') return false;
+        const marker = /claude|anthropic/i;
+        // Scan top-level string values AND one level of nested objects (ST stores the model/source
+        // under different keys across versions, sometimes nested e.g. profile.settings.model). Depth
+        // is capped at 1 to avoid cycles/cost; that covers every known profile shape.
         for (const v of Object.values(p)) {
-            if (typeof v === 'string' && /claude|anthropic/i.test(v)) return true;
+            if (typeof v === 'string') { if (marker.test(v)) return true; }
+            else if (v && typeof v === 'object' && !Array.isArray(v)) {
+                for (const nv of Object.values(v)) {
+                    if (typeof nv === 'string' && marker.test(nv)) return true;
+                }
+            }
         }
         return false;
     } catch { return false; }
