@@ -112,7 +112,7 @@ const MAX_EXPANSION_TOTAL = 16;
  * @param {{fact: Object, category: string, tier: string}} r
  * @returns {number}
  */
-function estimateInjectionTokens(r) {
+export function estimateInjectionTokens(r) {
     const f = r.fact;
     const kb = (f.knownBy || []).join(', ');
     const prefix = kb ? `[${kb}]` : '[everyone]';
@@ -610,7 +610,7 @@ function confidenceFactor(fact) {
     const f = CONFIDENCE_FACTOR[String(c).toLowerCase()];
     return f === undefined ? 1.0 : f;
 }
-function retrievalSalience(fact, now) {
+export function retrievalSalience(fact, now) {
     const importance = clampImportance(fact?.importance);
     const kind = normalizeKind(fact?.kind);
     // USE-IT-OR-LOSE-IT: rank from the MORE RECENT of lastUpdated/lastUsedAt (using a fact

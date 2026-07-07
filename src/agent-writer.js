@@ -797,8 +797,8 @@ export function registerWriterWriteTool() {
                 + 'Pin ONE durable fact into long-term memory so it is remembered in future replies. '
                 + 'Use this for a stable, important detail the story just established that should persist — '
                 + 'a name, a relationship, a vow, a location, a lasting trait or change. Pass a short stable '
-                + '"key" (e.g. "eye_color", "home_town") and the "value". Optionally set "category" (e.g. People, '
-                + 'Places, Events; defaults to Unsorted), "subject" (whom/what the fact is about), "importance" '
+                + '"key" (e.g. "eye_color", "home_town") and the "value". Set "category" to the fitting bucket '
+                + '(People/Places/Things/Relationships/Events/World), "subject" (whom/what the fact is about), "importance" '
                 + '(1-5, higher = more foundational), and "aspect" (the facet, e.g. appearance, history). '
                 + 'Add-only — this never deletes or overwrites unrelated facts; re-pinning the same key updates it.',
             parameters: {
@@ -815,7 +815,7 @@ export function registerWriterWriteTool() {
                     },
                     category: {
                         type: 'string',
-                        description: 'Optional category bucket (e.g. People, Places, Events). Defaults to "Unsorted".',
+                        description: 'Pick the fitting bucket: People, Places, Things, Relationships, Events, or World. Omit ONLY when none fits (falls back to "Unsorted").',
                     },
                     subject: {
                         type: 'string',

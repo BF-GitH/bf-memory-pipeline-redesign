@@ -6,7 +6,7 @@ import { runDraftAgent } from './agent-draft.js';
 import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPictureBlock, buildMomentEchoBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { retrieveFacts, extractContextKeywords, isFactVisible } from './fact-retrieval.js';
+import { retrieveFacts, extractContextKeywords, isFactVisible, retrievalSalience, estimateInjectionTokens } from './fact-retrieval.js';
 import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveAspect, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage, getRelationshipMomentThread } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, detectProfileForToolFirst } from './profiler.js';
@@ -702,6 +702,12 @@ function findMemoryTargetIndex(chat, includeLast = false) {
     return -1;
 }
 
+// UNSORTED PRIMARY GUARANTEE (audit F-ARCH-2). Invariant: Unsorted competes under the budget;
+// the newest/most salient few are guaranteed. This cap is how many of the top salience-ranked
+// active Unsorted facts are guaranteed injection as `primary` each turn (recent pins stay
+// visible); the REST are admitted as secondary only while the retrievalTokenBudget allows.
+const UNSORTED_PRIMARY_CAP = 6;
+
 // --- Core Pipeline Logic (runs inline, blocks generation) ---
 
 async function runPipelineInline(data) {
@@ -977,8 +983,8 @@ async function runPipelineInline(data) {
     updateStatus('running', 'Selecting facts...');
 
     // DETERMINISTIC retrieval builder. Reuses the existing speculative + delta-keyword
-    // merge, and ALWAYS folds in every active Unsorted fact so retrieval can never blank
-    // that catch-all.
+    // merge, and folds in the active Unsorted facts under the token budget (top few
+    // guaranteed) so the catch-all stays represented without growing the injection unbounded.
     const buildDeterministicRetrieval = async () => {
         const speculativeKeywordSet = new Set(contextKeywords.map(k => k.toLowerCase()));
         const deltaKeywords = draftResult.neededFacts.filter(k => !speculativeKeywordSet.has(k.toLowerCase()));
@@ -994,14 +1000,47 @@ async function runPipelineInline(data) {
         } else {
             addDebugLog('info', 'No delta keywords needed — speculative retrieval covered everything');
         }
-        // ALWAYS include active Unsorted facts (visibility-filtered).
+        // UNSORTED ADMISSION (audit F-ARCH-2). Invariant: Unsorted competes under the budget;
+        // the newest/most salient few are guaranteed. The old path injected EVERY active
+        // Unsorted fact as un-budgeted primary, so model-pinned facts (remember_fact defaults
+        // to Unsorted) re-injected on every future turn and prompts grew monotonically. Now:
+        // rank by the SAME deterministic retrievalSalience the overflow tiers use, guarantee
+        // the top UNSORTED_PRIMARY_CAP as primary (recent pins stay visible), and admit the
+        // REST as secondary only while the retrievalTokenBudget allows — mirroring
+        // retrieveFacts' admitTier token accounting, re-applied here because this append runs
+        // AFTER retrieveFacts returned (a bare tier label alone would bypass the budget).
         const existingKeys = new Set(det.facts.map(r => `${r.category}:${r.fact.key}`));
+        const unsorted = [];
         for (const { fact, category } of collectBranchFactsIndexed(index, ['Unsorted'])) {
             const id = `${category}:${fact.key}`;
             if (!existingKeys.has(id) && isFactVisible(fact)) {
-                det.facts.push({ fact, category, tier: 'primary' });
+                unsorted.push({ fact, category, tier: 'secondary' });
                 existingKeys.add(id);
             }
+        }
+        const now = Date.now();
+        unsorted.sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+        for (const r of unsorted.slice(0, UNSORTED_PRIMARY_CAP)) {
+            r.tier = 'primary';
+            det.facts.push(r);
+        }
+        // Overflow: charge everything already chosen (retrieved + guaranteed Unsorted) against
+        // the shared budget first, then admit ranked Unsorted overflow while it fits.
+        const unsortedBudget = Number(settings.retrievalTokenBudget) || 800;
+        let unsortedUsedTokens = det.facts.reduce((sum, r) => sum + estimateInjectionTokens(r), 0);
+        let unsortedAdmitted = 0, unsortedDropped = 0;
+        for (const r of unsorted.slice(UNSORTED_PRIMARY_CAP)) {
+            const cost = estimateInjectionTokens(r);
+            if (unsortedUsedTokens + cost > unsortedBudget) { unsortedDropped++; continue; }
+            det.facts.push(r);
+            unsortedUsedTokens += cost;
+            unsortedAdmitted++;
+        }
+        if (unsorted.length > 0) {
+            addDebugLog('info', `Unsorted admission: ${Math.min(unsorted.length, UNSORTED_PRIMARY_CAP)} guaranteed primary, ${unsortedAdmitted} budget-admitted secondary, ${unsortedDropped} dropped over budget (${unsortedUsedTokens}/${unsortedBudget} tokens)`, {
+                subsystem: 'retrieval', event: 'retrieval.unsorted',
+                data: { total: unsorted.length, guaranteed: Math.min(unsorted.length, UNSORTED_PRIMARY_CAP), admitted: unsortedAdmitted, dropped: unsortedDropped, usedTokens: unsortedUsedTokens, budget: unsortedBudget },
+            });
         }
         det.stats = {
             primary: det.facts.filter(r => r.tier === 'primary').length,
