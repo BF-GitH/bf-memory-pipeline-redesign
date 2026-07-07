@@ -6,8 +6,9 @@ existing export, and each new behavior is `try/catch`-wrapped to degrade to prio
 
 **Defaults:** strictly-better, low-risk wins are **ON**; heavier/architectural features are **OFF**
 (opt-in) so they can be enabled and tested individually. All settings live in `DEFAULT_SETTINGS`
-(`src/settings.js`) with matching coercion in `validateSettings`; the 3 ON features and the 5
-opt-in features all have UI controls in `templates/settings.html`.
+(`src/settings.js`) with matching coercion in `validateSettings`; all eight features have UI
+controls in `templates/settings.html`. (Since the 0.43.0 tool-first flip, `remember_fact` is
+also ON by default — 4 ON / 4 opt-in.)
 
 | Feature | Source system | Setting(s) | Default |
 |---|---|---|---|
@@ -17,7 +18,7 @@ opt-in features all have UI controls in `templates/settings.html`.
 | Bi-temporal fact validity | Graphiti / Zep `valid_at`/`invalid_at` | `biTemporal` | OFF |
 | Semantic entity resolution / merge | Graphiti node dedup / mem0 linking | `entityResolution`, `entityResolutionThreshold` | OFF |
 | User-level shared memory | Zep / mem0 user scoping | `userLevelMemory` | OFF |
-| Model-writable `remember_fact` tool | Letta `core_memory_append` | `enableWriterWriteTool` | OFF |
+| Model-writable `remember_fact` tool | Letta `core_memory_append` | `enableWriterWriteTool` | **ON** (flipped in 0.43.0) |
 | Idle-time consolidation | Letta sleeptime agent | `idleConsolidation`, `idleConsolidationMs` | OFF |
 
 ---
@@ -82,7 +83,7 @@ persistence. On write, user-subject facts are mirrored into the shared store; on
 character store wins). Merged copies carry a transient `__sharedOrigin` tag that `saveDatabase` and
 the profile snapshot strip, so the shared store stays the single source of truth. `src/database.js`.
 
-### 7. Model-writable `remember_fact` tool — `enableWriterWriteTool` (false)
+### 7. Model-writable `remember_fact` tool — `enableWriterWriteTool` (true since 0.43.0)
 **What it does (ELI5):** gives the main model a tool to *pin* a fact directly, complementing the
 read-only `search_memory` pull tool.
 **How:** mirrors the `search_memory` registration pattern with an add-only write tool
@@ -107,7 +108,7 @@ the existing `maybeRunReflection()` (which no-ops unless a reflection is armed a
   the function-tool API) can't be exercised outside the app. Smoke-test on this branch before relying
   on it, especially the opt-in `userLevelMemory` (shared-store read-merge) and `entityResolution`
   (false-merge risk is mitigated by the high threshold + heavy logging, but watch the logs).
-- `userLevelMemory` has no "clear shared store" UI yet, and the shared store appears as an orphan
+- `userLevelMemory` now has a "Clear shared user memory" button (Writer tab), and the shared store appears as an orphan
   `character_attachments[bf_shared_user_memory]` bucket (harmless, never selectable).
 
 Reference implementations cloned at `../memory-research/{mem0,letta,graphiti,zep}`; see

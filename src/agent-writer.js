@@ -448,6 +448,50 @@ function injectIntoMessages(messages, injection) {
 // =============================================================================
 
 const RECALL_TOOL_NAME = 'search_memory';
+
+// Description + parameter schema hoisted to consts so estimateToolSchemaTokens() (bottom of file)
+// can price the EXACT text that rides EVERY main-model request. Kept deliberately tight: the
+// schema is a fixed per-turn cost, and each CALL additionally makes ST re-send the whole prompt
+// as an extra billed round-trip — so the description steers the model to batch, not to
+// "search liberally".
+const RECALL_TOOL_DESCRIPTION = 'Search long-term memory for stored facts NOT already in your context. Read-only, but NOT free: '
+    + 'each call re-sends the entire prompt as an extra billed round-trip. Search only when the injected '
+    + '[Memory Context] block does not already cover what you need, and BATCH every keyword into ONE query '
+    + 'instead of several calls. Pass keyword(s), or an exact "Category/key" handle (as shown in the '
+    + 'established-facts list) to pull that full record. To RECAP a whole scene, pass its number or name in '
+    + '"scene". When this moment is an emotional callback between two characters (a confession, a betrayal '
+    + 'resurfacing, a reunion), pass both names in "with" to pull the pair\'s significant moments in order.';
+const RECALL_TOOL_PARAMETERS = {
+    $schema: 'http://json-schema.org/draft-04/schema#',
+    type: 'object',
+    properties: {
+        query: {
+            type: 'string',
+            description: 'Keyword(s) to search for — batch every term you need into this one query — or an '
+                + 'exact "Category/key" handle, or a scene-recap phrase like "recap the market scene".',
+        },
+        category: {
+            type: 'string',
+            description: 'Optional category to restrict the search to (e.g. People, Places, Events).',
+        },
+        limit: {
+            type: 'integer',
+            description: 'Optional max number of facts to return (default 20).',
+        },
+        scene: {
+            type: 'string',
+            description: 'Optional scene to RECAP: a scene number (e.g. "3") or scene name (e.g. "the market"). '
+                + 'Returns that scene\'s full facts, including older/superseded details. Takes precedence over the keyword query.',
+        },
+        with: {
+            type: 'string',
+            description: 'Optional relationship recall: two character names (e.g. "<name> and <other>") to pull the '
+                + 'PAIR\'s significant moments across all scenes in chronological order, including superseded details. '
+                + 'One name returns that character\'s own moments. Overrides the keyword query ("scene" wins over this).',
+        },
+    },
+    required: ['query'],
+};
 // Module-level guard so register/unregister stay idempotent across init + toggle re-runs.
 let _recallToolRegistered = false;
 let _recallToolApiUnavailableLogged = false; // fail-level "API missing" notice fires once
@@ -533,53 +577,8 @@ export function registerWriterRecallTool() {
         api.register({
             name: RECALL_TOOL_NAME,
             displayName: 'Search Memory',
-            description: 'ALWAYS search memory BEFORE you reply whenever the user message or the scene references '
-                + 'anyone, anywhere, or anything that may have been established earlier — a person, place, prior event, '
-                + 'promise, preference, relationship, or any detail you are not certain is already in your context. '
-                + 'Searching is cheap and read-only, so search liberally: prefer over-searching to contradicting an '
-                + 'established fact, and call it again with different keywords if the first query misses. '
-                + 'Search long-term memory for stored facts that are NOT already in your context. '
-                + 'Pass a keyword query; optionally narrow by category, or pass an exact "Category/key" handle '
-                + '(as shown in the established-facts list) to pull that full record. To RECAP a whole scene, '
-                + 'pass the scene number or name in "scene" (or just ask in the query, e.g. "recap the market '
-                + 'scene") — a scene recap returns the full scene including older/superseded details. '
-                + 'When THIS moment is an emotional callback or turning point between two characters (a confession, '
-                + 'a betrayal resurfacing, a reunion), recall their shared history by passing both names in "with" '
-                + '(e.g. "<name> and <other>") — this returns the pair\'s significant moments across all scenes, in order. '
-                + 'Read-only.',
-            parameters: {
-                $schema: 'http://json-schema.org/draft-04/schema#',
-                type: 'object',
-                properties: {
-                    query: {
-                        type: 'string',
-                        description: 'Keyword(s) to search for, an exact "Category/key" handle to pull one record, '
-                            + 'or a scene-recap phrase like "recap the market scene" / "what happened in scene 3".',
-                    },
-                    category: {
-                        type: 'string',
-                        description: 'Optional category to restrict the search to (e.g. People, Places, Events).',
-                    },
-                    limit: {
-                        type: 'integer',
-                        description: 'Optional max number of facts to return (default 20).',
-                    },
-                    scene: {
-                        type: 'string',
-                        description: 'Optional scene to RECAP: a scene number (e.g. "3") or scene name (e.g. "the market"). '
-                            + 'Returns that scene\'s full set of facts, including older/superseded details. Takes precedence over the keyword query.',
-                    },
-                    with: {
-                        type: 'string',
-                        description: 'Optional relationship recall: two character names (e.g. "<name> and <other>", or comma-separated) '
-                            + 'to pull the PAIR\'s emotional history — their significant moments (confessions, betrayals, reunions) across '
-                            + 'all scenes, in chronological order, including older/superseded details. Use it when the present beat echoes '
-                            + 'a turning point between two characters. One name returns that character\'s own significant moments. '
-                            + 'Takes precedence over the keyword query (the "scene" arg wins over this).',
-                    },
-                },
-                required: ['query'],
-            },
+            description: RECALL_TOOL_DESCRIPTION,
+            parameters: RECALL_TOOL_PARAMETERS,
             action: searchMemoryAction,
             formatMessage: ({ query } = {}) => `Searching memory for "${String(query ?? '').slice(0, 80)}"…`,
             shouldRegister: () => recallToolEnabled(),
@@ -645,6 +644,48 @@ export function syncWriterRecallTool() {
 // =============================================================================
 
 const WRITE_TOOL_NAME = 'remember_fact';
+
+// Hoisted for estimateToolSchemaTokens(), same as the recall tool. States each instruction ONCE
+// (the previous copy repeated its trigger list twice and the pin instruction three times — pure
+// schema bloat billed on every request).
+const WRITE_TOOL_DESCRIPTION = 'Pin ONE durable fact into long-term memory the moment the story establishes it, so it persists '
+    + 'into future replies — a name, relationship, vow, location, or lasting trait/change. Pass a short '
+    + 'stable "key" (snake_case, e.g. "eye_color") and the "value"; optionally "category" '
+    + '(People/Places/Things/Relationships/Events/World), "subject" (whom/what it is about), "importance" '
+    + '(1-5, higher = more foundational), and "aspect" (the facet, e.g. appearance, history). Add-only: '
+    + 'never deletes or overwrites unrelated facts; re-pinning the same key updates it. Each call costs a '
+    + 'full prompt round-trip — pin once, and only facts worth keeping.';
+const WRITE_TOOL_PARAMETERS = {
+    $schema: 'http://json-schema.org/draft-04/schema#',
+    type: 'object',
+    properties: {
+        key: {
+            type: 'string',
+            description: 'Short, stable identifier for the fact (snake_case preferred, e.g. "eye_color", "captains_vow").',
+        },
+        value: {
+            type: 'string',
+            description: 'The fact itself — the established truth to remember.',
+        },
+        category: {
+            type: 'string',
+            description: 'Pick the fitting bucket: People, Places, Things, Relationships, Events, or World. Omit ONLY when none fits (falls back to "Unsorted").',
+        },
+        subject: {
+            type: 'string',
+            description: 'Optional: whom or what the fact is about (the subject axis).',
+        },
+        importance: {
+            type: 'integer',
+            description: 'Optional importance 1-5 (higher = more foundational / longer retained).',
+        },
+        aspect: {
+            type: 'string',
+            description: 'Optional facet of the subject the fact describes (e.g. appearance, history, relationship).',
+        },
+    },
+    required: ['key', 'value'],
+};
 // Module-level guard so register/unregister stay idempotent across init + toggle re-runs.
 let _writeToolRegistered = false;
 let _writeToolApiUnavailableLogged = false; // fail-level "API missing" notice fires once
@@ -722,8 +763,6 @@ async function rememberFactAction({ key, value, category, subject, importance, a
             if (getSettingsSafe()?.enableAutoLinking !== false) linkIndex = buildMemoryIndex(await getAllDatabases());
         } catch { linkIndex = null; }
 
-        // ADD-ONLY upsert: exact-key / normalized-variant merge is fine (idempotent re-pin updates
-        // the value in place), but nothing is ever removed.
         upsertFact(db, factToWrite);
 
         if (linkIndex) {
@@ -731,7 +770,10 @@ async function rememberFactAction({ key, value, category, subject, importance, a
                 const stored = findFactMatch(db, factToWrite.key);
                 if (stored) autoLinkFact(linkIndex, stored, cat, 'writer:remember_fact');
             } catch (linkErr) {
-                try { void rememberToolLog('debug', `Writer write: auto-link skipped (${linkErr?.message || linkErr})`, { subsystem: 'writer', event: 'tool.remember_fact', reason: 'AUTOLINK_SKIPPED' }); } catch { /* never block the save */ }
+                // Event deliberately NOT 'tool.remember_fact': that event marks one tool INVOCATION
+                // (the activity panel + tool-loop token estimate count it), and this skip is part of
+                // the same invocation already logged below.
+                try { void rememberToolLog('debug', `Writer write: auto-link skipped (${linkErr?.message || linkErr})`, { subsystem: 'writer', event: 'tool.remember_fact.autolink', reason: 'AUTOLINK_SKIPPED' }); } catch { /* never block the save */ }
             }
         }
 
@@ -791,47 +833,8 @@ export function registerWriterWriteTool() {
         api.register({
             name: WRITE_TOOL_NAME,
             displayName: 'Remember Fact',
-            description: 'Proactively pin important new facts the moment the story establishes them — do not wait '
-                + 'to be asked. Whenever a lasting detail appears (a name, a relationship, a vow, a location, a trait, '
-                + 'or a meaningful change), call this so it survives into future replies. '
-                + 'Pin ONE durable fact into long-term memory so it is remembered in future replies. '
-                + 'Use this for a stable, important detail the story just established that should persist — '
-                + 'a name, a relationship, a vow, a location, a lasting trait or change. Pass a short stable '
-                + '"key" (e.g. "eye_color", "home_town") and the "value". Optionally set "category" (e.g. People, '
-                + 'Places, Events; defaults to Unsorted), "subject" (whom/what the fact is about), "importance" '
-                + '(1-5, higher = more foundational), and "aspect" (the facet, e.g. appearance, history). '
-                + 'Add-only — this never deletes or overwrites unrelated facts; re-pinning the same key updates it.',
-            parameters: {
-                $schema: 'http://json-schema.org/draft-04/schema#',
-                type: 'object',
-                properties: {
-                    key: {
-                        type: 'string',
-                        description: 'Short, stable identifier for the fact (snake_case preferred, e.g. "eye_color", "captains_vow").',
-                    },
-                    value: {
-                        type: 'string',
-                        description: 'The fact itself — the established truth to remember.',
-                    },
-                    category: {
-                        type: 'string',
-                        description: 'Optional category bucket (e.g. People, Places, Events). Defaults to "Unsorted".',
-                    },
-                    subject: {
-                        type: 'string',
-                        description: 'Optional: whom or what the fact is about (the subject axis).',
-                    },
-                    importance: {
-                        type: 'integer',
-                        description: 'Optional importance 1-5 (higher = more foundational / longer retained).',
-                    },
-                    aspect: {
-                        type: 'string',
-                        description: 'Optional facet of the subject the fact describes (e.g. appearance, history, relationship).',
-                    },
-                },
-                required: ['key', 'value'],
-            },
+            description: WRITE_TOOL_DESCRIPTION,
+            parameters: WRITE_TOOL_PARAMETERS,
             action: rememberFactAction,
             formatMessage: ({ key } = {}) => `Remembering "${String(key ?? '').slice(0, 80)}"…`,
             shouldRegister: () => writeToolEnabled(),
@@ -877,4 +880,22 @@ export function unregisterWriterWriteTool() {
 export function syncWriterWriteTool() {
     if (writeToolEnabled()) registerWriterWriteTool();
     else unregisterWriterWriteTool();
+}
+
+/**
+ * Approximate the FIXED per-request token cost of the ENABLED Writer tool schemas. Every
+ * main-model request carries each registered tool's name + description + parameter schema, so
+ * this overhead is paid on EVERY turn even when no tool is called. ESTIMATE ONLY: JSON.stringify
+ * length / 4 (the same 1 token ≈ 4 chars heuristic buildSceneBlock uses) — the true cost depends
+ * on the provider's tool-schema serialization and tokenizer. Read by the Tokens tab (settings.js
+ * renderTokens). Never throws.
+ * @returns {number} approximate tokens (0 when no tool is enabled)
+ */
+export function estimateToolSchemaTokens() {
+    let chars = 0;
+    try {
+        if (recallToolEnabled()) chars += JSON.stringify({ name: RECALL_TOOL_NAME, description: RECALL_TOOL_DESCRIPTION, parameters: RECALL_TOOL_PARAMETERS }).length;
+        if (writeToolEnabled()) chars += JSON.stringify({ name: WRITE_TOOL_NAME, description: WRITE_TOOL_DESCRIPTION, parameters: WRITE_TOOL_PARAMETERS }).length;
+    } catch { return 0; }
+    return Math.round(chars / 4);
 }

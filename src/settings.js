@@ -3,9 +3,8 @@
 
 import { getConnectionProfiles, getCurrentProfileId } from './profiler.js';
 import { DEFAULT_DRAFT_PROMPT } from './agent-draft.js';
-import { DEFAULT_FINDER_PROMPT } from './agent-finder.js';
 import { DEFAULT_MEMORY_PROMPT } from './agent-memory.js';
-import { DEFAULT_WRITER_FORMAT } from './agent-writer.js';
+import { DEFAULT_WRITER_FORMAT, estimateToolSchemaTokens } from './agent-writer.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 import {
     getEntities, setEntityStatus, reloadEntitiesFromChat,
@@ -84,8 +83,8 @@ let lastInserted = { runId: null, timestamp: null, updates: [] };
 // pipeline.js right after a successful injection; rendered on the Tokens tab so a user can SEE, at a
 // glance, what memory the reply was given and roughly what it cost.
 let lastInjection = { runId: null, timestamp: null, facts: [], approxTokens: 0 };
-let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, finderInput, finderOutput, reflectionInput, reflectionOutput, mainOutput, ts, approx}
-let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, finderInput, finderOutput, reflectionInput, reflectionOutput, mainOutput, toolCalls, toolLoopIn, ts, approx}
+let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
 // Scene card — the always-injected "what is true right now" core working-memory block.
 // Persisted per-chat in chat_metadata.bf_mem_scene, reloaded on CHAT_CHANGED.
 // null = no scene yet (back-compatible: absent scene behaves as no scene card).
@@ -114,17 +113,16 @@ const DEFAULT_SETTINGS = {
     // EXISTING users are unaffected — merge-missing-defaults only fills ABSENT keys, so anyone who
     // already has these keys keeps their values and detectPreset() shows whatever they match.
     uiPreset: 'balanced',
+    // First-run onboarding wizard (src/onboarding.js): true once the user has FINISHED or
+    // SKIPPED it — either way it never auto-shows again. The "Re-run setup guide" button in
+    // the General tab reopens it on demand.
+    onboardingDone: false,
     useMemoryProfile: true,
     // Per-agent connection profiles (replacing single memoryProfile).
     // Old `memoryProfile` is kept on the stored object for rollback safety
     // and migrated forward in migrateLegacySettings().
     agent1Profile: '',
     agent3Profile: '',
-    // Agent 4 (Fact Finder, STAGE 2 of two-stage retrieval) connection profile.
-    // Empty => reuse Agent 1's profile (the design default). `agent4Profile` is the
-    // canonical key; `finderProfile` is accepted as an alias (validated/migrated below).
-    agent4Profile: '',
-    finderProfile: '',
     // Per-agent context message counts (replacing single contextMessages).
     // Agent 3 default raised from 2 -> 5 (FIX #2a): a 2-message window truncated
     // long single-message backstory disclosures and the surrounding exchange that
@@ -169,9 +167,9 @@ const DEFAULT_SETTINGS = {
     // messages so stored facts REPLACE old turns instead of stacking on top (the core token win).
     // Existing users keep their stored value (often 0). 0 still means "no trim / full history".
     agent2ContextMessages: 10,
-    // A2/B5 — FROZEN INJECTION. 0 = off (default; every turn runs the Drafter + Finder fresh). When
-    // > 0, a genuine new turn REUSES the previous run's cached fact/scene injection (skipping those
-    // two LLM calls) for up to this many turns before a full refresh. Saves tokens/latency AND keeps
+    // A2/B5 — FROZEN INJECTION. 0 = off (default; every turn runs the Drafter fresh). When
+    // > 0, a genuine new turn REUSES the previous run's cached fact/scene injection (skipping that
+    // LLM call) for up to this many turns before a full refresh. Saves tokens/latency AND keeps
     // the injected block byte-stable so a server-side prompt cache can reuse the prefix. Memory is
     // unaffected — the post-reply Scribe still extracts every turn; only the INJECTED facts may be up
     // to N turns stale. Clamp 0..20.
@@ -276,21 +274,9 @@ const DEFAULT_SETTINGS = {
     // Full-chat rebuild concurrency (atomic #17): max parallel Scribe calls during a
     // "Run on current chat" backfill (shared DB object → no lost writes). Clamp 1..6.
     rebuildConcurrency: 3,
-    // Semantic retrieval (atomic #1/#16). Default OFF. When on, facts are embedded (vector) on
-    // write and the query is embedded at retrieval so facts match by MEANING, not just keyword/
-    // trigram/graph. callEmbeddingAPI probes CMRS + known ST routes and GRACEFULLY NO-OPS if
-    // none respond — safe to enable on any backend (retrieval just stays keyword-only).
-    // C4/A3 default flip: semantic (vector) retrieval ON for fresh installs. GRACEFULLY no-ops when
-    // no embedding endpoint responds (callEmbeddingAPI → null → keyword/trigram retrieval), so it is
-    // TOOL-FIRST DEFAULT: OFF. Embeddings / semantic recall are NOT part of the tool-first path —
-    // Claude drives recall via search_memory, which is the intended "semantic" layer. The vector
-    // code remains in the repo but is dormant by default; turn this ON only if you deliberately
-    // configure an embedding model. (It no-ops anyway when no embedding endpoint responds.)
+    // RETIRED (v0.50.x): the vector/embedding stack was removed; kept inert for stored-settings
+    // back-compat only — nothing reads it anymore.
     semanticRetrieval: false,
-    embeddingProfile: '',                       // CMRS profile for embeddings (blank = reuse Agent 1's)
-    embeddingSource: '',                        // ST vector source for embeddings (blank = derive from the active chat source, e.g. 'openrouter')
-    embeddingModel: 'text-embedding-3-small',   // embedding model (auto-prefixed per source; openrouter → openai/text-embedding-3-small)
-    semanticThreshold: 0.75,                    // min cosine similarity for a semantic hit
     // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
     // no random dice). These keys are kept for settings persistence/back-compat and the
     // existing sliders, but no longer gate which facts get injected. Safe to remove the
@@ -358,26 +344,9 @@ const DEFAULT_SETTINGS = {
     // merge loudly. Deterministic (NO LLM call). Absent (older settings) → defaults apply.
     entityResolution: false,
     entityResolutionThreshold: 0.85,
-    // Two-stage retrieval: STAGE 2 detail finder (Agent 4). When true (default), after
-    // Agent 1 picks #Branches from the menu, Agent 4 reads the full facts under those
-    // branches (+ all Unsorted) and chooses the relevant subset for injection. When false
-    // (or on any finder error/empty), the pipeline falls back to deterministic retrieveFacts.
-    // DEFAULT FLIPPED TO false (2026-05-31): the Finder is also HARD-DISABLED in pipeline.js
-    // (see the long note at `const wantFinder = false`). It was redundant once semantic + graph +
-    // anchors landed, and was timing out at scale anyway. Kept as a setting only for a future revert.
-    useFinderAgent: false,
-    // FINDER LATENCY BUDGET (ms). Max wall-clock the reply-blocking path may wait on the Stage-2
-    // finder before falling back to the (already-computed) deterministic retrieval. On expiry the
-    // in-flight finder LLM call is ABORTED (stops burning tokens). Lowered from the original 6000
-    // to 3500 so a slow model adds at most ~3.5s, not ~6s, per turn. See the adaptive circuit
-    // breaker in pipeline.js: after the finder blows the budget repeatedly it stops blocking at all.
-    finderBudgetMs: 3500,
-    // FINDER TARGET (soft floor): the finder aims for ~this many facts (a floor, not the hard cap)
-    // so it returns a useful set instead of a tight 5–7. The hard ceiling stays the finder maxFacts.
-    finderTargetFacts: 12,
     // GUARANTEED ANCHORS: how many key anchor facts (identity / current-state / active relationship)
-    // per present character to always inject alongside the finder's picks, so the in-focus
-    // character's anchors surface even if the finder misses them. 0 disables.
+    // per present character to always inject alongside the retrieved facts, so the in-focus
+    // character's anchors surface even if retrieval misses them. 0 disables.
     finderAnchorsPerCharacter: 3,
     // USER-LEVEL SHARED MEMORY (Zep/mem0 user-scoping). Default OFF. When ON, facts whose SUBJECT
     // resolves to the user persona ({{user}}) are ALSO routed into a single shared, durable
@@ -388,8 +357,6 @@ const DEFAULT_SETTINGS = {
     // back-compat: when OFF, storage AND retrieval are byte-identical to today (no shared store is
     // ever read or written). Absent (older settings) => default false.
     userLevelMemory: false,
-    // Optional system-prompt override for Agent 4. Empty => DEFAULT_FINDER_PROMPT.
-    finderPrompt: '',
     draftPrompt: '',
     memoryPrompt: '',
     writerFormat: '',
@@ -472,10 +439,10 @@ function validateSettings(s) {
     s.contextMessages = Math.floor(clamp(s.contextMessages, 1, 50, 5));
     s.agent1ContextMessages = Math.floor(clamp(s.agent1ContextMessages, 1, 50, 5));
     s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 5));
-    s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 0));
+    s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 10)); // garbage-fallback matches DEFAULT_SETTINGS (10), like its neighbors
     // A2/B5 frozen injection: 0 = off; clamp to a sane window so it can't freeze forever.
     s.injectionFreezeTurns = Math.floor(clamp(s.injectionFreezeTurns, 0, 20, 0));
-    s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
+    s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  0, 100, 10)); // 0 = never show the review popup (F-UX-6)
     s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 50, 3));
     s.retrievalTokenBudget = Math.floor(clamp(s.retrievalTokenBudget, 50, 8000, 800));
     s.recencyCutoffDays = Math.floor(clamp(s.recencyCutoffDays, 0, 3650, 0));
@@ -486,7 +453,8 @@ function validateSettings(s) {
     if (typeof s.confidenceRanking !== 'boolean') s.confidenceRanking = true;
     s.confidenceWeight = clamp(s.confidenceWeight, 0, 1, 0.3);
     s.rebuildConcurrency = Math.floor(clamp(s.rebuildConcurrency, 1, 6, 3));
-    s.semanticThreshold = clamp(s.semanticThreshold, 0.1, 0.99, 0.75);
+    // RETIRED vector stack (v0.50.x): coerced inert for stored-settings back-compat; nothing reads it.
+    if (typeof s.semanticRetrieval !== 'boolean') s.semanticRetrieval = false;
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
     // Feature #4 depth-dice probabilities are 0..1 floats (not clamped to ints).
@@ -532,17 +500,9 @@ function validateSettings(s) {
     if (typeof s.memoryProfile !== 'string')     s.memoryProfile = '';
     if (typeof s.agent1Profile !== 'string')     s.agent1Profile = '';
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
-    if (typeof s.agent4Profile !== 'string')     s.agent4Profile = '';
-    if (typeof s.finderProfile !== 'string')     s.finderProfile = '';
-    // Accept `finderProfile` as an alias for `agent4Profile`: if only the alias is set,
-    // fold it onto the canonical key so downstream code only reads agent4Profile.
-    if (!s.agent4Profile && s.finderProfile) s.agent4Profile = s.finderProfile;
-    if (typeof s.useFinderAgent !== 'boolean')   s.useFinderAgent = false; // Finder hard-disabled; default off to match DEFAULT_SETTINGS
-    // Finder latency/target/anchor knobs (clamped to sane bounds; defaults match DEFAULT_SETTINGS).
-    s.finderBudgetMs = Math.floor(clamp(s.finderBudgetMs, 1000, 15000, 3500));
-    s.finderTargetFacts = Math.floor(clamp(s.finderTargetFacts, 0, 30, 12));
+    // Guaranteed present-character anchors (live; the retired Finder's other knobs are gone).
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
-    if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
+    if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = true;
     // Coercion matches the tool-first DEFAULT (true): an absent key (older saved settings) resolves
     // to ON, consistent with DEFAULT_SETTINGS, instead of contradicting it. Users who explicitly
     // saved `false` keep it (an explicit boolean passes this guard untouched).
@@ -554,7 +514,7 @@ function validateSettings(s) {
     // Anything absent/garbage coerces to 'hybrid'. 'hybrid'/'tool-only' DROP the blocking Agent 1
     // LLM call from the reply-critical path (the latency win); 'push' restores it.
     if (s.memoryMode !== 'push' && s.memoryMode !== 'tool-only' && s.memoryMode !== 'hybrid') s.memoryMode = 'hybrid';
-    if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
+    if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = true; // matches DEFAULT_SETTINGS (tool-first flip)
     // Temporal grounding defaults ON (free, deterministic): absent/invalid => true (back-compat).
     if (typeof s.temporalGrounding !== 'boolean') s.temporalGrounding = true;
     // B3 safe slice — default OFF (absent/garbage => false = unchanged behavior).
@@ -571,7 +531,9 @@ function validateSettings(s) {
     // a renamed preset) coerces to 'custom' so the dropdown falls back safely. The actual knob
     // values are NOT touched here — detectPreset()/applyPreset() own that; this only guards the id.
     if (!PRESET_IDS.has(s.uiPreset)) s.uiPreset = 'custom';
-    if (typeof s.finderPrompt !== 'string')      s.finderPrompt = '';
+    // First-run onboarding: absent/garbage => false, so existing installs see the wizard exactly
+    // once (finish or skip flips it true; it never auto-shows again).
+    if (typeof s.onboardingDone !== 'boolean') s.onboardingDone = false;
     if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
     if (typeof s.writerFormat !== 'string')      s.writerFormat = '';
@@ -1005,7 +967,12 @@ export function addDebugLog(type, message, opts = {}) {
     renderDebugLog();
     // Tool-first redesign: refresh the "What Claude did" panel on tool-call events so memory
     // recalls/writes appear live. Cheap (scans the small ring buffer); guarded inside.
-    if (entry.event === 'tool.search_memory' || entry.event === 'tool.remember_fact') renderToolActivity();
+    // Each such event is ONE tool invocation → also fold its estimated re-billed prompt
+    // round-trip into the run/session token records (addToolLoopTokens).
+    if (entry.event === 'tool.search_memory' || entry.event === 'tool.remember_fact') {
+        addToolLoopTokens();
+        renderToolActivity();
+    }
 
     if (extensionSettings?.debugMode) {
         const tag = level.toUpperCase();
@@ -1049,6 +1016,11 @@ function renderToolActivity() {
         (e.event === 'tool.search_memory' ? g.search : g.write).push(e);
     }
     const turns = [...groups.values()].slice(0, 12); // most recent 12 turns
+    // Per-call token ESTIMATE: each tool call re-bills the whole prompt as an extra round-trip,
+    // priced at the LAST measured main-model prompt input (see addToolLoopTokens). One current
+    // figure is applied to every listed turn — older turns had a different prompt size, so their
+    // line is an approximation (0 → estimate hidden when no run has measured input yet).
+    const perCall = Number(lastRunTokens?.actualInput) || Number(lastRunTokens?.baselineInput) || 0;
     let totalSearch = 0, totalWrite = 0;
     const html = turns.map(g => {
         const n = g.search.length + g.write.length;
@@ -1066,11 +1038,13 @@ function renderToolActivity() {
         }
         return `<details class="bf-mem-tool-turn" open>`
             + `<summary>Turn <code>${esc(g.rid)}</code> — ${g.search.length} recall, ${g.write.length} pin`
+            + (perCall ? ` <span class="bf-mem-dim" title="Estimated re-billed prompt tokens: ${n} call(s) × last measured prompt input (${fmt(perCall)}). Each tool call re-sends the whole prompt as an extra round-trip.">· ~${fmt(n * perCall)} tok</span>` : '')
             + (hot ? ` <span class="bf-mem-tool-warn" title="High tool-call count this turn — possible runaway loop">⚠ ${n} calls</span>` : '')
             + `</summary>${rows.join('')}</details>`;
     }).join('');
     el.innerHTML = html;
-    if (summaryEl) summaryEl.textContent = `${turns.length} turn(s) · ${totalSearch} recall, ${totalWrite} pin`;
+    if (summaryEl) summaryEl.textContent = `${turns.length} turn(s) · ${totalSearch} recall, ${totalWrite} pin`
+        + (perCall ? ` · ~${fmt((totalSearch + totalWrite) * perCall)} tok est.` : '');
 }
 
 /**
@@ -1604,7 +1578,7 @@ function loadTokensFromMeta() {
             const inherited = !!currentChatId && owner !== null && owner !== currentChatId;
             if (inherited) {
                 lastRunTokens = null;
-                sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+                sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
                 addDebugLog('info', `Tokens reset for inherited/branch chat ${currentChatId} (record owned by ${owner})`, {
                     subsystem: 'settings', event: 'tokens.reset', actor: 'SYSTEM', reason: 'BRANCH_INHERITED',
                     data: { chatId: currentChatId, ownerChatId: owner, isBranch: isBranchChat(currentChatId) },
@@ -1616,7 +1590,7 @@ function loadTokensFromMeta() {
             lastRunTokens = (stored.lastRun && typeof stored.lastRun === 'object') ? stored.lastRun : null;
             sessionTokens = (stored.session && typeof stored.session === 'object')
                 ? stored.session
-                : { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+                : { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
         }
     } catch { /* ignore */ }
 }
@@ -1700,6 +1674,32 @@ export function addReflectionTokens({ reflectionInput = 0, reflectionOutput = 0 
     renderTokens();
 }
 
+// Called from addDebugLog whenever the main model actually invokes a memory tool
+// (search_memory recall / remember_fact pin) during generation.
+//
+// ESTIMATE ONLY — SillyTavern's tool-calling loop does not expose per-round token usage, but
+// each tool call makes ST re-send the ENTIRE prompt (plus the growing tool transcript) as one
+// extra billed round-trip. We price each call at this turn's measured main-model prompt input
+// (actualInput, falling back to baselineInput), which slightly UNDER-estimates: later rounds
+// also carry the earlier tool calls/results.
+//
+// ORDERING/ATTRIBUTION: the run's token record is created at prompt-ready (setRunTokens),
+// BEFORE the main generation starts; tool calls fire DURING that generation — so every tool
+// event lands on the CURRENT lastRunTokens. This is the same post-hoc stamping pattern
+// addAgent3Tokens / setMainOutputTokens use for their after-the-fact figures.
+function addToolLoopTokens() {
+    const perCall = Number(lastRunTokens?.actualInput) || Number(lastRunTokens?.baselineInput) || 0;
+    if (lastRunTokens) {
+        lastRunTokens.toolCalls = (Number(lastRunTokens.toolCalls) || 0) + 1;
+        lastRunTokens.toolLoopIn = (Number(lastRunTokens.toolLoopIn) || 0) + perCall;
+    }
+    // Guarded += so a session record persisted before this field existed can't go NaN.
+    sessionTokens.toolCalls = (Number(sessionTokens.toolCalls) || 0) + 1;
+    sessionTokens.toolLoopIn = (Number(sessionTokens.toolLoopIn) || 0) + perCall;
+    saveTokensToMeta();
+    renderTokens();
+}
+
 // Called by pipeline.js MESSAGE_RECEIVED handler when the main reply lands.
 export function setMainOutputTokens(n) {
     const out = Number(n) || 0;
@@ -1711,7 +1711,7 @@ export function setMainOutputTokens(n) {
 
 export function reloadTokensFromChat() {
     lastRunTokens = null;
-    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
     loadTokensFromMeta();
     renderTokens();
 }
@@ -2202,10 +2202,13 @@ function renderTokens() {
 
     const L = lastRunTokens;
     // Extension total now includes ALL four pipeline agents that make LLM calls:
-    // Drafter (agent1), Scribe (agent3), Librarian/finder (Agent 4) and the Reflection pass.
+    // Drafter (agent1), Scribe (agent3), Librarian/finder (Agent 4) and the Reflection pass —
+    // PLUS the estimated Writer tool-loop round-trips (each search_memory / remember_fact call
+    // re-bills the whole prompt; see addToolLoopTokens), so the NET row reflects them.
     const fIn = L.finderInput || 0, fOut = L.finderOutput || 0;
     const rIn = L.reflectionInput || 0, rOut = L.reflectionOutput || 0;
-    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0) + fIn + rIn;
+    const tIn = L.toolLoopIn || 0, tCalls = L.toolCalls || 0;
+    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0) + fIn + rIn + tIn;
     const extOut = (L.mainOutput || 0) + (L.agent1Output || 0) + (L.agent3Output || 0) + fOut + rOut;
     const netIn = extIn - (L.baselineInput || 0);   // negative = saved
     const netOut = extOut - (L.mainOutput || 0);     // agent output overhead (always >= 0)
@@ -2222,6 +2225,11 @@ function renderTokens() {
     const netInClass = netIn < 0 ? 'bf-mem-tok-save' : 'bf-mem-tok-bad';
     const netInStr = (netIn < 0 ? '' : '+') + fmt(netIn);
 
+    // Fixed per-request cost of the ENABLED Writer tool schemas (rough JSON-length/4 estimate;
+    // 0 when both tools are off). Shown as a one-liner so the always-on overhead is visible.
+    let schemaTok = 0;
+    try { schemaTok = estimateToolSchemaTokens(); } catch { /* estimator unavailable — hide the line */ }
+
     lastEl.innerHTML = `
         <table class="bf-mem-db-table">
             <thead><tr><th></th><th>Input</th><th>Output</th></tr></thead>
@@ -2232,15 +2240,20 @@ function renderTokens() {
                 ${(fIn || fOut) ? `<tr><td>— Librarian (finder)</td><td>${fmt(fIn)}</td><td>${fmt(fOut)}</td></tr>` : ''}
                 <tr><td>— Scribe</td><td>${fmt(L.agent3Input)}</td><td>${fmt(L.agent3Output)}</td></tr>
                 <tr><td>— Reflection</td><td>${fmt(rIn)}</td><td>${fmt(rOut)}</td></tr>
+                ${(tCalls || tIn) ? `<tr><td title="Each search_memory / remember_fact call makes SillyTavern re-send the whole prompt as an extra billed round-trip. Estimated as calls × this turn's measured prompt input (ST doesn't expose per-round usage).">— Tool round-trips (est., ${tCalls} call${tCalls === 1 ? '' : 's'})</td><td>~${fmt(tIn)}</td><td>—</td></tr>` : ''}
                 <tr><td><b>Extension total</b></td><td><b>${fmt(extIn)}</b></td><td><b>${fmt(extOut)}</b></td></tr>
                 <tr><td><b>NET vs baseline</b></td><td class="${netInClass}">${netInStr}</td><td class="bf-mem-tok-cost">+${fmt(netOut)}</td></tr>
             </tbody>
         </table>
+        ${schemaTok ? `<small class="bf-mem-hint" title="Fixed overhead billed on EVERY main-model request while the tools are enabled: each request carries the tool descriptions + parameter schemas. Approximated as JSON length ÷ 4.">Tool schemas (per request): ~${fmt(schemaTok)} tokens</small><br>` : ''}
         <small class="bf-mem-hint">Approx. token counts (local tokenizer). Negative input = saved; output overhead is the agent calls.</small>`;
 
     if (sessEl) {
         const s = sessionTokens;
-        const sExtIn = (s.actualInput || 0) + (s.agentInput || 0);
+        // Session NET includes the estimated tool-loop round-trips too (same reasoning as the
+        // last-run table above).
+        const sToolIn = s.toolLoopIn || 0, sToolCalls = s.toolCalls || 0;
+        const sExtIn = (s.actualInput || 0) + (s.agentInput || 0) + sToolIn;
         const sExtOut = (s.mainOutput || 0) + (s.agentOutput || 0);
         const sNetIn = sExtIn - (s.baselineInput || 0);
         const sNetClass = sNetIn < 0 ? 'bf-mem-tok-save' : 'bf-mem-tok-bad';
@@ -2249,6 +2262,7 @@ function renderTokens() {
                 <thead><tr><th>${s.runs} run(s)</th><th>Input</th><th>Output</th></tr></thead>
                 <tbody>
                     <tr><td>Baseline total</td><td>${fmt(s.baselineInput)}</td><td>${fmt(s.mainOutput)}</td></tr>
+                    ${(sToolCalls || sToolIn) ? `<tr><td title="Each search_memory / remember_fact call re-bills the whole prompt as an extra round-trip (estimated).">Tool round-trips (est., ${sToolCalls} call${sToolCalls === 1 ? '' : 's'})</td><td>~${fmt(sToolIn)}</td><td>—</td></tr>` : ''}
                     <tr><td>Extension total</td><td>${fmt(sExtIn)}</td><td>${fmt(sExtOut)}</td></tr>
                     <tr><td><b>NET</b></td><td class="${sNetClass}">${(sNetIn < 0 ? '' : '+') + fmt(sNetIn)}</td><td class="bf-mem-tok-cost">+${fmt(sExtOut - (s.mainOutput || 0))}</td></tr>
                 </tbody>
@@ -2292,8 +2306,7 @@ export function exportLogsJSON() {
 function reloadProfiles() {
     const agent1Select = document.getElementById('bf_mem_agent1_profile');
     const agent3Select = document.getElementById('bf_mem_agent3_profile');
-    const agent4Select = document.getElementById('bf_mem_agent4_profile');
-    if (!agent1Select && !agent3Select && !agent4Select) return;
+    if (!agent1Select && !agent3Select) return;
 
     const profiles = getConnectionProfiles();
     const activeProfile = getCurrentProfileId();
@@ -2317,20 +2330,6 @@ function reloadProfiles() {
 
     populate(agent1Select, extensionSettings?.agent1Profile);
     populate(agent3Select, extensionSettings?.agent3Profile);
-    populate(agent4Select, extensionSettings?.agent4Profile);
-}
-
-/**
- * Enable/disable the embedding profile selector + "Test embedding endpoint" button to mirror the
- * Semantic-retrieval toggle: they're only meaningful when semantic is on. Idempotent + null-safe so
- * it can be called from the toggle handler and at init. Pure DOM, no behavior change to retrieval.
- */
-function syncEmbeddingControls() {
-    const on = extensionSettings?.semanticRetrieval === true;
-    for (const id of ['bf_mem_embedding_source', 'bf_mem_embedding_model', 'bf_mem_test_embedding']) {
-        const el = document.getElementById(id);
-        if (el) el.disabled = !on;
-    }
 }
 
 // --- Tabs ---
@@ -4628,9 +4627,9 @@ async function showLinkedChatsPopup() {
 // -----------------------------------------------------------------------------
 // One dropdown that maps a single choice onto the many token/retrieval knobs, so a new user
 // doesn't have to understand ~40 settings. This is ALSO the delivery vehicle for the token
-// cuts (Parts A/B): "Cheap" flips on history-trimming, drops the Finder LLM, turns on the
-// pull-on-demand recall tool, and tightens the injection caps. Everything else stays under the
-// existing per-tab controls ("Advanced").
+// cuts (Parts A/B): "Cheap" flips on history-trimming, turns on the pull-on-demand recall
+// tool, and tightens the injection caps. Everything else stays under the existing per-tab
+// controls ("Advanced").
 //
 // DESIGN: a preset only writes the keys listed in GOVERNED_KEYS — never `enabled`, never the
 // connection profiles, never prompts. Detection compares ONLY those keys, so a user's unrelated
@@ -4642,56 +4641,41 @@ const PRESET_IDS = new Set(['cheap', 'balanced', 'maxrecall', 'custom']);
 
 // The exact knobs a preset governs. Detection + apply both operate on ONLY these keys.
 const GOVERNED_KEYS = [
-    // useFinderAgent intentionally NOT governed: the Finder (Agent 4) is hard-disabled in the
-    // pipeline (wantFinder=false), so writing/comparing it via presets is a no-op that only made
-    // preset switching look like it changed retrieval. Presets now leave it untouched.
-    'semanticRetrieval', 'agent2ContextMessages',
+    'agent2ContextMessages',
     'enableSummaryPyramid', 'enableWriterRecallTool',
-    'retrievalTokenBudget', 'finderTargetFacts', 'finderAnchorsPerCharacter',
+    'retrievalTokenBudget', 'finderAnchorsPerCharacter',
     'reflectionInterval',
 ];
 
-// Preset signatures. NOTE on semanticRetrieval:true everywhere — it GRACEFULLY no-ops when no
-// embedding endpoint responds (callEmbeddingAPI returns null → keyword/trigram retrieval), so it
-// is safe to enable blind; it only helps when an embedding model is configured.
+// Preset signatures.
 const PRESETS = {
-    // CHEAP — fewest tokens: no Finder LLM (vectors/keyword retrieve), trim history so facts
-    // replace old turns, lean on the pull-on-demand recall tool + a small overview, tight caps,
-    // consolidate less often.
+    // CHEAP — fewest tokens: trim history so facts replace old turns, lean on the
+    // pull-on-demand recall tool + a small overview, tight caps, consolidate less often.
     cheap: {
-        useFinderAgent: false,
-        semanticRetrieval: false,
         agent2ContextMessages: 10,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
         retrievalTokenBudget: 300,
-        finderTargetFacts: 6,
         finderAnchorsPerCharacter: 2,
         reflectionInterval: 20,
     },
-    // BALANCED — the recommended default: Finder on for precise picks, semantic on, modest history
-    // trim, overview + recall tool on, default caps.
+    // BALANCED — the recommended default: modest history trim, overview + recall tool on,
+    // default caps.
     balanced: {
-        useFinderAgent: true,
-        semanticRetrieval: false,
         agent2ContextMessages: 10,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
         retrievalTokenBudget: 800,
-        finderTargetFacts: 12,
         finderAnchorsPerCharacter: 3,
         reflectionInterval: 12,
     },
     // MAX RECALL — quality over cost: full history (no trim), wide caps, more anchors, frequent
     // consolidation. The most expensive option.
     maxrecall: {
-        useFinderAgent: true,
-        semanticRetrieval: false,
         agent2ContextMessages: 0,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
         retrievalTokenBudget: 1600,
-        finderTargetFacts: 16,
         finderAnchorsPerCharacter: 4,
         reflectionInterval: 10,
     },
@@ -4734,18 +4718,16 @@ let _applyingPreset = false;
  * jQuery no-ops on a missing selector, so this is safe even if a control isn't in the DOM yet.
  */
 function syncPresetControls() {
-    $('#bf_mem_finder_enabled').prop('checked', extensionSettings.useFinderAgent !== false);
-    $('#bf_mem_semantic_enabled').prop('checked', extensionSettings.semanticRetrieval === true);
     $('#bf_mem_pyramid_enabled').prop('checked', extensionSettings.enableSummaryPyramid === true);
     $('#bf_mem_recall_tool_enabled').prop('checked', extensionSettings.enableWriterRecallTool === true);
     $('#bf_mem_agent2_context').val(extensionSettings.agent2ContextMessages);
     $('#bf_mem_agent2_context_val').text(extensionSettings.agent2ContextMessages);
     $('#bf_mem_reflection_interval').val(extensionSettings.reflectionInterval);
     $('#bf_mem_reflection_interval_val').text(extensionSettings.reflectionInterval);
-    // NOTE: retrievalTokenBudget / finderTargetFacts / finderAnchorsPerCharacter are governed by
-    // presets but have NO on-screen control (no slider in settings.html) — nothing to sync here.
-    // They're still written by applyPreset() and consumed by the pipeline; they simply can't be
-    // hand-edited from the UI, so they can never drift a preset to "Custom".
+    // NOTE: retrievalTokenBudget / finderAnchorsPerCharacter are governed by presets but have
+    // NO on-screen control (no slider in settings.html) — nothing to sync here. They're still
+    // written by applyPreset() and consumed by the pipeline; they simply can't be hand-edited
+    // from the UI, so they can never drift a preset to "Custom".
 }
 
 /**
@@ -4922,9 +4904,7 @@ export async function initSettings() {
         // Only the governed settings that HAVE an on-screen control are listed (the three
         // budget/target/anchor keys have no slider, so they can't be manually edited anyway).
         const governedSelector = [
-            // #bf_mem_finder_enabled removed: useFinderAgent is no longer in GOVERNED_KEYS (Finder
-            // hard-disabled), so toggling it must NOT flip the preset to Custom.
-            '#bf_mem_semantic_enabled', '#bf_mem_pyramid_enabled',
+            '#bf_mem_pyramid_enabled',
             '#bf_mem_recall_tool_enabled', '#bf_mem_agent2_context', '#bf_mem_reflection_interval',
         ].join(',');
         $('#bf_memory_settings').on('change input', governedSelector, function () {
@@ -4956,20 +4936,6 @@ export async function initSettings() {
     $('#bf_mem_refresh_profiles').on('click', () => {
         reloadProfiles();
         toastr.info('Profiles refreshed', 'BF Memory');
-    });
-
-    // Agent 4 (Fact Finder) — toggle + profile selector (Agent 2 tab / Fact Finder section).
-    // reloadProfiles() above already populated the dropdown; just bind value + change.
-    $('#bf_mem_finder_enabled').prop('checked', extensionSettings.useFinderAgent !== false).on('change', function () {
-        const before = extensionSettings.useFinderAgent !== false;
-        extensionSettings.useFinderAgent = $(this).prop('checked');
-        addDebugLog('info', `Finder agent ${extensionSettings.useFinderAgent ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'useFinderAgent' }, before, after: !!extensionSettings.useFinderAgent });
-        saveSettings();
-    });
-    $('#bf_mem_agent4_profile').val(extensionSettings.agent4Profile || '').on('change', function () {
-        extensionSettings.agent4Profile = $(this).val() || '';
-        addDebugLog('info', `Finder profile changed`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent4Profile', value: extensionSettings.agent4Profile } });
-        saveSettings();
     });
 
     // Agent 1 context slider
@@ -5388,20 +5354,6 @@ export async function initSettings() {
         toastr.info('Writer format reset', 'BF Memory');
     });
 
-    // Fact Finder (Agent 4) prompt editor + reset (Agent 2 tab).
-    $('#bf_mem_finder_prompt').val(extensionSettings.finderPrompt || DEFAULT_FINDER_PROMPT).off('input').on('input', function () {
-        const val = $(this).val();
-        extensionSettings.finderPrompt = (val === DEFAULT_FINDER_PROMPT) ? '' : val;
-        saveSettings();
-    });
-    $('#bf_mem_reset_finder_prompt').on('click', () => {
-        extensionSettings.finderPrompt = '';
-        $('#bf_mem_finder_prompt').val(DEFAULT_FINDER_PROMPT);
-        addDebugLog('info', 'Finder prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'finderPrompt', isDefault: true } });
-        saveSettings();
-        toastr.info('Librarian prompt reset', 'BF Memory');
-    });
-
     // --- Database Tab: Profiles ---
     refreshDbProfileDropdown();
 
@@ -5602,89 +5554,9 @@ export async function initSettings() {
         $('#bf_mem_run_full_chat_cancel').prop('disabled', true).text('Cancelling…');
     });
 
-    // Semantic retrieval toggle (atomic #1).
-    $('#bf_mem_semantic_enabled').prop('checked', extensionSettings.semanticRetrieval === true).on('change', function () {
-        extensionSettings.semanticRetrieval = $(this).prop('checked');
-        saveSettings();
-        if (extensionSettings.semanticRetrieval) {
-            toastr.info('Semantic retrieval on. Click "Embed all facts" to vectorize existing facts; new facts embed automatically.', 'BF Memory');
-        }
-        syncEmbeddingControls();
-    });
-
-    // Embedding source + model (ST 1.18 vector store uses these, NOT a connection profile).
-    $('#bf_mem_embedding_source').val(extensionSettings.embeddingSource || '').on('change', function () {
-        extensionSettings.embeddingSource = ($(this).val() || '').trim();
-        saveSettings();
-    });
-    $('#bf_mem_embedding_model').val(extensionSettings.embeddingModel || '').on('change', function () {
-        extensionSettings.embeddingModel = ($(this).val() || '').trim() || 'text-embedding-3-small';
-        saveSettings();
-    });
-
-    // Test embedding endpoint: structured probe with a specific success/failure reason. Read-only.
-    $('#bf_mem_test_embedding').on('click', async () => {
-        const btn = $('#bf_mem_test_embedding');
-        const out = $('#bf_mem_test_embedding_result');
-        btn.prop('disabled', true);
-        out.show().text('Testing…');
-        try {
-            // Test via the REAL mechanism on ST 1.18+: insert+query a throwaway collection through
-            // ST's server-side vector store (the /api/backends/.../embeddings routes don't exist here).
-            const { testVectorEmbedding } = await import('./st-vectors.js');
-            const r = await testVectorEmbedding();
-            if (r.ok) {
-                out.html(`<span style="color:#4caf50;">✓ Working</span> — embeddings via source <b>${escapeHtml(r.source)}</b>, model <code>${escapeHtml(r.model)}</code>.`);
-            } else {
-                out.html(`<span style="color:#f44336;">✗ Failed</span> — ${escapeHtml(r.reason)}`);
-            }
-        } catch (err) {
-            out.html(`<span style="color:#f44336;">✗ Error</span> — ${escapeHtml(err.message || String(err))}`);
-        } finally {
-            btn.prop('disabled', false);
-        }
-    });
-
-    // Enable/disable the embedding selector + test button with the semantic toggle.
-    syncEmbeddingControls();
-
-    // --- Embed all facts (atomic #16): one-shot semantic backfill of the current character's DB ---
-    $('#bf_mem_embed_all').on('click', async () => {
-        if (!extensionSettings.semanticRetrieval) {
-            toastr.info('Enable "Semantic retrieval" first, then embed.', 'BF Memory');
-            return;
-        }
-        // C6: confirm before a potentially large embedding backfill — one embedding API call per
-        // batch of facts, so a big store can mean many calls / real cost. Mirrors the rebuild confirm.
-        const okEmbed = await showConfirm('Embed all stored facts for this character now? This sends every not-yet-embedded fact to your embedding endpoint and may make many API calls.');
-        if (!okEmbed) return;
-        const btn = $('#bf_mem_embed_all');
-        const progress = $('#bf_mem_embed_all_progress');
-        btn.prop('disabled', true).text('Embedding…');
-        progress.show().text('Starting…');
-        try {
-            const { bulkEmbedAllFacts } = await import('./fact-embedding.js');
-            const result = await bulkEmbedAllFacts(({ done, total }) => {
-                progress.text(`Embedding ${done}/${total} fact(s)…`);
-            });
-            if (result.total === 0) {
-                progress.text('All facts already embedded (or none to embed).');
-                toastr.info('Nothing to embed — facts are already vectorized or the store is empty.', 'BF Memory');
-            } else {
-                progress.text(`Done: ${result.succeeded}/${result.total} embedded.`);
-                toastr.success(`Embedded ${result.succeeded}/${result.total} fact(s)`, 'BF Memory');
-            }
-        } catch (err) {
-            toastr.error(`Embed failed: ${err.message}`, 'BF Memory');
-            progress.text(`Failed: ${err.message}`);
-        } finally {
-            btn.prop('disabled', false).html('<i class="fa-solid fa-vector-square"></i> Embed all facts (semantic)');
-        }
-    });
-
     // --- Tokens Tab ---
     $('#bf_mem_tokens_reset').on('click', () => {
-        sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+        sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
         saveTokensToMeta();
         renderTokens();
     });
@@ -5953,6 +5825,19 @@ export async function initSettings() {
     // pipeline.js now persists via saveCurrentToActiveProfile(capturedDbProfile)
     // after every Agent 3 write, with capture-at-write semantics. The old
     // unprotected handler here was a residual leak path (same class as Issue #2).
+
+    // --- First-run onboarding wizard ---
+    // Shown ONCE, only after the whole UI above is bound: every wizard write routes through
+    // the live controls (.val().trigger('change')) so the existing handlers persist it.
+    // Dynamic import + guards mean a wizard failure can never break extension load.
+    try {
+        $('#bf_mem_rerun_onboarding').on('click', () => {
+            import('./onboarding.js').then(m => m.showOnboarding(true)).catch(() => { /* wizard is best-effort */ });
+        });
+        if (extensionSettings.onboardingDone !== true) {
+            import('./onboarding.js').then(m => m.maybeShowOnboarding()).catch(() => { /* wizard is best-effort */ });
+        }
+    } catch { /* onboarding must never block init */ }
 
     // --- Initial state ---
     updateStatus('idle');

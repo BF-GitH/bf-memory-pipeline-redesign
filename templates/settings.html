@@ -44,10 +44,9 @@
                 <b>How much</b> to spend on recall depth (injection budget, present-character anchors, reflection cadence). Fine-tune anything in the tabs below — that switches this to “Custom”.
             </small>
 
-            <!-- Tabs (chronological order each turn: Drafter → Librarian → Writer → Scribe) -->
+            <!-- Tabs (chronological order each turn: Drafter → Writer → Scribe) -->
             <div class="bf-mem-tabs" role="tablist">
                 <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_agent1" tabindex="0">Drafter</button>
-                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent4" tabindex="-1" style="display:none;">Librarian</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent2" tabindex="-1">Writer</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent3" tabindex="-1">Scribe</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_general" tabindex="-1">General</button>
@@ -89,7 +88,7 @@
                             <input type="checkbox" id="bf_mem_scene_enabled" />
                             <span>Inject live scene card</span>
                         </label>
-                        <small class="bf-mem-hint">Adds a short "here's what's happening right now" line to the AI before it writes — where you are, who's in the room, what everyone wants, what just happened. It keeps the AI from forgetting the current moment, and it's free (no extra AI call). E.g. <i>Location: tavern | Present: Mira, you | Goal: find the thief</i>.</small>
+                        <small class="bf-mem-hint">Adds a short "here's what's happening right now" line to the AI before it writes — where you are, who's in the room, what everyone wants, what just happened. It keeps the AI from forgetting the current moment — no extra AI call, though the line itself costs a few prompt tokens each turn. E.g. <i>Location: tavern | Present: Mira, you | Goal: find the thief</i>.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Current Scene (live)</label>
                             <div id="bf_mem_scene_view" class="bf-mem-fact-list">
@@ -138,66 +137,6 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                 </div>
             </div>
 
-            <!-- Tab: Librarian (fetches the relevant facts for the Writer) -->
-            <div id="bf_mem_tab_agent4" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header"><i class="fa-solid fa-magnifying-glass"></i> Librarian</div>
-                    <div class="bf-mem-section-body">
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="bf_mem_finder_enabled" />
-                            <span>Use the Librarian agent (STAGE 2 retrieval)</span>
-                        </label>
-                        <small class="bf-mem-hint">Adds a helper AI that double-checks which saved facts are actually worth showing the AI, instead of just keyword-matching. Better picks, but it costs one more AI call. If it's off or hits an error, the extension falls back to simple keyword matching, so nothing breaks.</small>
-                        <small class="bf-mem-hint">No setting needed here — this helper always just reads the last 2 messages plus whatever topics the planner asked for.</small>
-                        <div class="bf-mem-field" style="margin-top:8px;">
-                            <label>Librarian Profile</label>
-                            <div class="bf-mem-profile-row">
-                                <select id="bf_mem_agent4_profile" class="text_pole"></select>
-                            </div>
-                            <small class="bf-mem-hint">Which AI does this fact-picking job. Leave blank and it reuses the Drafter's AI. A cheap, fast AI is plenty for this.</small>
-                        </div>
-                    </div>
-                </div>
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-pen"></i> Librarian Prompt
-                        <button id="bf_mem_reset_finder_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
-                            <i class="fa-solid fa-undo"></i>
-                        </button>
-                    </div>
-                    <div class="bf-mem-section-body">
-                        <textarea id="bf_mem_finder_prompt" class="bf-mem-textarea" rows="10" placeholder="Librarian system prompt..."></textarea>
-                        <small class="bf-mem-hint">The instructions that tell the fact-picking helper how to choose which facts matter. Advanced — leave it alone unless you know what you're doing; the reset button restores it.</small>
-                        <details id="bf_mem_librarian_assembly" class="bf-mem-assembly">
-                            <summary>What actually gets sent (assembly order)</summary>
-                            <div class="bf-mem-assembly-body">
-                                <p>The prompt field above is only the <b>SYSTEM</b> message. At runtime a <b>USER</b> message is built from the Drafter's draft, recent chat, and the candidate facts under the picked branches. The full call looks like:</p>
-<pre><span class="bf-mem-asm-label">[SYSTEM]</span> your Librarian prompt above
-
-<span class="bf-mem-asm-label">[USER]</span>
-## Character Info
-<span class="bf-mem-asm-ph">{character card}</span>
-
-## User Persona
-<span class="bf-mem-asm-ph">{your persona}</span>
-
-## Scene Direction (draft of next reply)
-<span class="bf-mem-asm-ph">{the Drafter's #Draft}</span>
-
-## Recent Chat
-<span class="bf-mem-asm-ph">{last 2 messages}</span>
-
-## Candidate Facts (choose from these, by Category/key)
-<span class="bf-mem-asm-ph">{full facts under the Drafter's picked branches + all Unsorted, as Category/key = value}</span>
-
-Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Category/key identifiers.</pre>
-                                <p>Each <code>##</code> section is omitted if its data is empty.</p>
-                            </div>
-                        </details>
-                    </div>
-                </div>
-            </div>
-
             <!-- Tab: Writer (the main model that writes the reply) -->
             <div id="bf_mem_tab_agent2" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
                 <details class="bf-mem-eli5">
@@ -236,12 +175,12 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_recall_tool_enabled" />
                             <span>Let the Writer search memory on demand (search_memory tool)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. Lets the AI look something up in your memory itself, mid-reply, if it needs a fact it wasn't already handed — like checking a notebook. It only reads, never changes anything. Only works with AIs that can use tools (e.g. Claude). E.g. mid-scene the AI looks up "what's Mira afraid of?" on its own.</small>
+                        <small class="bf-mem-hint">On by default. Lets the AI look something up in your memory itself, mid-reply, if it needs a fact it wasn't already handed — like checking a notebook. It only reads, never changes anything — but each lookup re-sends the whole prompt as an extra billed round-trip (the Tokens tab shows the estimated cost). Only works with AIs that can use tools (e.g. Claude). E.g. mid-scene the AI looks up "what's Mira afraid of?" on its own.</small>
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_write_tool_enabled" />
                             <span>Let the Writer pin a fact on demand (remember_fact tool)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. Lets the AI jot down an important fact into memory itself, mid-reply, when something worth remembering happens. It only adds notes, never deletes them. Only works with AIs that can use tools (e.g. Claude). E.g. the AI saves "you gave Mira your ring" on its own.</small>
+                        <small class="bf-mem-hint">On by default. Lets the AI jot down an important fact into memory itself, mid-reply, when something worth remembering happens. It only adds notes, never deletes them — and like the recall tool, each pin costs an extra prompt round-trip. Only works with AIs that can use tools (e.g. Claude). E.g. the AI saves "you gave Mira your ring" on its own.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -251,7 +190,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_pyramid_enabled" />
                             <span>Inject a Big Picture overview (story + relevant shelf summaries)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. Gives the AI a short "story so far" recap plus quick summaries of the topics in play, instead of dumping hundreds of separate facts — a bird's-eye view. It stays small so it won't cost much, and the AI can still dig into details when it needs to. E.g. "Chapter so far: you and Mira escaped the city and are now hiding in the woods."</small>
+                        <small class="bf-mem-hint">On by default. Gives the AI a short "story so far" recap plus quick summaries of the topics in play, instead of dumping hundreds of separate facts — a bird's-eye view. It stays small so it won't cost much, and the AI can still dig into details when it needs to. E.g. "Chapter so far: you and Mira escaped the city and are now hiding in the woods."</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -381,7 +320,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
 [Scene] Location: … | Present: … | Goal: … | Recently: …   <span class="bf-mem-asm-ph">(scene card, only if enabled)</span>
 
 <span class="bf-mem-asm-ph">{your Writer Injection Format template above, with:}</span>
-  {facts}  → <span class="bf-mem-asm-ph">the deterministic/semantic retrieval's chosen facts</span>
+  {facts}  → <span class="bf-mem-asm-ph">the deterministic retrieval's chosen facts</span>
   {draft}  → <span class="bf-mem-asm-ph">the Drafter's #Draft (scene direction)</span></pre>
                             </div>
                         </details>
@@ -454,14 +393,14 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                     <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context &amp; Review</div>
                     <div class="bf-mem-section-body">
                         <div class="bf-mem-field">
-                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">2</span></label>
-                            <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="2" />
-                            <small class="bf-mem-hint">How many recent messages the note-taker reads when saving facts. <b>2</b> = your last message and the AI's reply. Higher catches more but costs a little more. E.g. 2 is fine for most chats.</small>
+                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">5</span></label>
+                            <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="5" />
+                            <small class="bf-mem-hint">How many recent messages the note-taker reads when saving facts. <b>5</b> is the default — enough to catch multi-message beats. Higher catches more but costs a little more. Lower it to 2 to save a little on cost.</small>
                         </div>
                         <div class="bf-mem-field">
                             <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
-                            <input type="range" id="bf_mem_review_interval" min="3" max="100" step="1" value="10" />
-                            <small class="bf-mem-hint">How often a pop-up lets you check and fix the facts the note-taker saved. E.g. 10 means a review window every 10 messages. Higher = fewer interruptions.</small>
+                            <input type="range" id="bf_mem_review_interval" min="0" max="100" step="1" value="10" />
+                            <small class="bf-mem-hint">How often a pop-up shows the facts the note-taker <b>already saved</b>, so you can edit or delete any that are wrong. E.g. 10 means a check-in every 10 messages. Higher = fewer interruptions. <b>0 = never show</b> the pop-up.</small>
                         </div>
                     </div>
                 </div>
@@ -559,6 +498,12 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <input type="checkbox" id="bf_mem_toast" />
                             <span>Show toast notifications</span>
                         </label>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <button type="button" id="bf_mem_rerun_onboarding" class="menu_button">
+                                <i class="fa-solid fa-graduation-cap"></i> Re-run setup guide
+                            </button>
+                            <small class="bf-mem-hint">Reopens the short first-run walkthrough (memory mode, cost preset, note-taker model). It only changes what you actively pick in it.</small>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -628,42 +573,6 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             </button>
                         </div>
                         <div id="bf_mem_full_chat_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
-                        <!-- Embeddings / semantic-retrieval UI is intentionally HIDDEN: the tool-first
-                             design uses Claude's search_memory as the semantic layer, not vectors. The
-                             controls stay in the DOM (so bindings don't error) but are not shown or
-                             selectable, and semanticRetrieval defaults false — so it can't be enabled
-                             from settings. The vector code remains in the repo, dormant. -->
-                        <div class="bf-mem-embedding-hidden" style="display:none;" aria-hidden="true">
-                        <label class="checkbox_label" style="margin-top:10px;" title="Match facts by MEANING (embeddings), not just keywords/graph. Requires a working embedding endpoint; no-ops safely if none is found.">
-                            <input type="checkbox" id="bf_mem_semantic_enabled" />
-                            <span>Semantic retrieval (embeddings) — experimental, off by default</span>
-                        </label>
-                        <div class="bf-mem-db-actions" style="margin-top:6px;">
-                            <button id="bf_mem_embed_all" class="menu_button" title="Vectorize all stored facts for semantic retrieval (requires Semantic retrieval enabled + a working embedding endpoint)">
-                                <i class="fa-solid fa-vector-square"></i> Embed all facts (semantic)
-                            </button>
-                        </div>
-                        <div id="bf_mem_embed_all_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
-                        <!-- Embedding provider: on ST 1.18 embeddings go through ST's vector store
-                             (/api/vector/*), which embeds with a SOURCE + MODEL — not a connection
-                             profile. Leave source blank to auto-derive from your active chat provider. -->
-                        <div class="bf-mem-field" style="margin-top:10px;">
-                            <label for="bf_mem_embedding_source">Embedding source</label>
-                            <input type="text" id="bf_mem_embedding_source" class="text_pole" style="width:100%;" placeholder="auto (from your chat provider, e.g. openrouter)" />
-                            <small class="bf-mem-hint">SillyTavern vector source for embeddings. Blank = auto-detect from your active chat connection (e.g. <code>openrouter</code>, <code>openai</code>). Override only if your embeddings live elsewhere.</small>
-                        </div>
-                        <div class="bf-mem-field" style="margin-top:8px;">
-                            <label for="bf_mem_embedding_model">Embedding model</label>
-                            <input type="text" id="bf_mem_embedding_model" class="text_pole" style="width:100%;" placeholder="text-embedding-3-small" />
-                            <small class="bf-mem-hint">Embedding model name. For OpenRouter the <code>openai/</code> prefix is added automatically (so <code>text-embedding-3-small</code> works). Click Test to confirm.</small>
-                        </div>
-                        <div class="bf-mem-db-actions" style="margin-top:6px;">
-                            <button id="bf_mem_test_embedding" class="menu_button" title="Send a tiny probe to the selected embedding endpoint and report whether it works + the vector size.">
-                                <i class="fa-solid fa-plug-circle-check"></i> Test embedding endpoint
-                            </button>
-                        </div>
-                        <div id="bf_mem_test_embedding_result" class="bf-mem-hint" style="display:none;margin-top:6px;"></div>
-                        </div><!-- /.bf-mem-embedding-hidden -->
                     </div>
                 </div>
 

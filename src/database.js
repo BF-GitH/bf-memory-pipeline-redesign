@@ -63,8 +63,8 @@ const USE_BONUS_WEIGHT = 0.06;
 const USE_BONUS_CAP = 0.20;
 
 // COLD penalty (salienceScore). A cold-tiered fact is deprioritized overflow: it must sort
-// BELOW every hot ACTIVE fact when bounding a candidate set (scopedScribeCandidates,
-// capFinderCandidates) so a cold fact only occupies a capped slot when no hot fact contends
+// BELOW every hot ACTIVE fact when bounding a candidate set (scopedScribeCandidates)
+// so a cold fact only occupies a capped slot when no hot fact contends
 // for it — while still ranking cold facts against EACH OTHER by their own salience, and still
 // sorting ABOVE fully-superseded (active===false) history, which carries the ~ -1 floor.
 // Hot-active scores live in [~0.13, ~1.05]. We compress a cold fact's raw blend into the band
@@ -72,16 +72,6 @@ const USE_BONUS_CAP = 0.20;
 // the hot floor, COLD_SPAN keeps the whole cold set above the superseded floor.
 const COLD_BASE = -0.10;  // cold ceiling: just below the minimum hot-active score (~0.13)
 const COLD_SPAN = 0.80;   // cold facts occupy (COLD_BASE - COLD_SPAN, COLD_BASE) ⊂ (-0.9, -0.1)
-
-// FINDER CANDIDATE CAP (latency fix). The Stage-2 finder's INPUT — the candidate facts rendered
-// into its prompt — was unbounded: a whole-category branch pick admitted EVERY active fact in
-// that category, INCLUDING cold-tiered ones. With "infinite facts / never delete", a heavy
-// category grows without bound and the finder prompt (hence the finder LLM latency) grows with
-// it. We cap the candidate set to the top-N by retrieval salience and EXCLUDE cold facts, so the
-// finder prompt stays bounded no matter how large the store grows. Cold facts can still surface
-// via direct keyword/subject match elsewhere; they just don't bloat the finder prompt. The
-// finder OUTPUT cap (maxFacts=24) was always there — this caps the INPUT.
-const FINDER_CANDIDATE_CAP = 50;
 
 /**
  * Bounded, log-scaled frequency bonus from a fact's useCount, shared by both salience
@@ -988,8 +978,8 @@ function factValuesEqual(a, b) {
  * traits survive even when old, while transient states/events fade fast.
  *
  * `penalizeCold`: when true, an already-cold fact is sunk below every hot ACTIVE fact (see
- * COLD_BASE/COLD_SPAN) so the candidate-bounding callers (scopedScribeCandidates /
- * capFinderCandidates) only admit a cold fact when no hot fact contends for the slot. It
+ * COLD_BASE/COLD_SPAN) so the candidate-bounding caller (scopedScribeCandidates)
+ * only admits a cold fact when no hot fact contends for the slot. It
  * defaults to FALSE so the cold-tiering ranker (coldTierOverflow) keeps ranking by INTRINSIC
  * salience — otherwise an already-cold fact could never climb back into the hot set, breaking
  * resurrection (coldTierOverflow keepHot / COLD_REACTIVATED).
@@ -1021,8 +1011,8 @@ function salienceScore(fact, now, penalizeCold = false) {
     const raw = IMPORTANCE_WEIGHT * (importance / 5) + RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
     // COLD penalty (candidate-bounding only — see penalizeCold doc): a cold-tiered (overflow) fact
     // must sort BELOW every hot ACTIVE fact yet keep its own importance/recency order and stay ABOVE
-    // superseded history. We map its raw blend (in [0, ~1.05]) into the (-0.9, -0.1) band so the two
-    // callers that bound candidate sets (scopedScribeCandidates / capFinderCandidates) only admit a
+    // superseded history. We map its raw blend (in [0, ~1.05]) into the (-0.9, -0.1) band so the
+    // caller that bounds candidate sets (scopedScribeCandidates) only admits a
     // cold fact when no hot fact contends for the slot — making real the "cold facts sort last"
     // claim those comments assert. (raw / 1.05 normalizes to [0,1] before the band map.)
     if (penalizeCold && fact && fact.cold === true) {
@@ -2223,49 +2213,6 @@ export function scopedScribeCandidates(index, subjects, keywords, cap = 60) {
 }
 
 /**
- * Bound the Stage-2 FINDER candidate INPUT (latency fix). Given the raw candidate list a branch
- * pick produced, (1) EXCLUDE cold-tiered facts — they would bloat the finder prompt with
- * deprioritized overflow and can still surface via direct match elsewhere — and (2) cap to the
- * top-N HOT facts by retrieval salience (importance + recency + use bonus). Keeps the finder
- * prompt bounded regardless of how large the store grows under "infinite facts". Returns the
- * (possibly capped) list and logs `finder.candidate_cap` when it actually trimmed.
- * @param {Array<{fact: Object, category: string}>} candidates - raw candidates (post-focus/links)
- * @param {number} [cap=FINDER_CANDIDATE_CAP] - max candidates to send to the finder
- * @returns {{candidates: Array<{fact: Object, category: string}>, total: number, hot: number, capped: boolean}}
- */
-export function capFinderCandidates(candidates, cap = FINDER_CANDIDATE_CAP) {
-    const all = Array.isArray(candidates) ? candidates : [];
-    // INCLUDE cold facts in the candidate set. We used to hard-filter them here with the rationale
-    // that they "can still surface via direct match" — but that escape hatch only exists on the
-    // DETERMINISTIC retrieval path (retrieveFacts/searchFactsIndexed), which does NOT run when the
-    // Finder succeeds (the default path). So excluding cold here made every cold-tiered fact
-    // INVISIBLE to the Writer in any chat where it had overflowed the hot set — a durable, stored
-    // fact the model would then deny. We now keep cold facts as candidates and rely purely on the
-    // salience cap to bound the list: salienceScore applies a COLD penalty (see COLD_BASE/COLD_SPAN)
-    // that sorts cold facts below every hot fact, so they only occupy a capped slot when no hot fact
-    // contends for it.
-    const hotCount = all.reduce((n, { fact }) => n + (isHotFact(fact) ? 1 : 0), 0);
-    let out = all;
-    let capped = false;
-    if (all.length > cap) {
-        const now = Date.now();
-        out = all
-            .slice()
-            .sort((a, b) => salienceScore(b.fact, now, true) - salienceScore(a.fact, now, true))
-            .slice(0, cap);
-        capped = true;
-    }
-    if (capped) {
-        const coldKept = out.reduce((n, { fact }) => n + (isHotFact(fact) ? 0 : 1), 0);
-        addDebugLog('info', `Finder candidate cap: ${all.length} -> ${out.length} (over-cap dropped ${all.length - out.length}; ${coldKept} cold kept)`, {
-            subsystem: 'finder', event: 'finder.candidate_cap', reason: 'CAP',
-            data: { total: all.length, overCapDropped: all.length - out.length, kept: out.length, coldKept, cap },
-        });
-    }
-    return { candidates: out, total: all.length, hot: hotCount, capped };
-}
-
-/**
  * Uncached loader (HYBRID orchestrator). Decides where the authoritative working copy lives and
  * returns the SAME { category -> DatabaseSchema } map shape callers already expect. Split out of
  * getAllDatabases() so the per-turn cache wrapper above can memoize it.
@@ -2289,6 +2236,15 @@ export function capFinderCandidates(candidates, cap = FINDER_CANDIDATE_CAP) {
  */
 async function loadAllDatabases(avatar) {
     if (!avatar) return {};
+
+    // LEGACY HYGIENE: strip pre-v0.31 inline `fact.embedding` vectors (10-30KB/fact) from a
+    // loaded map — nothing reads them, they just bloat every snapshot/save.
+    const stripLegacyEmbeddings = (map) => {
+        for (const db of Object.values(map || {})) {
+            for (const fact of (db?.facts || [])) delete fact.embedding;
+        }
+        return map;
+    };
 
     // FALLBACK PATH: no usable IDB → original attachment-only behavior, unchanged.
     if (!idbAvailable()) {
@@ -2364,7 +2320,7 @@ async function loadAllDatabases(avatar) {
                         categoriesAfter: countCats(attachMap), factsAfter,
                     },
                 });
-                return rec.databases; // keep the richer live working store; do NOT clobber
+                return stripLegacyEmbeddings(rec.databases); // keep the richer live working store; do NOT clobber
             }
             await idbPutDatabases(avatar, attachMap, attachStamp);
             addDebugLog('info', 'Rehydrated IndexedDB from newer attachment snapshot', {
@@ -2382,7 +2338,7 @@ async function loadAllDatabases(avatar) {
 
         // CASE C — IDB is authoritative (present and >= snapshot, or attachments empty). Serve IDB;
         // a genuinely empty store returns {} (skeleton is layered on by callers via withSkeleton).
-        if (idbHasData) return rec.databases;
+        if (idbHasData) return stripLegacyEmbeddings(rec.databases);
         return {};
     } catch (e) {
         // ANY IDB failure → transparent fallback to the original attachment-only loader.
@@ -2467,6 +2423,7 @@ async function loadAllDatabasesFromAttachments(avatar) {
                 // History into Events, etc. — so existing chats keep working without a
                 // migration write. New-category DBs map to themselves (no-op).
                 for (const fact of (db.facts || [])) {
+                    delete fact.embedding; // legacy pre-v0.31 inline vectors (10-30KB/fact); nothing reads them
                     const target = mapLegacyCategory(db.category, fact);
                     // Stamp the per-fact category so deriveScope/aspect and the menu read the
                     // resolved Layer-1 home (the fact may diverge from the file's category when
@@ -2681,7 +2638,15 @@ async function saveDatabaseToAttachment(avatar, db) {
 
     const attachments = extensionSettings.character_attachments[avatar];
 
-    // Remove existing attachment with same name
+    // Upload the replacement FIRST; only remove the old file once the new one is safely
+    // stored. Deleting before a failed upload permanently lost the category in
+    // attachment-only mode (audit F-STOR-1).
+    const { uploadFileAttachment } = await import('../../../../chats.js');
+    const uniqueName = `${Date.now()}_${fileName}`;
+    const fileUrl = await uploadFileAttachment(uniqueName, base64Data);
+    if (!fileUrl) throw new Error('Upload failed');
+
+    // Remove the superseded attachment with the same name (the new file is durable now)
     const existingIdx = attachments.findIndex(a => a.name === fileName);
     if (existingIdx >= 0) {
         try {
@@ -2689,12 +2654,6 @@ async function saveDatabaseToAttachment(avatar, db) {
         } catch { /* ignore */ }
         attachments.splice(existingIdx, 1);
     }
-
-    // Upload new file
-    const { uploadFileAttachment } = await import('../../../../chats.js');
-    const uniqueName = `${Date.now()}_${fileName}`;
-    const fileUrl = await uploadFileAttachment(uniqueName, base64Data);
-    if (!fileUrl) throw new Error('Upload failed');
 
     attachments.push({
         url: fileUrl,
@@ -2823,19 +2782,6 @@ function mergeProvenance(existing, incoming, now) {
  */
 export function sinceIso(days) {
     return new Date(Date.now() - Math.max(0, days) * 86400000).toISOString();
-}
-
-/**
- * Compact human-readable provenance summary, e.g. "learned msg_12, updated msg_31 msg_45".
- * @param {FactSchema} fact
- * @returns {string}
- */
-export function getProvenanceSummary(fact) {
-    if (!fact) return '(no provenance)';
-    const genesis = fact.source || '(unknown)';
-    const updates = (fact.sourceHistory || []).map(e => e && e.src).filter(Boolean);
-    if (!updates.length) return `learned ${genesis}`;
-    return `learned ${genesis}, updated ${updates.join(' ')}`;
 }
 
 /**
@@ -3871,144 +3817,6 @@ function getCharacterNameWords() {
 }
 
 /**
- * Search across all databases for facts matching keywords
- * @param {Object<string, DatabaseSchema>} databases - All databases
- * @param {string[]} keywords - Keywords to search for
- * @returns {Array<{fact: FactSchema, category: string, tier: string}>}
- */
-export function searchFacts(databases, keywords) {
-    const MAX_PRIMARY = 8;
-    const results = [];
-    const nameWords = getCharacterNameWords();
-    const lowerKeywords = keywords.map(k => k.toLowerCase());
-
-    // Pre-process keywords: split into words, filter out char names and short words
-    const keywordWordSets = lowerKeywords.map(kw => {
-        return kw.split(/\s+/).filter(w => w.length > 3 && !nameWords.has(w));
-    }).filter(words => words.length > 0);
-
-    for (const [category, db] of Object.entries(databases)) {
-        const categoryLower = category.toLowerCase();
-
-        for (const fact of db.facts) {
-            // Supersession: skip facts whose value has been superseded so retrieval/
-            // injection surfaces only what is CURRENTLY true. History snapshots are
-            // retained on disk (and visible via the track/diary) but never injected here.
-            if (!isActiveFact(fact)) continue;
-            // Layer A (aliases): fold the fact's aliases into the keyword-match text alongside
-            // key/value/tags so an alternative name/nickname can satisfy a hit. Aliases are
-            // MATCH-ONLY — they affect search here but are NEVER shown to the writer (see
-            // formatFactsForWriter, which excludes them exactly like `context`).
-            const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
-
-            // Direct keyword match: require phrase-level relevance
-            // Single-word keywords: that word must match
-            // Multi-word keywords: at least 2 words must match (not just any one)
-            const directMatch = keywordWordSets.some(words => {
-                if (words.length === 0) return false;
-                const matchCount = words.filter(word => factText.includes(word) || categoryLower.includes(word)).length;
-                if (words.length === 1) return matchCount >= 1;
-                return matchCount >= 2; // Multi-word phrases need 2+ word hits
-            });
-
-            if (directMatch) {
-                results.push({ fact, category, tier: 'primary' });
-                continue;
-            }
-
-            // Check relationship links for secondary/tertiary matches
-            if (fact.relationships) {
-                const secondaryMatch = (fact.relationships.secondary || []).some(ref => {
-                    const refLower = ref.toLowerCase();
-                    return keywordWordSets.some(words =>
-                        words.some(word => refLower.includes(word))
-                    );
-                });
-                if (secondaryMatch) {
-                    results.push({ fact, category, tier: 'secondary' });
-                    continue;
-                }
-
-                const tertiaryMatch = (fact.relationships.tertiary || []).some(ref => {
-                    const refLower = ref.toLowerCase();
-                    return keywordWordSets.some(words =>
-                        words.some(word => refLower.includes(word))
-                    );
-                });
-                if (tertiaryMatch) {
-                    results.push({ fact, category, tier: 'tertiary' });
-                }
-            }
-        }
-    }
-
-    // Cap primary results: if too many, demote extras to secondary. COLD DEPRIORITIZATION
-    // (infinite-facts): demote COLD-tiered matches out of primary FIRST so HOT facts keep the
-    // scarce primary slots — cold facts are still kept (as secondary, bounded by MAX_SECONDARY
-    // downstream) and remain findable; they just lose ties for the top tier to hot facts.
-    const primaryResults = results.filter(r => r.tier === 'primary');
-    if (primaryResults.length > MAX_PRIMARY) {
-        let toDemote = primaryResults.length - MAX_PRIMARY;
-        // Pass 1: demote cold primary matches first (oldest iteration order among cold).
-        for (const result of results) {
-            if (toDemote <= 0) break;
-            if (result.tier === 'primary' && isColdFact(result.fact)) {
-                result.tier = 'secondary';
-                toDemote--;
-            }
-        }
-        // Pass 2: if still over cap (not enough cold to demote), demote remaining hot extras
-        // by iteration order (unchanged from the original behavior).
-        for (const result of results) {
-            if (toDemote <= 0) break;
-            if (result.tier === 'primary') {
-                result.tier = 'secondary';
-                toDemote--;
-            }
-        }
-    }
-
-    // Relationship-based expansion: facts related to primary hits get promoted
-    const primaryFacts = results.filter(r => r.tier === 'primary');
-    const alreadyFound = new Set(results.map(r => `${r.category}:${r.fact.key}`));
-
-    for (const primaryResult of primaryFacts) {
-        if (!primaryResult.fact.relationships) continue;
-        const relatedRefs = [
-            ...(primaryResult.fact.relationships.primary || []),
-            ...(primaryResult.fact.relationships.secondary || []),
-        ];
-
-        // Search remaining facts for relationship matches
-        for (const [category, db] of Object.entries(databases)) {
-            for (const fact of db.facts) {
-                if (!isActiveFact(fact)) continue; // never expand into superseded history
-                const id = `${category}:${fact.key}`;
-                if (alreadyFound.has(id)) continue;
-
-                const factIdentifiers = `${category} ${fact.key} ${(fact.tags || []).join(' ')}`.toLowerCase();
-                const matched = relatedRefs.some(ref => factIdentifiers.includes(ref.toLowerCase()));
-                if (matched) {
-                    results.push({ fact, category, tier: 'secondary' });
-                    alreadyFound.add(id);
-                }
-            }
-        }
-    }
-
-    return results;
-}
-
-/**
- * Get all database category names
- * @param {Object<string, DatabaseSchema>} databases
- * @returns {string[]}
- */
-export function getCategoryNames(databases) {
-    return Object.keys(databases);
-}
-
-/**
  * Produce a COMPACT keys-only inventory of all stored facts as `Category/key`
  * (one per line, no values) so it can be cheaply injected into Agent 1's prompt as
  * a menu of EXACT keys it can request. Values are intentionally omitted to keep the
@@ -4045,87 +3853,6 @@ function findDbByCategory(databases, category) {
         if (String(name).toLowerCase() === want) return [name, db];
     }
     return null;
-}
-
-/**
- * STAGE 1 — build the compact PLANNER MENU (Agent 1's map of the store). 3-LAYER MODEL:
- * the menu axis is CATEGORY (Layer 1) × ASPECT (Layer 2) — the CHARACTER is a deep tag,
- * NOT a branch, so a character no longer surfaces as a top-level branch (the bug this
- * model fixes). Each line lists a Layer-1 category and, under it, only its NON-EMPTY
- * Layer-2 aspects with active-fact counts. NO values — structure only — so it stays small.
- * Example line: `People: status(3), appearance(2), childhood(1)`.
- *
- * TWO-TIER MENU (granular-taxonomy redesign): with ~90 fixed labels, rendering the FULL
- * skeleton with `(0)` lines would drown the planner in mostly-empty noise (re-creating the
- * over-selection problem). So the PLANNER sees ONLY labels with ≥1 active fact — an empty
- * drawer has nothing to retrieve, so hiding it loses no recall while making every shown
- * label a real signal ("`finances(2)` means money genuinely matters for someone"). On a
- * fresh/empty DB this returns an EMPTY string — correct: there is nothing to open. The
- * FULL fixed vocab (for the NOTE-TAKER and the Database UI tab) is fullTaxonomyMenu().
- *
- * Only ACTIVE facts are counted (superseded history is never a retrieval target). Within a
- * category, populated aspects render in fixed vocab order, then any populated out-of-vocab
- * aspect by count. A category with zero active facts is omitted entirely. Deterministic
- * category ordering: L1 order first, then any custom extras.
- * @param {Object<string, DatabaseSchema>} databases
- * @returns {string} Multi-line menu (one populated category per line). '' when nothing stored.
- */
-export function summarizeMenu(databases) {
-    const dbs = withSkeleton(databases || {});
-    // Ordered list of category names: canonical Layer-1 order first, then any custom extras.
-    const present = Object.keys(dbs);
-    const ordered = [];
-    for (const c of MENU_CATEGORY_ORDER) {
-        if (present.some(p => p.toLowerCase() === c.toLowerCase())) ordered.push(c);
-    }
-    for (const c of present) {
-        if (!MENU_CATEGORY_ORDER.some(m => m.toLowerCase() === c.toLowerCase())) ordered.push(c);
-    }
-
-    const lines = [];
-    for (const cat of ordered) {
-        const found = findDbByCategory(dbs, cat);
-        if (!found) continue;
-        const [name, db] = found;
-        // Count active HOT facts per Layer-2 aspect. Cold-tiered facts (infinite-facts feature)
-        // are deprioritized: they're hidden from the PLANNER menu so the planner doesn't
-        // proactively open a drawer for low-salience overflow — but they remain fully QUERYABLE
-        // (keyword/exact/fuzzy match paths still admit them, which un-colds on re-mention), so
-        // hiding them from the menu loses no recall, it just stops them inflating the menu.
-        const counts = new Map();
-        for (const fact of (db.facts || [])) {
-            if (!isActiveFact(fact)) continue;
-            if (!isHotFact(fact)) continue;
-            const asp = deriveAspect(fact);
-            counts.set(asp, (counts.get(asp) || 0) + 1);
-        }
-        // PLANNER tier: render ONLY non-empty aspects (count > 0). Populated vocab labels in
-        // fixed order first, then any populated out-of-vocab aspect by count. Skip the whole
-        // category line when it holds nothing active.
-        const vocab = aspectVocabFor(name);
-        const parts = vocab.filter(a => (counts.get(a) || 0) > 0).map(a => `${a}(${counts.get(a)})`);
-        const extras = [...counts.keys()]
-            .filter(a => !vocab.includes(a) && counts.get(a) > 0)
-            .sort((a, b) => (counts.get(b) - counts.get(a)) || String(a).localeCompare(String(b)));
-        for (const a of extras) parts.push(`${a}(${counts.get(a)})`);
-        if (parts.length) lines.push(`${name}: ${parts.join(', ')}`);
-    }
-    return lines.join('\n');
-}
-
-/**
- * FULL-vocab view of the taxonomy: every Layer-1 category and ALL its Layer-2 leaf labels, in
- * fixed order, regardless of what's stored. FLAT (one category per line) for back-compat — the
- * nested 3-level shape is flattened via flatVocab. COMPANION to summarizeMenu's non-empty planner
- * tier; used where the FULL FLAT list is needed (the Database UI tab skeleton; any caller wanting
- * the old single-line-per-category shape). Pure / no DB needed (the vocab is a code constant).
- * Example line: `People: status, identity, name, ...`.
- * @returns {string} Multi-line full-vocab menu (one category per line). Never empty.
- */
-export function fullTaxonomyMenu() {
-    // effectiveCategories = built-in L1 + any user-added overlay categories; flatVocab merges
-    // overlay leaves per category. Empty overlay => byte-identical to the built-in-only menu.
-    return effectiveCategories().map(cat => `${cat}: ${flatVocab(cat).join(', ')}`).join('\n');
 }
 
 /**
@@ -4231,68 +3958,6 @@ export function groupedTaxonomySubAreas() {
         if (subAreas.length) lines.push(`${cat}: ${subAreas.join(', ')}`);
     }
     return lines.join('\n');
-}
-
-/**
- * STAGE 2 input — collect the FULL active facts living under the branches Agent 1 picked,
- * PLUS (always, unconditionally) every active fact in the Unsorted catch-all. 3-LAYER MODEL:
- * a branch is a `Category` (all aspects in it) or `Category/aspect` (just that Layer-2 aspect,
- * matched via deriveAspect) — the CHARACTER is a tag, never a branch, so picking a branch no
- * longer drags in every fact of a character. Matching is case-insensitive and tolerant of
- * surrounding punctuation Agent 1 may wrap a pick in. Superseded history is excluded. Returns
- * results in the same `{ fact, category }` shape retrieveFacts/formatFactsForWriter use,
- * deduped by `category:key`. Unknown/hallucinated branches simply match nothing.
- * @param {Object<string, DatabaseSchema>} databases
- * @param {string[]} branches - Agent 1's branch picks (`Category` or `Category/aspect`)
- * @returns {Array<{fact: Object, category: string}>}
- */
-export function collectBranchFacts(databases, branches) {
-    const out = [];
-    const seen = new Set();
-    const norm = (s) => String(s ?? '')
-        .trim()
-        .replace(/^[\s\-*•"'`(\[\{]+/, '')
-        .replace(/[\s.,;:"'`)\]\}]+$/, '')
-        .trim()
-        .toLowerCase();
-
-    const push = (category, fact) => {
-        if (!isActiveFact(fact)) return;
-        const id = `${category}:${fact.key}`;
-        if (seen.has(id)) return;
-        seen.add(id);
-        out.push({ fact, category });
-    };
-
-    // Parse picks into a set of wanted categories and category/aspect pairs.
-    const wantWholeCat = new Set();       // lowercased category names (all aspects)
-    const wantCatAspect = new Set();      // `category||aspect` lowercased pairs
-    for (const raw of (branches || [])) {
-        const s = String(raw ?? '');
-        const slashIdx = s.indexOf('/');
-        if (slashIdx < 0) {
-            const cat = norm(s);
-            if (cat) wantWholeCat.add(cat);
-        } else {
-            const cat = norm(s.slice(0, slashIdx));
-            const asp = norm(s.slice(slashIdx + 1));
-            if (cat && asp) wantCatAspect.add(`${cat}||${asp}`);
-            else if (cat) wantWholeCat.add(cat); // `Category/` with empty aspect -> whole category
-        }
-    }
-
-    for (const [category, db] of Object.entries(databases)) {
-        const catLower = category.toLowerCase();
-        const wholeCat = wantWholeCat.has(catLower);
-        const isUnsorted = catLower === 'unsorted'; // ALWAYS included
-        for (const fact of (db.facts || [])) {
-            if (!isActiveFact(fact)) continue;
-            if (wholeCat || isUnsorted) { push(category, fact); continue; }
-            const asp = deriveAspect(fact);
-            if (asp && wantCatAspect.has(`${catLower}||${asp}`)) push(category, fact);
-        }
-    }
-    return out;
 }
 
 /**
@@ -4515,11 +4180,11 @@ export async function deleteDebugLogFile(chatId) {
  * @property {number} lastUpdated
  * @property {string} [source] - Message reference where fact was established
  * @property {string} [context] - OPTIONAL prose note giving the situation around a fact
- *   (Feature #3). Injection-only and EXCLUDED from searchFacts() match text. Absent on
+ *   (Feature #3). Injection-only and EXCLUDED from searchFactsIndexed() match text. Absent on
  *   facts written by older versions (backward-compatible).
  * @property {string[]} [aliases] - OPTIONAL alternative names/nicknames/descriptors the
  *   fact's subject might be referred to by in a future message (Layer A of the retrieval
- *   cascade). MATCH-ONLY: folded into searchFacts() match text so a paraphrase can satisfy
+ *   cascade). MATCH-ONLY: folded into searchFactsIndexed() match text so a paraphrase can satisfy
  *   a keyword hit, but NEVER shown to the writer (excluded from formatFactsForWriter,
  *   exactly like `context`). Unioned (deduped) across re-mentions in upsertFact. Absent on
  *   facts from older versions (backward-compatible — behaves exactly like no aliases).
