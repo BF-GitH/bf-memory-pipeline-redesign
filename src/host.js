@@ -119,13 +119,28 @@ export function getUserPersonaName() {
 }
 
 /**
- * This extension's settings bag (`ctx.extensionSettings['bf-memory-pipeline']`), or null.
+ * This extension's settings key. Derived from the install FOLDER name (same derivation as
+ * settings.js's EXTENSION_NAME) because that is the key settings.js writes under — a
+ * hardcoded 'bf-memory-pipeline' here silently returned NULL for every agent module when
+ * the repo folder is named e.g. 'bf-memory-pipeline-redesign' (found in runtime testing).
+ */
+export const EXTENSION_SETTINGS_KEY = (() => {
+    try {
+        const parts = new URL(import.meta.url).pathname.split('/');
+        const srcIdx = parts.lastIndexOf('src');
+        if (srcIdx > 0) return parts[srcIdx - 1];
+    } catch { /* fallback */ }
+    return 'bf-memory-pipeline';
+})();
+
+/**
+ * This extension's settings bag (`ctx.extensionSettings[EXTENSION_SETTINGS_KEY]`), or null.
  * Mirrors the cycle-safe `getSettingsSafe()` pattern duplicated across the agent modules.
  * @returns {object|null}
  */
 export function getExtensionSettings() {
     try {
-        return rawCtx()?.extensionSettings?.['bf-memory-pipeline'] ?? null;
+        return rawCtx()?.extensionSettings?.[EXTENSION_SETTINGS_KEY] ?? null;
     } catch {
         return null;
     }
