@@ -236,12 +236,12 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_recall_tool_enabled" />
                             <span>Let the Writer search memory on demand (search_memory tool)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. Lets the AI look something up in your memory itself, mid-reply, if it needs a fact it wasn't already handed — like checking a notebook. It only reads, never changes anything. Only works with AIs that can use tools (e.g. Claude). E.g. mid-scene the AI looks up "what's Mira afraid of?" on its own.</small>
+                        <small class="bf-mem-hint">On by default. Lets the AI look something up in your memory itself, mid-reply, if it needs a fact it wasn't already handed — like checking a notebook. It only reads, never changes anything. Only works with AIs that can use tools (e.g. Claude). E.g. mid-scene the AI looks up "what's Mira afraid of?" on its own.</small>
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_write_tool_enabled" />
                             <span>Let the Writer pin a fact on demand (remember_fact tool)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. Lets the AI jot down an important fact into memory itself, mid-reply, when something worth remembering happens. It only adds notes, never deletes them. Only works with AIs that can use tools (e.g. Claude). E.g. the AI saves "you gave Mira your ring" on its own.</small>
+                        <small class="bf-mem-hint">On by default. Lets the AI jot down an important fact into memory itself, mid-reply, when something worth remembering happens. It only adds notes, never deletes them. Only works with AIs that can use tools (e.g. Claude). E.g. the AI saves "you gave Mira your ring" on its own.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -251,7 +251,7 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <input type="checkbox" id="bf_mem_pyramid_enabled" />
                             <span>Inject a Big Picture overview (story + relevant shelf summaries)</span>
                         </label>
-                        <small class="bf-mem-hint">Off by default. Gives the AI a short "story so far" recap plus quick summaries of the topics in play, instead of dumping hundreds of separate facts — a bird's-eye view. It stays small so it won't cost much, and the AI can still dig into details when it needs to. E.g. "Chapter so far: you and Mira escaped the city and are now hiding in the woods."</small>
+                        <small class="bf-mem-hint">On by default. Gives the AI a short "story so far" recap plus quick summaries of the topics in play, instead of dumping hundreds of separate facts — a bird's-eye view. It stays small so it won't cost much, and the AI can still dig into details when it needs to. E.g. "Chapter so far: you and Mira escaped the city and are now hiding in the woods."</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -454,9 +454,9 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                     <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context &amp; Review</div>
                     <div class="bf-mem-section-body">
                         <div class="bf-mem-field">
-                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">2</span></label>
-                            <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="2" />
-                            <small class="bf-mem-hint">How many recent messages the note-taker reads when saving facts. <b>2</b> = your last message and the AI's reply. Higher catches more but costs a little more. E.g. 2 is fine for most chats.</small>
+                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">5</span></label>
+                            <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="5" />
+                            <small class="bf-mem-hint">How many recent messages the note-taker reads when saving facts. <b>5</b> is the default — enough to catch multi-message beats. Higher catches more but costs a little more. Lower it to 2 to save a little on cost.</small>
                         </div>
                         <div class="bf-mem-field">
                             <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
