@@ -1555,7 +1555,12 @@ async function runMemoryExtraction() {
             },
         });
         setLastInserted(committed);
-        for (const update of memoryResult.updates) trackUpdate(update);
+        // F-UX-6: reviewInterval 0 = never show the review popup. Skip queueing entirely while
+        // disabled so pendingReviewItems can't grow unboundedly (facts are already saved above).
+        const reviewEvery = Math.floor(settings.reviewInterval ?? 10);
+        if (reviewEvery > 0) {
+            for (const update of memoryResult.updates) trackUpdate(update);
+        }
 
         // Mark the AI target + the user message (Agent 3 saw both) as processed so the
         // per-message icon / "skip already processed" / our own re-extract gate honor it.
@@ -1572,7 +1577,7 @@ async function runMemoryExtraction() {
         setWatermark(true);
 
         // Review popup (deferred), capturing the chat id so it can't pop in the wrong chat.
-        if (tickMessageCounter(settings.reviewInterval || 10)) {
+        if (reviewEvery > 0 && tickMessageCounter(reviewEvery)) {
             addDebugLog('info', `[${runId}] Review interval reached, will show popup shortly`);
             const targetChatIdForPopup = SillyTavern.getContext().chatId;
             setTimeout(async () => {
@@ -1581,7 +1586,7 @@ async function runMemoryExtraction() {
                     return;
                 }
                 await showReviewPopup(
-                    () => addDebugLog('info', 'User accepted all memory updates'),
+                    () => addDebugLog('info', 'User confirmed reviewed facts (Looks good)'),
                     async (editedItems) => {
                         // Defensive: never upsert informational contradiction items (atomic #7).
                         const writable = editedItems.filter(i => i.action !== 'conflict');

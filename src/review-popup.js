@@ -101,7 +101,7 @@ export function getPendingItems() {
 }
 
 /**
- * Clear all pending items (after user accepts)
+ * Clear all pending items (on every popup close path — the facts are already saved)
  */
 export function clearPendingItems() {
     const meta = getMeta();
@@ -150,7 +150,7 @@ export async function showReviewPopup(onAccept, onEdit) {
                 <input class="bf-mem-key" value="${escapeHtml(item.key)}" data-field="key" data-idx="${idx}" />
                 <textarea class="bf-mem-value" data-field="value" data-idx="${idx}" rows="2">${escapeHtml(item.value || '')}</textarea>
                 <span class="bf-mem-known">Known by: ${escapeHtml(knownBy)}</span>
-                <button class="bf-mem-remove-btn" data-idx="${idx}" title="Remove this update">X</button>
+                <button class="bf-mem-remove-btn" data-idx="${idx}" title="Delete this fact from memory">X</button>
             </div>`;
     };
 
@@ -179,12 +179,12 @@ export async function showReviewPopup(onAccept, onEdit) {
     const html = `
         <div class="bf-mem-review-popup">
             <h3>Memory Review (${items.length} changes)</h3>
-            <p>Review facts extracted from recent messages. Edit or remove before saving.</p>
+            <p>These facts were just saved from recent messages. Edit them here, or delete any that are wrong.</p>
             <div class="bf-mem-review-list">
                 ${listHtml}
             </div>
             <div class="bf-mem-review-actions">
-                <button id="bf_mem_accept_all" class="menu_button">Accept All</button>
+                <button id="bf_mem_accept_all" class="menu_button">Looks good</button>
                 <button id="bf_mem_save_edited" class="menu_button">Save Edited</button>
                 <button id="bf_mem_dismiss" class="menu_button">Dismiss</button>
             </div>
@@ -238,21 +238,43 @@ export async function showReviewPopup(onAccept, onEdit) {
         overlay.addEventListener('click', (e) => {
             if (e.target === overlay) {
                 cleanup();
+                clearPendingItems();
                 resetCounter();
                 resolve('dismissed');
             }
         });
 
-        // Remove item button
-        overlay.addEventListener('click', (e) => {
-            if (e.target.classList.contains('bf-mem-remove-btn')) {
-                const idx = parseInt(e.target.dataset.idx);
-                const item = overlay.querySelector(`.bf-mem-review-item[data-idx="${idx}"]`);
-                if (item) item.remove();
+        // Delete item button. Facts are ALREADY saved by the time this popup shows, so ✕ must
+        // actually remove the fact from the database — routed through the SAME removeFact +
+        // saveDatabase path the per-message fact viewer uses (message-icon.js). Conflict rows
+        // are informational only: dismissing one just removes the row.
+        overlay.addEventListener('click', async (e) => {
+            if (!e.target.classList.contains('bf-mem-remove-btn')) return;
+            const idx = parseInt(e.target.dataset.idx);
+            const row = overlay.querySelector(`.bf-mem-review-item[data-idx="${idx}"]`);
+            const original = items[idx];
+            if (original && original.action !== 'conflict') {
+                e.target.disabled = true;
+                try {
+                    const { getAllDatabases, removeFact, saveDatabase } = await import('./database.js');
+                    const dbs = await getAllDatabases();
+                    const db = dbs[original.category];
+                    if (db) { removeFact(db, original.key); await saveDatabase(db); }
+                    const { addDebugLog } = await import('./settings.js');
+                    addDebugLog('info', `Review popup: deleted ${original.category}/${original.key}`, {
+                        subsystem: 'settings', event: 'fact.deleted', actor: 'USER', data: { category: original.category, key: original.key },
+                    });
+                    if (typeof toastr !== 'undefined') toastr.success(`Deleted ${original.category}/${original.key}`, 'BF Memory', { timeOut: 2000 });
+                } catch (err) {
+                    e.target.disabled = false;
+                    if (typeof toastr !== 'undefined') toastr.error(`Delete failed: ${err.message || err}`, 'BF Memory');
+                    return; // keep the row so the user can retry
+                }
             }
+            if (row) row.remove();
         });
 
-        // Accept all
+        // "Looks good" — facts are already saved; this just confirms and closes.
         overlay.querySelector('#bf_mem_accept_all')?.addEventListener('click', () => {
             cleanup();
             clearPendingItems();
@@ -277,7 +299,8 @@ export async function showReviewPopup(onAccept, onEdit) {
                 editedItems.push({
                     ...original,
                     key: keyInput?.value || original.key,
-                    value: valueInput?.value || original.value,
+                    // NOT `|| original.value` — that made it impossible to blank a value.
+                    value: valueInput ? valueInput.value : original.value,
                 });
             });
 
@@ -288,9 +311,11 @@ export async function showReviewPopup(onAccept, onEdit) {
             resolve('edited');
         });
 
-        // Dismiss (keep items for next review)
+        // Dismiss. Also CLEARS the pending queue — the facts are already saved, and keeping
+        // items made every subsequent popup bigger (unbounded queue growth, audit F-UX-6).
         overlay.querySelector('#bf_mem_dismiss')?.addEventListener('click', () => {
             cleanup();
+            clearPendingItems();
             resetCounter();
             resolve('dismissed');
         });

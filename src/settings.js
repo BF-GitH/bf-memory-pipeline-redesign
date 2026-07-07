@@ -438,7 +438,7 @@ function validateSettings(s) {
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 10)); // garbage-fallback matches DEFAULT_SETTINGS (10), like its neighbors
     // A2/B5 frozen injection: 0 = off; clamp to a sane window so it can't freeze forever.
     s.injectionFreezeTurns = Math.floor(clamp(s.injectionFreezeTurns, 0, 20, 0));
-    s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
+    s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  0, 100, 10)); // 0 = never show the review popup (F-UX-6)
     s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 50, 3));
     s.retrievalTokenBudget = Math.floor(clamp(s.retrievalTokenBudget, 50, 8000, 800));
     s.recencyCutoffDays = Math.floor(clamp(s.recencyCutoffDays, 0, 3650, 0));

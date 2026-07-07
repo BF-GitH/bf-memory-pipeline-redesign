@@ -51,7 +51,7 @@ In **every** mode the Scribe extracts facts *after* the reply arrives (on `MESSA
 | **Retrieval token budget** (`retrievalTokenBudget`) | 800 | Hard cap (50–8000) on the injected fact block. |
 | **Writer context limit** (`agent2ContextMessages`) | 10 | How many recent messages the main model sees. **0 = full history.** Trimming lets stored facts replace old turns — the core token win. |
 | **Scribe context** (`agent3ContextMessages`) | 5 | How many recent messages the note-taker reads per extraction. |
-| **Review interval** (`reviewInterval`) | 10 | Fact-review popup every N messages (range 3–100). Higher = fewer interruptions. |
+| **Review interval** (`reviewInterval`) | 10 | Fact-review popup every N messages (0 = never show it). Higher = fewer interruptions. |
 | **Memory lookups** (`enableWriterRecallTool`) | ON | Registers the `search_memory` pull tool. Read-only; no-ops on non-tool models. |
 | **Memory notes** (`enableWriterWriteTool`) | ON | Registers the `remember_fact` pin tool. Add-only; no-ops on non-tool models. |
 
