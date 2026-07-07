@@ -15,7 +15,22 @@ import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInsert
 import { detectAndRecord, showEntityPopup, runEntityResolution } from './agent-entities.js';
 
 // Pipeline state
-let isInternalCall = false; // true when our agents are making LLM calls
+// F-ORCH-2 (overlapping internal-call windows): this used to be a single boolean
+// (`let isInternalCall = false`) set/cleared by THREE overlapping async flows —
+// runPipelineInline's Agent-1 window, runMemoryExtraction (held across the whole Scribe
+// call), and maybeRunReflection. Whichever flow finished FIRST cleared the flag out from
+// under the others; worse, a flag held by a long background extraction made a GENUINE user
+// turn hard-skip the pipeline and generate with ZERO memory injection, silently. Now a
+// REFERENCE COUNT: every flow increments on entry and decrements in its own `finally`
+// (clamped at 0 — CHAT_CHANGED force-resets to 0, so a straggling finally must not drive
+// it negative), so overlapping windows compose correctly. Read ONLY via isInternalCall().
+let internalCallDepth = 0;
+// True while ANY of our own agent flows has an LLM-call window open. NOTE: the normal agent
+// transports (CMRS / direct proxy fetch, see llm-call.js) never re-enter ST's generation
+// events at all — this guard exists for the rare generateQuietPrompt FALLBACK leg
+// (llm-call.js priority 3), which DOES run ST's full generation pipeline and would
+// otherwise recurse into us.
+const isInternalCall = () => internalCallDepth > 0;
 let chatChangedAt = 0;
 let lastTriggeredUserMsgIndex = -1;
 let lastInjection = null; // cached injection text for the FIRST generation (scene + facts + Agent-1 draft)
@@ -52,6 +67,18 @@ let idleConsolidationTimer = null;
 // path. This guard prevents two MESSAGE_RECEIVED events (e.g. a fast follow-up turn) from
 // launching overlapping extractions that race on the same DB save.
 let memoryExtractionInFlight = false;
+// F-ORCH-3 (silent memory loss): retry state for extraction attempts dropped by the busy /
+// cancelled early-returns in runMemoryExtraction. The target scan only ever finds the LAST
+// genuine AI message, so a dropped attempt was never re-tried — the exchange was permanently
+// lost. Both flags are ONE-SHOT (bounded — never a retry loop):
+//  - extractionRetryAfterBusy: armed when an attempt finds a prior extraction still committing;
+//    consumed by that in-flight run's `finally`, which re-schedules ONE settle extraction
+//    ('retry-busy'). Chained to a REAL run finishing — no timer polling, cannot spin.
+//  - cancelledRetryArmed: armed when an attempt is dropped because pipelineCancelled was set by
+//    a Stop on a LATER generation; schedules ONE timer retry ('retry-cancelled'). Reset when an
+//    extraction actually proceeds (each new drop window may retry once) and on CHAT_CHANGED.
+let extractionRetryAfterBusy = false;
+let cancelledRetryArmed = false;
 // Character registry: count successful memory-extraction runs and, every
 // characterCheckInterval, run a deterministic scan for newly-seen NAMED entities off the
 // critical path (after the post-reply extraction has committed its facts). Mirrors the
@@ -583,9 +610,17 @@ function shouldRunPipeline(data) {
         return false;
     }
 
-    // Skip our own internal LLM calls (Agent 1, Agent 3)
-    if (isInternalCall) {
-        addDebugLog('debug', 'Skipping pipeline (internal agent call)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'INTERNAL' });
+    // Skip our own internal LLM calls (Agent 1, Agent 3, reflection). KEPT as a hard skip
+    // (F-ORCH-2, deliberate choice): CHAT_COMPLETION_PROMPT_READY's payload is only
+    // { chat, dryRun } — it carries NO quiet/type marker — so our own generateQuietPrompt
+    // FALLBACK leg (llm-call.js priority 3) is indistinguishable from a genuine user turn
+    // here, and the quiet/dryRun checks below can NOT catch it. Dropping this skip would let
+    // the agents recurse off our own fallback call. The cost is softened instead: a genuine
+    // user turn arriving during a background internal window now falls through to the cached
+    // re-inject fallback in the event handlers (see initPipeline) rather than generating
+    // with zero memory injection.
+    if (isInternalCall()) {
+        addDebugLog('debug', 'Skipping pipeline (internal agent call window open)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'INTERNAL' });
         return false;
     }
 
@@ -846,7 +881,7 @@ async function runPipelineInline(data) {
 
     const agent1Start = Date.now();
     try {
-        isInternalCall = true;
+        internalCallDepth++; // F-ORCH-2: ref-counted internal window (paired with the finally below)
         const promises = [];
 
         // Agent 1: Draft + STAGE 1 menu picker (returns #Branches) — PUSH mode only. In hybrid/
@@ -882,7 +917,9 @@ async function runPipelineInline(data) {
         endRun(); // clear ambient run id on the abnormal exit
         return;
     } finally {
-        isInternalCall = false;
+        // F-ORCH-2: decrement (never assign false) — another flow may still hold the window.
+        // Clamped at 0 because CHAT_CHANGED force-resets the count mid-flight.
+        internalCallDepth = Math.max(0, internalCallDepth - 1);
     }
 
     // --- Agent 3 (memory extraction) is no longer processed here ---
@@ -1316,12 +1353,38 @@ async function runPipelineInline(data) {
  * Wrapped in try/catch: an extraction failure must NEVER break generation or the next turn.
  */
 async function runMemoryExtraction() {
-    if (memoryExtractionInFlight) return; // a prior extraction is still committing
+    if (memoryExtractionInFlight) {
+        // F-ORCH-3 (silent memory loss): returning silently here permanently dropped this
+        // exchange — the target scan only ever finds the LAST genuine AI message, so a later
+        // attempt targets a later reply and this one is never re-tried. Arm a ONE-SHOT retry
+        // chained to the in-flight run's completion: its `finally` re-schedules the settle
+        // extraction ('retry-busy') once the store is free. Never re-armed while already armed,
+        // and each arm is consumed by exactly one real run finishing — no retry loop possible.
+        if (!extractionRetryAfterBusy) {
+            extractionRetryAfterBusy = true;
+            addDebugLog('info', 'Agent 3 (post-reply): prior extraction still committing — ONE retry chained to its completion');
+        }
+        return; // a prior extraction is still committing
+    }
     const settings = getSettings();
     if (!settings || !settings.enabled) return;
-    if (isInternalCall) return; // never extract off our own agent calls
+    if (isInternalCall()) return; // never extract off our own agent calls
     if (pipelineCancelled) {
-        addDebugLog('info', 'Agent 3 (post-reply): skipped — generation was stopped/cancelled');
+        // F-ORCH-3 (same permanent-drop property — verified): a pending settle timer nearly
+        // always exists because the target reply fully LANDED (MESSAGE_RECEIVED reset
+        // pipelineCancelled at that moment), so a true flag here means the user pressed Stop on
+        // a LATER generation — yet the silent drop skipped the EARLIER, completed exchange
+        // forever. Schedule ONE timer retry: if the cancel has cleared by fire time (any next
+        // turn/MESSAGE_RECEIVED resets it) the exchange is recovered; if the user stayed
+        // stopped+idle the retry drops again WITH a log and does NOT re-arm (one-shot; reset
+        // when a run actually proceeds, and on CHAT_CHANGED).
+        if (!cancelledRetryArmed) {
+            cancelledRetryArmed = true;
+            addDebugLog('info', 'Agent 3 (post-reply): skipped — generation was stopped/cancelled; scheduling ONE retry so the completed exchange isn\'t silently dropped');
+            scheduleSettleExtraction('retry-cancelled', false);
+        } else {
+            addDebugLog('info', 'Agent 3 (post-reply): still cancelled on retry — exchange left unprocessed (no further retries)');
+        }
         return;
     }
     const ctx0 = SillyTavern.getContext();
@@ -1397,7 +1460,10 @@ async function runMemoryExtraction() {
     setWatermark(BF_MEM_IN_FLIGHT);
 
     memoryExtractionInFlight = true;
-    isInternalCall = true; // our extraction LLM call must not re-trigger the pipeline
+    // F-ORCH-3: a run is genuinely proceeding — re-open the one-shot cancelled-retry window so a
+    // FUTURE cancelled drop (a distinct event) may schedule its own single retry again.
+    cancelledRetryArmed = false;
+    internalCallDepth++; // F-ORCH-2: our extraction LLM call must not re-trigger the pipeline (paired with the finally)
     let memoryResult = null;
     // H7: track whether we got far enough that the Scribe may have written to the store. Until
     // runMemoryUpdater resolves successfully, NOTHING in this function has touched the DB, so an
@@ -1650,7 +1716,18 @@ async function runMemoryExtraction() {
         }
     } finally {
         memoryExtractionInFlight = false;
-        isInternalCall = false;
+        // F-ORCH-2: decrement (never assign false) — clamped, see the counter's declaration.
+        internalCallDepth = Math.max(0, internalCallDepth - 1);
+        // F-ORCH-3: consume a busy-drop retry chained to THIS run — an extraction attempt arrived
+        // while we were committing and would otherwise have been permanently lost. Re-schedule the
+        // settle extraction ONCE now that the store is free; every guard (bf_mem_processed /
+        // cancelled / target scan) re-evaluates at fire time, so an already-covered exchange is a
+        // cheap no-op, and runPostPasses=false because the original MESSAGE_RECEIVED path already
+        // dispatched the reflection/entity passes for its turn.
+        if (extractionRetryAfterBusy) {
+            extractionRetryAfterBusy = false;
+            scheduleSettleExtraction('retry-busy', false);
+        }
         // OBSERVABILITY: one concise post-reply timing line (debug level) for the slowness hunt.
         // Includes the Scribe prompt size + prefix-stability so a giant UNSTABLE system prompt is
         // obvious. Pure log in the finally — never alters control flow or the next turn.
@@ -1703,7 +1780,7 @@ async function maybeRunReflection() {
     reflectionPending = null;
     reflectionInFlight = true;
     successfulRunsSinceReflection = 0; // reset the cadence regardless of outcome
-    isInternalCall = true; // ensure the reflection LLM call can't re-trigger the pipeline
+    internalCallDepth++; // F-ORCH-2: the reflection LLM call can't re-trigger the pipeline (paired with the finally)
     const reflectStart = Date.now();
     try {
         updateStatus('running', 'Reflecting (consolidating memory)...');
@@ -1750,7 +1827,8 @@ async function maybeRunReflection() {
         });
     } finally {
         reflectionInFlight = false;
-        isInternalCall = false;
+        // F-ORCH-2: decrement (never assign false) — clamped, see the counter's declaration.
+        internalCallDepth = Math.max(0, internalCallDepth - 1);
         updateStatus('idle');
     }
 }
@@ -1857,7 +1935,7 @@ function tryFrozenInjection(data) {
     const cached = lastInjectionNoDraft || lastInjection;
     if (!cached) return false;                                      // nothing cached yet → full run
     if (turnsSinceFullInjection >= freeze) return false;           // window elapsed → refresh (full run)
-    if (isInternalCall || data?.dryRun) return false;              // never on our own / dry-run calls
+    if (isInternalCall() || data?.dryRun) return false;            // never on our own / dry-run calls
 
     const success = injectMemoryContext(data, cached);
     if (!success) return false;                                    // inject failed → fall through to full run
@@ -1897,7 +1975,7 @@ function tryFrozenInjectionText(data) {
     const cached = lastInjectionNoDraft || lastInjection;
     if (!cached) return false;
     if (turnsSinceFullInjection >= freeze) return false;
-    if (isInternalCall || !data || typeof data.prompt !== 'string') return false;
+    if (isInternalCall() || !data || typeof data.prompt !== 'string') return false;
 
     data.prompt = cached + '\n\n' + data.prompt;
     try {
@@ -1942,20 +2020,41 @@ export function initPipeline() {
         // which was planned for the original roll and would mis-steer a divergent re-roll.
         // Skip if pipeline just injected in this same generation cycle (double-fire guard).
         const swipeInjection = lastInjectionNoDraft || lastInjection;
-        if (swipeInjection && !isInternalCall && !data?.dryRun && !pipelineJustInjected) {
+        // F-ORCH-2 (behavioral half): the `!isInternalCall` condition was REMOVED here. A genuine
+        // user turn arriving while a background flow (post-reply extraction / reflection) holds
+        // the internal window is hard-skipped by shouldRunPipeline (unavoidable — see the gate
+        // comment there: this event's payload can't distinguish our own quiet-fallback call from
+        // a real turn), and this fallback used to refuse too — so the turn generated with ZERO
+        // memory injection, silently. Serving the CACHED block is safe for BOTH identities of
+        // the event: a genuine turn gets last turn's scene+facts (degraded, not amnesiac); our
+        // own rare generateQuietPrompt-fallback call just gains one inert context line.
+        // pipelineJustInjected still prevents double-injection within one generation cycle.
+        if (swipeInjection && !data?.dryRun && !pipelineJustInjected) {
             const settings = getSettings();
             if (!settings || !settings.enabled) return;
 
             const success = injectMemoryContext(data, swipeInjection);
             if (success) {
-                addDebugLog('info', `Swipe/regen: re-injected cached facts without stale draft (${swipeInjection.length} chars)`);
+                if (isInternalCall()) {
+                    // 'info' (not debug) on purpose: a user turn served DEGRADED during background
+                    // extraction is exactly what someone debugging memory quality must see.
+                    addDebugLog('info', `Turn during internal agent window — served CACHED memory injection (degraded: no fresh retrieval/draft; ${swipeInjection.length} chars)`, { subsystem: 'pipeline', event: 'pipeline.inject.degraded', reason: 'INTERNAL_BUSY' });
+                } else {
+                    addDebugLog('info', `Swipe/regen: re-injected cached facts without stale draft (${swipeInjection.length} chars)`);
+                }
             }
         }
     });
 
     // Handle text completion APIs (same inline blocking approach)
     eventSource.on(eventTypes.GENERATE_AFTER_DATA, async (data, dryRun) => {
-        if (dryRun || isInternalCall) return;
+        // F-ORCH-2 (behavioral half, text-completion parity): the hard `isInternalCall` early
+        // return was removed — it made a genuine user turn during a background internal window
+        // generate with ZERO memory on text-completion backends (the same silent loss as the
+        // chat-completion path above). Our own agent calls still can't run the full pipeline
+        // here (shouldRunPipeline skips INTERNAL), so an internal-window generation falls
+        // through to the cached re-inject below — degraded but not amnesiac.
+        if (dryRun) return;
         // DOUBLE-FIRE FIX: chat-completion backends (mainApi === 'openai' — OpenAI, OpenRouter,
         // Claude, etc.) emit BOTH `chat_completion_prompt_ready` AND `generate_after_data` for a
         // SINGLE generation. The chat-completion handler above already runs the full pipeline and
@@ -1986,7 +2085,13 @@ export function initPipeline() {
             if (!settings || !settings.enabled) return;
 
             data.prompt = swipeInjection + '\n\n' + data.prompt;
-            addDebugLog('info', `Swipe/regen (text): re-injected cached facts without stale draft (${swipeInjection.length} chars)`);
+            if (isInternalCall()) {
+                // F-ORCH-2: 'info' (not debug) on purpose — a user turn served DEGRADED during
+                // background extraction must be visible when debugging memory quality.
+                addDebugLog('info', `Turn during internal agent window (text) — served CACHED memory injection (degraded; ${swipeInjection.length} chars)`, { subsystem: 'pipeline', event: 'pipeline.inject.degraded', reason: 'INTERNAL_BUSY' });
+            } else {
+                addDebugLog('info', `Swipe/regen (text): re-injected cached facts without stale draft (${swipeInjection.length} chars)`);
+            }
         }
     });
 
@@ -2116,7 +2221,10 @@ export function initPipeline() {
         // (pre-switch) map; the cache is partitioned by (avatar, chatId), so a same-character switch
         // is invalidated too.
         invalidateDatabaseCache();
-        isInternalCall = false;
+        // F-ORCH-2: force-reset the internal-call ref-count — a stuck window must never outlive
+        // the chat. In-flight flows' finally blocks decrement CLAMPED at 0, so this can't go
+        // negative afterwards.
+        internalCallDepth = 0;
         lastInjection = null;
         lastInjectionNoDraft = null;
         pipelineJustInjected = false;
@@ -2125,6 +2233,10 @@ export function initPipeline() {
         turnsSinceFullInjection = 0;
         // Drop any pending swipe-settle extraction so it can't fire against the new chat.
         if (swipeSettleTimer) { clearTimeout(swipeSettleTimer); swipeSettleTimer = null; }
+        // F-ORCH-3: drop armed extraction retries too — they belong to the OLD chat's exchange
+        // and must not schedule/consume a retry against the new chat.
+        extractionRetryAfterBusy = false;
+        cancelledRetryArmed = false;
         groupSkipToastShown = false;
         chatChangedAt = Date.now();
         // Reflection cadence is per-chat: reset the counter and drop any armed pass so a

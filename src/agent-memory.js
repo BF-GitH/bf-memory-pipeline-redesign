@@ -568,7 +568,23 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
 
     // Extract #MEM section
     const memMatch = text.match(/#MEM\s*([\s\S]*?)(?=\n\s*#WHY|\n\s*#SUMMARY|$)/i);
-    if (!memMatch) return result;
+    if (!memMatch) {
+        // F-SCRIBE-1 (silent memory loss): a NON-EMPTY reply with no #MEM header used to return
+        // updates:[] with error:null — pipeline.js then committed the bf_mem_processed watermark
+        // and the exchange was NEVER re-extracted. Distinguish the LEGITIMATE no-facts shapes the
+        // prompt allows ("If nothing: just `.` immediately" — a bare `.`, optionally followed by
+        // a #WHY/#SUMMARY explanation, or a `(none)`) from genuinely unparseable output. Only the
+        // latter sets result.error, which routes the caller down its existing error path
+        // (setWatermark(false)) so the exchange retries next turn instead of being lost. (The
+        // legacy #Facts: JSON fallback, when applicable, already returned above — reaching here
+        // means it produced nothing.)
+        const remainder = text.replace(/#(?:WHY|SUMMARY)\s*[\s\S]*$/i, '').trim();
+        const legitimateEmpty = remainder === '' || remainder === '.' || /^\(none\)$/i.test(remainder);
+        if (!legitimateEmpty) {
+            result.error = 'unparseable Scribe output (missing #MEM header)';
+        }
+        return result;
+    }
 
     const memBlock = memMatch[1].trim();
 
@@ -581,13 +597,20 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
     // no canonical Layer-1 name is routed here instead of being silently mis-filed.
     const UNSORTED_CATEGORY = 'Unsorted';
 
+    // F-SCRIBE-1: count #MEM-block lines we DROP (non-'+' lines and '+' lines that fail to
+    // parse). The legitimate terminators ('.'/empty lines) are skipped BEFORE the count, so a
+    // clean no-facts block never trips this. All-dropped → error below (retry the exchange);
+    // partially dropped → warning log only (never fail a turn whose survivors already parsed).
+    let droppedLines = 0;
+
     for (const rawLine of memBlock.split('\n')) {
         // Strip leading bullets, numbering, whitespace
         let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
         if (!line || line === '.') continue;
 
-        // Must start with +
-        if (!line.startsWith('+')) continue;
+        // Must start with + — anything else inside the #MEM block is model output we are about
+        // to discard (F-SCRIBE-1: counted, no longer silently ignored).
+        if (!line.startsWith('+')) { droppedLines++; continue; }
         line = line.slice(1).trim();
 
         // Parse: Category/key = value | @KnownBy | #tags
@@ -640,7 +663,8 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
 
         // Clean key to snake_case
         key = key.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
-        if (!key) continue;
+        // F-SCRIBE-1: a '+' line whose key cleans to nothing is a failed parse — count the drop.
+        if (!key) { droppedLines++; continue; }
 
         // Split rest on | to get value, @knownBy, #tags, rel:, @src:, track:, >context
         const segments = rest.split('|').map(s => s.trim());
@@ -1034,6 +1058,24 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         // Layer A: only attach aliases when the writer provided some (keep object lean / back-compat).
         if (aliases.length) update.aliases = aliases;
         result.updates.push(update);
+    }
+
+    // F-SCRIBE-1: if the #MEM block contained lines we dropped, don't let the turn slip away
+    // silently. All-dropped (no update survived) → treat as a parse ERROR, the "#MEM present but
+    // nothing parseable" sibling of the missing-header case above, so the caller's existing error
+    // path (setWatermark(false)) retries the exchange next turn. NOTE the legitimate no-facts
+    // shapes (bare `.` / `(none)` / empty block) returned BEFORE the loop and can never reach
+    // this. Partially dropped (some updates survived) → keep the good updates and just log a
+    // warning; failing the whole turn would re-extract (and double-propose) the survivors.
+    if (droppedLines > 0) {
+        if (result.updates.length === 0) {
+            result.error = `unparseable Scribe output (#MEM present but all ${droppedLines} line(s) unparseable)`;
+        } else {
+            addDebugLog('info', `WARNING: Scribe #MEM block dropped ${droppedLines} unparseable line(s), kept ${result.updates.length} update(s) — possible partial fact loss`, {
+                subsystem: 'agent3', event: 'scribe.parse.partial_drop', reason: 'PARTIAL_DROP',
+                data: { droppedLines, kept: result.updates.length },
+            });
+        }
     }
 
     console.log(`[BFMemory] Agent 3: ${result.updates.length} updates, summary: "${result.summary.substring(0, 100)}"`);
