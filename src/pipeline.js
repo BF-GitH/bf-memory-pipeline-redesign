@@ -800,7 +800,7 @@ async function runPipelineInline(data) {
     for (let i = 0; i < recentMessages.length; i++) {
         const msg = recentMessages[i];
         const role = msg.is_user ? 'USER' : 'AI';
-        addDebugLog('info', `  [${i + 1}/${recentMessages.length}] ${role}: ${msg.mes}`);
+        addDebugLog('info', `  [${i + 1}/${recentMessages.length}] ${role}: ${String(msg.mes || '').substring(0, 120)}`);
     }
 
     showWorkingIndicator();

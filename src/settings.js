@@ -472,7 +472,7 @@ function validateSettings(s) {
     s.contextMessages = Math.floor(clamp(s.contextMessages, 1, 50, 5));
     s.agent1ContextMessages = Math.floor(clamp(s.agent1ContextMessages, 1, 50, 5));
     s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 5));
-    s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 0));
+    s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 10)); // garbage-fallback matches DEFAULT_SETTINGS (10), like its neighbors
     // A2/B5 frozen injection: 0 = off; clamp to a sane window so it can't freeze forever.
     s.injectionFreezeTurns = Math.floor(clamp(s.injectionFreezeTurns, 0, 20, 0));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
@@ -542,7 +542,7 @@ function validateSettings(s) {
     s.finderBudgetMs = Math.floor(clamp(s.finderBudgetMs, 1000, 15000, 3500));
     s.finderTargetFacts = Math.floor(clamp(s.finderTargetFacts, 0, 30, 12));
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
-    if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
+    if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = true;
     // Coercion matches the tool-first DEFAULT (true): an absent key (older saved settings) resolves
     // to ON, consistent with DEFAULT_SETTINGS, instead of contradicting it. Users who explicitly
     // saved `false` keep it (an explicit boolean passes this guard untouched).
@@ -554,7 +554,7 @@ function validateSettings(s) {
     // Anything absent/garbage coerces to 'hybrid'. 'hybrid'/'tool-only' DROP the blocking Agent 1
     // LLM call from the reply-critical path (the latency win); 'push' restores it.
     if (s.memoryMode !== 'push' && s.memoryMode !== 'tool-only' && s.memoryMode !== 'hybrid') s.memoryMode = 'hybrid';
-    if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
+    if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = true; // matches DEFAULT_SETTINGS (tool-first flip)
     // Temporal grounding defaults ON (free, deterministic): absent/invalid => true (back-compat).
     if (typeof s.temporalGrounding !== 'boolean') s.temporalGrounding = true;
     // B3 safe slice — default OFF (absent/garbage => false = unchanged behavior).

@@ -385,7 +385,7 @@ export function parseReflectResult(response) {
     let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim()).replace(/```/g, '');
 
     // #STORY ... (bounded before #SHELVES/#OBS — whichever comes first).
-    const storyMatch = text.match(/#STORY\s*([\s\S]*?)(?=\n\s*#SHELVES|\n\s*#OBS|$)/i);
+    const storyMatch = text.match(/#STORY\s*([\s\S]*?)(?=\n\s*#(?:SHELVES|OBS|CALLBACK|REEVAL)\b|$)/i);
     if (storyMatch) {
         let s = storyMatch[1].trim();
         // The grammar tells the model to terminate the section with a lone ".". Strip a
@@ -397,7 +397,7 @@ export function parseReflectResult(response) {
     }
 
     // #SHELVES lines: `+ Category/aspect = short summary`. Bounded before #OBS.
-    const shelvesMatch = text.match(/#SHELVES\s*([\s\S]*?)(?=\n\s*#OBS|\n\s*#REEVAL|$)/i);
+    const shelvesMatch = text.match(/#SHELVES\s*([\s\S]*?)(?=\n\s*#(?:OBS|CALLBACK|REEVAL)\b|$)/i);
     if (shelvesMatch) {
         const block = shelvesMatch[1].trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {

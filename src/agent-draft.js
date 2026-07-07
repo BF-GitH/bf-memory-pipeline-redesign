@@ -176,7 +176,7 @@ function parseDraftResult(response) {
         result.neededFacts = factsRaw
             .split(/[;\n,]+/)
             .map(f => f.trim())
-            .filter(f => f.length > 0);
+            .filter(f => f.length > 0 && !/^\[.*\]$/.test(f) && !/^(none|n\/a|unknown|tbd)$/i.test(f));
     }
 
     // Extract optional #NextHint section (refinement #11): a tiny backstage breadcrumb of
@@ -196,8 +196,10 @@ function parseDraftResult(response) {
     // null (back-compatible: pipeline simply doesn't update the scene this turn).
     result.scene = parseSceneBlock(response);
 
-    // If parsing failed, try to extract any useful keywords
-    if (result.neededFacts.length === 0 && result.draft) {
+    // If the #Needed_Facts HEADER itself was missing (a true parse failure), try to extract
+    // any useful keywords. The prompt allows an empty section — an obediently-empty list must
+    // NOT trigger this, or sentence-starters pollute deterministic retrieval (audit F-DRAFT-1).
+    if (!factsMatch && result.draft) {
         // Extract capitalized words as fallback keywords
         const words = result.draft.match(/[A-Z][a-z]+/g) || [];
         result.neededFacts = [...new Set(words)];

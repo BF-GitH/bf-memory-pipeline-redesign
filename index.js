@@ -14,10 +14,14 @@ jQuery(async () => {
         const { initMessageIcons } = await import('./src/message-icon.js');
         initMessageIcons();
 
-        // Register the optional Writer recall tool (search_memory) when its setting is on.
-        // Default-OFF; idempotent; no-ops if ST's function-tool API is unavailable.
-        // Also sync the optional Writer WRITE tool (remember_fact) the same way. Default-OFF;
-        // idempotent; no-ops if ST's function-tool API is unavailable.
+        // Slash commands (/bfmem …) + the {{bf_facts}} macro. Was never wired before
+        // v0.50.2 — the whole module was dead code (audit F-ORCH-1).
+        const { initCommands } = await import('./src/commands.js');
+        initCommands();
+
+        // Register the Writer recall tool (search_memory) when its setting is on.
+        // Default-ON since the tool-first flip; idempotent; no-ops if ST's function-tool
+        // API is unavailable. Also sync the Writer WRITE tool (remember_fact) the same way.
         const { syncWriterRecallTool, syncWriterWriteTool } = await import('./src/agent-writer.js');
         syncWriterRecallTool();
         syncWriterWriteTool();

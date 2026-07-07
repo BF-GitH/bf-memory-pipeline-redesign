@@ -496,6 +496,15 @@ function mmrCandidateText(r) {
  */
 function mmrRerank(list, lambda, now) {
     if (!Array.isArray(list) || list.length <= 2) return list; // nothing to diversify
+    // Cold facts carry the -1000 retrievalSalience penalty; including even one in the min-max
+    // below collapses every hot score to ~1.0 and MMR degenerates to diversity-only (audit
+    // F-RETR-1). Rerank hot and cold as separate partitions — cold stays last, and each
+    // partition is homogeneous so the recursion terminates immediately.
+    const hotPart = list.filter(r => !isColdFact(r.fact));
+    const coldPart = list.filter(r => isColdFact(r.fact));
+    if (hotPart.length > 0 && coldPart.length > 0) {
+        return [...mmrRerank(hotPart, lambda, now), ...mmrRerank(coldPart, lambda, now)];
+    }
     // Precompute salience + normalize to [0,1] so it shares scale with trigram sim (also [0,1]).
     const sal = list.map(r => retrievalSalience(r.fact, now));
     let lo = Infinity, hi = -Infinity;
@@ -1639,7 +1648,10 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     const handleResolved = isHandleQuery && directResults.length > 0;
     if (!handleResolved) {
         // KEYWORD search over the prebuilt index (same matcher as the push path).
-        for (const r of searchFactsIndexed(index, databases, [q])) push(r, 'primary');
+        // Keep searchFactsIndexed's own tier: relationship-ref-only matches arrive as
+        // secondary/tertiary and must not outrank genuinely-direct hits (audit; the
+        // TIER_RANK sort below relies on honest tiers).
+        for (const r of searchFactsIndexed(index, databases, [q])) push(r);
 
         // FUZZY/ALIAS fallback (Layer B): trigram-match the query against active facts so typos and
         // morphology ("apartments"→"apartment") still resolve when the keyword path missed. Admits as

@@ -723,7 +723,10 @@ export async function runEntityResolution() {
                     && reg[other.displayLc]?.status === 'named';
                 const simMatch = sim >= threshold && !bothNamed;
 
-                if (!aliasMatch && !simMatch) continue;
+                // The bothNamed veto applies to BOTH signals: the user explicitly classified
+                // these as distinct recurring characters, and a single hallucinated `aka:` from
+                // the Scribe must not override that (module contract above; audit F-SCRIBE-2).
+                if ((!aliasMatch && !simMatch) || bothNamed) continue;
 
                 // Merge the lower-attested `other` INTO `canon`.
                 const reason = aliasMatch ? 'ALIAS_EXACT' : 'TRIGRAM_SIMILARITY';

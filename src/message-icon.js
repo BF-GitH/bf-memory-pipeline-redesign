@@ -55,7 +55,7 @@ function updateIconState(iconEl, msg) {
     // plain click could fire a billable LLM call. The title documents both gestures.
     iconEl.title = processed
         ? 'Scribe processed this message. Click to see the facts it produced · Shift+click to re-extract.'
-        : 'Scribe has NOT processed this message. Click to see facts (none yet) · Shift+click to extract.';
+        : 'Scribe has NOT processed this message. Click to see facts (none yet) · Shift+click to extract (makes an AI call).';
 }
 
 /**
@@ -76,9 +76,10 @@ async function onIconClick(e, mesId) {
     const iconEl = e.currentTarget;
     if (iconEl.classList.contains(ICON_LOADING_CLASS)) return; // prevent double-click
 
-    // Plain click on a message that HAS been processed → show its facts (no LLM call).
-    // Shift+click, or a not-yet-processed message → run extraction.
-    const wantExtract = e.shiftKey || !msg.extra?.bf_mem_processed;
+    // Plain click ALWAYS opens the free fact viewer (it handles the zero-facts case with a
+    // Shift+click hint). Only Shift+click runs the billable extraction — a plain click on an
+    // unprocessed message must never fire an LLM call (audit F-UX-2; the C2 footgun).
+    const wantExtract = e.shiftKey;
     if (!wantExtract) {
         try {
             await showMessageFacts(mesId);

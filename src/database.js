@@ -2681,7 +2681,15 @@ async function saveDatabaseToAttachment(avatar, db) {
 
     const attachments = extensionSettings.character_attachments[avatar];
 
-    // Remove existing attachment with same name
+    // Upload the replacement FIRST; only remove the old file once the new one is safely
+    // stored. Deleting before a failed upload permanently lost the category in
+    // attachment-only mode (audit F-STOR-1).
+    const { uploadFileAttachment } = await import('../../../../chats.js');
+    const uniqueName = `${Date.now()}_${fileName}`;
+    const fileUrl = await uploadFileAttachment(uniqueName, base64Data);
+    if (!fileUrl) throw new Error('Upload failed');
+
+    // Remove the superseded attachment with the same name (the new file is durable now)
     const existingIdx = attachments.findIndex(a => a.name === fileName);
     if (existingIdx >= 0) {
         try {
@@ -2689,12 +2697,6 @@ async function saveDatabaseToAttachment(avatar, db) {
         } catch { /* ignore */ }
         attachments.splice(existingIdx, 1);
     }
-
-    // Upload new file
-    const { uploadFileAttachment } = await import('../../../../chats.js');
-    const uniqueName = `${Date.now()}_${fileName}`;
-    const fileUrl = await uploadFileAttachment(uniqueName, base64Data);
-    if (!fileUrl) throw new Error('Upload failed');
 
     attachments.push({
         url: fileUrl,
