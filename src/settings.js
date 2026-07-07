@@ -113,6 +113,10 @@ const DEFAULT_SETTINGS = {
     // EXISTING users are unaffected — merge-missing-defaults only fills ABSENT keys, so anyone who
     // already has these keys keeps their values and detectPreset() shows whatever they match.
     uiPreset: 'balanced',
+    // First-run onboarding wizard (src/onboarding.js): true once the user has FINISHED or
+    // SKIPPED it — either way it never auto-shows again. The "Re-run setup guide" button in
+    // the General tab reopens it on demand.
+    onboardingDone: false,
     useMemoryProfile: true,
     // Per-agent connection profiles (replacing single memoryProfile).
     // Old `memoryProfile` is kept on the stored object for rollback safety
@@ -527,6 +531,9 @@ function validateSettings(s) {
     // a renamed preset) coerces to 'custom' so the dropdown falls back safely. The actual knob
     // values are NOT touched here — detectPreset()/applyPreset() own that; this only guards the id.
     if (!PRESET_IDS.has(s.uiPreset)) s.uiPreset = 'custom';
+    // First-run onboarding: absent/garbage => false, so existing installs see the wizard exactly
+    // once (finish or skip flips it true; it never auto-shows again).
+    if (typeof s.onboardingDone !== 'boolean') s.onboardingDone = false;
     if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
     if (typeof s.writerFormat !== 'string')      s.writerFormat = '';
@@ -5818,6 +5825,19 @@ export async function initSettings() {
     // pipeline.js now persists via saveCurrentToActiveProfile(capturedDbProfile)
     // after every Agent 3 write, with capture-at-write semantics. The old
     // unprotected handler here was a residual leak path (same class as Issue #2).
+
+    // --- First-run onboarding wizard ---
+    // Shown ONCE, only after the whole UI above is bound: every wizard write routes through
+    // the live controls (.val().trigger('change')) so the existing handlers persist it.
+    // Dynamic import + guards mean a wizard failure can never break extension load.
+    try {
+        $('#bf_mem_rerun_onboarding').on('click', () => {
+            import('./onboarding.js').then(m => m.showOnboarding(true)).catch(() => { /* wizard is best-effort */ });
+        });
+        if (extensionSettings.onboardingDone !== true) {
+            import('./onboarding.js').then(m => m.maybeShowOnboarding()).catch(() => { /* wizard is best-effort */ });
+        }
+    } catch { /* onboarding must never block init */ }
 
     // --- Initial state ---
     updateStatus('idle');

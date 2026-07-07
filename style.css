@@ -536,8 +536,9 @@
 .bf-mem-fact-diff .bf-mem-diff-before { color: #f44336; }
 .bf-mem-fact-diff .bf-mem-diff-after { color: #4caf50; }
 
-/* Review Popup */
-#bf_mem_review_overlay {
+/* Review Popup (the onboarding wizard overlay reuses this exact backdrop) */
+#bf_mem_review_overlay,
+#bf_mem_onboarding_overlay {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, 0.7);
@@ -573,7 +574,8 @@
 /* Desktop: restore true vertical centering when there's plenty of room
    and no on-screen keyboard is likely (hover = mouse). */
 @media (hover: hover) and (min-height: 700px) {
-    #bf_mem_review_overlay { align-items: center; }
+    #bf_mem_review_overlay,
+    #bf_mem_onboarding_overlay { align-items: center; }
 }
 
 .bf-mem-review-popup h3 { margin: 0 0 10px; }
@@ -669,6 +671,27 @@
     gap: 8px;
     justify-content: flex-end;
 }
+
+/* First-run onboarding wizard (src/onboarding.js) — card + backdrop reuse the review
+   popup styles above; only the step-specific bits are new. */
+.bf-mem-onboarding { max-width: 560px; }
+.bf-mem-onboarding-progress { font-size: 11px; opacity: 0.6; margin: -6px 0 10px; }
+.bf-mem-onboarding-body { margin-bottom: 15px; }
+.bf-mem-onboarding-body p { margin: 0 0 10px; font-size: 13px; line-height: 1.5; }
+.bf-mem-onboarding-choice {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    padding: 8px;
+    margin: 0 0 6px;
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 5px;
+    cursor: pointer;
+}
+.bf-mem-onboarding-choice input { margin-top: 3px; flex: 0 0 auto; }
+.bf-mem-onboarding-choice small { opacity: 0.75; }
+.bf-mem-onboarding-list { margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.5; }
+.bf-mem-onboarding-list li { margin-bottom: 8px; }
 
 /* Summary Tab (Debug Light) */
 .bf-mem-summary {
