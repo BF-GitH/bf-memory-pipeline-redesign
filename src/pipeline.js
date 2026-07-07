@@ -3,20 +3,18 @@
 // ST's EventEmitter awaits async handlers, so generation waits for us.
 
 import { runDraftAgent } from './agent-draft.js';
-import { runFinderAgent, formatChosenFacts } from './agent-finder.js';
 import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPictureBlock, buildMomentEchoBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveAspect, deriveScope, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage, getRelationshipMomentThread } from './database.js';
+import { retrieveFacts, extractContextKeywords, isFactVisible } from './fact-retrieval.js';
+import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveAspect, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage, getRelationshipMomentThread } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
-import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId, detectProfileForToolFirst } from './profiler.js';
+import { getAgent1ProfileId, getAgent3ProfileId, detectProfileForToolFirst } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, setLastInjection, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid, isTriviallyEmptyForExtraction } from './settings.js';
 import { detectAndRecord, showEntityPopup, runEntityResolution } from './agent-entities.js';
 
 // Pipeline state
-let lastProcessedMessageIndex = -1;
 let isInternalCall = false; // true when our agents are making LLM calls
 let chatChangedAt = 0;
 let lastTriggeredUserMsgIndex = -1;
@@ -35,30 +33,6 @@ let profileDetectionLogged = false; // tool-first: log Claude-profile detection 
 // run and on CHAT_CHANGED. See tryFrozenInjection() for the full rationale.
 let turnsSinceFullInjection = 0;
 let pipelineCancelled = false; // set true when user clicks Stop / disables mid-run; checked before DB writes
-// FINDER BUDGET (latency fix). The Stage-2 finder (Agent 4) is the slowest, least-bounded agent
-// and used to be awaited UNCONDITIONALLY on the reply-blocking path (a 64s finder = a 64s stall).
-// We RACE it against a tight, SETTING-BACKED budget (settings.finderBudgetMs, default 3500ms; see
-// DEFAULT_FINDER_BUDGET_MS): if it doesn't finish in time we (a) ABORT the in-flight finder LLM
-// call via a finder-scoped AbortController so it stops burning tokens, and (b) use the ALREADY-
-// COMPUTED deterministic retrieval for THIS turn. So a slow/failing model degrades to "use the
-// deterministic facts this turn" — never a long stall — while a fast model still gets the finder's
-// refined pick. The abort is scoped to the finder ONLY (its own signal), never the concurrent
-// Agent-1 call.
-const DEFAULT_FINDER_BUDGET_MS = 3500; // fallback when settings.finderBudgetMs is unset
-function getFinderBudgetMs(settings) {
-    const v = Number(settings?.finderBudgetMs);
-    return Number.isFinite(v) && v >= 1000 ? Math.floor(v) : DEFAULT_FINDER_BUDGET_MS;
-}
-// ADAPTIVE CIRCUIT BREAKER (the "don't guarantee a budget-long wait every turn" half). On a model
-// that is CONSISTENTLY slower than the budget, blocking the reply for the full budget EVERY turn —
-// only to discard the finder and fall back — is a guaranteed per-turn latency tax for no benefit.
-// We track how many CONSECUTIVE turns the finder blew the budget; once it reaches the trip count we
-// STOP blocking on the finder (still launch it fire-and-forget so its result can warm nothing this
-// turn, but the reply does NOT wait) until a finder beats the budget again, which resets the breaker.
-const FINDER_BREAKER_TRIP = 2;    // consecutive over-budget turns before we stop blocking
-const FINDER_BREAKER_PROBE = 5;   // while tripped, re-test (probe) the finder once every N turns
-let finderOverBudgetStreak = 0;   // reset on any finder that beats the budget (or finder disabled)
-let finderTrippedTurns = 0;       // turns elapsed while the breaker is open (drives the probe cadence)
 let groupSkipToastShown = false; // show-once toast when skipping group chats
 let runRecordedInput = false; // true once setRunTokens fired this generation cycle; gates main-output attribution so swipes don't desync the counters
 // Reflection / consolidation: count successful pipeline runs (Agent 3 committed facts).
@@ -201,55 +175,11 @@ function armIdleConsolidation() {
     }
 }
 
-/**
- * CHARACTER-TAG FILTER for the Stage-2 finder candidate gather (3-layer model). The branch
- * picks Agent 1 makes are character-AGNOSTIC (`Category` / `Category/aspect`), so
- * collectBranchFacts hands back EVERY character's facts living in those aspects. That is the
- * cost this model exists to avoid: when Agent 1 named the focus character(s) in #Focus, we
- * narrow the candidates to facts that actually concern those people PLUS general/world facts,
- * and drop facts tagged to OTHER, unrelated characters in the same aspect.
- *
- * Keep a candidate when ANY holds:
- *   - no focus characters were named (general moment) — keep everything (no narrowing);
- *   - the fact is in the Unsorted catch-all (always kept, per the model);
- *   - the fact is NOT character-scoped (place/event/world facts are general context: a place
- *     or event must stay recallable independent of any character — see link-following);
- *   - the fact carries NO character tag (empty `involved` AND no character `subject`) — a
- *     general/shared fact with no specific owner;
- *   - the fact's `involved` participants OR its `subject` include a focus character.
- * Otherwise (a character-scoped fact owned by / about ONLY non-focus characters) drop it.
- *
- * Names are compared case-insensitively; `involved` holds clean names (the `@` sigil is
- * stripped at write time) and #Focus names have any leading `@` stripped at parse time.
- * @param {Array<{fact: Object, category: string}>} candidates
- * @param {string[]} focus - focus character names from Agent 1's #Focus (may be empty)
- * @returns {Array<{fact: Object, category: string}>}
- */
-function filterCandidatesByFocus(candidates, focus) {
-    const focusSet = new Set((focus || []).map(f => String(f || '').trim().toLowerCase()).filter(Boolean));
-    if (focusSet.size === 0) return candidates; // general moment — no character narrowing
-    return candidates.filter(({ fact, category }) => {
-        if (String(category || '').toLowerCase() === 'unsorted') return true; // catch-all always kept
-        // Place/event/world facts are general context, not owned by a single character.
-        if (deriveScope(fact) !== 'character') return true;
-        const involved = Array.isArray(fact.involved)
-            ? fact.involved.map(p => String(p || '').trim().toLowerCase()).filter(Boolean)
-            : [];
-        const subject = deriveSubject(fact); // already lowercased
-        // No character tag at all -> general/shared fact, keep it.
-        if (involved.length === 0 && !subject) return true;
-        // Keep when any participant or the subject is one of the focus characters.
-        if (subject && focusSet.has(subject)) return true;
-        for (const p of involved) if (focusSet.has(p)) return true;
-        return false; // character-scoped fact about ONLY non-focus characters -> drop
-    });
-}
-
 // ANCHOR ASPECTS: the durable / current-state / relationship leaves that a Writer must always
-// respect for a present character to stay in continuity (a name dropped breaks the scene). The
-// finder, told to "be selective", routinely omits these even though they're load-bearing — so we
-// GUARANTEE a few per present character deterministically (from the bySubject index) alongside the
-// finder's picks. Matched against deriveAspect() leaves; kept small and identity/state/relationship.
+// respect for a present character to stay in continuity (a name dropped breaks the scene).
+// Keyword retrieval can miss these even though they're load-bearing — so we GUARANTEE a few per
+// present character deterministically (from the bySubject index) alongside the retrieved facts.
+// Matched against deriveAspect() leaves; kept small and identity/state/relationship.
 const ANCHOR_ASPECTS = new Set([
     'identity', 'name', 'status', 'species', 'age', 'gender', 'pronouns', 'titles',
     'current_location', 'mood', 'goal', 'health',
@@ -258,7 +188,7 @@ const ANCHOR_ASPECTS = new Set([
 
 /**
  * Guarantee the in-focus characters' key anchors (identity / current-state / active relationship)
- * are injected even if the finder misses them. Pulls from the per-turn bySubject index (already
+ * are injected even if retrieval misses them. Pulls from the per-turn bySubject index (already
  * active-only) for each focus character, ranks by anchor-aspect priority then importance, and
  * returns up to `perChar` `{fact, category, tier:'primary'}` entries per character, EXCLUDING any
  * already chosen (so we never double-inject). Deterministic, no LLM, cheap (indexed by subject).
@@ -319,12 +249,49 @@ async function countChatTokens(arr) {
 }
 
 /**
+ * Format the chosen facts for the writer, IDENTICAL in shape to fact-retrieval's
+ * formatFactsForWriter so the injection stays uniform: `[knownBy] Category/key = value`
+ * with the optional context note appended. Re-applies the rename-tolerant visibility filter
+ * defensively (never inject a hidden fact). Moved here from the retired agent-finder.js —
+ * the deterministic retrieval + anchor paths are its only remaining consumers.
+ * @param {Array<{fact: Object, category: string}>} results
+ * @returns {string}
+ */
+function formatChosenFacts(results) {
+    const visible = (results || []).filter(({ fact }) => isFactVisible(fact));
+    if (visible.length === 0) return '(No stored facts available)';
+    const lines = [];
+    for (const { fact, category } of visible) {
+        const knownBy = (fact.knownBy || []).join(', ');
+        const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
+        const hasValue = String(fact.value ?? '').trim() !== '';
+        const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
+        // Episodic-memory feature (mirror of formatFactsForWriter): append a `moment`'s short
+        // emotional `tone` compactly so the beat reads with its feeling, e.g. `Events/key: <note> (tense)`.
+        const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
+        // INJECTION DE-DUPLICATION (mirror of formatFactsForWriter): storage keeps
+        // BOTH value and note, but when a note exists it already carries the fact, so
+        // inject the NOTE IN PLACE OF the value. With no note, inject `key = value`.
+        let line;
+        if (note) {
+            line = `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}`;
+        } else if (hasValue) {
+            line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
+        } else {
+            line = `${prefix} ${category}/${fact.key}`;
+        }
+        lines.push(line);
+    }
+    return lines.join('\n');
+}
+
+/**
  * Record this run's token metrics for the Tokens tab. Wrapped in try/catch so a
  * tokenizer failure can never abort the pipeline run. Sets runRecordedInput so the
  * MESSAGE_RECEIVED handler only attributes main-model output to a run that actually
  * recorded input this generation cycle (prevents swipe-driven counter desync).
  */
-function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult, finderTokens }) {
+function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult }) {
     try {
         setRunTokens({
             baselineInput: baselineInput || 0,
@@ -333,10 +300,10 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
             agent1Output: draftResult?.tokensOut || 0,
             agent3Input: memoryResult?.tokensIn || 0,
             agent3Output: memoryResult?.tokensOut || 0,
-            // Stage-2 finder (Agent 4) — its own slot so the Tokens tab can show it discretely
-            // and the NET-vs-baseline calc counts it. 0 when the finder didn't run/complete.
-            finderInput: finderTokens?.input || 0,
-            finderOutput: finderTokens?.output || 0,
+            // Finder (Agent 4) slots retired with the finder — always 0; kept so the
+            // Tokens-tab record shape stays stable for existing readers.
+            finderInput: 0,
+            finderOutput: 0,
             mainOutput: 0,
         });
         runRecordedInput = true;
@@ -368,7 +335,7 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
  * @param {boolean} [a.cancelled]
  * @param {{NEW?:number,UPDATED?:number,SKIPPED?:number,EVICTED?:number}} [a.facts] count override
  */
-function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, finderTokens, reflectionTokens, agent1Skipped }) {
+function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, reflectionTokens, agent1Skipped }) {
     try {
         const duration = Date.now() - startTime;
         // When Agent 1 was intentionally skipped (hybrid/tool-only), it is neither "ok" nor "failed"
@@ -406,13 +373,11 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
         const bIn = Number(baselineInput) || 0;
         const aIn = Number(actualInput) || 0;
         const mainOut = Number(memoryResult?.mainOutput) || 0; // usually 0 on the inline path
-        // Stage-2 finder (Agent 4) + reflection pass tokens — folded into the NET so the per-run
-        // summary reflects the TRUE extension overhead (previously these two agents were omitted).
-        const fIn = Number(finderTokens?.input) || 0;
-        const fOut = Number(finderTokens?.output) || 0;
+        // Reflection pass tokens — folded into the NET so the per-run summary reflects the
+        // TRUE extension overhead.
         const rIn = Number(reflectionTokens?.input) || 0;
         const rOut = Number(reflectionTokens?.output) || 0;
-        const netIn = (aIn + a1In + a3In + fIn + rIn) - bIn;
+        const netIn = (aIn + a1In + a3In + rIn) - bIn;
         const failed = !!cancelled || (agent1Ran && !agent1Ok) || (agent3Ran && !agent3Ok);
         // Observability: stamp the DB context this run executed against, so every per-turn
         // summary line says which profile/avatar it touched (read-only — no behavior change).
@@ -429,7 +394,7 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
             `dur=${duration}ms | Agent1=${agent1Ran ? (agent1Ok ? 'ok' : 'failed') : 'skipped'} | ` +
             `Agent3 NEW=${nNew} UPDATED=${nUpd} SKIPPED=${nSkip} EVICTED=${nEvict} | ` +
             `tokens: baselineIn=${bIn} actualIn=${aIn} a1(in/out)=${a1In}/${a1Out} ` +
-            `a3(in/out)=${a3In}/${a3Out}${fIn || fOut ? ` finder(in/out)=${fIn}/${fOut}` : ''}` +
+            `a3(in/out)=${a3In}/${a3Out}` +
             `${rIn || rOut ? ` refl(in/out)=${rIn}/${rOut}` : ''}${mainOut ? ` mainOut=${mainOut}` : ''} net=${netIn >= 0 ? '+' : ''}${netIn}`,
             {
                 runId,
@@ -444,7 +409,7 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
                         agent3: agent3Ran ? (agent3Ok ? 'ok' : 'failed') : 'skipped',
                     },
                     facts: { NEW: nNew, UPDATED: nUpd, SKIPPED: nSkip, EVICTED: nEvict },
-                    tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, finderIn: fIn, finderOut: fOut, reflectionIn: rIn, reflectionOut: rOut, mainOut, netIn },
+                    tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, reflectionIn: rIn, reflectionOut: rOut, mainOut, netIn },
                     // PER-STAGE TIMING BREAKDOWN (observability only — slowness hunt). Whatever the
                     // caller measured this run (blocking-path stages and/or post-reply agent3 etc).
                     // Null/absent when a path didn't supply it. Keeps the legacy fields intact.
@@ -522,9 +487,8 @@ function getCharacterInfo() {
 /**
  * B4 (token cut): a SHORT character brief for the agents that don't need the full card. The
  * Drafter (Agent 1) plans the reply and genuinely needs the full description/personality/scenario,
- * but the Finder (Agent 4 — it only PICKS from a candidate list) and the Scribe (Agent 3 — it
- * extracts facts from the message text, not the card) barely use it. Sending the full ~4 KB card to
- * all three every turn was pure repeated input cost. This trims to the name + the FIRST ~400 chars
+ * but the Scribe (Agent 3 — it extracts facts from the message text, not the card) barely uses
+ * it. Sending the full ~4 KB card every turn was pure repeated input cost. This trims to the name + the FIRST ~400 chars
  * of the description (enough to anchor who {{char}} is) — typically ~10× smaller. Returns '' when no
  * character is selected, identical to getCharacterInfo().
  * @returns {string}
@@ -775,8 +739,7 @@ async function runPipelineInline(data) {
     const stageMs = {
         agent1Ms: null,                 // Agent 1 draft + speculative retrieval (parallel) wall-clock
         speculativeRetrievalMs: null,   // covered by the agent1 parallel block; recorded for clarity
-        finderMs: null,                 // time the reply ACTUALLY waited on Stage-2 (incl. budget race)
-        deterministicMs: null,          // deterministic-retrieval fallback build (when it runs)
+        deterministicMs: null,          // deterministic-retrieval build
         sceneBuildMs: null,             // scene/big-picture block build
         injectMs: null,                 // buildWriterInjection + injectMemoryContext + token recount
     };
@@ -816,9 +779,8 @@ async function runPipelineInline(data) {
     // Phase 3b: Agent 3 (memory extraction about the PREVIOUS exchange) was MOVED OFF
     // this latency-critical pre-generation path. It now runs POST-reply on
     // MESSAGE_RECEIVED (runMemoryExtraction), so the user no longer waits for
-    // fact-extraction-about-the-last-turn before THIS reply generates. Only the agents
-    // that feed THIS reply stay here: Agent 1 (draft/menu) + speculative retrieval, and
-    // the Stage-2 finder runs after Agent 1 below.
+    // fact-extraction-about-the-last-turn before THIS reply generates. Only the work
+    // that feeds THIS reply stays here: Agent 1 (draft/menu) + speculative retrieval.
     // SAFETY: We use CMRS (ConnectionManagerRequestService) to call the agent profile
     // directly by ID, WITHOUT switching the active UI profile. This is safe during
     // mid-generation because it doesn't touch the DOM or active connection state.
@@ -839,43 +801,17 @@ async function runPipelineInline(data) {
     const contextKeywords = extractContextKeywords(recentMessages);
     addDebugLog('info', `Speculative retrieval keywords: ${contextKeywords.join(', ')}`);
 
-    // Load databases once up front — reused for Agent 1's fact inventory/menu, the
-    // Stage-2 finder candidates, and the deterministic-retrieval fallback. (Agent 3's
-    // existing-DB context now loads separately on the post-reply extraction path.)
+    // Load databases once up front — reused for Agent 1's fact inventory/menu and the
+    // deterministic retrieval. (Agent 3's existing-DB context now loads separately on the
+    // post-reply extraction path.)
     const databases = await getAllDatabases();
-    // Per-turn in-memory fact index (memoized; built once, reused by the menu + Stage-2 branch
+    // Per-turn in-memory fact index (memoized; built once, reused by the menu + Unsorted
     // collect below so neither walks the full fact set).
     const index = await getMemoryIndex();
-    // FIX #12 (dead-payload removal): the keys-only fact inventory (`Category/key`, no values)
-    // is consumed ONLY by the deterministic-retrieval fallback (buildDeterministicRetrieval),
-    // which runs only when the Stage-2 finder is OFF. When the finder is ON (default), Agent 1
-    // never uses that inventory, so building + sending it just burns input tokens every turn.
-    // So we build it ONLY when the finder is disabled and otherwise pass '' (buildDraftPrompt
-    // then omits the "Existing Fact Keys" block entirely). The Stage-1 MENU stays unconditional.
-    // ============================================================================================
-    // FINDER (Agent 4 / Stage-2 LLM) — INTENTIONALLY HARD-DISABLED (2026-05-31).
-    // --------------------------------------------------------------------------------------------
-    // WHY: the Finder was a per-turn LLM call that only RE-RANKED facts already filtered by the
-    // Drafter's #Branches, then salience-ranked, MMR-diversified, graph-expanded (the spiderweb),
-    // semantically matched (ST-vector retrieval, v0.37–0.38), and topped up with the GUARANTEED
-    // present-character anchors. Live testing on a ~270-fact store showed two things:
-    //   (1) It consistently BLEW its 3.5s budget and aborted → the pipeline fell back to
-    //       deterministic retrieval anyway (the adaptive circuit-breaker was tripping), so at any
-    //       real store size it was already mostly OFF — while still costing a ~3.5s/turn wait.
-    //   (2) With it OFF, a 5-turn paraphrase-recall check still correctly recalled name (anchor),
-    //       job, allergy and pet via deterministic + semantic + anchors — i.e. it added NO recall
-    //       the rest of the stack doesn't already provide. Logs: "Finder agent disabled … using
-    //       deterministic retrieval", "Semantic expansion (ST vectors): admitted N", "Injected 3
-    //       guaranteed present-character anchor fact(s)".
-    // RESULT: dropping the per-turn LLM call is cheaper, faster, and latency-PREDICTABLE (no budget
-    // race, no breaker churn). `useFinderAgent` also now defaults false (settings.js).
-    //
-    // We force `wantFinder` to false here so the entire `if (wantFinder) { … runFinderAgent … }`
-    // block below is DEAD CODE — kept (not deleted) so re-enabling is a one-line revert. The UI
-    // toggle (#bf_mem_finder_enabled) is therefore inert until this line is reverted.
-    // TO RE-ENABLE: restore `const wantFinder = settings.useFinderAgent !== false;`.
-    // ============================================================================================
-    const wantFinder = false; // HARD-DISABLED — see the note above (was: settings.useFinderAgent !== false)
+    // The Finder (Agent 4 / Stage-2 LLM) was retired in v0.50.x: it was a per-turn LLM call that
+    // only re-ranked facts the deterministic + semantic + anchor stack already retrieved, blew its
+    // latency budget at any real store size, and added no recall. Retrieval is now always the
+    // deterministic path (buildDeterministicRetrieval below) + guaranteed anchors.
     // MEMORY MODE (tool-first redesign): 'hybrid' (default) and 'tool-only' DROP the blocking Agent 1
     // (Draft) LLM call from the reply-critical path — the main model (e.g. Claude via the Claude Code
     // CLI connection profile) pulls deeper memory on demand through the search_memory tool, so the
@@ -892,10 +828,10 @@ async function runPipelineInline(data) {
         try { detectProfileForToolFirst(settings); } catch { /* detection is best-effort */ }
     }
     // Agent 1's fact inventory + Stage-1 menu are consumed ONLY by the Draft prompt (and the
-    // deterministic fallback's delta keywords come from Agent 1's neededFacts). In hybrid/tool-only
+    // deterministic retrieval's delta keywords come from Agent 1's neededFacts). In hybrid/tool-only
     // mode Agent 1 never runs, so skip building them — that also avoids a full-store key walk
     // (summarizeKeys) and a menu aggregate every turn.
-    const factInventory = (runAgent1 && !wantFinder) ? summarizeKeys(databases) : '';
+    const factInventory = runAgent1 ? summarizeKeys(databases) : '';
     // STAGE 1 menu: compact Category×aspect map (counts, NO values) Agent 1 picks branches from.
     // Counts come from the index aggregate, not a full-fact walk. Built only when Agent 1 runs.
     const factMenu = runAgent1 ? summarizeMenuIndexed(index) : '';
@@ -1037,14 +973,12 @@ async function runPipelineInline(data) {
         }
     }
 
-    // --- Fact Retrieval: STAGE 2 (detail finder) with deterministic fallback ---
+    // --- Fact Retrieval: deterministic (no LLM) ---
     updateStatus('running', 'Selecting facts...');
 
-    // DETERMINISTIC FALLBACK builder (FALLBACK requirement). Used when the finder is
-    // disabled, errors, times out, or returns nothing. Reuses the existing speculative +
-    // delta-keyword merge so behavior matches the pre-two-stage pipeline, and ALWAYS folds
-    // in every active Unsorted fact so a failed detail pass can never blank that catch-all.
-    // A failed detail pass must never blank memory.
+    // DETERMINISTIC retrieval builder. Reuses the existing speculative + delta-keyword
+    // merge, and ALWAYS folds in every active Unsorted fact so retrieval can never blank
+    // that catch-all.
     const buildDeterministicRetrieval = async () => {
         const speculativeKeywordSet = new Set(contextKeywords.map(k => k.toLowerCase()));
         const deltaKeywords = draftResult.neededFacts.filter(k => !speculativeKeywordSet.has(k.toLowerCase()));
@@ -1060,7 +994,7 @@ async function runPipelineInline(data) {
         } else {
             addDebugLog('info', 'No delta keywords needed — speculative retrieval covered everything');
         }
-        // ALWAYS include active Unsorted facts (visibility-filtered), even on the fallback path.
+        // ALWAYS include active Unsorted facts (visibility-filtered).
         const existingKeys = new Set(det.facts.map(r => `${r.category}:${r.fact.key}`));
         for (const { fact, category } of collectBranchFactsIndexed(index, ['Unsorted'])) {
             const id = `${category}:${fact.key}`;
@@ -1076,199 +1010,22 @@ async function runPipelineInline(data) {
         };
         // Format via the SHARED formatter (formatChosenFacts) instead of a hand-rolled copy.
         // The old inline version drifted: it dropped a moment's `tone` (and any temporal tail)
-        // that formatChosenFacts/formatFactsForWriter include. Since the Finder is now hard-disabled
-        // this fallback runs every turn, so that drift silently stripped episodic tone from every
-        // injection. Reusing the shared formatter keeps the deterministic path identical to the
-        // anchor path (which also uses formatChosenFacts) — single source of truth, no drift.
+        // that formatChosenFacts/formatFactsForWriter include. Reusing the shared formatter keeps
+        // this path identical to the anchor path (which also uses formatChosenFacts) — single
+        // source of truth, no drift.
         det.formatted = formatChosenFacts(det.facts);
         return det;
     };
 
-    let retrieval = null;
-    // TOKEN TRACKING (Tokens tab): the Stage-2 finder (Agent 4) is an LLM call whose cost was
-    // previously discarded. Capture its in/out token counts here so they fold into the run/session
-    // totals + get their own Tokens-tab row. Only populated when the finder actually completed
-    // (beat the budget); a budget-aborted/disabled/errored finder contributes 0.
-    let finderTokens = { input: 0, output: 0 };
-    // wantFinder was computed up front (gates whether the fact inventory was built for Agent 1).
-    if (wantFinder) {
-        // STAGE 2: gather the FULL active facts under Agent 1's picked branches PLUS, always,
-        // every active Unsorted fact (collectBranchFacts folds Unsorted in unconditionally).
-        const branchFacts = collectBranchFactsIndexed(index, draftResult.branches);
-        // CHARACTER-TAG FILTER (3-layer model): branches are character-agnostic, so the gather
-        // above returns EVERY character's facts in those aspects. When Agent 1 named the focus
-        // character(s), narrow to facts about THEM plus general/world facts and DROP unrelated
-        // characters' facts — the whole point of the model (bounded by character relevance,
-        // saving tokens). Applied BEFORE link-following so place⇄event⇄people expansion can
-        // still surface the linked people of an in-scope event. No focus = no narrowing.
-        const candidatesAll = filterCandidatesByFocus(branchFacts, draftResult.focus);
-        // LINK-FOLLOWING (Phase 4b): when Agent 1 picks a PLACE/person branch, surface the
-        // linked events (and an event's place+people) to the finder too, so the same
-        // scope-graph traversal that helps deterministic retrieval also benefits the finder.
-        // One bounded hop, deduped by id; newly pulled facts enter as secondary candidates.
-        const branchSeen = new Set(candidatesAll.map(({ fact, category }) => `${category}:${fact.key}`));
-        expandLinks(databases, candidatesAll, branchSeen);
-        // SEMANTIC CANDIDATES (default-path fix): the finder injects its pick from THIS candidate
-        // pool, but the pool is built from Agent-1's branches + link-following only — so embedding-
-        // matched facts that no branch/keyword surfaced were never PICKABLE, which is why enabling
-        // semantic barely changed the injected set when the finder is on. Fold in the semantic hits
-        // the speculative retrieval already produced this turn (it ran semanticLayer → ST vectors),
-        // so the finder can actually choose them. No extra embedding call. Gated by semanticRetrieval;
-        // capFinderCandidates still bounds the pool below.
-        if (settings.semanticRetrieval && speculativeRetrieval && Array.isArray(speculativeRetrieval.facts)) {
-            let addedSem = 0;
-            for (const r of speculativeRetrieval.facts) {
-                if (!r || r.via !== 'semantic' || !r.fact || !r.category) continue;
-                const id = `${r.category}:${r.fact.key}`;
-                if (branchSeen.has(id) || !isFactVisible(r.fact)) continue;
-                candidatesAll.push({ fact: r.fact, category: r.category });
-                branchSeen.add(id);
-                addedSem++;
-            }
-            if (addedSem) addDebugLog('info', `STAGE 2: added ${addedSem} semantic candidate(s) to the finder pool`, { subsystem: 'finder', event: 'finder.semantic_candidates', data: { added: addedSem } });
-        }
-        const candidatesVisible = candidatesAll.filter(({ fact }) => isFactVisible(fact));
-        // CANDIDATE INPUT CAP (latency fix): exclude cold facts and cap to top-N by salience so
-        // the finder prompt stays bounded as the store grows. (Output was always capped at 24.)
-        const { candidates } = capFinderCandidates(candidatesVisible);
-        addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) (from ${candidatesVisible.length} visible) from ${draftResult.branches.length} branch pick(s) + Unsorted${draftResult.focus.length ? ` (focus: ${draftResult.focus.join(', ')})` : ''} (incl. link expansion, cold-excluded + capped)`);
-        const finderProfileId = getAgent4ProfileId(settings);
-        const finderBudgetMs = getFinderBudgetMs(settings);
-        const finderTarget = Math.max(0, Number(settings?.finderTargetFacts) || 0);
-        const finderStart = Date.now();
-        // ADAPTIVE CIRCUIT BREAKER: if the finder blew the budget the last FINDER_BREAKER_TRIP turns
-        // in a row, it is consistently slower than the budget on this connection — blocking the reply
-        // for the full budget every turn only to discard it is a pure latency tax. While the breaker
-        // is OPEN we SKIP the finder entirely (no LLM call → zero token burn, ~0ms wait) and use the
-        // deterministic facts, EXCEPT on a periodic PROBE turn (every FINDER_BREAKER_PROBE turns) that
-        // re-tests whether the model has gotten fast enough — a probe that beats the budget RESETS the
-        // breaker. So a consistently-slow model costs the full budget for at most FINDER_BREAKER_TRIP
-        // turns, then ~0 thereafter (one probe every N turns), instead of a guaranteed per-turn tax.
-        const breakerOpen = finderOverBudgetStreak >= FINDER_BREAKER_TRIP;
-        // Probe on every Nth open turn (the 5th, 10th, …) — NOT the first, so a tripped breaker
-        // actually saves the budget wait before re-testing.
-        const isProbe = breakerOpen && ((finderTrippedTurns + 1) % FINDER_BREAKER_PROBE === 0);
-        // FINDER ABORT SCOPE: a dedicated controller so a budget timeout aborts ONLY the finder LLM
-        // call (stops burning tokens) and never the concurrent Agent-1 call.
-        const finderAbort = new AbortController();
-        // OFF THE BLOCKING PATH: race the finder against the budget. The deterministic retrieval
-        // (already-computable, no LLM) is the instant fallback the reply uses if the finder doesn't
-        // beat the budget. On budget expiry we ABORT the in-flight finder so it stops billing.
-        try {
-            if (breakerOpen && !isProbe) {
-                // SKIP entirely: do not launch the finder at all (no tokens, no wait). Advance the
-                // tripped-turn counter so a probe fires on schedule, and use deterministic facts.
-                finderTrippedTurns++;
-                stageMs.finderMs = Date.now() - finderStart; // ~0ms — we did not block
-                addDebugLog('info', `STAGE 2 finder circuit-breaker OPEN (over budget ${finderOverBudgetStreak}x in a row) — skipping finder this turn (no LLM call), using deterministic retrieval; next probe in ${FINDER_BREAKER_PROBE - (finderTrippedTurns % FINDER_BREAKER_PROBE)} turn(s)`, {
-                    subsystem: 'finder', event: 'finder.budget', reason: 'CIRCUIT_BREAKER_OPEN',
-                    data: { agent: 'finder', profileId: finderProfileId || null, budgetMs: finderBudgetMs, overBudgetStreak: finderOverBudgetStreak, candidateCount: candidates.length, fallback: 'deterministic', blocked: false, finderLaunched: false },
-                });
-            } else {
-                if (isProbe) {
-                    finderTrippedTurns++; // count this probe turn so the cadence keeps advancing
-                    addDebugLog('info', `STAGE 2 finder PROBE turn (breaker open) — re-testing finder speed against the ${finderBudgetMs / 1000}s budget`, {
-                        subsystem: 'finder', event: 'finder.budget', reason: 'CIRCUIT_BREAKER_PROBE',
-                        data: { agent: 'finder', profileId: finderProfileId || null, budgetMs: finderBudgetMs, overBudgetStreak: finderOverBudgetStreak },
-                    });
-                }
-                const finderP = runFinderAgent({
-                    candidates,
-                    draft: draftResult.draft,
-                    recentChat: formattedChat,
-                    // B4: the Finder only PICKS from a candidate list — a short brief is plenty,
-                    // and saves resending the full card every turn.
-                    characterInfo: getCharacterInfoBrief(),
-                    userPersona,
-                    profileId: finderProfileId,
-                    targetFacts: finderTarget,
-                    signal: finderAbort.signal,
-                });
-                const BUDGET = Symbol('finder-budget');
-                let budgetTimer;
-                const budgetP = new Promise((resolve) => { budgetTimer = setTimeout(() => resolve(BUDGET), finderBudgetMs); });
-                const raced = await Promise.race([finderP, budgetP]).finally(() => clearTimeout(budgetTimer));
-                // Time the reply ACTUALLY waited on Stage-2 — measured around the budget RACE, so it
-                // captures the budget-fallback case (capped at ~finderBudgetMs) as well as a finder
-                // that beat the budget. NOT just the finder LLM time. Observability only.
-                stageMs.finderMs = Date.now() - finderStart;
+    const detStart = Date.now();
+    const retrieval = await buildDeterministicRetrieval();
+    stageMs.deterministicMs = Date.now() - detStart; // observability: retrieval build wall-clock
 
-                if (raced === BUDGET) {
-                    // Budget exceeded → ABORT the in-flight finder (stops token burn), use the
-                    // deterministic facts THIS turn, and advance the over-budget streak (may trip
-                    // the breaker so we stop blocking on subsequent slow turns).
-                    finderOverBudgetStreak++;
-                    finderAbort.abort(new DOMException(`Finder exceeded ${finderBudgetMs}ms budget`, 'AbortError'));
-                    addDebugLog('info', `STAGE 2 finder exceeded ${finderBudgetMs / 1000}s budget — aborted in-flight call, using deterministic retrieval for this turn (over-budget streak ${finderOverBudgetStreak})`, {
-                        subsystem: 'finder', event: 'finder.budget', reason: 'BUDGET_EXCEEDED',
-                        data: { agent: 'finder', profileId: finderProfileId || null, budgetMs: finderBudgetMs, candidateCount: candidates.length, fallback: 'deterministic', aborted: true, overBudgetStreak: finderOverBudgetStreak },
-                    });
-                    // Avoid an unhandled rejection on the dropped/aborted finder promise.
-                    finderP.catch(() => {});
-                } else {
-                    // The finder beat the budget → RESET the breaker (connection is fast enough now).
-                    finderOverBudgetStreak = 0;
-                    finderTrippedTurns = 0;
-                    const finder = raced;
-                    // TOKEN CAPTURE: the finder LLM call ran and returned (beat the budget), so its
-                    // tokens were spent whether or not it chose facts — record them for the Tokens tab.
-                    finderTokens = { input: Number(finder?.tokensIn) || 0, output: Number(finder?.tokensOut) || 0 };
-                    if (finderTokens.input || finderTokens.output) {
-                        addDebugLog('info', `STAGE 2 finder tokens: in=${finderTokens.input} out=${finderTokens.output}`, {
-                            subsystem: 'finder', event: 'finder.run',
-                            data: { agent: 'finder', profileId: finderProfileId || null, tokensIn: finderTokens.input, tokensOut: finderTokens.output },
-                        });
-                    }
-                    // Use finder results when it succeeded AND chose something. Empty/error => fall back.
-                    if (finder && !finder.error && Array.isArray(finder.facts) && finder.facts.length > 0) {
-                        const facts = finder.facts.map(({ fact, category }) => ({ fact, category, tier: 'primary' }));
-                        retrieval = {
-                            facts,
-                            formatted: finder.formatted || formatChosenFacts(finder.facts),
-                            stats: { primary: facts.length, secondary: 0, tertiary: 0 },
-                        };
-                        addDebugLog('info', `STAGE 2 finder chose ${facts.length} fact(s) for injection`, {
-                            subsystem: 'finder', event: 'finder.run',
-                            data: { agent: 'finder', profileId: finderProfileId || null, success: true, durationMs: Date.now() - finderStart, candidateCount: candidates.length, chosenCount: facts.length, targetFacts: finderTarget },
-                        });
-                    } else {
-                        addDebugLog('info', `STAGE 2 finder ${finder?.error ? `errored (${finder.error})` : 'returned nothing'} — falling back to deterministic retrieval`, {
-                            subsystem: 'finder', event: 'finder.run', reason: finder?.error ? 'FINDER_ERROR' : 'FINDER_EMPTY',
-                            data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finder?.error || null, fallback: 'deterministic' },
-                        });
-                    }
-                }
-            }
-        } catch (finderErr) {
-            // The reply stopped waiting on Stage-2 here (a throw before the race recorded it).
-            if (stageMs.finderMs === null) stageMs.finderMs = Date.now() - finderStart;
-            addDebugLog('fail', `STAGE 2 finder threw (${finderErr.message || finderErr}) — falling back to deterministic retrieval`, {
-                subsystem: 'finder', event: 'finder.run', reason: 'FINDER_THREW',
-                data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finderErr.message || String(finderErr), fallback: 'deterministic' },
-            });
-        }
-    } else {
-        finderOverBudgetStreak = 0; finderTrippedTurns = 0; // finder off → keep the breaker reset so re-enabling starts clean
-        addDebugLog('info', 'Finder agent disabled (useFinderAgent=false) — using deterministic retrieval', {
-            subsystem: 'finder', event: 'finder.run', reason: 'FINDER_DISABLED',
-            data: { agent: 'finder', fired: false, fallback: 'deterministic' },
-        });
-    }
-
-    // FALLBACK: finder disabled, errored, or empty → deterministic retrieval (over Agent 1's
-    // keyword requests + speculative) which ALWAYS still includes active Unsorted facts.
-    if (!retrieval) {
-        const detStart = Date.now();
-        retrieval = await buildDeterministicRetrieval();
-        stageMs.deterministicMs = Date.now() - detStart; // observability: fallback build wall-clock
-    }
-
-    // GUARANTEED PRESENT-CHARACTER ANCHORS (injection composition fix). Whichever path produced
-    // `retrieval` (finder OR deterministic), ensure each in-focus character's key anchors
-    // (identity / current-state / active relationship) are present even if the finder/retrieval
-    // missed them — a Writer that forgets a present character's name or relationship breaks
-    // continuity. Pulled deterministically from the bySubject index (no LLM, cheap) and merged
-    // in WITHOUT removing any chosen fact; only NEW anchors are appended.
+    // GUARANTEED PRESENT-CHARACTER ANCHORS (injection composition fix). Ensure each in-focus
+    // character's key anchors (identity / current-state / active relationship) are present even
+    // if retrieval missed them — a Writer that forgets a present character's name or relationship
+    // breaks continuity. Pulled deterministically from the bySubject index (no LLM, cheap) and
+    // merged in WITHOUT removing any chosen fact; only NEW anchors are appended.
     if (settings.finderAnchorsPerCharacter > 0 && Array.isArray(draftResult.focus) && draftResult.focus.length) {
         const chosenIds = new Set(retrieval.facts.map(({ fact, category }) => `${String(category).toLowerCase()}:${String(fact.key).toLowerCase()}`));
         const anchors = collectAnchorFacts(index, draftResult.focus, settings.finderAnchorsPerCharacter, chosenIds);
@@ -1313,8 +1070,8 @@ async function runPipelineInline(data) {
         // so the Tokens tab stays in sync and the per-cycle main-output gate is armed.
         // Agent 3 no longer runs here, so memoryResult is null on the blocking path —
         // its tokens are recorded separately via addAgent3Tokens on MESSAGE_RECEIVED.
-        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, finderTokens });
-        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, finderTokens, agent1Skipped: !runAgent1 });
+        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null });
+        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, agent1Skipped: !runAgent1 });
         hideWorkingIndicator();
         updateStatus('idle');
         // Cancelled inline: no post-reply work will run for this turn — disarm + clear ambient.
@@ -1444,16 +1201,16 @@ async function runPipelineInline(data) {
     // (memoryResult: null) — its tokens are folded in later via addAgent3Tokens on
     // the MESSAGE_RECEIVED path, which updates lastRunTokens.agent3* without bumping
     // the run count or re-counting input.
-    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null, finderTokens });
+    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null });
     // FIX #10: consolidated per-run summary (after token recording — values in scope).
     // Thread the per-stage breakdown so ONE summary line carries the full timing picture.
-    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, finderTokens, agent1Skipped: !runAgent1 });
+    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, agent1Skipped: !runAgent1 });
 
     // OBSERVABILITY: one concise per-stage timing line (debug level) for the slowness hunt.
     // Pure log — emitting it changes no state and runs after the blocking work is recorded.
     const blockingTotalMs = Date.now() - startTime;
     addDebugLog('debug',
-        `[${runId}] Stage timing: agent1=${stageMs.agent1Ms ?? '-'}ms finder=${stageMs.finderMs ?? '-'}ms ` +
+        `[${runId}] Stage timing: agent1=${stageMs.agent1Ms ?? '-'}ms ` +
         `det=${stageMs.deterministicMs ?? '-'}ms scene=${stageMs.sceneBuildMs ?? '-'}ms ` +
         `inject=${stageMs.injectMs ?? '-'}ms total=${blockingTotalMs}ms`,
         { runId, subsystem: 'pipeline', event: 'pipeline.timing', data: { phase: 'blocking', ...stageMs, totalMs: blockingTotalMs } },
@@ -1470,7 +1227,7 @@ async function runPipelineInline(data) {
         // identity-stable category:key) in the use buffer; the next post-reply extraction save
         // drains it onto the freshly-loaded fact objects, so the bumps ride that existing save
         // with NO extra per-turn write. (retrieval.facts are the chosen {fact, category} refs
-        // for every path: finder, deterministic fallback, speculative.) Thread the run id so the
+        // for every path: deterministic + speculative + anchors.) Thread the run id so the
         // strengthening log groups under this turn.
         markFactsUsed(retrieval.facts);
         // A4 — Injection Viewer: surface WHAT the Writer was given this turn + a rough token cost
@@ -1760,7 +1517,6 @@ async function runMemoryExtraction() {
         });
         setLastInserted(committed);
         for (const update of memoryResult.updates) trackUpdate(update);
-        lastProcessedMessageIndex = memoryTargetIndex;
 
         // Mark the AI target + the user message (Agent 3 saw both) as processed so the
         // per-message icon / "skip already processed" / our own re-extract gate honor it.
@@ -2029,8 +1785,8 @@ async function maybeRunEntityCheck() {
 
 /**
  * A2/B5 — FROZEN INJECTION. On a genuine new turn, OPTIONALLY reuse the cached draft-less injection
- * (the same scene + facts block the last full run produced) instead of re-running the Drafter +
- * Finder agents. This (a) skips those per-turn LLM calls (token/latency win) and (b) keeps the
+ * (the same scene + facts block the last full run produced) instead of re-running the Drafter.
+ * This (a) skips that per-turn LLM call (token/latency win) and (b) keeps the
  * injected system block BYTE-STABLE across the frozen window, so a server-side prompt cache can
  * reuse the prefix (the cache-stability half — see the note in llm-call.js).
  *
@@ -2075,7 +1831,7 @@ function tryFrozenInjection(data) {
 
     turnsSinceFullInjection++;
     pipelineJustInjected = true; // double-fire guard (mirrors the full-run + swipe paths)
-    addDebugLog('info', `Frozen injection: reused cached facts (turn ${turnsSinceFullInjection}/${freeze}) — skipped Drafter + Finder (${cached.length} chars)`, {
+    addDebugLog('info', `Frozen injection: reused cached facts (turn ${turnsSinceFullInjection}/${freeze}) — skipped Drafter (${cached.length} chars)`, {
         subsystem: 'pipeline', event: 'pipeline.frozen', reason: 'REUSED_CACHE',
         data: { turnsSinceFullInjection, freeze, chars: cached.length },
     });
@@ -2111,7 +1867,7 @@ function tryFrozenInjectionText(data) {
 
     turnsSinceFullInjection++;
     pipelineJustInjected = true;
-    addDebugLog('info', `Frozen injection (text): reused cached facts (turn ${turnsSinceFullInjection}/${freeze}) — skipped Drafter + Finder (${cached.length} chars)`, {
+    addDebugLog('info', `Frozen injection (text): reused cached facts (turn ${turnsSinceFullInjection}/${freeze}) — skipped Drafter (${cached.length} chars)`, {
         subsystem: 'pipeline', event: 'pipeline.frozen', reason: 'REUSED_CACHE_TEXT',
         data: { turnsSinceFullInjection, freeze, chars: cached.length },
     });
@@ -2160,7 +1916,7 @@ export function initPipeline() {
         // Claude, etc.) emit BOTH `chat_completion_prompt_ready` AND `generate_after_data` for a
         // SINGLE generation. The chat-completion handler above already runs the full pipeline and
         // injects into the correct message-ARRAY shape; letting this text-shape handler also fire
-        // ran the Drafter + Finder a SECOND time every turn (~2× tokens + ~2× latency) and injected
+        // ran the Drafter a SECOND time every turn (~2× tokens + ~2× latency) and injected
         // into the wrong (prompt-string) shape. So defer entirely to the chat-completion handler for
         // those backends. Text-completion backends do NOT emit `chat_completion_prompt_ready`, so
         // they still run here. (If the API can't be read, fall through and run — better than a
@@ -2263,20 +2019,17 @@ export function initPipeline() {
                 }
             }
         }
-        // Also reset the Agent 3 dedup counter — indices shift after deletion,
-        // and the prior "already processed" guard at runPipelineInline (line ~232)
-        // would otherwise silently skip new AI replies that happen to land at
-        // indices ≤ the stale lastProcessedMessageIndex.
-        lastProcessedMessageIndex = -1;
-        addDebugLog('info', `Message deleted — reset lastUserMsg=${lastTriggeredUserMsgIndex}, lastProcessedMessageIndex=-1`);
+        // Extraction dedup is handled by the per-message bf_mem_processed flag (stamped on
+        // extracted messages, checked by runMemoryExtraction) — indices shifting after a
+        // deletion can't skip new AI replies, so only the trigger index needs a reset here.
+        addDebugLog('info', `Message deleted — reset lastUserMsg=${lastTriggeredUserMsgIndex}`);
     });
 
-    // Reset on swipe/regenerate. The monotonic lastTriggeredUserMsgIndex /
-    // lastProcessedMessageIndex never rewound on swipe, so once they raced ahead of
-    // the chat's true state every later turn was silently skipped forever (FIX #1).
-    // Rewind both indices to the current chat and clear the swiped AI message's
-    // bf_mem_processed flag — its content just changed, so any prior extraction is
-    // stale and the next genuine turn must be allowed to re-process it.
+    // Reset on swipe/regenerate. The monotonic lastTriggeredUserMsgIndex never rewound
+    // on swipe, so once it raced ahead of the chat's true state every later turn was
+    // silently skipped forever (FIX #1). Rewind it to the current chat and clear the
+    // swiped AI message's bf_mem_processed flag — its content just changed, so any prior
+    // extraction is stale and the next genuine turn must be allowed to re-process it.
     eventSource.on(eventTypes.MESSAGE_SWIPED, (mesId) => {
         const currentChat = SillyTavern.getContext().chat;
         lastTriggeredUserMsgIndex = -1;
@@ -2288,7 +2041,6 @@ export function initPipeline() {
                 }
             }
         }
-        lastProcessedMessageIndex = -1;
         // Invalidate extraction on the swiped message (content replaced).
         const swipedIdx = Number.isInteger(mesId) ? mesId : (currentChat ? currentChat.length - 1 : -1);
         if (currentChat && currentChat[swipedIdx]?.extra?.bf_mem_processed) {
@@ -2321,7 +2073,6 @@ export function initPipeline() {
         // is invalidated too.
         invalidateDatabaseCache();
         isInternalCall = false;
-        lastProcessedMessageIndex = -1;
         lastInjection = null;
         lastInjectionNoDraft = null;
         pipelineJustInjected = false;

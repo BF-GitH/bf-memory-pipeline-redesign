@@ -3,7 +3,6 @@
 
 import { getConnectionProfiles, getCurrentProfileId } from './profiler.js';
 import { DEFAULT_DRAFT_PROMPT } from './agent-draft.js';
-import { DEFAULT_FINDER_PROMPT } from './agent-finder.js';
 import { DEFAULT_MEMORY_PROMPT } from './agent-memory.js';
 import { DEFAULT_WRITER_FORMAT } from './agent-writer.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
@@ -120,11 +119,6 @@ const DEFAULT_SETTINGS = {
     // and migrated forward in migrateLegacySettings().
     agent1Profile: '',
     agent3Profile: '',
-    // Agent 4 (Fact Finder, STAGE 2 of two-stage retrieval) connection profile.
-    // Empty => reuse Agent 1's profile (the design default). `agent4Profile` is the
-    // canonical key; `finderProfile` is accepted as an alias (validated/migrated below).
-    agent4Profile: '',
-    finderProfile: '',
     // Per-agent context message counts (replacing single contextMessages).
     // Agent 3 default raised from 2 -> 5 (FIX #2a): a 2-message window truncated
     // long single-message backstory disclosures and the surrounding exchange that
@@ -169,9 +163,9 @@ const DEFAULT_SETTINGS = {
     // messages so stored facts REPLACE old turns instead of stacking on top (the core token win).
     // Existing users keep their stored value (often 0). 0 still means "no trim / full history".
     agent2ContextMessages: 10,
-    // A2/B5 — FROZEN INJECTION. 0 = off (default; every turn runs the Drafter + Finder fresh). When
-    // > 0, a genuine new turn REUSES the previous run's cached fact/scene injection (skipping those
-    // two LLM calls) for up to this many turns before a full refresh. Saves tokens/latency AND keeps
+    // A2/B5 — FROZEN INJECTION. 0 = off (default; every turn runs the Drafter fresh). When
+    // > 0, a genuine new turn REUSES the previous run's cached fact/scene injection (skipping that
+    // LLM call) for up to this many turns before a full refresh. Saves tokens/latency AND keeps
     // the injected block byte-stable so a server-side prompt cache can reuse the prefix. Memory is
     // unaffected — the post-reply Scribe still extracts every turn; only the INJECTED facts may be up
     // to N turns stale. Clamp 0..20.
@@ -276,21 +270,9 @@ const DEFAULT_SETTINGS = {
     // Full-chat rebuild concurrency (atomic #17): max parallel Scribe calls during a
     // "Run on current chat" backfill (shared DB object → no lost writes). Clamp 1..6.
     rebuildConcurrency: 3,
-    // Semantic retrieval (atomic #1/#16). Default OFF. When on, facts are embedded (vector) on
-    // write and the query is embedded at retrieval so facts match by MEANING, not just keyword/
-    // trigram/graph. callEmbeddingAPI probes CMRS + known ST routes and GRACEFULLY NO-OPS if
-    // none respond — safe to enable on any backend (retrieval just stays keyword-only).
-    // C4/A3 default flip: semantic (vector) retrieval ON for fresh installs. GRACEFULLY no-ops when
-    // no embedding endpoint responds (callEmbeddingAPI → null → keyword/trigram retrieval), so it is
-    // TOOL-FIRST DEFAULT: OFF. Embeddings / semantic recall are NOT part of the tool-first path —
-    // Claude drives recall via search_memory, which is the intended "semantic" layer. The vector
-    // code remains in the repo but is dormant by default; turn this ON only if you deliberately
-    // configure an embedding model. (It no-ops anyway when no embedding endpoint responds.)
+    // RETIRED (v0.50.x): the vector/embedding stack was removed; kept inert for stored-settings
+    // back-compat only — nothing reads it anymore.
     semanticRetrieval: false,
-    embeddingProfile: '',                       // CMRS profile for embeddings (blank = reuse Agent 1's)
-    embeddingSource: '',                        // ST vector source for embeddings (blank = derive from the active chat source, e.g. 'openrouter')
-    embeddingModel: 'text-embedding-3-small',   // embedding model (auto-prefixed per source; openrouter → openai/text-embedding-3-small)
-    semanticThreshold: 0.75,                    // min cosine similarity for a semantic hit
     // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
     // no random dice). These keys are kept for settings persistence/back-compat and the
     // existing sliders, but no longer gate which facts get injected. Safe to remove the
@@ -358,26 +340,9 @@ const DEFAULT_SETTINGS = {
     // merge loudly. Deterministic (NO LLM call). Absent (older settings) → defaults apply.
     entityResolution: false,
     entityResolutionThreshold: 0.85,
-    // Two-stage retrieval: STAGE 2 detail finder (Agent 4). When true (default), after
-    // Agent 1 picks #Branches from the menu, Agent 4 reads the full facts under those
-    // branches (+ all Unsorted) and chooses the relevant subset for injection. When false
-    // (or on any finder error/empty), the pipeline falls back to deterministic retrieveFacts.
-    // DEFAULT FLIPPED TO false (2026-05-31): the Finder is also HARD-DISABLED in pipeline.js
-    // (see the long note at `const wantFinder = false`). It was redundant once semantic + graph +
-    // anchors landed, and was timing out at scale anyway. Kept as a setting only for a future revert.
-    useFinderAgent: false,
-    // FINDER LATENCY BUDGET (ms). Max wall-clock the reply-blocking path may wait on the Stage-2
-    // finder before falling back to the (already-computed) deterministic retrieval. On expiry the
-    // in-flight finder LLM call is ABORTED (stops burning tokens). Lowered from the original 6000
-    // to 3500 so a slow model adds at most ~3.5s, not ~6s, per turn. See the adaptive circuit
-    // breaker in pipeline.js: after the finder blows the budget repeatedly it stops blocking at all.
-    finderBudgetMs: 3500,
-    // FINDER TARGET (soft floor): the finder aims for ~this many facts (a floor, not the hard cap)
-    // so it returns a useful set instead of a tight 5–7. The hard ceiling stays the finder maxFacts.
-    finderTargetFacts: 12,
     // GUARANTEED ANCHORS: how many key anchor facts (identity / current-state / active relationship)
-    // per present character to always inject alongside the finder's picks, so the in-focus
-    // character's anchors surface even if the finder misses them. 0 disables.
+    // per present character to always inject alongside the retrieved facts, so the in-focus
+    // character's anchors surface even if retrieval misses them. 0 disables.
     finderAnchorsPerCharacter: 3,
     // USER-LEVEL SHARED MEMORY (Zep/mem0 user-scoping). Default OFF. When ON, facts whose SUBJECT
     // resolves to the user persona ({{user}}) are ALSO routed into a single shared, durable
@@ -388,8 +353,6 @@ const DEFAULT_SETTINGS = {
     // back-compat: when OFF, storage AND retrieval are byte-identical to today (no shared store is
     // ever read or written). Absent (older settings) => default false.
     userLevelMemory: false,
-    // Optional system-prompt override for Agent 4. Empty => DEFAULT_FINDER_PROMPT.
-    finderPrompt: '',
     draftPrompt: '',
     memoryPrompt: '',
     writerFormat: '',
@@ -486,7 +449,8 @@ function validateSettings(s) {
     if (typeof s.confidenceRanking !== 'boolean') s.confidenceRanking = true;
     s.confidenceWeight = clamp(s.confidenceWeight, 0, 1, 0.3);
     s.rebuildConcurrency = Math.floor(clamp(s.rebuildConcurrency, 1, 6, 3));
-    s.semanticThreshold = clamp(s.semanticThreshold, 0.1, 0.99, 0.75);
+    // RETIRED vector stack (v0.50.x): coerced inert for stored-settings back-compat; nothing reads it.
+    if (typeof s.semanticRetrieval !== 'boolean') s.semanticRetrieval = false;
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
     // Feature #4 depth-dice probabilities are 0..1 floats (not clamped to ints).
@@ -532,15 +496,7 @@ function validateSettings(s) {
     if (typeof s.memoryProfile !== 'string')     s.memoryProfile = '';
     if (typeof s.agent1Profile !== 'string')     s.agent1Profile = '';
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
-    if (typeof s.agent4Profile !== 'string')     s.agent4Profile = '';
-    if (typeof s.finderProfile !== 'string')     s.finderProfile = '';
-    // Accept `finderProfile` as an alias for `agent4Profile`: if only the alias is set,
-    // fold it onto the canonical key so downstream code only reads agent4Profile.
-    if (!s.agent4Profile && s.finderProfile) s.agent4Profile = s.finderProfile;
-    if (typeof s.useFinderAgent !== 'boolean')   s.useFinderAgent = false; // Finder hard-disabled; default off to match DEFAULT_SETTINGS
-    // Finder latency/target/anchor knobs (clamped to sane bounds; defaults match DEFAULT_SETTINGS).
-    s.finderBudgetMs = Math.floor(clamp(s.finderBudgetMs, 1000, 15000, 3500));
-    s.finderTargetFacts = Math.floor(clamp(s.finderTargetFacts, 0, 30, 12));
+    // Guaranteed present-character anchors (live; the retired Finder's other knobs are gone).
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = true;
     // Coercion matches the tool-first DEFAULT (true): an absent key (older saved settings) resolves
@@ -571,7 +527,6 @@ function validateSettings(s) {
     // a renamed preset) coerces to 'custom' so the dropdown falls back safely. The actual knob
     // values are NOT touched here — detectPreset()/applyPreset() own that; this only guards the id.
     if (!PRESET_IDS.has(s.uiPreset)) s.uiPreset = 'custom';
-    if (typeof s.finderPrompt !== 'string')      s.finderPrompt = '';
     if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
     if (typeof s.writerFormat !== 'string')      s.writerFormat = '';
@@ -2292,8 +2247,7 @@ export function exportLogsJSON() {
 function reloadProfiles() {
     const agent1Select = document.getElementById('bf_mem_agent1_profile');
     const agent3Select = document.getElementById('bf_mem_agent3_profile');
-    const agent4Select = document.getElementById('bf_mem_agent4_profile');
-    if (!agent1Select && !agent3Select && !agent4Select) return;
+    if (!agent1Select && !agent3Select) return;
 
     const profiles = getConnectionProfiles();
     const activeProfile = getCurrentProfileId();
@@ -2317,20 +2271,6 @@ function reloadProfiles() {
 
     populate(agent1Select, extensionSettings?.agent1Profile);
     populate(agent3Select, extensionSettings?.agent3Profile);
-    populate(agent4Select, extensionSettings?.agent4Profile);
-}
-
-/**
- * Enable/disable the embedding profile selector + "Test embedding endpoint" button to mirror the
- * Semantic-retrieval toggle: they're only meaningful when semantic is on. Idempotent + null-safe so
- * it can be called from the toggle handler and at init. Pure DOM, no behavior change to retrieval.
- */
-function syncEmbeddingControls() {
-    const on = extensionSettings?.semanticRetrieval === true;
-    for (const id of ['bf_mem_embedding_source', 'bf_mem_embedding_model', 'bf_mem_test_embedding']) {
-        const el = document.getElementById(id);
-        if (el) el.disabled = !on;
-    }
 }
 
 // --- Tabs ---
@@ -4628,9 +4568,9 @@ async function showLinkedChatsPopup() {
 // -----------------------------------------------------------------------------
 // One dropdown that maps a single choice onto the many token/retrieval knobs, so a new user
 // doesn't have to understand ~40 settings. This is ALSO the delivery vehicle for the token
-// cuts (Parts A/B): "Cheap" flips on history-trimming, drops the Finder LLM, turns on the
-// pull-on-demand recall tool, and tightens the injection caps. Everything else stays under the
-// existing per-tab controls ("Advanced").
+// cuts (Parts A/B): "Cheap" flips on history-trimming, turns on the pull-on-demand recall
+// tool, and tightens the injection caps. Everything else stays under the existing per-tab
+// controls ("Advanced").
 //
 // DESIGN: a preset only writes the keys listed in GOVERNED_KEYS — never `enabled`, never the
 // connection profiles, never prompts. Detection compares ONLY those keys, so a user's unrelated
@@ -4642,56 +4582,41 @@ const PRESET_IDS = new Set(['cheap', 'balanced', 'maxrecall', 'custom']);
 
 // The exact knobs a preset governs. Detection + apply both operate on ONLY these keys.
 const GOVERNED_KEYS = [
-    // useFinderAgent intentionally NOT governed: the Finder (Agent 4) is hard-disabled in the
-    // pipeline (wantFinder=false), so writing/comparing it via presets is a no-op that only made
-    // preset switching look like it changed retrieval. Presets now leave it untouched.
-    'semanticRetrieval', 'agent2ContextMessages',
+    'agent2ContextMessages',
     'enableSummaryPyramid', 'enableWriterRecallTool',
-    'retrievalTokenBudget', 'finderTargetFacts', 'finderAnchorsPerCharacter',
+    'retrievalTokenBudget', 'finderAnchorsPerCharacter',
     'reflectionInterval',
 ];
 
-// Preset signatures. NOTE on semanticRetrieval:true everywhere — it GRACEFULLY no-ops when no
-// embedding endpoint responds (callEmbeddingAPI returns null → keyword/trigram retrieval), so it
-// is safe to enable blind; it only helps when an embedding model is configured.
+// Preset signatures.
 const PRESETS = {
-    // CHEAP — fewest tokens: no Finder LLM (vectors/keyword retrieve), trim history so facts
-    // replace old turns, lean on the pull-on-demand recall tool + a small overview, tight caps,
-    // consolidate less often.
+    // CHEAP — fewest tokens: trim history so facts replace old turns, lean on the
+    // pull-on-demand recall tool + a small overview, tight caps, consolidate less often.
     cheap: {
-        useFinderAgent: false,
-        semanticRetrieval: false,
         agent2ContextMessages: 10,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
         retrievalTokenBudget: 300,
-        finderTargetFacts: 6,
         finderAnchorsPerCharacter: 2,
         reflectionInterval: 20,
     },
-    // BALANCED — the recommended default: Finder on for precise picks, semantic on, modest history
-    // trim, overview + recall tool on, default caps.
+    // BALANCED — the recommended default: modest history trim, overview + recall tool on,
+    // default caps.
     balanced: {
-        useFinderAgent: true,
-        semanticRetrieval: false,
         agent2ContextMessages: 10,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
         retrievalTokenBudget: 800,
-        finderTargetFacts: 12,
         finderAnchorsPerCharacter: 3,
         reflectionInterval: 12,
     },
     // MAX RECALL — quality over cost: full history (no trim), wide caps, more anchors, frequent
     // consolidation. The most expensive option.
     maxrecall: {
-        useFinderAgent: true,
-        semanticRetrieval: false,
         agent2ContextMessages: 0,
         enableSummaryPyramid: true,
         enableWriterRecallTool: true,
         retrievalTokenBudget: 1600,
-        finderTargetFacts: 16,
         finderAnchorsPerCharacter: 4,
         reflectionInterval: 10,
     },
@@ -4734,18 +4659,16 @@ let _applyingPreset = false;
  * jQuery no-ops on a missing selector, so this is safe even if a control isn't in the DOM yet.
  */
 function syncPresetControls() {
-    $('#bf_mem_finder_enabled').prop('checked', extensionSettings.useFinderAgent !== false);
-    $('#bf_mem_semantic_enabled').prop('checked', extensionSettings.semanticRetrieval === true);
     $('#bf_mem_pyramid_enabled').prop('checked', extensionSettings.enableSummaryPyramid === true);
     $('#bf_mem_recall_tool_enabled').prop('checked', extensionSettings.enableWriterRecallTool === true);
     $('#bf_mem_agent2_context').val(extensionSettings.agent2ContextMessages);
     $('#bf_mem_agent2_context_val').text(extensionSettings.agent2ContextMessages);
     $('#bf_mem_reflection_interval').val(extensionSettings.reflectionInterval);
     $('#bf_mem_reflection_interval_val').text(extensionSettings.reflectionInterval);
-    // NOTE: retrievalTokenBudget / finderTargetFacts / finderAnchorsPerCharacter are governed by
-    // presets but have NO on-screen control (no slider in settings.html) — nothing to sync here.
-    // They're still written by applyPreset() and consumed by the pipeline; they simply can't be
-    // hand-edited from the UI, so they can never drift a preset to "Custom".
+    // NOTE: retrievalTokenBudget / finderAnchorsPerCharacter are governed by presets but have
+    // NO on-screen control (no slider in settings.html) — nothing to sync here. They're still
+    // written by applyPreset() and consumed by the pipeline; they simply can't be hand-edited
+    // from the UI, so they can never drift a preset to "Custom".
 }
 
 /**
@@ -4922,9 +4845,7 @@ export async function initSettings() {
         // Only the governed settings that HAVE an on-screen control are listed (the three
         // budget/target/anchor keys have no slider, so they can't be manually edited anyway).
         const governedSelector = [
-            // #bf_mem_finder_enabled removed: useFinderAgent is no longer in GOVERNED_KEYS (Finder
-            // hard-disabled), so toggling it must NOT flip the preset to Custom.
-            '#bf_mem_semantic_enabled', '#bf_mem_pyramid_enabled',
+            '#bf_mem_pyramid_enabled',
             '#bf_mem_recall_tool_enabled', '#bf_mem_agent2_context', '#bf_mem_reflection_interval',
         ].join(',');
         $('#bf_memory_settings').on('change input', governedSelector, function () {
@@ -4956,20 +4877,6 @@ export async function initSettings() {
     $('#bf_mem_refresh_profiles').on('click', () => {
         reloadProfiles();
         toastr.info('Profiles refreshed', 'BF Memory');
-    });
-
-    // Agent 4 (Fact Finder) — toggle + profile selector (Agent 2 tab / Fact Finder section).
-    // reloadProfiles() above already populated the dropdown; just bind value + change.
-    $('#bf_mem_finder_enabled').prop('checked', extensionSettings.useFinderAgent !== false).on('change', function () {
-        const before = extensionSettings.useFinderAgent !== false;
-        extensionSettings.useFinderAgent = $(this).prop('checked');
-        addDebugLog('info', `Finder agent ${extensionSettings.useFinderAgent ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'useFinderAgent' }, before, after: !!extensionSettings.useFinderAgent });
-        saveSettings();
-    });
-    $('#bf_mem_agent4_profile').val(extensionSettings.agent4Profile || '').on('change', function () {
-        extensionSettings.agent4Profile = $(this).val() || '';
-        addDebugLog('info', `Finder profile changed`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent4Profile', value: extensionSettings.agent4Profile } });
-        saveSettings();
     });
 
     // Agent 1 context slider
@@ -5388,20 +5295,6 @@ export async function initSettings() {
         toastr.info('Writer format reset', 'BF Memory');
     });
 
-    // Fact Finder (Agent 4) prompt editor + reset (Agent 2 tab).
-    $('#bf_mem_finder_prompt').val(extensionSettings.finderPrompt || DEFAULT_FINDER_PROMPT).off('input').on('input', function () {
-        const val = $(this).val();
-        extensionSettings.finderPrompt = (val === DEFAULT_FINDER_PROMPT) ? '' : val;
-        saveSettings();
-    });
-    $('#bf_mem_reset_finder_prompt').on('click', () => {
-        extensionSettings.finderPrompt = '';
-        $('#bf_mem_finder_prompt').val(DEFAULT_FINDER_PROMPT);
-        addDebugLog('info', 'Finder prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'finderPrompt', isDefault: true } });
-        saveSettings();
-        toastr.info('Librarian prompt reset', 'BF Memory');
-    });
-
     // --- Database Tab: Profiles ---
     refreshDbProfileDropdown();
 
@@ -5600,86 +5493,6 @@ export async function initSettings() {
     $('#bf_mem_run_full_chat_cancel').on('click', () => {
         fullChatCancel = true;
         $('#bf_mem_run_full_chat_cancel').prop('disabled', true).text('Cancelling…');
-    });
-
-    // Semantic retrieval toggle (atomic #1).
-    $('#bf_mem_semantic_enabled').prop('checked', extensionSettings.semanticRetrieval === true).on('change', function () {
-        extensionSettings.semanticRetrieval = $(this).prop('checked');
-        saveSettings();
-        if (extensionSettings.semanticRetrieval) {
-            toastr.info('Semantic retrieval on. Click "Embed all facts" to vectorize existing facts; new facts embed automatically.', 'BF Memory');
-        }
-        syncEmbeddingControls();
-    });
-
-    // Embedding source + model (ST 1.18 vector store uses these, NOT a connection profile).
-    $('#bf_mem_embedding_source').val(extensionSettings.embeddingSource || '').on('change', function () {
-        extensionSettings.embeddingSource = ($(this).val() || '').trim();
-        saveSettings();
-    });
-    $('#bf_mem_embedding_model').val(extensionSettings.embeddingModel || '').on('change', function () {
-        extensionSettings.embeddingModel = ($(this).val() || '').trim() || 'text-embedding-3-small';
-        saveSettings();
-    });
-
-    // Test embedding endpoint: structured probe with a specific success/failure reason. Read-only.
-    $('#bf_mem_test_embedding').on('click', async () => {
-        const btn = $('#bf_mem_test_embedding');
-        const out = $('#bf_mem_test_embedding_result');
-        btn.prop('disabled', true);
-        out.show().text('Testing…');
-        try {
-            // Test via the REAL mechanism on ST 1.18+: insert+query a throwaway collection through
-            // ST's server-side vector store (the /api/backends/.../embeddings routes don't exist here).
-            const { testVectorEmbedding } = await import('./st-vectors.js');
-            const r = await testVectorEmbedding();
-            if (r.ok) {
-                out.html(`<span style="color:#4caf50;">✓ Working</span> — embeddings via source <b>${escapeHtml(r.source)}</b>, model <code>${escapeHtml(r.model)}</code>.`);
-            } else {
-                out.html(`<span style="color:#f44336;">✗ Failed</span> — ${escapeHtml(r.reason)}`);
-            }
-        } catch (err) {
-            out.html(`<span style="color:#f44336;">✗ Error</span> — ${escapeHtml(err.message || String(err))}`);
-        } finally {
-            btn.prop('disabled', false);
-        }
-    });
-
-    // Enable/disable the embedding selector + test button with the semantic toggle.
-    syncEmbeddingControls();
-
-    // --- Embed all facts (atomic #16): one-shot semantic backfill of the current character's DB ---
-    $('#bf_mem_embed_all').on('click', async () => {
-        if (!extensionSettings.semanticRetrieval) {
-            toastr.info('Enable "Semantic retrieval" first, then embed.', 'BF Memory');
-            return;
-        }
-        // C6: confirm before a potentially large embedding backfill — one embedding API call per
-        // batch of facts, so a big store can mean many calls / real cost. Mirrors the rebuild confirm.
-        const okEmbed = await showConfirm('Embed all stored facts for this character now? This sends every not-yet-embedded fact to your embedding endpoint and may make many API calls.');
-        if (!okEmbed) return;
-        const btn = $('#bf_mem_embed_all');
-        const progress = $('#bf_mem_embed_all_progress');
-        btn.prop('disabled', true).text('Embedding…');
-        progress.show().text('Starting…');
-        try {
-            const { bulkEmbedAllFacts } = await import('./fact-embedding.js');
-            const result = await bulkEmbedAllFacts(({ done, total }) => {
-                progress.text(`Embedding ${done}/${total} fact(s)…`);
-            });
-            if (result.total === 0) {
-                progress.text('All facts already embedded (or none to embed).');
-                toastr.info('Nothing to embed — facts are already vectorized or the store is empty.', 'BF Memory');
-            } else {
-                progress.text(`Done: ${result.succeeded}/${result.total} embedded.`);
-                toastr.success(`Embedded ${result.succeeded}/${result.total} fact(s)`, 'BF Memory');
-            }
-        } catch (err) {
-            toastr.error(`Embed failed: ${err.message}`, 'BF Memory');
-            progress.text(`Failed: ${err.message}`);
-        } finally {
-            btn.prop('disabled', false).html('<i class="fa-solid fa-vector-square"></i> Embed all facts (semantic)');
-        }
     });
 
     // --- Tokens Tab ---

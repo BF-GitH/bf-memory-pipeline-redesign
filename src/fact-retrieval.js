@@ -2,10 +2,8 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sinceIso } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sinceIso } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
-import { callEmbeddingAPI } from './llm-call.js';
-import { getEmbeddingProfileId } from './profiler.js';
 import * as host from './host.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -20,8 +18,7 @@ import * as host from './host.js';
 //     PRIMARY hit and only after an Agent 3 write cycle has populated `fact.simLinks`.
 // So sim-links cannot reproduce this recall: a chat word matching NO stored fact yields no
 // primary seed (sim-links contribute nothing), and conceptually-related-but-textually-
-// dissimilar categories share too few trigrams to ever link. The semantic layer (item #1)
-// is the only true conceptual analogue, and it is opt-in/default-off. Gating removal behind
+// dissimilar categories share too few trigrams to ever link. Gating removal behind
 // an accumulated-fact count does not help — the gap is structural, not a warm-up phase.
 const FALLBACK_MAPPINGS = {
     // Location triggers
@@ -124,64 +121,6 @@ function estimateInjectionTokens(r) {
     return Math.ceil(line.length / 4);
 }
 
-// Max semantic (embedding) hits admitted as secondary per retrieval (atomic #1).
-const SEMANTIC_MAX_SECONDARY = 8;
-// SEMANTIC PRIORITY: how many front-of-line secondary slots are RESERVED for semantic hits so the
-// meaning-matched facts survive the salience-ranked secondary cap (otherwise a low-importance but
-// on-topic semantic hit gets CAP_SECONDARY'd out, which is exactly what made enabling semantic
-// barely change the injected set). Kept well below MAX_SECONDARY so salience/MMR still own most slots.
-const SEMANTIC_RESERVED_SECONDARY = 4;
-
-/** Cosine similarity of two equal-length numeric vectors. 0 on mismatch/empty. */
-function cosineSimilarity(a, b) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || a.length !== b.length) return 0;
-    let dot = 0, na = 0, nb = 0;
-    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
-    return (na && nb) ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
-}
-
-/**
- * Semantic expansion (atomic #1, opt-in). Embeds the query keywords and admits the top
- * cosine-closest active+visible facts (carrying a cached `embedding`) above the configured
- * threshold as SECONDARY. Fully guarded: no-ops when semantic retrieval is off, no endpoint
- * responds, or no facts are embedded yet — so it never breaks keyword/graph retrieval.
- * @param {Object} databases
- * @param {string[]} allKeywords
- * @param {Array} results - mutated in place
- * @param {Set<string>} alreadyFound - `category:key` ids already present (mutated)
- */
-async function semanticLayer(databases, allKeywords, results, alreadyFound) {
-    const s = (() => { try { return getSettings(); } catch { return null; } })();
-    if (!s?.semanticRetrieval) return;
-    const queryText = (allKeywords || []).join(' ').trim();
-    if (!queryText) return;
-
-    // ST 1.18 does server-side embeddings only (no raw vectors back), so we delegate to its vector
-    // store: query the per-character collection by the turn text and resolve the matched hashes to
-    // facts in scope. Verified to do true semantic matching via OpenRouter. Fully guarded — any
-    // failure yields an empty set and keyword/graph retrieval is untouched.
-    let ids;
-    try {
-        const { querySemanticIds } = await import('./st-vectors.js');
-        ids = await querySemanticIds(queryText, SEMANTIC_MAX_SECONDARY, databases);
-    } catch { return; }
-    if (!ids || ids.size === 0) return;
-
-    let admitted = 0;
-    for (const [category, db] of Object.entries(databases || {})) {
-        if (admitted >= SEMANTIC_MAX_SECONDARY) break;
-        for (const fact of (db.facts || [])) {
-            const id = `${category}:${fact.key}`;
-            if (!ids.has(id) || alreadyFound.has(id)) continue;
-            if (!isActiveFact(fact) || !isFactVisible(fact)) continue;
-            results.push({ fact, category, tier: 'secondary', via: 'semantic' });
-            alreadyFound.add(id);
-            if (++admitted >= SEMANTIC_MAX_SECONDARY) break;
-        }
-    }
-    if (admitted > 0) addDebugLog('info', `Semantic expansion (ST vectors): admitted ${admitted} fact(s)`);
-}
-
 /**
  * Retrieve relevant facts based on Agent 1's needed info list
  * @param {string[]} neededInfo - Array of fact categories/keywords from Agent 1
@@ -275,12 +214,6 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // MAX_TERTIARY injection caps below remain the final backstop.
     gatherExpansionCandidates(databases, index, directResults, alreadyFound);
 
-    // SEMANTIC EXPANSION (atomic #1, opt-in). Embed the query and admit facts whose cached
-    // vector is cosine-close to it — catching meaning the keyword/trigram/graph lanes miss
-    // ("safe snack?" → peanut-allergy fact). No-ops gracefully when semantic retrieval is off,
-    // no facts are embedded yet, or no embedding endpoint responds.
-    await semanticLayer(databases, allKeywords, directResults, alreadyFound);
-
     // DETERMINISTIC tier inclusion (Feature #2a). The old code rolled Math.random()
     // against secondaryChance/tertiaryChance and silently dropped correctly-retrieved
     // facts — the real cause of "the writer skips facts." We now include facts by tier
@@ -347,19 +280,6 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
             // Degrade to the salience order already computed above — never break retrieval.
             addDebugLog('debug', `MMR rerank skipped: ${e?.message || e}`, { subsystem: 'retrieval', event: 'retrieval.mmr.error' });
         }
-    }
-
-    // SEMANTIC PRIORITY (move-to-front). retrievalSalience + MMR order `secondary` by importance/
-    // recency/diversity — none of which is MEANING. So a semantic hit that's the most ON-TOPIC fact
-    // for this turn but low-importance/cold would sink below the MAX_SECONDARY cap and never reach
-    // the Writer (the reason enabling semantic barely changed the injected set). Reserve up to
-    // SEMANTIC_RESERVED_SECONDARY front slots for `via:'semantic'` admits so they survive the cap;
-    // the remaining slots stay in salience/MMR order. Stable + bounded → can't flood the prompt, and
-    // it's a no-op when semantic is off (no `via:'semantic'` entries exist).
-    if (secondary.some(r => r.via === 'semantic')) {
-        const sem = secondary.filter(r => r.via === 'semantic');
-        const rest = secondary.filter(r => r.via !== 'semantic');
-        secondary = [...sem.slice(0, SEMANTIC_RESERVED_SECONDARY), ...rest, ...sem.slice(SEMANTIC_RESERVED_SECONDARY)];
     }
 
     // TOKEN-BUDGET admission (#10): primary tokens charged first; secondary then tertiary
@@ -1396,9 +1316,19 @@ export async function explainFactRetrieval(key, keywords = []) {
         reason = 'KNOWNBY_INVISIBLE';
         detail = { key: match.fact.key, category: match.category, knownBy: match.fact.knownBy || [], ...useInfo };
     } else {
-        // Active + visible: would it have matched the given keywords?
+        // Active + visible: would it have matched the given keywords? Inline check mirroring the
+        // retired searchFacts() direct-match rule: split each keyword into words (>3 chars);
+        // single-word keywords need 1 word hit, multi-word phrases need 2+, matched against the
+        // fact's `key value tags aliases` text plus the category name.
         const kw = (keywords || []).filter(Boolean);
-        const hit = kw.length ? searchFacts({ [match.category]: { category: match.category, facts: [match.fact] } }, kw).length > 0 : false;
+        const factText = `${match.fact.key} ${match.fact.value} ${(match.fact.tags || []).join(' ')} ${(match.fact.aliases || []).join(' ')}`.toLowerCase();
+        const catLower = match.category.toLowerCase();
+        const hit = kw.some(k => {
+            const words = String(k).toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            if (words.length === 0) return false;
+            const n = words.filter(w => factText.includes(w) || catLower.includes(w)).length;
+            return words.length === 1 ? n >= 1 : n >= 2;
+        });
         reason = hit ? 'WOULD_ADMIT' : (kw.length ? 'NO_KEYWORD_MATCH' : 'ACTIVE_VISIBLE');
         detail = { key: match.fact.key, category: match.category, tier: 'unknown', testedKeywords: kw, keywordHit: hit, ...useInfo };
     }

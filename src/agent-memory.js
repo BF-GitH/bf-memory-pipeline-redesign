@@ -1463,25 +1463,6 @@ async function applyUpdates(updates, existingDatabases) {
         }
     }));
 
-    // Embed-on-write: when semantic retrieval is enabled, push the changed facts' vectors into
-    // SillyTavern's server-side vector store (ST 1.18 has no raw-vector route; see st-vectors.js).
-    // Fire-and-forget + opt-in; inserts are idempotent per fact hash and no-op when the feature is
-    // off or the endpoint fails. No fact.embedding / re-save needed — vectors live in ST's store.
-    if (modified.size > 0 && getSettingsSafe()?.semanticRetrieval) {
-        (async () => {
-            const { insertFactVectors } = await import('./st-vectors.js');
-            const { isActiveFact, isSequenceFact } = await import('./database.js');
-            const entries = [];
-            for (const cat of modified) {
-                for (const f of (existingDatabases[cat]?.facts || [])) {
-                    if (isActiveFact(f) && !isSequenceFact(f)) entries.push({ category: cat, fact: f });
-                }
-            }
-            const n = await insertFactVectors(entries);
-            if (n > 0) addDebugLog('info', `Embed-on-write (ST vectors): inserted ${n} fact vector(s)`);
-        })().catch(e => addDebugLog('info', `Embed-on-write failed (non-fatal): ${e.message || e}`));
-    }
-
     return applied;
 }
 
