@@ -88,7 +88,7 @@
                             <input type="checkbox" id="bf_mem_scene_enabled" />
                             <span>Inject live scene card</span>
                         </label>
-                        <small class="bf-mem-hint">Adds a short "here's what's happening right now" line to the AI before it writes — where you are, who's in the room, what everyone wants, what just happened. It keeps the AI from forgetting the current moment, and it's free (no extra AI call). E.g. <i>Location: tavern | Present: Mira, you | Goal: find the thief</i>.</small>
+                        <small class="bf-mem-hint">Adds a short "here's what's happening right now" line to the AI before it writes — where you are, who's in the room, what everyone wants, what just happened. It keeps the AI from forgetting the current moment — no extra AI call, though the line itself costs a few prompt tokens each turn. E.g. <i>Location: tavern | Present: Mira, you | Goal: find the thief</i>.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Current Scene (live)</label>
                             <div id="bf_mem_scene_view" class="bf-mem-fact-list">
@@ -175,12 +175,12 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                             <input type="checkbox" id="bf_mem_recall_tool_enabled" />
                             <span>Let the Writer search memory on demand (search_memory tool)</span>
                         </label>
-                        <small class="bf-mem-hint">On by default. Lets the AI look something up in your memory itself, mid-reply, if it needs a fact it wasn't already handed — like checking a notebook. It only reads, never changes anything. Only works with AIs that can use tools (e.g. Claude). E.g. mid-scene the AI looks up "what's Mira afraid of?" on its own.</small>
+                        <small class="bf-mem-hint">On by default. Lets the AI look something up in your memory itself, mid-reply, if it needs a fact it wasn't already handed — like checking a notebook. It only reads, never changes anything — but each lookup re-sends the whole prompt as an extra billed round-trip (the Tokens tab shows the estimated cost). Only works with AIs that can use tools (e.g. Claude). E.g. mid-scene the AI looks up "what's Mira afraid of?" on its own.</small>
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_write_tool_enabled" />
                             <span>Let the Writer pin a fact on demand (remember_fact tool)</span>
                         </label>
-                        <small class="bf-mem-hint">On by default. Lets the AI jot down an important fact into memory itself, mid-reply, when something worth remembering happens. It only adds notes, never deletes them. Only works with AIs that can use tools (e.g. Claude). E.g. the AI saves "you gave Mira your ring" on its own.</small>
+                        <small class="bf-mem-hint">On by default. Lets the AI jot down an important fact into memory itself, mid-reply, when something worth remembering happens. It only adds notes, never deletes them — and like the recall tool, each pin costs an extra prompt round-trip. Only works with AIs that can use tools (e.g. Claude). E.g. the AI saves "you gave Mira your ring" on its own.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">

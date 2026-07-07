@@ -332,6 +332,12 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
             finderInput: 0,
             finderOutput: 0,
             mainOutput: 0,
+            // Writer tool-loop round-trips (search_memory / remember_fact) fire DURING the main
+            // generation — i.e. AFTER this record is created — so they start at 0 here and
+            // settings.js addToolLoopTokens() stamps the per-call ESTIMATE onto this run's
+            // record as each call lands (same post-hoc pattern as mainOutput / agent3 tokens).
+            toolCalls: 0,
+            toolLoopIn: 0,
         });
         runRecordedInput = true;
     } catch (err) {
@@ -404,6 +410,10 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
         // TRUE extension overhead.
         const rIn = Number(reflectionTokens?.input) || 0;
         const rOut = Number(reflectionTokens?.output) || 0;
+        // NOTE: Writer tool-loop round-trips (search_memory / remember_fact) are NOT in this
+        // netIn — this summary runs at prompt-ready, BEFORE the main generation in which those
+        // tools fire. Their estimated cost is attributed post-hoc to the run's token record
+        // (settings.js addToolLoopTokens) and folded into the Tokens-tab NET row instead.
         const netIn = (aIn + a1In + a3In + rIn) - bIn;
         const failed = !!cancelled || (agent1Ran && !agent1Ok) || (agent3Ran && !agent3Ok);
         // Observability: stamp the DB context this run executed against, so every per-turn
