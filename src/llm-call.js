@@ -1,7 +1,10 @@
 // BF Memory Pipeline - Direct LLM Call
-// Bypasses SillyTavern's generateQuietPrompt (which includes chat context/system prompt)
 // Uses ConnectionManagerRequestService when a profile is specified (no DOM/UI switching).
-// Falls back to direct fetch or generateQuietPrompt.
+// Falls back to a direct fetch against ST's backend proxy. There is deliberately NO
+// generateQuietPrompt fallback leg (F-WRITE-4): it dragged the FULL chat context through
+// the user's MAIN model (billed, slow), could not be aborted by our cancel/budget signals,
+// and polluted the agents' strict parser format with roleplay prose. When both transports
+// fail, the call returns '' and callers degrade to deterministic retrieval instead.
 
 import { addDebugLog } from './settings.js';
 import * as host from './host.js';
@@ -98,8 +101,11 @@ function isAbortError(err) {
 function isNonRetryableError(err) {
     if (isAbortError(err)) return true;
     const msg = String(err?.message || err || '');
-    // callSTProxy throws `ST proxy <status>: <body>` — match a 4xx status code.
-    if (/\b4\d\d\b/.test(msg)) return true;
+    // callSTProxy throws EXACTLY `ST proxy <status>: <body>` — anchor on that structured
+    // prefix. The old bare `/\b4\d\d\b/` matched ANY 3-digit run in the message (":443" in a
+    // URL, IP octets like 192.168.0.404, byte counts), misclassifying transient network
+    // errors as deterministic 4xx and skipping the single retry they deserved.
+    if (/^ST proxy 4\d\d:/.test(msg)) return true;
     if (/bad request|unauthorized|forbidden|quota|insufficient|invalid api key/i.test(msg)) return true;
     return false;
 }
@@ -109,7 +115,7 @@ function isNonRetryableError(err) {
  * ABORT the underlying work when either fires. Unlike a bare Promise.race, the timeout here
  * calls controller.abort() so a transport that supports the signal (the proxy fetch) actually
  * STOPS rather than lingering in the background billing tokens. Legs that can't take a signal
- * (CMRS, generateQuietPrompt) at least stop being awaited the instant the timeout/abort fires.
+ * (CMRS) at least stop being awaited the instant the timeout/abort fires.
  * @param {(signal: AbortSignal) => Promise<any>} fn - receives the leg's abort signal
  * @param {number} ms - per-leg timeout
  * @param {AbortSignal} [parentSignal] - the call-level signal (budget/cancel)
@@ -387,27 +393,28 @@ async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'un
     }
     if (aborted()) throw new DOMException('Aborted after CMRS', 'AbortError');
 
-    // Priority 2: Direct ST proxy fetch (reads current DOM config)
+    // Priority 2 (LAST leg): Direct ST proxy fetch (reads current DOM config)
     try {
         const result = await withTimeout((sig) => callSTProxy(messages, sig), LLM_TIMEOUT_MS, signal);
         return result;
     } catch (proxyErr) {
         if (isAbortError(proxyErr)) throw proxyErr;
-        // A deterministic 4xx (Bad Request / quota) will fail identically on the quiet fallback
-        // AND on a retry — re-throw so callAgentLLM short-circuits instead of burning the budget.
+        // A deterministic 4xx (Bad Request / quota) will fail identically on a retry —
+        // re-throw so callAgentLLM short-circuits instead of burning the budget.
         if (isNonRetryableError(proxyErr)) throw proxyErr;
-        addDebugLog('info', `ST proxy failed (${proxyErr.message}), falling back to generateQuietPrompt`);
+        // F-WRITE-4: there is NO generateQuietPrompt fallback leg anymore. It dragged the FULL
+        // chat context through the user's MAIN model, could not be aborted, and its roleplay-
+        // flavored output broke the agents' strict #Section parsers. Log clearly what failed and
+        // that the deterministic fallback takes over, then surface the failure exactly like the
+        // error path does: re-throw so callAgentLLM's retry/empty-return handling applies (one
+        // retry for this transient failure, then return '' — callers fall back to deterministic
+        // retrieval, which is memory > a polluted parse).
+        addDebugLog('fail', `All LLM transports failed (CMRS${profileId ? '' : ' skipped — no profile'}, then ST proxy: ${proxyErr.message}) — no generateQuietPrompt fallback (F-WRITE-4); deterministic retrieval takes over for this call`, {
+            subsystem: 'pipeline', event: 'llm.transports_exhausted', reason: 'ALL_TRANSPORTS_FAILED',
+            data: { agent, profileId: profileId || null, error: String(proxyErr.message || proxyErr) },
+        });
+        throw proxyErr;
     }
-    if (aborted()) throw new DOMException('Aborted after proxy', 'AbortError');
-
-    // Priority 3: generateQuietPrompt (includes chat context, but better than nothing)
-    const fallbackPrompt = `${systemPrompt}\n\n${userPrompt}`;
-    const result = await withTimeout(
-        () => host.generateQuietPrompt({ quietPrompt: fallbackPrompt, skipWIAN: true }),
-        LLM_TIMEOUT_MS,
-        signal,
-    );
-    return typeof result === 'string' ? result : String(result || '');
 }
 
 /**

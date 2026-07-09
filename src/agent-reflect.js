@@ -107,7 +107,17 @@ const MAX_OBSERVATIONS = 8;
 const MAX_REEVAL_CANDIDATES = 15;
 // A current-state fact is "stale" (a re-eval candidate) once it hasn't been touched for
 // this long — it may be a one-off the extractor recorded that never recurred.
+// F-SCRIBE-5: wall-clock alone is NOT sufficient — kept only as the SECONDARY condition
+// (see REEVAL_STALE_STATE_MSGS below; BOTH must hold).
 const REEVAL_STALE_STATE_MS = 24 * 60 * 60 * 1000; // 24h of wall-clock since last update
+// F-SCRIBE-5 (wall-clock staleness): a weekly player trips the 24h check on EVERY kind:state
+// fact even though the STORY hasn't moved at all — every current-state fact became a
+// promote/drop candidate on real-world elapsed time. Staleness is therefore gated on
+// IN-STORY distance as the PRIMARY condition: the fact's validAt (the source message index
+// it was established at) must be at least this many messages behind the current chat length
+// before it can be a re-eval candidate. The wall-clock check above is KEPT as a secondary
+// condition — a fact must be BOTH story-stale AND wall-clock-stale to qualify.
+const REEVAL_STALE_STATE_MSGS = 80; // in-story messages the chat must have moved past the fact
 // SUMMARY PYRAMID (middle layer) — hard cap on how many (category, aspect) shelves we ask
 // the model to (re)summarize per reflection pass. This is the cost guard: a huge store with
 // hundreds of buckets can't explode the call — only the MOST-CHANGED handful are refreshed
@@ -189,6 +199,15 @@ If there is no story yet, put a single "." under #STORY. If no shelves were list
  */
 function collectReevalCandidates(databases) {
     const now = Date.now();
+    // F-SCRIBE-5: resolve the current chat length ONCE for the in-story staleness gate.
+    // Defensive: when the chat is unavailable we cannot prove the story moved on, so NO
+    // state fact qualifies as stale this pass (conservative — the Unsorted/misc candidate
+    // path below is unaffected). Never throws.
+    let chatLen = null;
+    try {
+        const chat = host.getChat();
+        if (Array.isArray(chat)) chatLen = chat.length;
+    } catch { /* no chat context — the in-story gate simply can't pass */ }
     const out = [];
     for (const [category, db] of Object.entries(databases || {})) {
         for (const fact of (db.facts || [])) {
@@ -197,7 +216,17 @@ function collectReevalCandidates(databases) {
             const kind = String(fact.kind || '').toLowerCase();
             const isMisc = category === 'Unsorted' || aspect === 'misc';
             const lastUpdated = Number(fact.lastUpdated) || 0;
-            const isStaleState = kind === 'state' && lastUpdated > 0 && (now - lastUpdated) >= REEVAL_STALE_STATE_MS;
+            // F-SCRIBE-5: BOTH conditions must hold for a state fact to be a stale candidate —
+            //   (a) IN-STORY (primary): the fact's validAt (source message index) sits at least
+            //       REEVAL_STALE_STATE_MSGS messages behind the current chat length — the story
+            //       genuinely moved past it, not just the real-world calendar; AND
+            //   (b) WALL-CLOCK (secondary, the original check): untouched for >= REEVAL_STALE_STATE_MS.
+            // A fact without a usable validAt (e.g. an old pre-provenance fact) can't prove (a)
+            // and is NOT flagged — never a promote/drop candidate on wall-clock alone.
+            const wallClockStale = kind === 'state' && lastUpdated > 0 && (now - lastUpdated) >= REEVAL_STALE_STATE_MS;
+            const validAt = Number.isInteger(fact.validAt) ? fact.validAt : null;
+            const inStoryStale = chatLen !== null && validAt !== null && (chatLen - validAt) >= REEVAL_STALE_STATE_MSGS;
+            const isStaleState = wallClockStale && inStoryStale;
             if (isMisc || isStaleState) {
                 out.push({ id: `${category}::${fact.key}`, category, key: fact.key, fact });
             }
@@ -509,11 +538,28 @@ export function parseReflectResult(response) {
 }
 
 /**
+ * Deterministic subject derivation from an observation key's prefix (the token before the
+ * first underscore) — a MINIMAL REPLICA of agent-memory.js's deriveSubjectFromKey (F-SCRIBE-6).
+ * NOT imported from agent-memory: agent-reflect → agent-memory would close an import cycle
+ * (agent-memory → settings.js → agent-reflect via the DEFAULT_*_PROMPT imports), so the
+ * 3-line rule is replicated here instead. `<name>_distrusts_authority` -> `<name>`.
+ * @param {string} key - snake_case observation key
+ * @returns {string} lowercased subject token ('' when the key is empty)
+ */
+function deriveSubjectFromObsKey(key) {
+    const k = String(key || '').trim().toLowerCase();
+    if (!k) return '';
+    const us = k.indexOf('_');
+    return us > 0 ? k.slice(0, us) : k;
+}
+
+/**
  * Run the reflection / consolidation pass. ONE LLM call. Writes the rolling summary to
  * chat_metadata via setReflection() and synthesized observations as normal facts via
- * upsertFact (category Behavior, kind:trait, importance 4, tagged observation/reflection)
- * so they ride the existing retrieval/eviction/supersession machinery and reconcile on
- * write (no duplicate spam).
+ * upsertFact (category People, aspect `habits`, subject derived from the observation key,
+ * kind:trait, importance 4, tagged observation/reflection — F-SCRIBE-6: the retired legacy
+ * `Behavior` category is no longer written) so they ride the existing retrieval/eviction/
+ * supersession machinery and reconcile on write (no duplicate spam).
  *
  * @param {object} args
  * @param {string} args.runId - the originating pipeline run id (for traceability)
@@ -688,7 +734,17 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         // duplicate spam against existing facts/observations with the same key.
         let written = 0;
         if (parsed.observations.length > 0) {
-            const category = 'Behavior';
+            // F-SCRIBE-6: observations were previously written to the RETIRED legacy 'Behavior'
+            // category — readable only through the mapLegacyCategory back-compat shim, bypassing
+            // the 3-layer filing every other write path uses. File them under People with an
+            // explicit Layer-2 aspect instead: 'habits' is the canonical leaf the legacy
+            // 'behavior' aspect maps to (see database.js aspect remaps) and the natural home for
+            // the durable behavioral patterns this pass synthesizes; normalizeAspect keeps the
+            // value honest if the vocab ever moves. The subject is derived from the observation
+            // key's prefix exactly the way agent-memory's parser stamps it (deriveSubjectFromObsKey
+            // below), so the bySubject index / focus filter treat these facts like Scribe-written ones.
+            const category = 'People';
+            const aspect = normalizeAspect('habits', category);
             if (!databases[category]) databases[category] = createEmptyDatabase(category);
             const db = databases[category];
             const charName = host.getCurrentCharacterName();
@@ -696,6 +752,8 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
                 upsertFact(db, {
                     key: obs.key,
                     value: obs.value,
+                    aspect,
+                    subject: deriveSubjectFromObsKey(obs.key),
                     tags: ['observation', 'reflection'],
                     knownBy: charName ? [charName] : [],
                     relationships: { primary: [], secondary: [], tertiary: [] },
@@ -707,7 +765,7 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             }
             try {
                 await saveDatabase(db);
-                addDebugLog('pass', `[${runId}] Reflection wrote ${written} observation(s) to Behavior`);
+                addDebugLog('pass', `[${runId}] Reflection wrote ${written} observation(s) to ${category}/${aspect}`);
             } catch (err) {
                 addDebugLog('fail', `[${runId}] Reflection failed to save observations: ${err.message || err}`);
             }

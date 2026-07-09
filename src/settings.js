@@ -283,10 +283,16 @@ const DEFAULT_SETTINGS = {
     // UI later; the values are inert.
     secondaryChance: 50,
     tertiaryChance: 15,
-    // Feature #4 — depth-dice sequence retrieval. For a relevant track we always include
-    // the current step, then roll each depth tier (steps back) at these probabilities;
-    // the furthest successful roll sets how far back we reach (contiguously). Stored as
-    // 0..1 floats. Absent on older settings → defaults below apply (back-compatible).
+    // Feature #4 / audit F-RETR-5 — sequence-track "History reach". ONE integer (0-4): how many
+    // OLDER steps of a relevant track are always shown alongside the current step (contiguous,
+    // no gaps). Replaces the four depthDice percent sliders: deterministicTrackReach had reduced
+    // those to a binary >=50% include-threshold, so 1-49% were all identical and 50-100% were all
+    // identical — the percent UI was a lie. Default 2 = exactly what the legacy defaults
+    // (70/50/25/10) derived through that threshold, so behavior is unchanged out of the box.
+    trackReachSteps: 2,
+    // DEPRECATED (F-RETR-5): legacy depth-dice weights, kept INERT for stored-settings
+    // back-compat only. No UI binds them anymore; fact-retrieval.js reads trackReachSteps and
+    // only falls back to deriving a reach from these for stored settings that predate the key.
     depthDice1: 0.70,
     depthDice2: 0.50,
     depthDice3: 0.25,
@@ -457,7 +463,11 @@ function validateSettings(s) {
     if (typeof s.semanticRetrieval !== 'boolean') s.semanticRetrieval = false;
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
-    // Feature #4 depth-dice probabilities are 0..1 floats (not clamped to ints).
+    // F-RETR-5 history reach: whole steps 0..4. Default 2 = the reach the legacy depth-dice
+    // defaults (70/50/25/10) derived through the >=50% include-threshold.
+    s.trackReachSteps = Math.floor(clamp(s.trackReachSteps, 0, 4, 2));
+    // DEPRECATED depth-dice probabilities (0..1 floats): coerced for stored-settings back-compat
+    // only — no UI binds them and retrieval only reads them as a pre-trackReachSteps fallback.
     s.depthDice1 = clamp(s.depthDice1, 0, 1, 0.70);
     s.depthDice2 = clamp(s.depthDice2, 0, 1, 0.50);
     s.depthDice3 = clamp(s.depthDice3, 0, 1, 0.25);
@@ -4724,10 +4734,13 @@ function syncPresetControls() {
     $('#bf_mem_agent2_context_val').text(extensionSettings.agent2ContextMessages);
     $('#bf_mem_reflection_interval').val(extensionSettings.reflectionInterval);
     $('#bf_mem_reflection_interval_val').text(extensionSettings.reflectionInterval);
-    // NOTE: retrievalTokenBudget / finderAnchorsPerCharacter are governed by presets but have
-    // NO on-screen control (no slider in settings.html) — nothing to sync here. They're still
-    // written by applyPreset() and consumed by the pipeline; they simply can't be hand-edited
-    // from the UI, so they can never drift a preset to "Custom".
+    // Retrieval token budget (F-UX-4): governed AND on-screen (Writer tab), so keep it in sync.
+    $('#bf_mem_retrieval_budget').val(extensionSettings.retrievalTokenBudget);
+    $('#bf_mem_retrieval_budget_val').text(extensionSettings.retrievalTokenBudget);
+    // NOTE: finderAnchorsPerCharacter is governed by presets but has NO on-screen control
+    // (no slider in settings.html) — nothing to sync for it. It's still written by
+    // applyPreset() and consumed by the pipeline; it simply can't be hand-edited from the
+    // UI, so it can never drift a preset to "Custom".
 }
 
 /**
@@ -4901,11 +4914,12 @@ export async function initSettings() {
         // Manual edit of ANY governed control flips the dropdown back to "Custom" so it never lies.
         // Delegated so it covers every governed input regardless of bind order; skipped while
         // applyPreset() is doing its own programmatic writes (_applyingPreset guard).
-        // Only the governed settings that HAVE an on-screen control are listed (the three
-        // budget/target/anchor keys have no slider, so they can't be manually edited anyway).
+        // Only the governed settings that HAVE an on-screen control are listed
+        // (finderAnchorsPerCharacter has no slider, so it can't be manually edited anyway).
         const governedSelector = [
             '#bf_mem_pyramid_enabled',
             '#bf_mem_recall_tool_enabled', '#bf_mem_agent2_context', '#bf_mem_reflection_interval',
+            '#bf_mem_retrieval_budget',
         ].join(',');
         $('#bf_memory_settings').on('change input', governedSelector, function () {
             if (_applyingPreset) return;
@@ -4979,6 +4993,21 @@ export async function initSettings() {
         const val = parseInt($(this).val(), 10) || 0;
         extensionSettings.injectionFreezeTurns = val;
         $('#bf_mem_freeze_turns_val').text(val);
+        saveSettings();
+    });
+
+    // Retrieval token budget slider (F-UX-4). PRESET-GOVERNED: this key is written by the
+    // Cheap/Balanced/Max Recall presets, so the control is also listed in the delegated
+    // governed-control listener (initSettings) that flips the preset dropdown to "Custom" on a
+    // manual edit, and re-synced by syncPresetControls() when a preset is applied.
+    $('#bf_mem_retrieval_budget').val(extensionSettings.retrievalTokenBudget);
+    $('#bf_mem_retrieval_budget_val').text(extensionSettings.retrievalTokenBudget);
+    $('#bf_mem_retrieval_budget').on('input', function () {
+        const val = parseInt($(this).val(), 10) || 800;
+        const before = extensionSettings.retrievalTokenBudget;
+        extensionSettings.retrievalTokenBudget = val;
+        $('#bf_mem_retrieval_budget_val').text(val);
+        if (before !== val) addDebugLog('debug', `Retrieval token budget: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'retrievalTokenBudget' }, before, after: val });
         saveSettings();
     });
 
@@ -5174,20 +5203,19 @@ export async function initSettings() {
     // deterministic, so these gated nothing. The settings keys (secondaryChance/tertiaryChance)
     // are retained inert in DEFAULT_SETTINGS/validateSettings for back-compat only.
 
-    // Depth-dice sliders (Feature #4). Stored as 0..1 floats; UI shows percent.
-    [1, 2, 3, 4].forEach(n => {
-        const slider = `#bf_mem_depth${n}`;
-        const label = `#bf_mem_depth${n}_val`;
-        const key = `depthDice${n}`;
-        const pct = Math.round((Number(extensionSettings[key]) || 0) * 100);
-        $(slider).val(pct);
-        $(label).text(`${pct}%`);
-        $(slider).on('input', function () {
-            const v = parseInt($(this).val());
-            extensionSettings[key] = v / 100;
-            $(label).text(`${v}%`);
-            saveSettings();
-        });
+    // History reach stepper (F-RETR-5) — replaces the four depth-dice percent sliders, which
+    // deterministicTrackReach had reduced to a binary >=50% threshold (1-49% identical,
+    // 50-100% identical). One honest 0-4 integer control; the legacy depthDice keys stay
+    // stored-inert for back-compat and nothing binds them anymore.
+    $('#bf_mem_track_reach').val(extensionSettings.trackReachSteps);
+    $('#bf_mem_track_reach_val').text(extensionSettings.trackReachSteps);
+    $('#bf_mem_track_reach').on('input', function () {
+        const val = parseInt($(this).val(), 10) || 0;
+        const before = extensionSettings.trackReachSteps;
+        extensionSettings.trackReachSteps = val;
+        $('#bf_mem_track_reach_val').text(val);
+        if (before !== val) addDebugLog('debug', `History reach: ${before} → ${val} step(s)`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'trackReachSteps' }, before, after: val });
+        saveSettings();
     });
 
     // Toast

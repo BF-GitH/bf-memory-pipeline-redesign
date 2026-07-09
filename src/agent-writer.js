@@ -237,35 +237,68 @@ export function buildMomentEchoBlock(scene, thread, injectedKeys, maxTokens = 40
 /**
  * Build the fact injection block that gets inserted into the prompt
  * This doesn't call an LLM - it prepares context for the main generation
+ *
+ * F-ARCH-5 (push boilerplate in hybrid): the draft is ALWAYS empty in hybrid/tool-only mode
+ * (and on the cached draft-less swipe variant), so rendering a literal
+ * "#Scene Direction:\n(no direction)" plus the 4-bullet "How to use the facts above" block
+ * every turn was pure token waste. Now:
+ *   - empty draft → the template paragraph containing {draft} is omitted entirely;
+ *   - NO facts AND no draft → the whole template (header + "(none available)" + instruction
+ *     boilerplate) is skipped; only the scene/overview block remains, or '' when there is
+ *     nothing meaningful at all. Callers handle '' (the pipeline skips injectMemoryContext;
+ *     the swipe/frozen caches treat '' as "no cached injection").
  * @param {string} draft - Draft from Agent 1
  * @param {string} factsFormatted - Formatted facts from retrieval
  * @param {string} [sceneBlock] - Optional compact scene block to prepend ABOVE facts
- * @returns {string} Injection text to add to the prompt
+ * @returns {string} Injection text to add to the prompt ('' when nothing meaningful to say)
  */
 export function buildWriterInjection(draft, factsFormatted, sceneBlock = '') {
     const settings = getSettingsSafe();
 
     const template = settings?.writerFormat || DEFAULT_WRITER_FORMAT;
-    const factsText = (factsFormatted && factsFormatted !== '(No stored facts available)') ? factsFormatted : '(none available)';
-    const draftText = draft || '(no direction)';
+    const hasFacts = !!(factsFormatted && factsFormatted !== '(No stored facts available)');
+    const hasDraft = !!(draft && String(draft).trim());
+    const factsText = hasFacts ? factsFormatted : '(none available)';
+    const draftText = hasDraft ? draft : '(no direction)';
 
-    // Single-pass regex substitution: avoids order-dependent re-substitution
-    // (e.g. factsText containing literal "{draft}" can't get re-replaced)
-    const vars = { facts: factsText, draft: draftText };
-    let rendered = template.replace(/\{(facts|draft)\}/g, (_, key) => vars[key]);
+    let rendered = '';
+    if (hasFacts || hasDraft) {
+        // Empty draft → drop the template paragraph (blank-line-delimited block) that holds the
+        // {draft} placeholder, so no "#Scene Direction: (no direction)" stub is rendered. Works
+        // for the default template and any custom template that keeps the draft in its own
+        // paragraph. Defensive: a paragraph that ALSO contains {facts} is never dropped (a custom
+        // template merging both placeholders must keep its facts).
+        let tpl = template;
+        if (!hasDraft) {
+            tpl = tpl
+                .split(/\n{2,}/)
+                .filter(p => !p.includes('{draft}') || p.includes('{facts}'))
+                .join('\n\n');
+        }
 
-    // Safety guard: if {facts} / {draft} placeholders missing from template, append.
-    const missing = [];
-    if (!template.includes('{facts}')) missing.push(`#Established Facts:\n${factsText}`);
-    if (!template.includes('{draft}')) missing.push(`#Scene Direction:\n${draftText}`);
-    if (missing.length > 0) {
-        rendered = `${rendered}\n\n${missing.join('\n\n')}`;
+        // Single-pass regex substitution: avoids order-dependent re-substitution
+        // (e.g. factsText containing literal "{draft}" can't get re-replaced)
+        const vars = { facts: factsText, draft: draftText };
+        rendered = tpl.replace(/\{(facts|draft)\}/g, (_, key) => vars[key]);
+
+        // Safety guard: if {facts} / {draft} placeholders missing from template, append.
+        // The {draft} fallback only applies when there IS a draft (an empty draft section is
+        // omitted by design above, never appended back).
+        const missing = [];
+        if (!template.includes('{facts}')) missing.push(`#Established Facts:\n${factsText}`);
+        if (hasDraft && !template.includes('{draft}')) missing.push(`#Scene Direction:\n${draftText}`);
+        if (missing.length > 0) {
+            rendered = rendered ? `${rendered}\n\n${missing.join('\n\n')}` : missing.join('\n\n');
+        }
     }
+    // else: no facts AND no draft — the template would be pure boilerplate around
+    // "(none available)", so skip it entirely (F-ARCH-5).
 
     // Scene card goes ABOVE the fact list: it's the present-moment core context the
     // writer should anchor on before reading individual facts. One combined message.
+    // With an empty rendered body the scene block alone is still a meaningful injection.
     if (sceneBlock && sceneBlock.trim()) {
-        rendered = `${sceneBlock.trim()}\n\n${rendered}`;
+        rendered = rendered ? `${sceneBlock.trim()}\n\n${rendered}` : sceneBlock.trim();
     }
 
     return rendered;
@@ -293,8 +326,9 @@ function writerLog(level, message, opts = {}) {
  * @param {string} injection - The memory injection text
  * @param {object} [options]
  * @param {number} [options.trimToLast=0] - If > 0, trim the chat history to the last N
- *   user/assistant messages BEFORE injecting (preserves any system prefix). Lets the
- *   main model see only a focused window — relies on stored facts to fill the gap.
+ *   user/assistant messages BEFORE injecting (preserves ALL system messages — the leading
+ *   prefix AND depth-injected world info / Author's Note). Lets the main model see only a
+ *   focused window — relies on stored facts to fill the gap.
  * @returns {boolean} True if injection succeeded
  */
 export function injectMemoryContext(data, injection, options = {}) {
@@ -372,20 +406,37 @@ function describeInjectPayload(data) {
 
 /**
  * Trim a messages array IN-PLACE to keep at most `keepLast` user/assistant messages.
- * System messages at the start (character card, system prompt) are preserved.
- * Used to hide old chat history from the main model when the user opts into facts-
- * replace-history mode.
+ * ALL system messages are preserved — the leading prefix (character card, system prompt)
+ * AND system messages injected at depth INSIDE the chat (world info, Author's Note,
+ * other extensions' injections). Used to hide old chat history from the main model when
+ * the user opts into facts-replace-history mode.
+ *
+ * F-WRITE-3: the old implementation preserved only the LEADING system run, then counted
+ * and spliced everything after it as "chat" — so depth-injected system messages both
+ * consumed the keepLast window AND were deleted outright. Now only role user/assistant
+ * messages count toward keepLast, and removal walks oldest-first skipping every
+ * non-user/assistant entry (system/tool/etc. survive in place).
  */
 function trimChatHistory(messages, keepLast) {
-    // Find where the system-prefix ends and actual chat begins
-    let chatStart = 0;
-    while (chatStart < messages.length && messages[chatStart]?.role === 'system') {
-        chatStart++;
+    if (!Array.isArray(messages)) return;
+    // Only genuine chat turns count toward the window; anything else (system, tool, …)
+    // is invisible to the budget and immune to removal.
+    const isChatMsg = (m) => m && (m.role === 'user' || m.role === 'assistant');
+    let chatCount = 0;
+    for (const m of messages) {
+        if (isChatMsg(m)) chatCount++;
     }
-    const chatLen = messages.length - chatStart;
-    if (chatLen > keepLast) {
-        const removeCount = chatLen - keepLast;
-        messages.splice(chatStart, removeCount);
+    let removeCount = chatCount - keepLast;
+    if (removeCount <= 0) return;
+    // Remove the OLDEST chat messages first, skipping (and thus preserving) every
+    // system-role entry in place so world info / Author's Note injects survive.
+    for (let i = 0; i < messages.length && removeCount > 0;) {
+        if (isChatMsg(messages[i])) {
+            messages.splice(i, 1);
+            removeCount--;
+        } else {
+            i++;
+        }
     }
 }
 

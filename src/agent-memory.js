@@ -837,9 +837,18 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
             // >context — OPTIONAL prose note (Feature #3). `>` was chosen because it
             // does NOT collide with the existing |/@/#/rel:/@src: grammar. Only attach
             // when the surrounding situation genuinely matters (see prompt).
+            // F-SCRIBE-4 (pipe truncation): the note is documented as the LAST field on the
+            // line, but the naive split('|') above chops a verbatim quote/summary containing
+            // a literal pipe into phantom "segments" — everything after the pipe used to be
+            // silently discarded (or worse, mis-parsed as a marker). Once the `>` segment is
+            // seen, REJOIN it with ALL remaining segments so the full note survives. Rejoined
+            // with the canonical ` | ` grammar spacing (the segments were trimmed at split
+            // time, so the original spacing is unrecoverable — acceptable for a prose note);
+            // empty phantom segments (a `||` inside the note) are dropped.
             if (seg.startsWith('>')) {
-                context = seg.slice(1).trim();
-                continue;
+                const noteTail = segments.slice(i + 1).filter(s => s !== '');
+                context = [seg.slice(1).trim(), ...noteTail].join(' | ').trim();
+                break; // the note consumes the rest of the line by contract (last field)
             }
 
             // track:<name>[#ord] — OPTIONAL sequence step (Feature #4). The ord is
@@ -892,6 +901,19 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
             const tagsMatch = seg.match(/^(?:tags?)\s*:\s*(.+)/i);
             if (tagsMatch) {
                 tags = tagsMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+                continue;
+            }
+
+            // F-SCRIBE-4 (grammar-drift visibility): a non-empty segment that matched NO known
+            // marker used to be discarded SILENTLY — a model drifting from the grammar (or a
+            // VALUE containing a literal pipe, whose tail lands here as phantom segments) lost
+            // data invisibly. Log a warning so drift shows up in the debug log. Observability
+            // only: the line's surviving markers still parse and the update still stores.
+            if (seg) {
+                addDebugLog('info', `WARNING: Scribe segment matched no known marker (discarded): "${seg.slice(0, 80)}"`, {
+                    subsystem: 'agent3', event: 'scribe.parse.unknown_segment', reason: 'GRAMMAR_DRIFT',
+                    data: { segment: seg.slice(0, 200), line: pathPart },
+                });
             }
         }
 

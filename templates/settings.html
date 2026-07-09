@@ -166,6 +166,11 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                             <input type="range" id="bf_mem_freeze_turns" min="0" max="20" step="1" value="0" />
                             <small class="bf-mem-hint">Reuses the same set of saved facts for several replies in a row instead of looking them up fresh every time. <b>0 = off</b> (look up fresh every reply). Saves time and money, and is gentler on the AI. E.g. set 3 to reuse the same facts for 3 replies. Your memory still keeps growing every turn — only the facts shown to the AI are held steady for a bit.</small>
                         </div>
+                        <div class="bf-mem-field" style="margin-top:10px;">
+                            <label>Retrieval token budget <span class="bf-mem-val" id="bf_mem_retrieval_budget_val">800</span></label>
+                            <input type="range" id="bf_mem_retrieval_budget" min="50" max="8000" step="50" value="800" />
+                            <small class="bf-mem-hint">How much room (in tokens) the saved facts may take up in the AI's prompt each reply. Bigger = the AI is handed more facts every turn (better memory, costs more); smaller = leaner and cheaper. The most relevant facts always go in first, so shrinking this only trims the least-important extras. Changing it switches the preset dropdown to "Custom".</small>
+                        </div>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -276,24 +281,12 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                     </div>
                 </div>
                 <div class="bf-mem-section">
-                    <div class="bf-mem-section-header"><i class="fa-solid fa-timeline"></i> Sequence Depth Dice</div>
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-timeline"></i> Sequence History Reach</div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">For things that change over time (like where a character has been), the AI always sees the latest step. These dials set the <i>chance</i> of also showing older steps, so sometimes it remembers more history, sometimes less. E.g. a 70% chance to also recall where Mira was one step ago. The furthest step it reaches back to fills in everything in between — no gaps.</small>
+                        <small class="bf-mem-hint">For things that change over time (like where a character has been), the AI always sees the latest step. This sets how many <i>older</i> steps it also sees — always exactly this many, no dice. E.g. at 2, it recalls Mira's current location plus the two places she was before, with nothing skipped in between. 0 = only the latest step.</small>
                         <div class="bf-mem-field">
-                            <label>1 Step Back <span class="bf-mem-val" id="bf_mem_depth1_val">70%</span></label>
-                            <input type="range" id="bf_mem_depth1" min="0" max="100" step="5" value="70" />
-                        </div>
-                        <div class="bf-mem-field">
-                            <label>2 Steps Back <span class="bf-mem-val" id="bf_mem_depth2_val">50%</span></label>
-                            <input type="range" id="bf_mem_depth2" min="0" max="100" step="5" value="50" />
-                        </div>
-                        <div class="bf-mem-field">
-                            <label>3 Steps Back <span class="bf-mem-val" id="bf_mem_depth3_val">25%</span></label>
-                            <input type="range" id="bf_mem_depth3" min="0" max="100" step="5" value="25" />
-                        </div>
-                        <div class="bf-mem-field">
-                            <label>4 Steps Back <span class="bf-mem-val" id="bf_mem_depth4_val">10%</span></label>
-                            <input type="range" id="bf_mem_depth4" min="0" max="100" step="5" value="10" />
+                            <label>History reach (steps back) <span class="bf-mem-val" id="bf_mem_track_reach_val">2</span></label>
+                            <input type="range" id="bf_mem_track_reach" min="0" max="4" step="1" value="2" />
                         </div>
                     </div>
                 </div>

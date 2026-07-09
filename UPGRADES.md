@@ -110,6 +110,15 @@ the existing `maybeRunReflection()` (which no-ops unless a reflection is armed a
   (false-merge risk is mitigated by the high threshold + heavy logging, but watch the logs).
 - `userLevelMemory` now has a "Clear shared user memory" button (Writer tab), and the shared store appears as an orphan
   `character_attachments[bf_shared_user_memory]` bucket (harmless, never selectable).
+- **Multi-device deletes (tombstones):** deleting a category (or clearing the shared user store) now
+  stamps a `deletedCategories: { [category]: deletedAtMs }` tombstone into the IDB record, and the
+  durable snapshot carries it in every surviving category file. Another device's rehydrate guard
+  adopts a newer-but-smaller snapshot for a category whose tombstone is **newer** than that
+  category's local activity (a deliberate delete); a shrink with **no** tombstone is still refused
+  per-category (stale-snapshot protection). Caveats: tombstones only travel while at least one
+  populated category file remains to carry them — wiping **every** category leaves no snapshot
+  carrier, so a fully-emptied store can still be resurrected by another device's next flush; and
+  attachment-only mode (no IndexedDB) has no snapshot machinery, so tombstones don't apply there.
 
 Reference implementations cloned at `../memory-research/{mem0,letta,graphiti,zep}`; see
 `../memory-research/INDEX.md`.

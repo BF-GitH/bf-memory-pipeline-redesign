@@ -124,10 +124,29 @@ function registerMacro(context) {
         // Returns last snapshot (1-turn lag) and refreshes for the next read. While the first
         // refresh is still pending we return the placeholder instead of an empty string.
         const getter = () => { refresh(); return seeded ? cache : PLACEHOLDER; };
+        // NEWEST API FIRST: current ST builds expose a macro registry on the context
+        // (context.macros.registry.registerMacro) and log a DEPRECATION warning whenever the
+        // old MacrosParser.registerMacro path is used. Feature-detected AND individually
+        // try/caught so a shape mismatch on this one API (older/newer builds) silently falls
+        // through to the established fallbacks below — never throws into extension init
+        // (house rule: every registration degrades to the next API, then to a no-op).
+        try {
+            const registry = context.macros?.registry;
+            if (registry && typeof registry.registerMacro === 'function') {
+                registry.registerMacro('bf_facts', getter);
+                addDebugLog('info', '{{bf_facts}} macro registered (macros.registry API)');
+                return true;
+            }
+        } catch (e) {
+            addDebugLog('info', `macros.registry registration failed, falling back: ${e?.message || e}`);
+        }
         if (typeof context.registerMacro === 'function') {
             context.registerMacro('bf_facts', getter);
             return true;
         }
+        // DEPRECATED fallback (older ST): MacrosParser.registerMacro — kept LAST so old
+        // installs keep the macro; current builds never reach it (registry above wins), so
+        // the host-side deprecation warning stops firing on up-to-date SillyTavern.
         if (context.MacrosParser && typeof context.MacrosParser.registerMacro === 'function') {
             context.MacrosParser.registerMacro('bf_facts', getter);
             return true;

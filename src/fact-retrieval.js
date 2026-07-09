@@ -107,18 +107,103 @@ const MAX_EXPANSION_PER_SEED = 3;
 const MAX_EXPANSION_TOTAL = 16;
 
 /**
- * Approximate injection token cost of a candidate (atomic #10), mirroring the writer line
- * `[knownBy] Category/key = value [— context]`, ~4 chars/token.
+ * BOUNDED PRIMARY TIER (audit F-RETR-4). Exact-key requests are honored as primary — always kept,
+ * never budget-gated — so an Agent 1 that requests a long `Category/key` list could blow past the
+ * whole retrievalTokenBudget with primaries alone. Cap how many EXACT-KEY primaries a single turn
+ * may keep; the excess (lowest retrievalSalience first) is DEMOTED to secondary, where it competes
+ * under the normal salience/count/token caps instead of bypassing every budget. Track-continuity
+ * primaries are deliberately NOT capped (continuity is mandatory once a track is in scope).
+ */
+const EXACT_KEY_PRIMARY_CAP = 12;
+
+/**
+ * SHARED per-fact line builder (audit F-RETR-3). This is THE single source of truth for what one
+ * injected fact line looks like — used by BOTH formatFactsForWriter (the actual injection) and
+ * estimateInjectionTokens (the budget math) so the token estimate can never drift from the real
+ * output again. Before this, the estimator charged `[kb] Cat/key = value [— context]` (context
+ * only for primary) while the formatter injected the NOTE in place of the value for ALL tiers and
+ * appended tone + bi-temporal tails — so budgets were computed against a line that was never sent.
+ *
+ * Behavior is byte-identical to the formatter's old inline `formatLine` + `temporalTail`:
+ *   - a fact WITH a note injects `[kb] Category/key: note (tone)?{from→until}?` (note replaces value),
+ *   - a fact with only a value injects `[kb] Category/key = value{from→until}?`,
+ *   - degenerate (neither) keeps the key visible.
+ * The bi-temporal tail only exists when the caller passes `biTemporalOn` (the opt-in setting);
+ * when the feature is off the fields are never written, so output is unchanged.
+ * @param {Object} fact
+ * @param {string} category
+ * @param {boolean} [biTemporalOn=false] - settings.biTemporal, read ONCE by the caller
+ * @returns {string}
+ */
+export function buildFactLine(fact, category, biTemporalOn = false) {
+    const knownBy = (fact.knownBy || []).join(', ');
+    const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
+    const hasValue = String(fact.value ?? '').trim() !== '';
+    const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
+    // Episodic-memory feature: a `moment`-kind fact carries a short emotional `tone` we append
+    // compactly so the beat reads WITH its feeling, e.g. `Events/key: <note> (tender)`.
+    const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
+    // BI-TEMPORAL (feature, opt-in): annotate a fact carrying `validFrom`/`validUntil` with a
+    // compact `{from→until}` tail so the Writer sees WHEN the fact is true in-story.
+    let temporal = '';
+    if (biTemporalOn) {
+        const from = (typeof fact.validFrom === 'string' && fact.validFrom.trim()) ? fact.validFrom.trim() : '';
+        const until = (typeof fact.validUntil === 'string' && fact.validUntil.trim()) ? fact.validUntil.trim() : '';
+        if (from || until) temporal = ` {${from || '?'}→${until || 'now'}}`;
+    }
+    // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
+    // only needs one. When a fact HAS a note, the note already carries the
+    // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
+    // showing both would be redundant. With no note, inject `Category/key = value`.
+    // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
+    if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${temporal}`;
+    if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${temporal}`;
+    // Degenerate: neither value nor note — keep the key so it's still visible.
+    return `${prefix} ${category}/${fact.key}${temporal}`;
+}
+
+/**
+ * Subject grouping key/label shared by formatFactsForWriter (which groups lines under one
+ * `[Subject]` header per distinct subject) and estimateInjectionTokens (which must CHARGE for
+ * that header the first time a subject appears). The sentinel can't collide with a real subject.
+ */
+const SUBJECT_MISC_KEY = ' misc';
+function subjectGroupKey(fact) {
+    const subjRaw = String(deriveSubject(fact) ?? '').trim();
+    return subjRaw ? subjRaw.toLowerCase() : SUBJECT_MISC_KEY;
+}
+function subjectGroupLabel(fact) {
+    const subjRaw = String(deriveSubject(fact) ?? '').trim();
+    return subjRaw || 'Misc';
+}
+
+/**
+ * Approximate injection token cost of a candidate (atomic #10), ~4 chars/token, computed over the
+ * EXACT line formatFactsForWriter will emit (shared buildFactLine — audit F-RETR-3 fix; the two
+ * used to drift: note-vs-value, tone and bi-temporal tails were injected but never charged).
+ *
+ * SUBJECT-HEADER OVERHEAD: the formatter also emits one `[Subject]` group-header line per distinct
+ * subject. When the caller passes `seenSubjects` (a Set of subject group keys already charged),
+ * the FIRST fact of a not-yet-seen subject is charged that header line too. This function NEVER
+ * mutates the set — the caller marks a subject seen only when the fact is actually admitted, so a
+ * budget-rejected candidate can't consume the header charge for later same-subject candidates.
+ * Callers without grouping (e.g. pipeline.js formatChosenFacts, which emits flat lines) simply
+ * omit the set and get the plain per-line estimate.
  * @param {{fact: Object, category: string, tier: string}} r
+ * @param {Set<string>|null} [seenSubjects=null] - subject keys already charged a header
  * @returns {number}
  */
-export function estimateInjectionTokens(r) {
+export function estimateInjectionTokens(r, seenSubjects = null) {
     const f = r.fact;
-    const kb = (f.knownBy || []).join(', ');
-    const prefix = kb ? `[${kb}]` : '[everyone]';
-    let line = `${prefix} ${r.category}/${f.key} = ${f.value || ''}`;
-    if (r.tier === 'primary' && typeof f.context === 'string' && f.context.trim()) line += ` — ${f.context.trim()}`;
-    return Math.ceil(line.length / 4);
+    // Read the bi-temporal flag the same way the formatter does (best-effort; default off).
+    let biTemporalOn = false;
+    try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
+    let chars = buildFactLine(f, r.category, biTemporalOn).length;
+    if (seenSubjects && !seenSubjects.has(subjectGroupKey(f))) {
+        // One `[Subject]` header line (brackets + label) plus its newline.
+        chars += subjectGroupLabel(f).length + 3;
+    }
+    return Math.ceil(chars / 4);
 }
 
 /**
@@ -235,6 +320,21 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     const cutoffIso = cutoffDays > 0 ? sinceIso(cutoffDays) : null;
     const passesRecency = (r) => !cutoffIso || !r.fact.createdAt || r.fact.createdAt >= cutoffIso;
 
+    // F-RETR-4 — cap honored exact-key primaries per turn. Keep the EXACT_KEY_PRIMARY_CAP most
+    // salient `via:'exact'` primaries; demote the rest to SECONDARY so they still compete for the
+    // overflow slots (salience/MMR/token budget) instead of being unconditionally injected.
+    // Track-continuity and keyword primaries are untouched.
+    const exactPrimaries = directResults.filter(r => r.tier === 'primary' && r.via === 'exact');
+    if (exactPrimaries.length > EXACT_KEY_PRIMARY_CAP) {
+        exactPrimaries.sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+        const demoted = exactPrimaries.slice(EXACT_KEY_PRIMARY_CAP);
+        for (const r of demoted) r.tier = 'secondary';
+        addDebugLog('info', `Exact-key primary cap: ${exactPrimaries.length} exact-key primaries exceed cap ${EXACT_KEY_PRIMARY_CAP} — demoted ${demoted.length} (lowest salience) to secondary`, {
+            subsystem: 'retrieval', event: 'retrieval.primary_cap',
+            data: { exact: exactPrimaries.length, cap: EXACT_KEY_PRIMARY_CAP, demoted: demoted.length, demotedKeys: demoted.slice(0, 10).map(r => `${r.category}/${r.fact.key}`) },
+        });
+    }
+
     const primary = directResults.filter(r => r.tier === 'primary');
     let secondary = directResults.filter(r => r.tier === 'secondary');
     let tertiary = directResults.filter(r => r.tier === 'tertiary');
@@ -285,18 +385,40 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // TOKEN-BUDGET admission (#10): primary tokens charged first; secondary then tertiary
     // admitted by salience until the token budget OR the count cap is reached (smaller wins).
     // The first overflow candidate is always admitted (never an empty overflow on a tiny budget).
-    let usedTokens = primary.reduce((sum, r) => sum + estimateInjectionTokens(r), 0);
+    // SUBJECT-HEADER LEDGER (F-RETR-3): formatFactsForWriter emits one `[Subject]` header line per
+    // distinct subject, so the FIRST charged fact of a new subject also pays for that header. The
+    // estimator only READS the set; we mark a subject seen when its fact is actually admitted, so
+    // a budget-rejected candidate never eats the header charge for later same-subject facts.
+    const estSeenSubjects = new Set();
+    const markSubjectSeen = (r) => estSeenSubjects.add(subjectGroupKey(r.fact));
+    let usedTokens = primary.reduce((sum, r) => {
+        const cost = estimateInjectionTokens(r, estSeenSubjects);
+        markSubjectSeen(r);
+        return sum + cost;
+    }, 0);
+    // F-RETR-4 WARNING: primaries are NEVER budget-gated (exact-key picks and mandatory track-
+    // continuity steps must always land — deliberate design), but when their estimated tokens
+    // ALONE already exceed the whole retrievalTokenBudget the budget can't bound the injection
+    // at all this turn — say so loudly instead of silently blowing past it. Track-continuity
+    // steps are counted in the total (and broken out) so the log shows where the weight is.
+    if (usedTokens > budget) {
+        const trackSteps = primary.filter(r => isSequenceFact(r.fact)).length;
+        addDebugLog('info', `WARNING: primary facts alone are ~${usedTokens} tokens — over the ${budget}-token retrieval budget before any secondary/tertiary admission (${primary.length} primaries, incl. ${trackSteps} track-continuity step(s))`, {
+            subsystem: 'retrieval', event: 'retrieval.warn.primary_over_budget',
+            data: { primaryTokens: usedTokens, budget, primaryCount: primary.length, trackContinuitySteps: trackSteps },
+        });
+    }
     const admitted = [];
     const admitTier = (list, maxCount, capReason) => {
         let n = 0;
         for (const r of list) {
             if (n >= maxCount) { recordExclude(r, capReason, { rank: n + 1, of: list.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }); continue; }
-            const cost = estimateInjectionTokens(r);
+            const cost = estimateInjectionTokens(r, estSeenSubjects);
             if (admitted.length > 0 && usedTokens + cost > budget) {
                 recordExclude(r, 'CAP_TOKENS', { usedTokens, budget, score: Number(retrievalSalience(r.fact, now).toFixed(3)) });
                 continue;
             }
-            admitted.push(r); usedTokens += cost; n++;
+            admitted.push(r); usedTokens += cost; markSubjectSeen(r); n++;
         }
     };
     admitTier(secondary, MAX_SECONDARY, 'CAP_SECONDARY');
@@ -467,13 +589,17 @@ function mmrRerank(list, lambda, now) {
  * @param {Set<string>} seenIds - `category:key` ids already in results (mutated)
  */
 function fuzzyFallback(databases, neededInfo, results, seenIds) {
-    // Which entries already have a primary hit? An entry "covered" if any primary result's
-    // match text contains an entry word (cheap re-check against the existing primaries) — if
-    // not, it's a candidate for fuzzy rescue. We only fuzzy entries with NO primary coverage.
+    // Which entries already have a primary hit? An entry is "covered" only when ONE primary
+    // fact's tokens cover the MAJORITY of the entry's meaningful words, with exact word-boundary
+    // token matches. (Tightened from the old check, which concatenated ALL primary text and
+    // called an entry covered when ANY single entry word appeared as a SUBSTRING anywhere in it —
+    // so "art" hiding inside "apartment", or one word matching fact A while another matched
+    // fact B, over-suppressed the fuzzy rescue.) Uncovered entries get the fuzzy rescue below.
     const primaries = results.filter(r => r.tier === 'primary');
-    const primaryText = primaries
-        .map(r => `${r.fact.key} ${r.fact.value} ${(r.fact.tags || []).join(' ')} ${(r.fact.aliases || []).join(' ')}`.toLowerCase())
-        .join('  ');
+    const primaryTokenSets = primaries.map(r => {
+        const text = `${r.fact.key} ${r.fact.value} ${(r.fact.tags || []).join(' ')} ${(r.fact.aliases || []).join(' ')}`.toLowerCase();
+        return new Set(text.split(/[^a-z0-9]+/).filter(t => t.length > 0));
+    });
 
     let admitted = 0;
     for (const raw of (neededInfo || [])) {
@@ -481,10 +607,19 @@ function fuzzyFallback(databases, neededInfo, results, seenIds) {
         if (!entry) continue;
         if (entry.indexOf('/') >= 0) continue; // Category/key request — Layer C's job
         const entryLower = entry.toLowerCase();
-        // Skip entries that the exact/keyword path already covered as primary (any
-        // meaningful word of the entry already present in a primary fact's text).
+        // Meaningful entry words for the trigram rescue below (whitespace split, as before)...
         const words = entryLower.split(/\s+/).filter(w => w.length > 3);
-        const covered = words.length > 0 && words.some(w => primaryText.includes(w));
+        // ...and word-boundary TOKENS for the coverage check (same tokenizer as the fact side,
+        // so "mira's" compares as "mira"/"s" instead of never matching a token).
+        const entryTokens = entryLower.split(/[^a-z0-9]+/).filter(w => w.length > 3);
+        // Covered = a SINGLE primary fact's token set contains a STRICT MAJORITY of the entry's
+        // meaningful tokens. Per-entry AND per-fact — scattered one-word hits spread across
+        // different primaries no longer count as coverage, and substring hits don't count at all.
+        const covered = entryTokens.length > 0 && primaryTokenSets.some(tokens => {
+            let matched = 0;
+            for (const w of entryTokens) if (tokens.has(w)) matched++;
+            return matched * 2 > entryTokens.length;
+        });
         if (covered) continue;
 
         // Compare each WORD of the entry against each TOKEN of the fact and take the best
@@ -639,25 +774,28 @@ export function retrievalSalience(fact, now) {
 }
 
 /**
- * Default depth-dice "reach weights" (Feature #4). Each is how strongly we want to reach that
- * many steps back from the current step. Overridden by settings.depthDice* when present.
- * Historically these were rolled against Math.random per turn; the reach is now DETERMINISTIC
+ * LEGACY depth-dice "reach weights" (Feature #4) — back-compat fallback ONLY (audit F-RETR-5).
+ * The reach is now configured directly as `settings.trackReachSteps` (integer 0-4, one honest
+ * "History reach" control). These weights + the threshold below are consulted only for stored
+ * settings that PREDATE trackReachSteps, deriving the same reach the old UI actually produced.
+ * Historically these were rolled against Math.random per turn; the reach is DETERMINISTIC
  * (see deterministicTrackReach) so a swipe/regen — which re-injects from the cached snapshot and
  * MUST yield the same fact set (pipeline.js ~26-27) — can never silently pull a different slice
- * of history. The weights are reinterpreted as a fixed include-threshold, not a dice roll.
+ * of history.
  */
 const DEFAULT_DEPTH_PROBS = [0.70, 0.50, 0.25, 0.10]; // depth 1,2,3,4
 
 /**
- * DETERMINISTIC-INCLUDE threshold for the depth-dice weights. A depth tier is INCLUDED when its
- * configured weight is at/above this threshold (≥ 0.5 = "more likely than not"), and the reach is
- * the FURTHEST CONTIGUOUS depth that clears it (a gap stops the reach so continuity holds). With
- * the defaults [0.70, 0.50, 0.25, 0.10] this yields reach 2 — the same expected behavior the dice
- * used to average to, but now stable across swipes. No Math.random anywhere in the path.
+ * DETERMINISTIC-INCLUDE threshold for the LEGACY depth-dice weights (fallback path only). A depth
+ * tier is INCLUDED when its configured weight is at/above this threshold (≥ 0.5 = "more likely
+ * than not"), and the reach is the FURTHEST CONTIGUOUS depth that clears it (a gap stops the
+ * reach so continuity holds). With the defaults [0.70, 0.50, 0.25, 0.10] this yields reach 2 —
+ * which is exactly the trackReachSteps default. This threshold is WHY the percent sliders were
+ * retired (F-RETR-5): it made 1-49% identical and 50-100% identical, so the four dials were a lie.
  */
 const DEPTH_INCLUDE_THRESHOLD = 0.5;
 
-/** Read configured depth probabilities (clamped 0..1), falling back to defaults. */
+/** Read LEGACY depth probabilities (clamped 0..1), falling back to defaults. Fallback path only. */
 function getDepthProbs() {
     const s = (() => { try { return getSettings(); } catch { return null; } })() || {};
     const pick = (v, d) => {
@@ -673,15 +811,26 @@ function getDepthProbs() {
 }
 
 /**
- * DETERMINISTIC reach from the depth-dice weights (replaces the old per-turn Math.random roll).
- * The reach is the FURTHEST CONTIGUOUS depth whose configured weight clears
- * DEPTH_INCLUDE_THRESHOLD — a gap (a tier below threshold) stops the reach so continuity is
- * preserved. Same inputs (settings) → same reach, every time, so swipes/regens that re-derive
- * retrieval get an identical history slice (no silent drift; pipeline.js ~26-27 invariant).
- * @param {number[]} probs - configured depth weights for depths 1..N
+ * DETERMINISTIC track reach (audit F-RETR-5). Source of truth is `settings.trackReachSteps`
+ * (integer 0-4: how many older steps beyond the current one to always include) — the single
+ * honest control that replaced the four depth-dice percent sliders. When the setting is absent
+ * (stored settings predating it, or a settings read failure) we fall back to the LEGACY
+ * derivation: the furthest CONTIGUOUS depth whose configured depthDice weight clears
+ * DEPTH_INCLUDE_THRESHOLD (a gap stops the reach so continuity is preserved) — byte-identical
+ * behavior for old installs until the user touches the new control. Same inputs (settings) →
+ * same reach, every time, so swipes/regens that re-derive retrieval get an identical history
+ * slice (no silent drift; pipeline.js ~26-27 invariant). No Math.random anywhere in the path.
+ * @param {number[]} probs - LEGACY depth weights for depths 1..N (fallback path only)
  * @returns {number} reach in [0, probs.length] (0 = current step only)
  */
 function deterministicTrackReach(probs) {
+    // NEW setting wins when present: a finite number is clamped to a whole 0..N step count.
+    const s = (() => { try { return getSettings(); } catch { return null; } })() || {};
+    const steps = Number(s.trackReachSteps);
+    if (Number.isFinite(steps)) {
+        return Math.max(0, Math.min(probs.length, Math.floor(steps)));
+    }
+    // LEGACY fallback: derive the reach from the stored depth-dice weights via the threshold.
     let reach = 0;
     for (let depth = 1; depth <= probs.length; depth++) {
         if (probs[depth - 1] >= DEPTH_INCLUDE_THRESHOLD) reach = depth;
@@ -1143,51 +1292,25 @@ export function formatFactsForWriter(results) {
     // byte-for-byte unchanged. Best-effort: a settings read failure simply omits the annotation.
     let biTemporalOn = false;
     try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
-    const temporalTail = (fact) => {
-        if (!biTemporalOn) return '';
-        const from = (typeof fact.validFrom === 'string' && fact.validFrom.trim()) ? fact.validFrom.trim() : '';
-        const until = (typeof fact.validUntil === 'string' && fact.validUntil.trim()) ? fact.validUntil.trim() : '';
-        if (!from && !until) return '';
-        return ` {${from || '?'}→${until || 'now'}}`;
-    };
 
-    const formatLine = (fact, category) => {
-        const knownBy = (fact.knownBy || []).join(', ');
-        const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-        const hasValue = String(fact.value ?? '').trim() !== '';
-        const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
-        // Episodic-memory feature: a `moment`-kind fact carries a short emotional `tone` we append
-        // compactly so the beat reads WITH its feeling, e.g. `Events/key: <note> (tender)`.
-        const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
-        const temporal = temporalTail(fact);
-        // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
-        // only needs one. When a fact HAS a note, the note already carries the
-        // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
-        // showing both would be redundant. With no note, inject `Category/key = value`.
-        // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
-        if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${temporal}`;
-        if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${temporal}`;
-        // Degenerate: neither value nor note — keep the key so it's still visible.
-        return `${prefix} ${category}/${fact.key}${temporal}`;
-    };
+    // Per-fact lines come from the SHARED buildFactLine (audit F-RETR-3): the estimator charges
+    // the exact same bytes this formatter emits, so budget math can never drift from the output.
 
     // Bucket lines by subject, preserving first-appearance order of both groups and lines.
-    const MISC_KEY = ' misc'; // sentinel that can't collide with a real subject
     const order = [];                  // subject keys in first-appearance order
     const groups = new Map();          // subjectKey -> { label, lines: string[] }
     for (const { fact, category } of results) {
-        const subjRaw = String(deriveSubject(fact) ?? '').trim();
-        const key = subjRaw ? subjRaw.toLowerCase() : MISC_KEY;
+        const key = subjectGroupKey(fact);
         if (!groups.has(key)) {
             // One-word header: the subject as stored (or "Misc" for the no-subject bucket).
-            groups.set(key, { label: subjRaw || 'Misc', lines: [] });
+            groups.set(key, { label: subjectGroupLabel(fact), lines: [] });
             order.push(key);
         }
-        groups.get(key).lines.push(formatLine(fact, category));
+        groups.get(key).lines.push(buildFactLine(fact, category, biTemporalOn));
     }
 
     // Emit "Misc" last (a trailing catch-all reads better than leading with un-grouped rows).
-    order.sort((a, b) => (a === MISC_KEY ? 1 : 0) - (b === MISC_KEY ? 1 : 0));
+    order.sort((a, b) => (a === SUBJECT_MISC_KEY ? 1 : 0) - (b === SUBJECT_MISC_KEY ? 1 : 0));
 
     const out = [];
     for (const key of order) {

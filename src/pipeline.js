@@ -25,11 +25,14 @@ import { detectAndRecord, showEntityPopup, runEntityResolution } from './agent-e
 // (clamped at 0 — CHAT_CHANGED force-resets to 0, so a straggling finally must not drive
 // it negative), so overlapping windows compose correctly. Read ONLY via isInternalCall().
 let internalCallDepth = 0;
-// True while ANY of our own agent flows has an LLM-call window open. NOTE: the normal agent
+// True while ANY of our own agent flows has an LLM-call window open. NOTE: the agent
 // transports (CMRS / direct proxy fetch, see llm-call.js) never re-enter ST's generation
-// events at all — this guard exists for the rare generateQuietPrompt FALLBACK leg
-// (llm-call.js priority 3), which DOES run ST's full generation pipeline and would
-// otherwise recurse into us.
+// events at all. This guard originally existed for the generateQuietPrompt FALLBACK leg,
+// which DID run ST's full generation pipeline and could recurse into us — that leg was
+// REMOVED (F-WRITE-4). The window is KEPT: it still marks background flows (post-reply
+// extraction, reflection) so a genuine turn arriving mid-flow is served the degraded
+// cached injection (with visible logging) instead of racing a fresh full run, and it
+// stays a cheap defense-in-depth should any future code call through ST's generation path.
 const isInternalCall = () => internalCallDepth > 0;
 let chatChangedAt = 0;
 let lastTriggeredUserMsgIndex = -1;
@@ -622,13 +625,15 @@ function shouldRunPipeline(data) {
 
     // Skip our own internal LLM calls (Agent 1, Agent 3, reflection). KEPT as a hard skip
     // (F-ORCH-2, deliberate choice): CHAT_COMPLETION_PROMPT_READY's payload is only
-    // { chat, dryRun } — it carries NO quiet/type marker — so our own generateQuietPrompt
-    // FALLBACK leg (llm-call.js priority 3) is indistinguishable from a genuine user turn
-    // here, and the quiet/dryRun checks below can NOT catch it. Dropping this skip would let
-    // the agents recurse off our own fallback call. The cost is softened instead: a genuine
-    // user turn arriving during a background internal window now falls through to the cached
-    // re-inject fallback in the event handlers (see initPipeline) rather than generating
-    // with zero memory injection.
+    // { chat, dryRun } — it carries NO quiet/type marker — so a call of ours that went
+    // through ST's generation pipeline would be indistinguishable from a genuine user turn
+    // here, and the quiet/dryRun checks below could NOT catch it. The generateQuietPrompt
+    // fallback leg that motivated this was REMOVED (F-WRITE-4) — the remaining transports
+    // (CMRS / direct proxy) never re-enter ST's generation events — but the skip stays as
+    // cheap defense-in-depth while extraction/reflection hold the window. The cost is
+    // softened instead: a genuine user turn arriving during a background internal window
+    // falls through to the cached re-inject fallback in the event handlers (see initPipeline)
+    // rather than generating with zero memory injection.
     if (isInternalCall()) {
         addDebugLog('debug', 'Skipping pipeline (internal agent call window open)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'INTERNAL' });
         return false;
@@ -962,7 +967,7 @@ async function runPipelineInline(data) {
         const focusList = scenePresent.length
             ? scenePresent
             : (charName && charName !== '(unknown)' ? [charName] : []);
-        draftResult = { draft: '', branches: [], focus: focusList, neededFacts: [], nextHint: [], scene: null, raw: '' };
+        draftResult = { draft: '', branches: [], focus: focusList, neededFacts: [], scene: null, raw: '' };
         addDebugLog('info', `Hybrid mode: skipped Agent 1 Draft LLM call — anchoring on speculative facts${focusList.length ? ` + anchors for (${focusList.join(', ')})${scenePresent.length ? '' : ' [active-char fallback; scene not parsed in hybrid]'}` : ''}; main model recalls via search_memory`, {
             subsystem: 'agent1', event: 'agent1.run', reason: 'SKIPPED_HYBRID',
             data: { agent: 'agent1', mode: memoryMode, skipped: true, focus: focusList, sceneStale: !scenePresent.length },
@@ -984,11 +989,10 @@ async function runPipelineInline(data) {
             },
         });
     }
-    // Older Agent 1 result shapes (or partial parses) may lack branches/focus/neededFacts/nextHint.
+    // Older Agent 1 result shapes (or partial parses) may lack branches/focus/neededFacts.
     if (!Array.isArray(draftResult.branches)) draftResult.branches = [];
     if (!Array.isArray(draftResult.focus)) draftResult.focus = [];
     if (!Array.isArray(draftResult.neededFacts)) draftResult.neededFacts = [];
-    if (!Array.isArray(draftResult.nextHint)) draftResult.nextHint = [];
 
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
     addDebugLog('info', `Branches picked: ${draftResult.branches.join('; ') || '(none)'}`);
@@ -1011,20 +1015,10 @@ async function runPipelineInline(data) {
         }
     }
 
-    // --- Next-scene fact hint (refinement #11): backstage breadcrumb only ---
-    // Agent 1 optionally emits #NextHint (topics likely relevant NEXT scene). We stash it
-    // on the triggering USER message's extra (bf_mem_next_hint) — NOT in any visible reply
-    // text, NOT injected into the writer. It's a future-use breadcrumb. Same guards as the
-    // scene write: only when not cancelled and the character didn't change mid-run.
-    if (!pipelineCancelled && draftResult.nextHint.length > 0 && lastUserMsgIndex >= 0 && chat[lastUserMsgIndex]) {
-        const currentCharAvatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || '';
-        if (currentCharAvatar === capturedCharAvatar) {
-            const hint = draftResult.nextHint.slice(0, 5);
-            chat[lastUserMsgIndex].extra = { ...(chat[lastUserMsgIndex].extra || {}), bf_mem_next_hint: hint };
-            SillyTavern.getContext().saveChatDebounced?.();
-            addDebugLog('info', `Next-scene hint stored on msg ${lastUserMsgIndex} (backstage): ${hint.join('; ')}`);
-        }
-    }
+    // F-WRITE-1: the old #NextHint breadcrumb (stored as bf_mem_next_hint on the triggering
+    // user message + a chat save) was removed end-to-end — nothing ever read it back, and the
+    // prompt section wasted Agent-1 output tokens every push-mode turn. Old chats may still
+    // carry stale bf_mem_next_hint entries in message.extra; they are inert and left in place.
 
     // --- Fact Retrieval: deterministic (no LLM) ---
     updateStatus('running', 'Selecting facts...');
@@ -1247,9 +1241,10 @@ async function runPipelineInline(data) {
     lastInjection = injection; // Used for THIS first generation only.
     // FIX #8a: cache a draft-less variant for swipes/regens. Same scene + facts (those are
     // turn-stable and safe to reuse), but pass an empty draft so the stale "what happens
-    // next" direction can't mis-steer a divergent re-roll. buildWriterInjection renders an
-    // empty draft as "(no direction)" inside the #Scene Direction slot — a neutral
-    // placeholder that doesn't push the re-roll toward the original swipe's planned beat.
+    // next" direction can't mis-steer a divergent re-roll. F-ARCH-5: buildWriterInjection
+    // now OMITS the #Scene Direction section entirely for an empty draft (no "(no direction)"
+    // stub), and returns '' when there are no facts and no scene either — a falsy cache value
+    // the swipe/frozen paths already treat as "nothing to re-inject".
     lastInjectionNoDraft = buildWriterInjection('', retrieval.formatted, overviewBlock);
 
     // Optional: trim main-model chat history to last N messages — relies on facts to
@@ -1258,7 +1253,15 @@ async function runPipelineInline(data) {
     const agent2Limit = Math.max(0, settings.agent2ContextMessages || 0);
     addDebugLog('info', `Injection ready (${injection.length} chars${agent2Limit ? `, trimming chat to last ${agent2Limit}` : ''}) in ${Date.now() - startTime}ms`);
 
-    const success = injectMemoryContext(data, injection, { trimToLast: agent2Limit });
+    // F-ARCH-5: buildWriterInjection returns '' when there is NOTHING meaningful to say (no
+    // facts, no draft, no scene/overview block — e.g. a fresh hybrid chat with an empty store).
+    // Skip injectMemoryContext entirely then: injecting an empty block is pure noise, and the
+    // '' would otherwise be logged as an injection FAILURE below. Skipping also skips the
+    // optional history trim — with no facts to replace the hidden history, trimming would
+    // remove context without compensation.
+    const success = injection
+        ? injectMemoryContext(data, injection, { trimToLast: agent2Limit })
+        : false;
 
     // Token comparison: main-model input AFTER trim+inject.
     // PERF (fix): avoid tokenizing the WHOLE chat a SECOND time. On the common path
@@ -1320,6 +1323,12 @@ async function runPipelineInline(data) {
         // (chars/4 of the injection block). Best-effort, off the critical path (injection already
         // happened), fully swallowed so the viewer can never affect generation.
         try { setLastInjection(retrieval.facts, Math.ceil((injection?.length || 0) / 4)); } catch { /* viewer best-effort */ }
+    } else if (!injection) {
+        // F-ARCH-5: nothing to inject is a normal (info) outcome, not a failure — the run
+        // produced no facts, no draft, and no scene block worth the tokens.
+        addDebugLog('info', 'Nothing to inject this turn (no facts, no draft, no scene) — injection skipped', {
+            subsystem: 'writer', event: 'inject.skipped', reason: 'EMPTY_INJECTION',
+        });
     } else {
         addDebugLog('fail', 'Failed to inject memory context');
     }
@@ -2032,13 +2041,13 @@ export function initPipeline() {
         const swipeInjection = lastInjectionNoDraft || lastInjection;
         // F-ORCH-2 (behavioral half): the `!isInternalCall` condition was REMOVED here. A genuine
         // user turn arriving while a background flow (post-reply extraction / reflection) holds
-        // the internal window is hard-skipped by shouldRunPipeline (unavoidable — see the gate
-        // comment there: this event's payload can't distinguish our own quiet-fallback call from
-        // a real turn), and this fallback used to refuse too — so the turn generated with ZERO
-        // memory injection, silently. Serving the CACHED block is safe for BOTH identities of
-        // the event: a genuine turn gets last turn's scene+facts (degraded, not amnesiac); our
-        // own rare generateQuietPrompt-fallback call just gains one inert context line.
-        // pipelineJustInjected still prevents double-injection within one generation cycle.
+        // the internal window is hard-skipped by shouldRunPipeline (see the gate comment there),
+        // and this fallback used to refuse too — so the turn generated with ZERO memory
+        // injection, silently. Serving the CACHED block gets that turn last turn's scene+facts
+        // (degraded, not amnesiac). (The generateQuietPrompt fallback leg that once made this
+        // event ambiguous was removed — F-WRITE-4 — so during an internal window this event now
+        // only ever means a genuine turn.) pipelineJustInjected still prevents double-injection
+        // within one generation cycle.
         if (swipeInjection && !data?.dryRun && !pipelineJustInjected) {
             const settings = getSettings();
             if (!settings || !settings.enabled) return;
@@ -2077,7 +2086,20 @@ export function initPipeline() {
         try {
             if (SillyTavern.getContext().mainApi === 'openai') return;
         } catch { /* unknown backend — fall through and run the full pipeline here */ }
-        if (shouldRunPipeline({ dryRun: false })) {
+        // F-ORCH-5: thread the REAL event fields into the gate instead of a synthetic
+        // `{ dryRun: false }` that discarded the payload. GENERATE_AFTER_DATA delivers the
+        // built generate_data object (plus the separate dryRun arg, already handled above);
+        // depending on the ST build it may carry `type`/`generationType` (quiet / impersonate /
+        // continue) and/or a `quiet` flag. Pass whatever is present through so those
+        // generations can be filtered on this text-completion path too. Absent fields are
+        // simply undefined — shouldRunPipeline's checks then fall through exactly as the old
+        // synthetic payload did, so builds that carry none of these fields behave identically.
+        if (shouldRunPipeline({
+            dryRun: false,
+            quiet: data?.quiet,
+            type: data?.type,
+            generationType: data?.generationType,
+        })) {
             // A2/B5: frozen-injection fast path (text-completion shape). Default off.
             if (tryFrozenInjectionText(data)) return;
             await runPipelineInline(data);
