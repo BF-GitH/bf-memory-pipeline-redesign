@@ -6,7 +6,7 @@ Works best with a **tool-calling-capable main model** (e.g. Claude) — the pull
 
 ## Install
 
-Drop into `SillyTavern/public/scripts/extensions/third-party/bf-memory-pipeline-redesign/` (or clone there). Enable in the Extensions panel. The drawer header shows the installed version, read live from `manifest.json` (e.g. `v0.50.1`) — handy for confirming you're testing the latest after a `git pull`.
+Drop into `SillyTavern/public/scripts/extensions/third-party/bf-memory-pipeline-redesign/` (or clone there). Enable in the Extensions panel. The drawer header shows the installed version, read live from `manifest.json` (e.g. `v0.60.0`) — handy for confirming you're testing the latest after a `git pull`.
 
 ---
 

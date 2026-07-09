@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.60.0] - 2026-07-09
+
+### Added / Changed / Removed — full audit implemented (PRs #3 + #4)
+
+> The 93-finding multi-agent audit (`docs/AUDIT-2026-07-07.md`) is now fully implemented.
+> Runtime smoke-tested in a real SillyTavern (release branch): loads with zero console errors.
+
+**Added**
+- **First-run onboarding wizard** (`src/onboarding.js`): 5-step guided setup (how memory works → memory mode → cost preset → Scribe profile → where to look while it runs). Skippable, shows once; "Re-run setup guide" button in the General tab.
+- **Opt-in typed-edge graph memory** (`typedEdges`, default **off** — UPGRADES feature #9): the Scribe can tag facts with `rel:<predicate>@<Category/key>` edges (employs/fears/loves/…); edges merge additively, expand through the anti-hub admitter, and render in `search_memory` output with simple relation-intent matching. Byte-identical behavior when off.
+- **Honest tool-cost accounting**: Tokens tab shows estimated tool round-trips + per-request tool-schema cost; tool-activity panel shows token estimates next to call counts. Slimmed tool descriptions save ~230 tokens per request.
+- **"Retrieval token budget" slider** (Writer tab) and a single honest **"History reach: 0–4 steps"** control replacing the four depth-dice percent sliders (which had silently become a binary ≥50% threshold).
+
+**Fixed (highlights)**
+- **Review popup is honest**: facts are saved *before* review, and the popup now says so; the ✕ actually deletes (same path as the per-message viewer); blank-value edit works; `reviewInterval 0` = never show; Dismiss clears the queue.
+- **Silent memory loss closed**: a Scribe reply missing `#MEM` flags an error and retries next turn; busy/cancelled extractions reschedule instead of dropping an exchange forever; a fast next message during background extraction gets the cached injection instead of none (`internalCallDepth` refcount).
+- **Unsorted-injection loop** (audit F-ARCH-2): Unsorted facts compete under the token budget — top 6 by salience guaranteed, the rest budget-ranked; `remember_fact` steers pins toward real categories.
+- **Data safety**: attachment saves upload-before-delete; IDB read-modify-write is now single-transaction (`idbUpdateRecord`); per-category clobber guard with deletion tombstones so cross-device deletes are honored, not resurrected; token estimator matches the actual injected format; exact-key primaries capped (12).
+- **Settings-key bug**: `host.getExtensionSettings()` hardcoded `bf-memory-pipeline` — every agent module silently read `null` settings in a `-redesign`-named install folder. Now folder-derived.
+- **`{{bf_facts}}` / `/bfmem` live**: `initCommands()` was never wired (dead module); macro registration migrated to the new `macros.register` API (which returns `null` on bad definitions instead of throwing — return value now checked), with legacy fallbacks.
+- Plus: capitalized-word keyword fallback gated to true parse failures; brain-icon plain click is always the free viewer; MMR cold-penalty normalization fix; trimChatHistory preserves depth-injected system messages; full-context `generateQuietPrompt` fallback leg removed; `#NextHint` (generated every turn, never read) removed; entity merges get an auditable `merged` status and the "both explicitly named" veto now covers alias signals; temporal grounding wired into backfill/per-message paths; README rewritten around the shipped hybrid/tool-first architecture.
+
+**Removed (−1,679 lines of retired code)**
+- The dormant vector/embedding stack (`st-vectors.js`, `fact-embedding.js`, dead API chain, hidden settings UI), the hard-disabled Finder/Agent 4 (`agent-finder.js`, dead pipeline block, Librarian tab), zero-caller database exports, deprecated profiler shims, and legacy `fact.embedding` float arrays (stripped on load).
+
+**Refactored**
+- `settings.js` (~6k lines) split into `debug-log.js`, `turn-state.js`, `db-panel.js`, `presets.js`, `ui-util.js` — mechanical, zero behavior change; `settings.js` re-exports everything so no importer changed.
+
 ## [0.50.1] - 2026-06-21
 
 ### Added / Changed — diagnostics + embeddings retired from the UI
