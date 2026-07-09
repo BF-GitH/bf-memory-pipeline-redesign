@@ -3,6 +3,10 @@
 // by Agent 3, grey = not yet. Click to force Agent 3 on that specific message.
 
 import { addDebugLog } from './settings.js';
+// F-UX-8 dedup: the popup loader + HTML escaper below used to be copy-pasted here and in
+// settings.js — both now live in ui-util.js. Aliased to the original local names so the
+// function bodies in this file are byte-identical to before the dedup.
+import { ensurePopup, Popup as _Popup, POPUP_TYPE as _POPUP_TYPE, escapeHtml as escapeHtmlMsg } from './ui-util.js';
 
 const ICON_CLASS = 'bf_mem_msg_icon';
 const ICON_PROCESSED_CLASS = 'bf_mem_msg_icon_processed';
@@ -145,27 +149,8 @@ async function onIconClick(e, mesId) {
     }
 }
 
-// C2 — lazy-loaded ST Popup module (same resilient multi-path import other modules use).
-let _Popup, _POPUP_TYPE;
-async function ensurePopup() {
-    if (_Popup) return true;
-    const paths = ['../../../../popup.js', '../../../../../popup.js', '../../../../scripts/popup.js'];
-    for (const p of paths) {
-        try {
-            const mod = await import(p);
-            _Popup = mod.Popup;
-            _POPUP_TYPE = mod.POPUP_TYPE;
-            return true;
-        } catch { /* try next */ }
-    }
-    return false;
-}
-
-function escapeHtmlMsg(text) {
-    return String(text ?? '')
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
+// C2 — the lazy-loaded ST Popup module (ensurePopup/_Popup/_POPUP_TYPE) and escapeHtmlMsg now
+// come from ui-util.js (F-UX-8 dedup) — see the aliased import at the top of this file.
 
 /**
  * C2 — collect the facts a given message produced. Every fact stamps `source: "msg_<index>"`

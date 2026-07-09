@@ -124,10 +124,38 @@ function registerMacro(context) {
         // Returns last snapshot (1-turn lag) and refreshes for the next read. While the first
         // refresh is still pending we return the placeholder instead of an empty string.
         const getter = () => { refresh(); return seeded ? cache : PLACEHOLDER; };
+        // NEWEST API FIRST: current ST builds expose `context.macros.register(name, options)`
+        // (the pattern ST's own bundled extensions use) where options is a definition object
+        // with a `handler` — passing a bare getter is a shape error. CRITICAL: the registry
+        // does NOT throw on a bad definition, it logs and returns null — so success must be
+        // checked via the RETURN VALUE, not try/catch. Feature-detected and individually
+        // guarded so any mismatch falls through to the established fallbacks below — never
+        // throws into extension init (house rule: degrade to the next API, then to a no-op).
+        try {
+            const m = context.macros;
+            const registerFn = typeof m?.register === 'function' ? m.register.bind(m)
+                : (typeof m?.registry?.registerMacro === 'function' ? m.registry.registerMacro.bind(m.registry) : null);
+            if (registerFn) {
+                const def = registerFn('bf_facts', {
+                    description: 'The facts BF Memory Pipeline has stored for the current character (compact list).',
+                    handler: getter,
+                });
+                if (def) {
+                    addDebugLog('info', '{{bf_facts}} macro registered (macros.register API)');
+                    return true;
+                }
+                addDebugLog('info', 'macros.register returned null, falling back to legacy APIs');
+            }
+        } catch (e) {
+            addDebugLog('info', `macros.register registration failed, falling back: ${e?.message || e}`);
+        }
         if (typeof context.registerMacro === 'function') {
             context.registerMacro('bf_facts', getter);
             return true;
         }
+        // DEPRECATED fallback (older ST): MacrosParser.registerMacro — kept LAST so old
+        // installs keep the macro; current builds never reach it (registry above wins), so
+        // the host-side deprecation warning stops firing on up-to-date SillyTavern.
         if (context.MacrosParser && typeof context.MacrosParser.registerMacro === 'function') {
             context.MacrosParser.registerMacro('bf_facts', getter);
             return true;

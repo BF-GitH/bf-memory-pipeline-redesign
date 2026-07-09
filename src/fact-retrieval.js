@@ -107,18 +107,103 @@ const MAX_EXPANSION_PER_SEED = 3;
 const MAX_EXPANSION_TOTAL = 16;
 
 /**
- * Approximate injection token cost of a candidate (atomic #10), mirroring the writer line
- * `[knownBy] Category/key = value [— context]`, ~4 chars/token.
+ * BOUNDED PRIMARY TIER (audit F-RETR-4). Exact-key requests are honored as primary — always kept,
+ * never budget-gated — so an Agent 1 that requests a long `Category/key` list could blow past the
+ * whole retrievalTokenBudget with primaries alone. Cap how many EXACT-KEY primaries a single turn
+ * may keep; the excess (lowest retrievalSalience first) is DEMOTED to secondary, where it competes
+ * under the normal salience/count/token caps instead of bypassing every budget. Track-continuity
+ * primaries are deliberately NOT capped (continuity is mandatory once a track is in scope).
+ */
+const EXACT_KEY_PRIMARY_CAP = 12;
+
+/**
+ * SHARED per-fact line builder (audit F-RETR-3). This is THE single source of truth for what one
+ * injected fact line looks like — used by BOTH formatFactsForWriter (the actual injection) and
+ * estimateInjectionTokens (the budget math) so the token estimate can never drift from the real
+ * output again. Before this, the estimator charged `[kb] Cat/key = value [— context]` (context
+ * only for primary) while the formatter injected the NOTE in place of the value for ALL tiers and
+ * appended tone + bi-temporal tails — so budgets were computed against a line that was never sent.
+ *
+ * Behavior is byte-identical to the formatter's old inline `formatLine` + `temporalTail`:
+ *   - a fact WITH a note injects `[kb] Category/key: note (tone)?{from→until}?` (note replaces value),
+ *   - a fact with only a value injects `[kb] Category/key = value{from→until}?`,
+ *   - degenerate (neither) keeps the key visible.
+ * The bi-temporal tail only exists when the caller passes `biTemporalOn` (the opt-in setting);
+ * when the feature is off the fields are never written, so output is unchanged.
+ * @param {Object} fact
+ * @param {string} category
+ * @param {boolean} [biTemporalOn=false] - settings.biTemporal, read ONCE by the caller
+ * @returns {string}
+ */
+export function buildFactLine(fact, category, biTemporalOn = false) {
+    const knownBy = (fact.knownBy || []).join(', ');
+    const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
+    const hasValue = String(fact.value ?? '').trim() !== '';
+    const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
+    // Episodic-memory feature: a `moment`-kind fact carries a short emotional `tone` we append
+    // compactly so the beat reads WITH its feeling, e.g. `Events/key: <note> (tender)`.
+    const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
+    // BI-TEMPORAL (feature, opt-in): annotate a fact carrying `validFrom`/`validUntil` with a
+    // compact `{from→until}` tail so the Writer sees WHEN the fact is true in-story.
+    let temporal = '';
+    if (biTemporalOn) {
+        const from = (typeof fact.validFrom === 'string' && fact.validFrom.trim()) ? fact.validFrom.trim() : '';
+        const until = (typeof fact.validUntil === 'string' && fact.validUntil.trim()) ? fact.validUntil.trim() : '';
+        if (from || until) temporal = ` {${from || '?'}→${until || 'now'}}`;
+    }
+    // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
+    // only needs one. When a fact HAS a note, the note already carries the
+    // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
+    // showing both would be redundant. With no note, inject `Category/key = value`.
+    // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
+    if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${temporal}`;
+    if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${temporal}`;
+    // Degenerate: neither value nor note — keep the key so it's still visible.
+    return `${prefix} ${category}/${fact.key}${temporal}`;
+}
+
+/**
+ * Subject grouping key/label shared by formatFactsForWriter (which groups lines under one
+ * `[Subject]` header per distinct subject) and estimateInjectionTokens (which must CHARGE for
+ * that header the first time a subject appears). The sentinel can't collide with a real subject.
+ */
+const SUBJECT_MISC_KEY = ' misc';
+function subjectGroupKey(fact) {
+    const subjRaw = String(deriveSubject(fact) ?? '').trim();
+    return subjRaw ? subjRaw.toLowerCase() : SUBJECT_MISC_KEY;
+}
+function subjectGroupLabel(fact) {
+    const subjRaw = String(deriveSubject(fact) ?? '').trim();
+    return subjRaw || 'Misc';
+}
+
+/**
+ * Approximate injection token cost of a candidate (atomic #10), ~4 chars/token, computed over the
+ * EXACT line formatFactsForWriter will emit (shared buildFactLine — audit F-RETR-3 fix; the two
+ * used to drift: note-vs-value, tone and bi-temporal tails were injected but never charged).
+ *
+ * SUBJECT-HEADER OVERHEAD: the formatter also emits one `[Subject]` group-header line per distinct
+ * subject. When the caller passes `seenSubjects` (a Set of subject group keys already charged),
+ * the FIRST fact of a not-yet-seen subject is charged that header line too. This function NEVER
+ * mutates the set — the caller marks a subject seen only when the fact is actually admitted, so a
+ * budget-rejected candidate can't consume the header charge for later same-subject candidates.
+ * Callers without grouping (e.g. pipeline.js formatChosenFacts, which emits flat lines) simply
+ * omit the set and get the plain per-line estimate.
  * @param {{fact: Object, category: string, tier: string}} r
+ * @param {Set<string>|null} [seenSubjects=null] - subject keys already charged a header
  * @returns {number}
  */
-export function estimateInjectionTokens(r) {
+export function estimateInjectionTokens(r, seenSubjects = null) {
     const f = r.fact;
-    const kb = (f.knownBy || []).join(', ');
-    const prefix = kb ? `[${kb}]` : '[everyone]';
-    let line = `${prefix} ${r.category}/${f.key} = ${f.value || ''}`;
-    if (r.tier === 'primary' && typeof f.context === 'string' && f.context.trim()) line += ` — ${f.context.trim()}`;
-    return Math.ceil(line.length / 4);
+    // Read the bi-temporal flag the same way the formatter does (best-effort; default off).
+    let biTemporalOn = false;
+    try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
+    let chars = buildFactLine(f, r.category, biTemporalOn).length;
+    if (seenSubjects && !seenSubjects.has(subjectGroupKey(f))) {
+        // One `[Subject]` header line (brackets + label) plus its newline.
+        chars += subjectGroupLabel(f).length + 3;
+    }
+    return Math.ceil(chars / 4);
 }
 
 /**
@@ -235,6 +320,21 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     const cutoffIso = cutoffDays > 0 ? sinceIso(cutoffDays) : null;
     const passesRecency = (r) => !cutoffIso || !r.fact.createdAt || r.fact.createdAt >= cutoffIso;
 
+    // F-RETR-4 — cap honored exact-key primaries per turn. Keep the EXACT_KEY_PRIMARY_CAP most
+    // salient `via:'exact'` primaries; demote the rest to SECONDARY so they still compete for the
+    // overflow slots (salience/MMR/token budget) instead of being unconditionally injected.
+    // Track-continuity and keyword primaries are untouched.
+    const exactPrimaries = directResults.filter(r => r.tier === 'primary' && r.via === 'exact');
+    if (exactPrimaries.length > EXACT_KEY_PRIMARY_CAP) {
+        exactPrimaries.sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+        const demoted = exactPrimaries.slice(EXACT_KEY_PRIMARY_CAP);
+        for (const r of demoted) r.tier = 'secondary';
+        addDebugLog('info', `Exact-key primary cap: ${exactPrimaries.length} exact-key primaries exceed cap ${EXACT_KEY_PRIMARY_CAP} — demoted ${demoted.length} (lowest salience) to secondary`, {
+            subsystem: 'retrieval', event: 'retrieval.primary_cap',
+            data: { exact: exactPrimaries.length, cap: EXACT_KEY_PRIMARY_CAP, demoted: demoted.length, demotedKeys: demoted.slice(0, 10).map(r => `${r.category}/${r.fact.key}`) },
+        });
+    }
+
     const primary = directResults.filter(r => r.tier === 'primary');
     let secondary = directResults.filter(r => r.tier === 'secondary');
     let tertiary = directResults.filter(r => r.tier === 'tertiary');
@@ -285,18 +385,40 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // TOKEN-BUDGET admission (#10): primary tokens charged first; secondary then tertiary
     // admitted by salience until the token budget OR the count cap is reached (smaller wins).
     // The first overflow candidate is always admitted (never an empty overflow on a tiny budget).
-    let usedTokens = primary.reduce((sum, r) => sum + estimateInjectionTokens(r), 0);
+    // SUBJECT-HEADER LEDGER (F-RETR-3): formatFactsForWriter emits one `[Subject]` header line per
+    // distinct subject, so the FIRST charged fact of a new subject also pays for that header. The
+    // estimator only READS the set; we mark a subject seen when its fact is actually admitted, so
+    // a budget-rejected candidate never eats the header charge for later same-subject facts.
+    const estSeenSubjects = new Set();
+    const markSubjectSeen = (r) => estSeenSubjects.add(subjectGroupKey(r.fact));
+    let usedTokens = primary.reduce((sum, r) => {
+        const cost = estimateInjectionTokens(r, estSeenSubjects);
+        markSubjectSeen(r);
+        return sum + cost;
+    }, 0);
+    // F-RETR-4 WARNING: primaries are NEVER budget-gated (exact-key picks and mandatory track-
+    // continuity steps must always land — deliberate design), but when their estimated tokens
+    // ALONE already exceed the whole retrievalTokenBudget the budget can't bound the injection
+    // at all this turn — say so loudly instead of silently blowing past it. Track-continuity
+    // steps are counted in the total (and broken out) so the log shows where the weight is.
+    if (usedTokens > budget) {
+        const trackSteps = primary.filter(r => isSequenceFact(r.fact)).length;
+        addDebugLog('info', `WARNING: primary facts alone are ~${usedTokens} tokens — over the ${budget}-token retrieval budget before any secondary/tertiary admission (${primary.length} primaries, incl. ${trackSteps} track-continuity step(s))`, {
+            subsystem: 'retrieval', event: 'retrieval.warn.primary_over_budget',
+            data: { primaryTokens: usedTokens, budget, primaryCount: primary.length, trackContinuitySteps: trackSteps },
+        });
+    }
     const admitted = [];
     const admitTier = (list, maxCount, capReason) => {
         let n = 0;
         for (const r of list) {
             if (n >= maxCount) { recordExclude(r, capReason, { rank: n + 1, of: list.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }); continue; }
-            const cost = estimateInjectionTokens(r);
+            const cost = estimateInjectionTokens(r, estSeenSubjects);
             if (admitted.length > 0 && usedTokens + cost > budget) {
                 recordExclude(r, 'CAP_TOKENS', { usedTokens, budget, score: Number(retrievalSalience(r.fact, now).toFixed(3)) });
                 continue;
             }
-            admitted.push(r); usedTokens += cost; n++;
+            admitted.push(r); usedTokens += cost; markSubjectSeen(r); n++;
         }
     };
     admitTier(secondary, MAX_SECONDARY, 'CAP_SECONDARY');
@@ -467,13 +589,17 @@ function mmrRerank(list, lambda, now) {
  * @param {Set<string>} seenIds - `category:key` ids already in results (mutated)
  */
 function fuzzyFallback(databases, neededInfo, results, seenIds) {
-    // Which entries already have a primary hit? An entry "covered" if any primary result's
-    // match text contains an entry word (cheap re-check against the existing primaries) — if
-    // not, it's a candidate for fuzzy rescue. We only fuzzy entries with NO primary coverage.
+    // Which entries already have a primary hit? An entry is "covered" only when ONE primary
+    // fact's tokens cover the MAJORITY of the entry's meaningful words, with exact word-boundary
+    // token matches. (Tightened from the old check, which concatenated ALL primary text and
+    // called an entry covered when ANY single entry word appeared as a SUBSTRING anywhere in it —
+    // so "art" hiding inside "apartment", or one word matching fact A while another matched
+    // fact B, over-suppressed the fuzzy rescue.) Uncovered entries get the fuzzy rescue below.
     const primaries = results.filter(r => r.tier === 'primary');
-    const primaryText = primaries
-        .map(r => `${r.fact.key} ${r.fact.value} ${(r.fact.tags || []).join(' ')} ${(r.fact.aliases || []).join(' ')}`.toLowerCase())
-        .join('  ');
+    const primaryTokenSets = primaries.map(r => {
+        const text = `${r.fact.key} ${r.fact.value} ${(r.fact.tags || []).join(' ')} ${(r.fact.aliases || []).join(' ')}`.toLowerCase();
+        return new Set(text.split(/[^a-z0-9]+/).filter(t => t.length > 0));
+    });
 
     let admitted = 0;
     for (const raw of (neededInfo || [])) {
@@ -481,10 +607,19 @@ function fuzzyFallback(databases, neededInfo, results, seenIds) {
         if (!entry) continue;
         if (entry.indexOf('/') >= 0) continue; // Category/key request — Layer C's job
         const entryLower = entry.toLowerCase();
-        // Skip entries that the exact/keyword path already covered as primary (any
-        // meaningful word of the entry already present in a primary fact's text).
+        // Meaningful entry words for the trigram rescue below (whitespace split, as before)...
         const words = entryLower.split(/\s+/).filter(w => w.length > 3);
-        const covered = words.length > 0 && words.some(w => primaryText.includes(w));
+        // ...and word-boundary TOKENS for the coverage check (same tokenizer as the fact side,
+        // so "mira's" compares as "mira"/"s" instead of never matching a token).
+        const entryTokens = entryLower.split(/[^a-z0-9]+/).filter(w => w.length > 3);
+        // Covered = a SINGLE primary fact's token set contains a STRICT MAJORITY of the entry's
+        // meaningful tokens. Per-entry AND per-fact — scattered one-word hits spread across
+        // different primaries no longer count as coverage, and substring hits don't count at all.
+        const covered = entryTokens.length > 0 && primaryTokenSets.some(tokens => {
+            let matched = 0;
+            for (const w of entryTokens) if (tokens.has(w)) matched++;
+            return matched * 2 > entryTokens.length;
+        });
         if (covered) continue;
 
         // Compare each WORD of the entry against each TOKEN of the fact and take the best
@@ -639,25 +774,28 @@ export function retrievalSalience(fact, now) {
 }
 
 /**
- * Default depth-dice "reach weights" (Feature #4). Each is how strongly we want to reach that
- * many steps back from the current step. Overridden by settings.depthDice* when present.
- * Historically these were rolled against Math.random per turn; the reach is now DETERMINISTIC
+ * LEGACY depth-dice "reach weights" (Feature #4) — back-compat fallback ONLY (audit F-RETR-5).
+ * The reach is now configured directly as `settings.trackReachSteps` (integer 0-4, one honest
+ * "History reach" control). These weights + the threshold below are consulted only for stored
+ * settings that PREDATE trackReachSteps, deriving the same reach the old UI actually produced.
+ * Historically these were rolled against Math.random per turn; the reach is DETERMINISTIC
  * (see deterministicTrackReach) so a swipe/regen — which re-injects from the cached snapshot and
  * MUST yield the same fact set (pipeline.js ~26-27) — can never silently pull a different slice
- * of history. The weights are reinterpreted as a fixed include-threshold, not a dice roll.
+ * of history.
  */
 const DEFAULT_DEPTH_PROBS = [0.70, 0.50, 0.25, 0.10]; // depth 1,2,3,4
 
 /**
- * DETERMINISTIC-INCLUDE threshold for the depth-dice weights. A depth tier is INCLUDED when its
- * configured weight is at/above this threshold (≥ 0.5 = "more likely than not"), and the reach is
- * the FURTHEST CONTIGUOUS depth that clears it (a gap stops the reach so continuity holds). With
- * the defaults [0.70, 0.50, 0.25, 0.10] this yields reach 2 — the same expected behavior the dice
- * used to average to, but now stable across swipes. No Math.random anywhere in the path.
+ * DETERMINISTIC-INCLUDE threshold for the LEGACY depth-dice weights (fallback path only). A depth
+ * tier is INCLUDED when its configured weight is at/above this threshold (≥ 0.5 = "more likely
+ * than not"), and the reach is the FURTHEST CONTIGUOUS depth that clears it (a gap stops the
+ * reach so continuity holds). With the defaults [0.70, 0.50, 0.25, 0.10] this yields reach 2 —
+ * which is exactly the trackReachSteps default. This threshold is WHY the percent sliders were
+ * retired (F-RETR-5): it made 1-49% identical and 50-100% identical, so the four dials were a lie.
  */
 const DEPTH_INCLUDE_THRESHOLD = 0.5;
 
-/** Read configured depth probabilities (clamped 0..1), falling back to defaults. */
+/** Read LEGACY depth probabilities (clamped 0..1), falling back to defaults. Fallback path only. */
 function getDepthProbs() {
     const s = (() => { try { return getSettings(); } catch { return null; } })() || {};
     const pick = (v, d) => {
@@ -673,15 +811,26 @@ function getDepthProbs() {
 }
 
 /**
- * DETERMINISTIC reach from the depth-dice weights (replaces the old per-turn Math.random roll).
- * The reach is the FURTHEST CONTIGUOUS depth whose configured weight clears
- * DEPTH_INCLUDE_THRESHOLD — a gap (a tier below threshold) stops the reach so continuity is
- * preserved. Same inputs (settings) → same reach, every time, so swipes/regens that re-derive
- * retrieval get an identical history slice (no silent drift; pipeline.js ~26-27 invariant).
- * @param {number[]} probs - configured depth weights for depths 1..N
+ * DETERMINISTIC track reach (audit F-RETR-5). Source of truth is `settings.trackReachSteps`
+ * (integer 0-4: how many older steps beyond the current one to always include) — the single
+ * honest control that replaced the four depth-dice percent sliders. When the setting is absent
+ * (stored settings predating it, or a settings read failure) we fall back to the LEGACY
+ * derivation: the furthest CONTIGUOUS depth whose configured depthDice weight clears
+ * DEPTH_INCLUDE_THRESHOLD (a gap stops the reach so continuity is preserved) — byte-identical
+ * behavior for old installs until the user touches the new control. Same inputs (settings) →
+ * same reach, every time, so swipes/regens that re-derive retrieval get an identical history
+ * slice (no silent drift; pipeline.js ~26-27 invariant). No Math.random anywhere in the path.
+ * @param {number[]} probs - LEGACY depth weights for depths 1..N (fallback path only)
  * @returns {number} reach in [0, probs.length] (0 = current step only)
  */
 function deterministicTrackReach(probs) {
+    // NEW setting wins when present: a finite number is clamped to a whole 0..N step count.
+    const s = (() => { try { return getSettings(); } catch { return null; } })() || {};
+    const steps = Number(s.trackReachSteps);
+    if (Number.isFinite(steps)) {
+        return Math.max(0, Math.min(probs.length, Math.floor(steps)));
+    }
+    // LEGACY fallback: derive the reach from the stored depth-dice weights via the threshold.
     let reach = 0;
     for (let depth = 1; depth <= probs.length; depth++) {
         if (probs[depth - 1] >= DEPTH_INCLUDE_THRESHOLD) reach = depth;
@@ -918,7 +1067,58 @@ function collectLinkCandidates(databases, seeds, alreadyFound) {
         }
     }
 
+    // DIRECTION 5 — TYPED EDGES (opt-in `typedEdges`, default OFF; audit F-ARCH-7). A seed fact
+    // carrying typed `edges` ([{p, t}] triples) pulls each edge's TARGET fact (`t` is a
+    // `Category/key` ref) as an expansion candidate. Every candidate is attributed to the SEED
+    // fact's own seedId (`edge:<cat>:<key>`), so the unified admitter's ANTI-HUB per-seed cap
+    // applies — a heavily-edged hub fact can't flood the tier. CANDIDACY-NOT-RANKING invariant
+    // honored: edges only decide ELIGIBILITY here; the admitter still orders by retrievalSalience
+    // with NO connectedness/degree term. Same emit() gate as every other direction (active +
+    // visible + deduped, tier 'secondary'). When the flag is OFF (or edges are absent — the
+    // default, since only the opt-in feature writes them) this block contributes nothing and the
+    // collector is byte-identical to today. Wrapped so a malformed edge can never break expansion.
+    try {
+        if (getSettings()?.typedEdges === true) {
+            for (const r of seeds) {
+                const fact = r.fact;
+                const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
+                if (factEdges.length === 0) continue;
+                const seedId = `edge:${r.category}:${fact.key}`;
+                for (const e of factEdges) {
+                    const target = resolveEdgeTarget(databases, e && e.t);
+                    if (target) emit(target.category, target.fact, seedId);
+                }
+            }
+        }
+    } catch { /* typed-edge expansion must never break the base collector (degrade to no edges) */ }
+
     return candidates;
+}
+
+/**
+ * Resolve a typed edge's `Category/key` target ref to the stored fact it names (typed-edge
+ * graph memory, F-ARCH-7). Case-insensitive on BOTH the category and the key so a Scribe
+ * casing drift ("people/Bob_name") still resolves; exact key identity otherwise (an edge is
+ * an IDENTITY reference to a real stored fact, mirroring the autoLinkRef contract). Returns
+ * `{category, fact}` or null (a hallucinated/stale ref simply resolves to nothing).
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {string} ref - `Category/key` target ref string (an edge's `t`)
+ * @returns {{category: string, fact: Object}|null}
+ */
+function resolveEdgeTarget(databases, ref) {
+    const s = String(ref || '').trim();
+    const slash = s.indexOf('/');
+    if (slash <= 0) return null;
+    const wantCat = s.slice(0, slash).trim().toLowerCase();
+    const wantKey = s.slice(slash + 1).trim().toLowerCase();
+    if (!wantCat || !wantKey) return null;
+    for (const [category, db] of Object.entries(databases)) {
+        if (category.toLowerCase() !== wantCat) continue;
+        for (const fact of (db.facts || [])) {
+            if (String(fact.key).toLowerCase() === wantKey) return { category, fact };
+        }
+    }
+    return null;
 }
 
 /**
@@ -1143,51 +1343,25 @@ export function formatFactsForWriter(results) {
     // byte-for-byte unchanged. Best-effort: a settings read failure simply omits the annotation.
     let biTemporalOn = false;
     try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
-    const temporalTail = (fact) => {
-        if (!biTemporalOn) return '';
-        const from = (typeof fact.validFrom === 'string' && fact.validFrom.trim()) ? fact.validFrom.trim() : '';
-        const until = (typeof fact.validUntil === 'string' && fact.validUntil.trim()) ? fact.validUntil.trim() : '';
-        if (!from && !until) return '';
-        return ` {${from || '?'}→${until || 'now'}}`;
-    };
 
-    const formatLine = (fact, category) => {
-        const knownBy = (fact.knownBy || []).join(', ');
-        const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-        const hasValue = String(fact.value ?? '').trim() !== '';
-        const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
-        // Episodic-memory feature: a `moment`-kind fact carries a short emotional `tone` we append
-        // compactly so the beat reads WITH its feeling, e.g. `Events/key: <note> (tender)`.
-        const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
-        const temporal = temporalTail(fact);
-        // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
-        // only needs one. When a fact HAS a note, the note already carries the
-        // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
-        // showing both would be redundant. With no note, inject `Category/key = value`.
-        // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
-        if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${temporal}`;
-        if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${temporal}`;
-        // Degenerate: neither value nor note — keep the key so it's still visible.
-        return `${prefix} ${category}/${fact.key}${temporal}`;
-    };
+    // Per-fact lines come from the SHARED buildFactLine (audit F-RETR-3): the estimator charges
+    // the exact same bytes this formatter emits, so budget math can never drift from the output.
 
     // Bucket lines by subject, preserving first-appearance order of both groups and lines.
-    const MISC_KEY = ' misc'; // sentinel that can't collide with a real subject
     const order = [];                  // subject keys in first-appearance order
     const groups = new Map();          // subjectKey -> { label, lines: string[] }
     for (const { fact, category } of results) {
-        const subjRaw = String(deriveSubject(fact) ?? '').trim();
-        const key = subjRaw ? subjRaw.toLowerCase() : MISC_KEY;
+        const key = subjectGroupKey(fact);
         if (!groups.has(key)) {
             // One-word header: the subject as stored (or "Misc" for the no-subject bucket).
-            groups.set(key, { label: subjRaw || 'Misc', lines: [] });
+            groups.set(key, { label: subjectGroupLabel(fact), lines: [] });
             order.push(key);
         }
-        groups.get(key).lines.push(formatLine(fact, category));
+        groups.get(key).lines.push(buildFactLine(fact, category, biTemporalOn));
     }
 
     // Emit "Misc" last (a trailing catch-all reads better than leading with un-grouped rows).
-    order.sort((a, b) => (a === MISC_KEY ? 1 : 0) - (b === MISC_KEY ? 1 : 0));
+    order.sort((a, b) => (a === SUBJECT_MISC_KEY ? 1 : 0) - (b === SUBJECT_MISC_KEY ? 1 : 0));
 
     const out = [];
     for (const key of order) {
@@ -1410,6 +1584,9 @@ function detectRelationshipQuery(query) {
         new RegExp(`\\bbetween\\s+${NAME}\\s+(?:and|&|\\+|with)\\s+${NAME}\\b`),
         // "A and B's history/relationship/past/story"
         new RegExp(`\\b${NAME}\\s+(?:and|&|\\+|with)\\s+${NAME}(?:'s)?\\s+(?:history|relationship|romance|story|past)\\b`),
+        // "A's relationship to B" / "A relationship with B" (typed-edge feature's minimal
+        // extension of the existing pair intent — same route, one more frame).
+        new RegExp(`\\b${NAME}(?:'s)?\\s+(?:history|relationship|romance|story|past)\\s+(?:to|with)\\s+${NAME}\\b`),
     ];
     for (const re of frames) {
         const m = lower.match(re);
@@ -1422,6 +1599,147 @@ function detectRelationshipQuery(query) {
         }
     }
     return null;
+}
+
+// ── TYPED-EDGE recall helpers (opt-in `typedEdges`, default OFF; audit F-ARCH-7) ────────────
+// Deterministic, bounded, zero-LLM helpers for (a) rendering a matched fact's typed edges
+// compactly on its search_memory output line and (b) answering simple relation-intent queries
+// ("who employs X") by matching a predicate token against stored edge predicates. Everything
+// here is only reachable when the typedEdges setting is ON (callers gate + try/catch), so the
+// default tool output is byte-identical.
+
+/**
+ * Compact edge tail for one fact's search_memory line: ` [rel: employs->People/bob_name, …]`.
+ * Renders at most 3 edges (the per-write cap) so a line can never balloon. Returns '' when the
+ * fact has no well-formed edges (the common case — output unchanged).
+ * @param {Object} fact
+ * @returns {string}
+ */
+function formatEdgeTail(fact) {
+    const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
+    const parts = [];
+    for (const e of factEdges) {
+        const p = String(e?.p ?? '').trim();
+        const t = String(e?.t ?? '').trim();
+        if (p && t) parts.push(`${p}->${t}`);
+        if (parts.length >= 3) break;
+    }
+    return parts.length ? ` [rel: ${parts.join(', ')}]` : '';
+}
+
+/**
+ * Append edge tails to the formatted search_memory text WITHOUT touching the shared
+ * formatFactsForWriter/buildFactLine contract (the push path + token estimator must stay
+ * byte-identical, so we post-process the TOOL output only). For each row whose fact carries
+ * edges, its exact line (rebuilt via the same buildFactLine the formatter used) is located in
+ * the text and the compact tail appended; a line that can't be located (defensive) is skipped.
+ * Deterministic; each output line is claimed at most once so duplicate lines stay stable.
+ * @param {string} text - formatFactsForWriter output
+ * @param {Array<{fact: Object, category: string}>} rows - the rows that produced `text`
+ * @returns {string}
+ */
+function appendEdgeTails(text, rows) {
+    let biTemporalOn = false;
+    try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
+    const lines = String(text ?? '').split('\n');
+    const claimed = new Set();
+    for (const { fact, category } of rows) {
+        const tail = formatEdgeTail(fact);
+        if (!tail) continue;
+        const line = buildFactLine(fact, category, biTemporalOn);
+        for (let i = 0; i < lines.length; i++) {
+            if (claimed.has(i) || lines[i] !== line) continue;
+            lines[i] = line + tail;
+            claimed.add(i);
+            break;
+        }
+    }
+    return lines.join('\n');
+}
+
+// Tokens that must never be mistaken for a relation predicate in "who <pred> <name>" frames
+// (auxiliaries/fillers a natural question contains). Small on purpose — the real gate is that
+// the predicate must ALSO match a stored edge predicate before the path activates.
+const EDGE_INTENT_STOP = new Set([
+    'is', 'are', 'was', 'were', 'does', 'did', 'has', 'had', 'have', 'the', 'and',
+    'will', 'would', 'can', 'could', 'should', 'not', 'about', 'with', 'that', 'this',
+]);
+
+/**
+ * Detect a simple RELATION-INTENT query (typed-edge feature): "who employs bob?" /
+ * "who loves the baker" / "who does bob employ" / "whom does mira fear". Returns
+ * `{p, name}` (predicate token + single-token name, both lowercased) or null for anything
+ * else — conservative, so ordinary keyword recall is unaffected. Deterministic, no LLM.
+ * @param {string} query
+ * @returns {{p: string, name: string}|null}
+ */
+function detectEdgeIntentQuery(query) {
+    const lower = String(query || '').trim().toLowerCase();
+    if (!lower) return null;
+    // "who <pred> <name>?" — e.g. "who employs bob".
+    let m = lower.match(/^\s*who\s+([a-z][a-z_'-]{2,})\s+(?:the\s+)?([a-z0-9][a-z0-9_'-]{1,})\s*\??\s*$/);
+    if (m && !EDGE_INTENT_STOP.has(m[1]) && !EDGE_INTENT_STOP.has(m[2])) return { p: m[1], name: m[2] };
+    // "who/whom does <name> <pred>?" — e.g. "who does bob employ".
+    m = lower.match(/^\s*whom?\s+does\s+(?:the\s+)?([a-z0-9][a-z0-9_'-]{1,})\s+([a-z][a-z_'-]{2,})\s*\??\s*$/);
+    if (m && !EDGE_INTENT_STOP.has(m[2]) && !EDGE_INTENT_STOP.has(m[1])) return { p: m[2], name: m[1] };
+    return null;
+}
+
+/** Predicate normalization for intent matching: lowercase + strip ONE trailing 's' so the
+ * query's "employ"/"employs" both match a stored `employs` (and vice versa). */
+function normalizeEdgePredicate(p) {
+    const s = String(p || '').trim().toLowerCase();
+    return s.endsWith('s') ? s.slice(0, -1) : s;
+}
+
+/** Does `name` (single lowercase token) name this subject/ref? Exact subject match, subject
+ * key-prefix match, or token membership in a `Category/key` ref's key part. Conservative. */
+function edgeNameMatches(name, subjectOrRef) {
+    const s = String(subjectOrRef || '').trim().toLowerCase();
+    if (!s || !name) return false;
+    if (s === name) return true;
+    // `Category/key` ref: match tokens of the key part; bare subject: match its underscore tokens.
+    const keyPart = s.includes('/') ? s.slice(s.indexOf('/') + 1) : s;
+    return keyPart === name || keyPart.split(/[^a-z0-9]+/).includes(name);
+}
+
+/**
+ * Collect facts answering a relation-intent query `{p, name}` (typed-edge feature). BOTH
+ * directions are matched deterministically over stored edges:
+ *   - HEAD answers ("who employs bob"): facts whose edge predicate matches `p` AND whose edge
+ *     TARGET ref names <name> — the matching fact's SUBJECT is the answer.
+ *   - TAIL answers ("who does bob employ"): facts whose SUBJECT is <name> with a `p`-matching
+ *     edge — the edge's target (rendered in the ` [rel: …]` tail) is the answer.
+ * Active facts only; visibility is filtered by the caller (same as the other recall paths).
+ * Bounded: one linear scan, results capped by the caller. Returns [{fact, category}].
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {{p: string, name: string}} intent
+ * @returns {Array<{fact: Object, category: string}>}
+ */
+function collectEdgeIntentMatches(databases, intent) {
+    const wantP = normalizeEdgePredicate(intent.p);
+    const name = String(intent.name || '').trim().toLowerCase();
+    const out = [];
+    if (!wantP || !name) return out;
+    for (const [category, db] of Object.entries(databases)) {
+        for (const fact of (db.facts || [])) {
+            if (!isActiveFact(fact)) continue;
+            const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
+            if (factEdges.length === 0) continue;
+            const subjIsName = edgeNameMatches(name, deriveSubject(fact));
+            for (const e of factEdges) {
+                if (normalizeEdgePredicate(e?.p) !== wantP) continue;
+                // HEAD direction: edge target names the queried person → this fact's subject
+                // answers "who <pred> <name>". TAIL direction: the queried person IS the
+                // subject → the edge target answers "who does <name> <pred>".
+                if (edgeNameMatches(name, e?.t) || subjIsName) {
+                    out.push({ fact, category });
+                    break; // one admission per fact
+                }
+            }
+        }
+    }
+    return out;
 }
 
 /**
@@ -1500,6 +1818,39 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     if (Object.keys(databases).length === 0) {
         return { text: 'No stored memory yet — nothing to search.', count: 0 };
     }
+
+    // RELATION-INTENT PATH (typed-edge graph memory, opt-in `typedEdges`; audit F-ARCH-7).
+    // A simple "who employs X" / "who does X employ" query is answered by matching the query's
+    // predicate token against the stored edge predicates of the resolved subject's facts —
+    // deterministic and bounded (one linear scan), no LLM. Only fires when the flag is ON, no
+    // scene/pair intent claimed the query first, AND at least one stored edge actually matches;
+    // otherwise it falls through to the normal keyword cascade below (zero regression risk).
+    // Wrapped so a failure here degrades to plain keyword recall.
+    try {
+        if (q && sceneTarget === null && relPair === null && getSettings()?.typedEdges === true) {
+            const edgeIntent = detectEdgeIntentQuery(q);
+            if (edgeIntent) {
+                let edgeRows = collectEdgeIntentMatches(databases, edgeIntent);
+                if (catFilter) edgeRows = edgeRows.filter(r => String(r.category).toLowerCase() === catFilter);
+                const ctxE = host.getCtx();
+                const namesE = ctxE ? { charName: ctxE.characters?.[ctxE.characterId]?.name || '', userName: ctxE.name1 || '' } : null;
+                edgeRows = edgeRows.filter(r => isFactVisible(r.fact, namesE));
+                if (edgeRows.length > 0) {
+                    const cappedEdge = edgeRows.slice(0, cap);
+                    addDebugLog('debug', `Relation-intent recall: "${edgeIntent.p}" ⇒ ${edgeIntent.name} → ${cappedEdge.length}/${edgeRows.length} edge-matched fact(s)`, {
+                        subsystem: 'retrieval', event: 'recall.edge_intent',
+                        data: { predicate: edgeIntent.p, name: edgeIntent.name, returned: cappedEdge.length, total: edgeRows.length },
+                    });
+                    const edgeText = appendEdgeTails(
+                        formatFactsForWriter(cappedEdge.map(r => ({ fact: r.fact, category: r.category, tier: 'primary' }))),
+                        cappedEdge,
+                    );
+                    return { text: edgeText, count: cappedEdge.length };
+                }
+                // No stored edge matched — fall through to the ordinary keyword cascade.
+            }
+        }
+    } catch { /* typed-edge intent must never break recall — degrade to keyword search */ }
 
     // RELATIONSHIP-THREAD PATH (Phase 0): return the couple's chronological moment-thread (cold +
     // superseded included), formatted like the push gist. Honors the optional category filter +
@@ -1634,7 +1985,15 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
 
     if (capped.length) {
         // Reuse the push formatter so the recalled lines look identical to the injected gist.
-        const text = formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })));
+        let text = formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })));
+        // TYPED EDGES (opt-in, F-ARCH-7): render each matched fact's edges compactly on its tool
+        // output line (` [rel: employs->People/bob_name]`) so the model sees the relation TYPE,
+        // not just that facts are related. Post-processes the TOOL output only — the shared
+        // buildFactLine/estimator contract (and the push injection) are untouched, and when the
+        // flag is OFF (or no fact carries edges) the text is byte-identical. Best-effort.
+        try {
+            if (getSettings()?.typedEdges === true) text = appendEdgeTails(text, capped);
+        } catch { /* never let edge rendering break recall output */ }
         return { text, count: capped.length };
     }
 

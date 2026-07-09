@@ -29,10 +29,15 @@ const ENTITIES_META_KEY = 'bf_mem_entities';
 // Valid registry statuses.
 //   named   = a recurring character with its own subject (promoted / pre-known)
 //   npc     = a one-off; stays in the shared NPC drawer, never re-asked
+//   merged  = a name VARIANT absorbed into a canonical subject by entity resolution
+//             (runEntityResolution). Carries an optional `into` field naming the canonical
+//             display it merged into (merge auditability). Treated as CLASSIFIED exactly
+//             like 'npc' (never re-offered) — but honestly labeled: it was NOT a one-off
+//             walk-on, it IS another character under a variant name.
 //   later   = user deferred the decision; re-offered on the next detection check
 //   pending = detected but not yet shown to the user (transient — set by detection,
 //             cleared when the popup is shown and the user decides)
-const VALID_STATUS = new Set(['named', 'npc', 'later', 'pending']);
+const VALID_STATUS = new Set(['named', 'npc', 'merged', 'later', 'pending']);
 
 // In-memory mirror of the registry for the current chat. Map of
 // entityName(lowercased) -> { name, status, firstSeen, lastSeen, count }.
@@ -59,6 +64,12 @@ function normalizeEntities(raw) {
             lastSeen: Number(v.lastSeen) || Number(v.firstSeen) || Date.now(),
             count: Number.isFinite(Number(v.count)) ? Math.max(0, Math.floor(Number(v.count))) : 1,
         };
+        // Merge auditability: preserve the optional `into` field (the canonical display a
+        // 'merged' variant was absorbed into). Only meaningful on status 'merged'; dropped
+        // for any other status so a stale audit crumb can't outlive a later re-decision.
+        if (status === 'merged' && typeof v.into === 'string' && v.into.trim()) {
+            out[key].into = v.into.trim();
+        }
     }
     return out;
 }
@@ -102,9 +113,11 @@ export function reloadEntitiesFromChat() {
  * Set/merge a single entity's status (and bump bookkeeping). Used by the popup decisions
  * and the UI's re-decide controls. Persists immediately.
  * @param {string} name - the entity's display name
- * @param {('named'|'npc'|'later'|'pending')} status
+ * @param {('named'|'npc'|'merged'|'later'|'pending')} status
+ * @param {{into?: string}} [extra] - optional extras. `into` names the canonical display a
+ *   'merged' variant was absorbed into (merge auditability); ignored for any other status.
  */
-export function setEntityStatus(name, status) {
+export function setEntityStatus(name, status, extra = {}) {
     const display = String(name || '').trim();
     if (!display) return;
     if (!VALID_STATUS.has(status)) return;
@@ -119,13 +132,22 @@ export function setEntityStatus(name, status) {
         lastSeen: now,
         count: prev?.count || 1,
     };
+    // Merge auditability: only a 'merged' entry carries `into` (the canonical name it was
+    // absorbed into). Any other status intentionally drops a stale `into` from a prior merge
+    // (the object above is rebuilt without it), matching normalizeEntities' load-time rule.
+    if (status === 'merged' && typeof extra?.into === 'string' && extra.into.trim()) {
+        reg[key].into = extra.into.trim();
+    }
     saveEntitiesToMeta();
 }
 
-/** True when a name is already CLASSIFIED (named or npc) — it won't be re-offered. */
+/** True when a name is already CLASSIFIED (named, npc, or merged) — it won't be re-offered.
+ *  'merged' counts as classified exactly like 'npc' (module contract in VALID_STATUS): an
+ *  absorbed name variant must never be re-offered as a "new" character — its facts already
+ *  live under the canonical subject. */
 function isClassified(reg, key) {
     const e = reg[key];
-    return !!e && (e.status === 'named' || e.status === 'npc');
+    return !!e && (e.status === 'named' || e.status === 'npc' || e.status === 'merged');
 }
 
 // --- Named-entity detection ---------------------------------------------------
@@ -756,8 +778,11 @@ export async function runEntityResolution() {
                 });
                 // Retire the absorbed variant in the registry so the detector won't re-offer it as a
                 // "new" character on the next check (its facts now live under the canonical subject;
-                // the variant name survives as a searchable alias on those facts). Best-effort.
-                try { setEntityStatus(other.display, 'npc'); } catch { /* best-effort */ }
+                // the variant name survives as a searchable alias on those facts). Status 'merged' —
+                // NOT 'npc', which would misrepresent the variant as a one-off walk-on — with `into`
+                // recording the canonical display for auditability. 'merged' is treated as classified
+                // everywhere 'npc' is (see isClassified / VALID_STATUS). Best-effort.
+                try { setEntityStatus(other.display, 'merged', { into: canon.display }); } catch { /* best-effort */ }
             }
         }
 

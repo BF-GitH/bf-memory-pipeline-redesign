@@ -1211,10 +1211,17 @@ async function saveSharedUserDatabase(db) {
     coldTierOverflow(db);
     if (idbAvailable()) {
         try {
-            const rec = await idbGetRecord(SHARED_USER_AVATAR);
-            const databases = (rec && rec.databases) ? rec.databases : {};
-            databases[db.category] = db;
-            await idbPutDatabases(SHARED_USER_AVATAR, databases, Date.now());
+            // ATOMIC read-modify-write (F-STOR-2): ONE readwrite transaction via idbUpdateRecord,
+            // so a mirror racing another mirror (or the shared-store clear) can't interleave a
+            // stale read and silently drop a category. Same tombstone lifecycle as saveDatabase:
+            // writing a category clears its delete-tombstone; others carry through.
+            await idbUpdateRecord(SHARED_USER_AVATAR, (rec) => {
+                const databases = (rec && rec.databases) ? rec.databases : {};
+                databases[db.category] = db;
+                const tombs = { ...((rec && rec.deletedCategories) || {}) };
+                delete tombs[db.category];
+                return { databases, updatedAt: Date.now(), deletedCategories: tombs };
+            });
             scheduleSnapshot(SHARED_USER_AVATAR);
             return;
         } catch (e) {
@@ -1245,11 +1252,21 @@ export async function clearSharedUserMemory() {
 
     let categories = 0;
     // 1) Empty the IDB working record (best-effort — on failure we still clear attachments below).
+    // ATOMIC (F-STOR-2): count + wipe inside ONE readwrite transaction so a concurrent mirror
+    // write can't land between our read and our put and be silently erased without a trace.
+    // TOMBSTONES (F-STOR-4): every wiped category gets a delete-tombstone — this is a deliberate
+    // USER-destructive clear, so if any shared category is later re-created and snapshotted, the
+    // tombstones ride along and stop another device from resurrecting the wiped ones.
     if (idbAvailable()) {
         try {
-            const rec = await idbGetRecord(SHARED_USER_AVATAR);
-            categories = (rec && rec.databases) ? Object.keys(rec.databases).length : 0;
-            await idbPutDatabases(SHARED_USER_AVATAR, {}, Date.now());
+            await idbUpdateRecord(SHARED_USER_AVATAR, (rec) => {
+                const live = (rec && rec.databases) ? Object.keys(rec.databases) : [];
+                categories = live.length;
+                const now = Date.now();
+                const tombs = { ...((rec && rec.deletedCategories) || {}) };
+                for (const cat of live) tombs[cat] = now;
+                return { databases: {}, updatedAt: now, deletedCategories: tombs };
+            });
         } catch (e) {
             console.error('[BFMemory] clearSharedUserMemory: IDB wipe failed; clearing attachments only', e);
             disableIdb('shared user IDB wipe failed');
@@ -1454,14 +1471,106 @@ async function idbGetRecord(avatar) {
  * @param {string} avatar
  * @param {Object<string, DatabaseSchema>} databases
  * @param {number} [updatedAt] - explicit timestamp (e.g. when adopting a snapshot's stamp)
+ * @param {Object<string, number>} [deletedCategories] - optional category TOMBSTONES
+ *   (`{ [category]: deletedAtMs }`, see deleteDatabase) carried on the record so the durable
+ *   snapshot can propagate deliberate deletes across devices. Omitted/empty => field not stored
+ *   (lean records; back-compat with pre-tombstone records is automatic — absent means none).
  * @returns {Promise<number>} the updatedAt actually written
  */
-async function idbPutDatabases(avatar, databases, updatedAt) {
+async function idbPutDatabases(avatar, databases, updatedAt, deletedCategories) {
     const db = await openIdb();
     const stamp = Number(updatedAt) || Date.now();
     const record = { avatar, databases: databases || {}, updatedAt: stamp, schema: SNAPSHOT_SCHEMA_VERSION };
+    if (deletedCategories && typeof deletedCategories === 'object' && Object.keys(deletedCategories).length > 0) {
+        record.deletedCategories = deletedCategories;
+    }
     await idbRequest(db, 'readwrite', (store) => store.put(record));
     return stamp;
+}
+
+/**
+ * ATOMIC read-modify-write of an avatar's full IDB record inside ONE readwrite transaction
+ * (audit F-STOR-2). The previous pattern — idbGetRecord (its own readonly txn) followed by
+ * idbPutDatabases (a second readwrite txn) — left a window where two concurrent writers to the
+ * SAME avatar (e.g. a per-category save racing a delete or the shared-store mirror) could both
+ * read the same base record and the second put would silently drop the first writer's category.
+ * IndexedDB serializes readwrite transactions per store, so doing the get AND the put inside one
+ * readwrite transaction makes the whole read-modify-write atomic: a concurrent updater's
+ * transaction cannot interleave between our read and our write.
+ *
+ * The mutator runs synchronously inside the transaction (IDB requires it — an await would let
+ * the txn auto-commit) with the CURRENT record (or null when none exists) and returns either:
+ *   { databases, updatedAt?, deletedCategories? } → written as the new record (same field
+ *       stamping as idbPutDatabases: updatedAt defaults to Date.now(), schema is stamped,
+ *       deletedCategories stored only when non-empty), or
+ *   null/undefined → NO write at all (record left byte-identical; no stamp bump).
+ * The promise resolves only AFTER the transaction COMMITS (tx.oncomplete), preserving the
+ * no-stale-read-after-write guarantee. A mutator throw aborts the transaction (nothing is
+ * written) and rejects, so callers' existing catch/fallback paths behave exactly as before.
+ * @param {string} avatar
+ * @param {(rec: {avatar:string, databases:Object, updatedAt:number, schema:number, deletedCategories?:Object}|null)
+ *   => ({databases:Object, updatedAt?:number, deletedCategories?:Object<string,number>}|null|undefined)} mutator
+ * @returns {Promise<Object|null>} the record actually written, or null when the mutator skipped
+ */
+async function idbUpdateRecord(avatar, mutator) {
+    const db = await openIdb();
+    return new Promise((resolve, reject) => {
+        let tx;
+        try { tx = db.transaction(IDB_STORE, 'readwrite'); } catch (e) { reject(e); return; }
+        let getReq;
+        let written = null;
+        try { getReq = tx.objectStore(IDB_STORE).get(avatar); } catch (e) { reject(e); return; }
+        getReq.onsuccess = () => {
+            try {
+                const result = mutator(getReq.result || null);
+                if (result && typeof result === 'object') {
+                    const record = {
+                        avatar,
+                        databases: result.databases || {},
+                        updatedAt: Number(result.updatedAt) || Date.now(),
+                        schema: SNAPSHOT_SCHEMA_VERSION,
+                    };
+                    if (result.deletedCategories && typeof result.deletedCategories === 'object'
+                        && Object.keys(result.deletedCategories).length > 0) {
+                        record.deletedCategories = result.deletedCategories;
+                    }
+                    // put() in the SAME transaction — this is the atomicity fix. A put failure
+                    // surfaces through tx.onerror/onabort below.
+                    tx.objectStore(IDB_STORE).put(record);
+                    written = record;
+                }
+            } catch (e) {
+                try { tx.abort(); } catch { /* already aborting/aborted */ }
+                reject(e);
+                return;
+            }
+        };
+        getReq.onerror = () => reject(getReq.error || new Error('IDB get error'));
+        tx.oncomplete = () => resolve(written);
+        tx.onabort = () => reject(tx.error || new Error('IDB tx aborted'));
+        tx.onerror = () => reject(tx.error || new Error('IDB tx error'));
+    });
+}
+
+/**
+ * Union two category-tombstone maps (`{ [category]: deletedAtMs }`), keeping the NEWEST stamp per
+ * category. Used when adopting an attachment snapshot so tombstones learned from another device
+ * merge with (never clobber) locally-recorded ones. Keys are category names, so the map stays
+ * naturally tiny (bounded by the category count) — no pruning needed. Null-safe on both sides.
+ * @param {Object<string, number>|null|undefined} a
+ * @param {Object<string, number>|null|undefined} b
+ * @returns {Object<string, number>}
+ */
+function mergeTombstones(a, b) {
+    const out = {};
+    for (const src of [a, b]) {
+        if (!src || typeof src !== 'object') continue;
+        for (const [cat, ts] of Object.entries(src)) {
+            const t = Number(ts) || 0;
+            if (t > (Number(out[cat]) || 0)) out[cat] = t;
+        }
+    }
+    return out;
 }
 
 // =============================================================================
@@ -1532,10 +1641,19 @@ async function snapshotAvatar(avatar, { reconcileDeletes = true } = {}) {
         // Write each POPULATED category to its own attachment file (existing layout). Empty
         // categories are skipped (matches the write-on-first-fact policy that kept the backend
         // from accumulating empty files).
+        // TOMBSTONES (F-STOR-4, multi-device deletes): stamp the record's category delete-markers
+        // (`deletedCategories: { [category]: deletedAtMs }`, written by deleteDatabase /
+        // clearSharedUserMemory) into EVERY per-category payload. A deleted category has no file
+        // of its own anymore, so the marker must ride the SURVIVING categories' files for another
+        // device's rehydrate guard (loadAllDatabases CASE B) to see the delete was deliberate.
+        // Absent/empty => field omitted (lean payloads; older builds simply ignore it).
+        const tombs = (rec.deletedCategories && typeof rec.deletedCategories === 'object'
+            && Object.keys(rec.deletedCategories).length > 0) ? rec.deletedCategories : null;
         for (const [category, sdb] of Object.entries(rec.databases)) {
             if (!sdb || !Array.isArray(sdb.facts) || sdb.facts.length === 0) continue;
             liveCategories.add(category.toLowerCase().replace(/[^a-z0-9]/g, '_'));
             const payload = { ...sdb, category, snapshotVersion: SNAPSHOT_SCHEMA_VERSION, updatedAt: stamp };
+            if (tombs) payload.deletedCategories = tombs;
             try {
                 await saveDatabaseToAttachment(avatar, payload);
             } catch (e) {
@@ -2257,8 +2375,12 @@ async function loadAllDatabases(avatar) {
         const idbHasData = !!(rec && rec.databases && Object.keys(rec.databases).length > 0);
 
         // Read the attachment snapshot once (legacy loader; also performs the legacy
-        // category/aspect remap). Its newest stamp drives the version compare.
-        const attachMap = await loadAllDatabasesFromAttachments(avatar);
+        // category/aspect remap). Its newest stamp drives the version compare. The meta collector
+        // gathers any category delete-TOMBSTONES stamped into the payloads by another device's
+        // snapshotAvatar (F-STOR-4) so the clobber guard below can honor deliberate deletes.
+        const attachMeta = { deletedCategories: {} };
+        const attachMap = await loadAllDatabasesFromAttachments(avatar, attachMeta);
+        const attachTombs = attachMeta.deletedCategories || {};
         const attachStamp = attachmentSnapshotStamp(avatar, attachMap);
         const attachHasData = Object.keys(attachMap).some(c => (attachMap[c]?.facts || []).length > 0);
 
@@ -2278,7 +2400,9 @@ async function loadAllDatabases(avatar) {
         // CASE A — MIGRATION: no IDB record yet, but attachments hold facts. Seed IDB ONCE,
         // adopting the snapshot stamp so a later device compare is meaningful. Serve attachments.
         if (idbStamp < 0 && attachHasData) {
-            await idbPutDatabases(avatar, attachMap, attachStamp || Date.now());
+            // Carry any snapshot tombstones into the seeded record so this device keeps
+            // re-emitting them in its own snapshots (F-STOR-4 propagation).
+            await idbPutDatabases(avatar, attachMap, attachStamp || Date.now(), attachTombs);
             addDebugLog('info', 'Migrated legacy attachment DBs into IndexedDB', {
                 subsystem: 'db', event: 'db.migrated', data: {
                     categories: Object.keys(attachMap).length,
@@ -2301,28 +2425,73 @@ async function loadAllDatabases(avatar) {
         // no longer folds in file upload time), so `attachStamp > idbStamp` should only be true for a
         // genuinely newer snapshot.
         if (attachHasData && attachStamp > idbStamp) {
-            // CLOBBER GUARD (data-safety): even when the stamp says the attachment is newer, REFUSE
-            // to replace a POPULATED live working store with attachment data that holds FEWER total
-            // facts. A rehydrate must never SHRINK the live fact set — that is the signature of a
-            // stale/partial snapshot (e.g. a sibling chat's older flush, or a snapshot captured mid
-            // clear) winning the version compare and resurrecting old/empty state over fresh work.
-            // The invariant: a rehydrate may only ADD or REPLACE-WITH-MORE, never reduce. When in
-            // doubt we KEEP the live data (fall through to CASE C → serve IDB).
-            const factsBefore = countFacts(idbDatabases);
-            const factsAfter = countFacts(attachMap);
-            if (idbHasData && factsBefore > 0 && factsAfter < factsBefore) {
-                addDebugLog('info', 'Rehydrate refused: attachment snapshot would SHRINK live facts (clobber guard)', {
-                    subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'CLOBBER_GUARD',
-                    data: {
-                        attachStamp, idbStamp, avatar, decision: 'KEEP_IDB',
-                        // before = live IDB (kept); after = the smaller attachment set we refused.
-                        categoriesBefore: countCats(idbDatabases), factsBefore,
-                        categoriesAfter: countCats(attachMap), factsAfter,
-                    },
-                });
-                return stripLegacyEmbeddings(rec.databases); // keep the richer live working store; do NOT clobber
+            // CLOBBER GUARD (data-safety), PER-CATEGORY + TOMBSTONE-AWARE (F-STOR-4). Even when
+            // the stamp says the attachment is newer, a rehydrate must never SHRINK a live
+            // category — that is the signature of a stale/partial snapshot (a sibling chat's
+            // older flush, a snapshot captured mid-clear) resurrecting old state over fresh work.
+            // The old guard compared ONE GLOBAL total, which had two failure modes:
+            //   (a) one stale category could veto adopting every other (genuinely newer) category;
+            //   (b) a DELIBERATE delete on device A shrank the total, so device B refused the
+            //       snapshot and then RESURRECTED the deleted category via its own next snapshot.
+            // Now each category decides for itself:
+            //   - attachment count >= local count            → safe (grew/equal) — adopt it;
+            //   - shrunk, but the snapshot carries a DELETE TOMBSTONE for the category that is
+            //     NEWER than the local category's last activity → deliberate cross-device delete
+            //     — adopt the smaller/absent snapshot state;
+            //   - shrunk with NO authorizing tombstone       → genuine staleness — KEEP the local
+            //     category (protective behavior preserved), while still adopting the rest.
+            // Local + snapshot tombstones merge (newest per category) into the adopted record so
+            // they keep propagating through this device's own snapshots.
+            const mergedTombs = mergeTombstones(rec && rec.deletedCategories, attachTombs);
+            if (idbHasData) {
+                // Most-recent local activity in a category: the db-level updatedAt or the newest
+                // fact lastUpdated, whichever is later (older payloads may lack either field).
+                const categoryRecency = (sdb) => {
+                    let max = Number(sdb?.updatedAt) || 0;
+                    for (const f of (sdb?.facts || [])) {
+                        const u = Number(f?.lastUpdated) || 0;
+                        if (u > max) max = u;
+                    }
+                    return max;
+                };
+                const refusedCats = [];    // shrunk, no authorizing tombstone → keep local version
+                const adoptedDeletes = []; // shrunk, tombstone newer than local activity → adopt
+                for (const [cat, sdb] of Object.entries(idbDatabases)) {
+                    const localCount = (sdb && Array.isArray(sdb.facts)) ? sdb.facts.length : 0;
+                    if (localCount === 0) continue; // nothing to protect
+                    const attachCount = (attachMap[cat] && Array.isArray(attachMap[cat].facts)) ? attachMap[cat].facts.length : 0;
+                    if (attachCount >= localCount) continue; // grew/equal — adopt freely
+                    const tomb = Number(attachTombs[cat]) || 0;
+                    if (tomb > categoryRecency(sdb)) adoptedDeletes.push(cat);
+                    else refusedCats.push(cat);
+                }
+                if (refusedCats.length > 0) {
+                    // PARTIAL ADOPT: take the snapshot wholesale EXCEPT the refused categories,
+                    // which keep their richer local version. Stamped with the snapshot's stamp so
+                    // an unchanged snapshot can't re-fire CASE B on the next load.
+                    const merged = { ...attachMap };
+                    for (const cat of refusedCats) merged[cat] = idbDatabases[cat];
+                    await idbPutDatabases(avatar, merged, attachStamp, mergedTombs);
+                    addDebugLog('info', 'Rehydrate partially refused: kept local categories the snapshot would SHRINK (clobber guard)', {
+                        subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'CLOBBER_GUARD',
+                        data: {
+                            attachStamp, idbStamp, avatar, decision: 'PARTIAL_ADOPT',
+                            refusedCategories: refusedCats, tombstoneDeletes: adoptedDeletes,
+                            // before = live IDB; after = the merged map actually adopted.
+                            categoriesBefore: countCats(idbDatabases), factsBefore: countFacts(idbDatabases),
+                            categoriesAfter: countCats(merged), factsAfter: countFacts(merged),
+                        },
+                    });
+                    return stripLegacyEmbeddings(merged);
+                }
+                if (adoptedDeletes.length > 0) {
+                    addDebugLog('info', 'Rehydrate adopting tombstoned category delete(s) from newer snapshot', {
+                        subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'TOMBSTONE_DELETE',
+                        data: { attachStamp, idbStamp, avatar, tombstoneDeletes: adoptedDeletes },
+                    });
+                }
             }
-            await idbPutDatabases(avatar, attachMap, attachStamp);
+            await idbPutDatabases(avatar, attachMap, attachStamp, mergedTombs);
             addDebugLog('info', 'Rehydrated IndexedDB from newer attachment snapshot', {
                 subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'NEWER_SNAPSHOT',
                 data: {
@@ -2400,9 +2569,14 @@ function attachmentSnapshotStamp(avatar, parsedMap) {
  * legacy-remap every category attachment for a character. This is BOTH the fallback path (IDB
  * unavailable/broken) AND the snapshot reader used by the hybrid orchestrator above.
  * @param {string} avatar
+ * @param {{deletedCategories?: Object<string, number>}} [meta] - optional OUT-collector. When the
+ *   hybrid orchestrator passes it, every parsed payload's `deletedCategories` tombstone map
+ *   (stamped by snapshotAvatar) is merged into `meta.deletedCategories` (newest stamp per
+ *   category wins) so the rehydrate guard can honor cross-device deletes. Fallback callers omit
+ *   it — zero behavior change on the attachment-only path.
  * @returns {Promise<Object<string, DatabaseSchema>>}
  */
-async function loadAllDatabasesFromAttachments(avatar) {
+async function loadAllDatabasesFromAttachments(avatar, meta) {
     if (!avatar) return {};
 
     const context = getContext();
@@ -2416,6 +2590,18 @@ async function loadAllDatabasesFromAttachments(avatar) {
             const content = await fetchAttachmentContent(attachment.url);
             if (content) {
                 const db = JSON.parse(content);
+                // TOMBSTONE COLLECTION (F-STOR-4): surface each payload's `deletedCategories`
+                // markers to the hybrid orchestrator (newest deletedAtMs per category wins across
+                // files). Only runs when a collector was passed; the returned databases map shape
+                // is untouched.
+                if (meta && db.deletedCategories && typeof db.deletedCategories === 'object'
+                    && !Array.isArray(db.deletedCategories)) {
+                    if (!meta.deletedCategories) meta.deletedCategories = {};
+                    for (const [cat, ts] of Object.entries(db.deletedCategories)) {
+                        const t = Number(ts) || 0;
+                        if (t > (Number(meta.deletedCategories[cat]) || 0)) meta.deletedCategories[cat] = t;
+                    }
+                }
                 // BACK-COMPAT (3-layer model): a DB stored under an OLD category name
                 // (Identity/Status/Behavior/History) is re-bucketed onto the new Layer-1
                 // set on read. We remap PER-FACT (scope-sensitive) and merge into the
@@ -2439,8 +2625,19 @@ async function loadAllDatabasesFromAttachments(avatar) {
                     // MIGRATION SAFETY: when BOTH a legacy file (e.g. bf_memory_db_identity.json)
                     // and the new-named file (bf_memory_db_people.json) coexist on disk during the
                     // transition, both remap into the same bucket — dedupe by key so the merged
-                    // bucket never carries a duplicate of the same fact.
-                    if (databases[target].facts.some(f => f.key === fact.key)) continue;
+                    // bucket never carries a duplicate of the same fact. On a collision keep the
+                    // NEWER copy by lastUpdated (was: first-file-wins, which silently kept the
+                    // OLDER fact whenever the stale legacy file happened to load first — audit
+                    // low-severity dedupe finding). Missing/invalid stamps coerce to 0, so a
+                    // stamped copy always beats an unstamped one; equal stamps keep the incumbent.
+                    const dupIdx = databases[target].facts.findIndex(f => f && f.key === fact.key);
+                    if (dupIdx >= 0) {
+                        const incumbent = databases[target].facts[dupIdx];
+                        if ((Number(fact.lastUpdated) || 0) > (Number(incumbent.lastUpdated) || 0)) {
+                            databases[target].facts[dupIdx] = fact; // replace in place (order preserved)
+                        }
+                        continue;
+                    }
                     databases[target].facts.push(fact);
                     // Carry the earliest createdAt forward for the merged bucket.
                     if (Number(db.createdAt) && (!databases[target].createdAt || db.createdAt < databases[target].createdAt)) {
@@ -2580,14 +2777,23 @@ export async function saveDatabase(db) {
     // attachment upload so behavior is identical for users without usable IDB.
     if (idbAvailable()) {
         try {
-            // Read-modify-write: merge this one category into the avatar's full IDB record so a
-            // single-category save never drops the other categories. The await on idbPutDatabases
-            // resolves only after the tx COMMITS — so the next getAllDatabases() (cache already
-            // invalidated above) re-reads and sees this write (no stale-read-after-write).
-            const rec = await idbGetRecord(avatar);
-            const databases = (rec && rec.databases) ? rec.databases : {};
-            databases[db.category] = db;
-            await idbPutDatabases(avatar, databases, Date.now());
+            // ATOMIC read-modify-write (F-STOR-2): merge this one category into the avatar's full
+            // IDB record INSIDE ONE readwrite transaction (idbUpdateRecord) so a single-category
+            // save never drops the other categories AND a concurrent writer to the same avatar
+            // can't interleave between our read and our write. The await resolves only after the
+            // tx COMMITS — so the next getAllDatabases() (cache already invalidated above)
+            // re-reads and sees this write (no stale-read-after-write).
+            await idbUpdateRecord(avatar, (rec) => {
+                const databases = (rec && rec.databases) ? rec.databases : {};
+                databases[db.category] = db;
+                // TOMBSTONE LIFECYCLE (F-STOR-4): writing facts into a category makes it LIVE
+                // again — clear any delete-tombstone for it (a stale tombstone must not authorize
+                // a future cross-device shrink of a re-created category). Other tombstones are
+                // carried through unchanged so a save never erases delete markers.
+                const tombs = { ...((rec && rec.deletedCategories) || {}) };
+                delete tombs[db.category];
+                return { databases, updatedAt: Date.now(), deletedCategories: tombs };
+            });
             // Mark dirty + arm the throttled durable snapshot to attachments.
             scheduleSnapshot(avatar);
             // USER-LEVEL SHARED MEMORY (opt-in): ALSO mirror this category's user-subject facts into
@@ -2696,13 +2902,28 @@ export async function deleteDatabase(category) {
 
     // HYBRID: drop the category from the IDB working record first so the next read can't resurrect
     // it. Best-effort — on IDB failure we disable IDB and still remove the attachment below.
+    // ATOMIC (F-STOR-2): the get + delete + put happen inside ONE readwrite transaction
+    // (idbUpdateRecord), so a concurrent per-category save can no longer interleave between our
+    // read and our write and have its category silently dropped by our stale put (or vice versa).
     if (idbAvailable()) {
         try {
-            const rec = await idbGetRecord(avatar);
-            if (rec && rec.databases && Object.prototype.hasOwnProperty.call(rec.databases, category)) {
+            await idbUpdateRecord(avatar, (rec) => {
+                // Preserved behavior: when the category isn't in the record, do NOT write at all
+                // (no stamp bump, record untouched) — exactly like the old guarded put.
+                if (!(rec && rec.databases && Object.prototype.hasOwnProperty.call(rec.databases, category))) {
+                    return null;
+                }
                 delete rec.databases[category];
-                await idbPutDatabases(avatar, rec.databases, Date.now());
-            }
+                // TOMBSTONE (F-STOR-4, multi-device deletes): record WHEN this category was
+                // deliberately deleted. The tombstone rides the IDB record and is stamped into
+                // every durable snapshot payload (snapshotAvatar), so ANOTHER device's rehydrate
+                // guard can distinguish "deliberate delete" (adopt the smaller snapshot) from
+                // "stale/partial snapshot" (refuse, keep local). Cleared when the category is
+                // re-created by a later save (see saveDatabase).
+                const tombs = { ...(rec.deletedCategories || {}) };
+                tombs[category] = Date.now();
+                return { databases: rec.databases, updatedAt: Date.now(), deletedCategories: tombs };
+            });
         } catch (e) {
             console.error('[BFMemory] IDB delete failed; removing attachment only', e);
             disableIdb('IDB delete failed mid-session');
@@ -2823,9 +3044,11 @@ export function upsertFact(db, fact) {
             const mergedContext = mergeContext(existing.context, seqFact.context);
             const mergedAliases = mergeAliases(existing.aliases, seqFact.aliases);
             const mergedInvolved = mergeInvolved(existing.involved, seqFact.involved);
+            // Typed edges (F-ARCH-7): union additively like the other accumulating fields.
+            const mergedEdges = mergeEdges(existing.edges, seqFact.edges);
             const sal = mergeSalience(existing, seqFact);
             const oldSeqVal = existing.value;
-            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, seqFact, Date.now()), createdAt: existing.createdAt || new Date().toISOString(), lastUpdated: Date.now() };
+            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...mergeProvenance(existing, seqFact, Date.now()), createdAt: existing.createdAt || new Date().toISOString(), lastUpdated: Date.now() };
             if (!factValuesEqual(oldSeqVal, seqFact.value)) {
                 addDebugLog('debug', `Sequence step updated: [${db.category}] ${existing.key} (track ${seqFact.track}, ord ${ord})`, {
                     subsystem: 'db', event: 'fact.updated', reason: 'VALUE_CHANGED',
@@ -2908,6 +3131,11 @@ export function upsertFact(db, fact) {
         const mergedAliases = mergeAliases(existing.aliases, fact.aliases);
         // Involved feature: union participants so a bare re-mention can't wipe a prior list.
         const mergedInvolved = mergeInvolved(existing.involved, fact.involved);
+        // Typed edges (F-ARCH-7): union additively (dedupe by p+t, incoming wins ties, cap
+        // MAX_FACT_EDGES) so a re-mention accumulates relationship triples rather than wiping
+        // them. Only ever non-undefined when the opt-in typedEdges feature wrote edges, so the
+        // default path stays byte-identical (an undefined `edges` never survives JSON).
+        const mergedEdges = mergeEdges(existing.edges, fact.edges);
         // Merge salience: keep the HIGHER importance (a fact only grows more foundational
         // as it's re-mentioned, never wiped by a bare re-mention); prefer the incoming
         // kind if the writer provided one, else keep existing.
@@ -2969,7 +3197,7 @@ export function upsertFact(db, fact) {
             if (typeof fact?.sourceMsg === 'string' && fact.sourceMsg) liveSceneOverride.sourceMsg = fact.sourceMsg;
             db.facts[canonIdx] = {
                 ...existing, ...fact, key: existing.key, relationships: mergedRels,
-                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...liveSceneOverride, active: true,
+                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...liveSceneOverride, active: true,
                 ...mergeProvenance(existing, fact, now),
                 createdAt: existing.createdAt || new Date(now).toISOString(),
                 supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
@@ -2988,7 +3216,7 @@ export function upsertFact(db, fact) {
         // (renaming would orphan any relationship refs pointing at the old key).
         const oldValue = existing.value;
         const updNow = Date.now();
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
         if (factValuesEqual(oldValue, fact.value)) {
             addDebugLog('debug', `Fact unchanged: [${db.category}] ${existing.key}`, {
                 subsystem: 'db', event: 'fact.unchanged',
@@ -3393,6 +3621,19 @@ function mergeSalience(existing, incoming) {
 // Pending used-fact ids (`category:key`) accumulated since the last drain. A Set dedupes a
 // fact that surfaced in multiple tiers in one turn so it's only bumped once per drain.
 let _pendingUsedFactIds = new Set();
+// AVATAR SCOPING (audit low-severity finding): the buffer is module-global, so without a scope
+// stamp, ids staged under character A could survive a character switch and be drained into
+// character B's freshly-loaded map — silently strengthening B's facts that happen to share a
+// `category:key` with A's. We stamp the buffer with the avatar it was staged under (derived the
+// same way every persistence path derives it: getCharacterAvatar()) and the drain DISCARDS the
+// buffer when its stamp differs from the drain-time avatar. Fact storage is avatar-keyed, so a
+// same-avatar chat switch draining into the same store is correct and intentionally allowed.
+let _pendingUsedFactAvatar = null;
+
+/** Best-effort current avatar for buffer scoping; null when no character is selected. */
+function currentUsageAvatar() {
+    try { return getCharacterAvatar() || null; } catch { return null; }
+}
 
 /**
  * Record that a set of facts were committed into the Writer's injected context this turn, so
@@ -3406,6 +3647,14 @@ let _pendingUsedFactIds = new Set();
  */
 export function markFactsUsed(usedFactRefs) {
     if (!Array.isArray(usedFactRefs)) return;
+    // Stamp the buffer with the CURRENT avatar (public signature unchanged). If leftover ids from
+    // a DIFFERENT character are still staged (their extraction never ran — e.g. the user switched
+    // characters mid-turn), discard them rather than let them cross-credit this character's facts.
+    const avatar = currentUsageAvatar();
+    if (_pendingUsedFactIds.size > 0 && _pendingUsedFactAvatar !== avatar) {
+        _pendingUsedFactIds = new Set();
+    }
+    _pendingUsedFactAvatar = avatar;
     for (const ref of usedFactRefs) {
         const cat = ref?.category;
         const key = ref?.fact?.key;
@@ -3436,6 +3685,21 @@ export function markFactsUsed(usedFactRefs) {
  */
 export function applyBufferedFactUsage(databases, runId) {
     if (_pendingUsedFactIds.size === 0) return [];
+    // AVATAR GUARD: the buffer only applies to the character it was staged under. When the drain
+    // target's avatar (derived the same way the staging side derives it) differs — the user
+    // switched characters between the inline mark and this extraction — DISCARD the buffer
+    // entirely: bumping another character's same-keyed facts would be silent cross-contamination,
+    // and the marks are meaningless for a store they were never observed in.
+    const avatar = currentUsageAvatar();
+    if (_pendingUsedFactAvatar !== avatar) {
+        addDebugLog('debug', 'Discarded stale used-fact buffer (staged under a different character)', {
+            runId, subsystem: 'retrieval', event: 'fact.strengthened', reason: 'AVATAR_MISMATCH_DISCARD',
+            data: { staged: _pendingUsedFactIds.size, stagedAvatar: _pendingUsedFactAvatar, drainAvatar: avatar },
+        });
+        _pendingUsedFactIds = new Set();
+        _pendingUsedFactAvatar = null;
+        return [];
+    }
     // Snapshot + clear up front so a re-entrant call (or a thrown error mid-loop) can't
     // double-apply or strand the buffer.
     const pending = _pendingUsedFactIds;
@@ -3517,6 +3781,43 @@ function mergeInvolved(existing, incoming) {
             if (seen.has(k)) continue;
             seen.add(k);
             out.push(s);
+        }
+    }
+    return out.length ? out : undefined;
+}
+
+// Hard cap on stored typed edges per fact (F-ARCH-7). The Scribe is capped at 3 per WRITE;
+// the STORED union across re-mentions may accumulate up to this many before the oldest
+// (existing) entries are dropped in favor of incoming ones.
+const MAX_FACT_EDGES = 6;
+
+/**
+ * Union TYPED EDGES across a re-mention (typed-edge graph memory, F-ARCH-7 / opt-in
+ * `typedEdges`). Each edge is `{p, t}` — predicate + `Category/key` target ref. Dedupes by
+ * p+t case-insensitively with the INCOMING side winning ties (a fresh write is the newer
+ * observation of the same edge), preserves order (incoming first, then surviving existing),
+ * drops malformed entries, and hard-caps the union at MAX_FACT_EDGES. Returns undefined when
+ * empty so a fact without edges stays lean (back-compat / byte-identical when the feature is
+ * off — the field is simply never present). Mirrors mergeAliases/mergeInvolved.
+ * @param {Array<{p:string, t:string}>|undefined} existing
+ * @param {Array<{p:string, t:string}>|undefined} incoming
+ * @returns {Array<{p:string, t:string}>|undefined}
+ */
+function mergeEdges(existing, incoming) {
+    const seen = new Set();
+    const out = [];
+    // INCOMING first so it wins ties AND keeps priority under the cap.
+    for (const list of [incoming, existing]) {
+        if (!Array.isArray(list)) continue;
+        for (const e of list) {
+            if (!e || typeof e !== 'object') continue;
+            const p = String(e.p ?? '').trim().toLowerCase();
+            const t = String(e.t ?? '').trim();
+            if (!p || !t) continue;
+            const id = `${p}|${t.toLowerCase()}`;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            if (out.length < MAX_FACT_EDGES) out.push({ p, t });
         }
     }
     return out.length ? out : undefined;
@@ -4243,6 +4544,14 @@ export async function deleteDebugLogFile(chatId) {
  *   (cf. Graphiti/Zep invalid_at). Emitted via the `until:` marker; ALSO auto-stamped on the OUTGOING
  *   snapshot at supersession (the incoming fact's `validFrom`, else current time) when not already
  *   set. DISTINCT from `supersededAt` (the RECORD-time end). Absent on older facts (back-compatible).
+ * @property {Array<{p:string, t:string}>} [edges] - OPTIONAL typed relationship edges (opt-in
+ *   `typedEdges` feature; audit F-ARCH-7, cf. Graphiti typed edges): (subject, predicate, object)
+ *   triples where this fact's SUBJECT is the head, `p` a lowercase verb-ish predicate (employs/
+ *   loves/fears/owns/parent_of/…) and `t` a `Category/key` ref to an existing fact about the
+ *   object. Emitted by Agent 3 via `rel:<predicate>@<Category/key>` (max 3 per write); unioned
+ *   additively at merge (mergeEdges: dedupe by p+t, incoming wins ties, cap 6). DISTINCT from the
+ *   untyped `relationships` overlay — edges carry a relation TYPE so retrieval can answer "who
+ *   employs X" vs "who loves X". Absent unless the feature wrote them (backward-compatible).
  * @property {number} [sceneNo] - OPTIONAL scene strand (Spiderweb 2): the monotonic scene NUMBER
  *   the fact was ESTABLISHED in (origin). Stamped at write from the current scene card; FIRST-WINS
  *   (a re-mention never moves it — mirrors validAt). The supersession path is the one exception:

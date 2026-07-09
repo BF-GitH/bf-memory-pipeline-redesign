@@ -29,9 +29,6 @@ OUTPUT FORMAT (follow exactly):
 #Needed_Facts:
 [Optional fallback keywords for the deterministic search, used only if the detail step is unavailable. Semicolon-separated. May include exact \`Category/key\` entries, or a few free-text keywords (e.g. <NAME> appearance) for things NOT yet stored. May be left empty.]
 
-#NextHint:
-[OPTIONAL. A tiny breadcrumb naming the few topics/branches likely to matter in the NEXT scene (where this exchange seems to be heading). Semicolon-separated; \`Category\` or \`Category/aspect\` tokens preferred, or short keywords. Keep it to at most ~5 items. This is backstage-only — it is NOT shown to anyone and NOT used to write this reply. Leave empty if unsure.]
-
 #Scene:
 Location: [where the scene is happening right now, a few words]
 Name: [OPTIONAL. A short, evocative label for THIS scene, e.g. "the market scene" or "the rooftop". Omit if unsure — a name is derived automatically from the location.]
@@ -77,7 +74,7 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona, prof
     } catch (error) {
         addDebugLog('fail', `Agent 1 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 1 (Draft) error:', error);
-        return { draft: '', branches: [], focus: [], neededFacts: [], nextHint: [], scene: null, raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
+        return { draft: '', branches: [], focus: [], neededFacts: [], scene: null, raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
     }
 }
 
@@ -109,7 +106,7 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory 
         dataParts.push(`## Existing Fact Keys (for #Needed_Facts fallback — exact Category/key)\n${factInventory.trim()}`);
     }
     dataParts.push(`## Recent Chat\n${recentChat}`);
-    dataParts.push('\nNow output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, and #Scene: sections.');
+    dataParts.push('\nNow output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, and #Scene: sections.');
 
     return { systemPrompt, userPrompt: dataParts.join('\n\n') };
 }
@@ -125,7 +122,6 @@ function parseDraftResult(response) {
         branches: [], // STAGE 1 picks: `Category` or `Category/aspect` strings (character-agnostic)
         focus: [], // OPTIONAL focus character(s) for the tag-filter (3-layer model); never a branch
         neededFacts: [],
-        nextHint: [], // refinement #11: backstage breadcrumb of topics likely relevant next scene
         scene: null, // optional #SCENE parse: { location, present[], goals[], newBeats[] }
         raw: response,
         error: null,
@@ -168,7 +164,13 @@ function parseDraftResult(response) {
             .filter(f => f.length > 0 && !/^\[.*\]$/.test(f) && !/^(none|n\/a|unknown|tbd|general|world)$/i.test(f));
     }
 
-    // Extract needed facts section (bounded before #NextHint/#Scene so it doesn't swallow them)
+    // Extract needed facts section (bounded before #NextHint/#Scene so it doesn't swallow them).
+    // NOTE (F-WRITE-1): #NextHint itself is NO LONGER requested or parsed — the feature was dead
+    // end-to-end (stored but never read) and its prompt section wasted tokens every push-mode
+    // turn. The `#Next[_ ]?Hint` tokens are KEPT in the boundary lookaheads here and above
+    // defensively: a user's persisted CUSTOM draft prompt may still instruct the model to emit
+    // the section, and without the boundary those stray lines would be swallowed into the
+    // neighboring sections (e.g. polluting neededFacts keywords).
     const factsMatch = response.match(/#Needed[_ ]Facts:?\s*([\s\S]*?)(?=#Next[_ ]?Hint|#Scene|$)/i);
     if (factsMatch) {
         const factsRaw = factsMatch[1].trim();
@@ -177,19 +179,6 @@ function parseDraftResult(response) {
             .split(/[;\n,]+/)
             .map(f => f.trim())
             .filter(f => f.length > 0 && !/^\[.*\]$/.test(f) && !/^(none|n\/a|unknown|tbd)$/i.test(f));
-    }
-
-    // Extract optional #NextHint section (refinement #11): a tiny backstage breadcrumb of
-    // topics likely relevant NEXT scene. Bounded before #Scene. Same tolerant split as
-    // branches; drop bracketed placeholders / "none". Capped to 5 to keep it tiny. This is
-    // stored in message.extra (NOT injected, NOT shown to the user) for future use.
-    const hintMatch = response.match(/#Next[_ ]?Hint:?\s*([\s\S]*?)(?=#Scene|$)/i);
-    if (hintMatch) {
-        result.nextHint = hintMatch[1]
-            .split(/[;\n,]+/)
-            .map(h => h.replace(/^[\s\-*•\d.)\]]+/, '').trim())
-            .filter(h => h.length > 0 && !/^\[.*\]$/.test(h) && !/^(none|n\/a|unknown|tbd)$/i.test(h))
-            .slice(0, 5);
     }
 
     // Extract optional #Scene block (always-on scene card). Missing block → scene stays
@@ -258,7 +247,6 @@ function parseSceneBlock(response) {
  * @property {string[]} branches - STAGE 1 menu picks (`Category` or `Category/aspect`, character-agnostic)
  * @property {string[]} focus - OPTIONAL focus character name(s) for the finder's character-tag filter (3-layer model). Empty for a general/world moment. Never a branch.
  * @property {string[]} neededFacts - List of fact categories/keywords to look up
- * @property {string[]} nextHint - Backstage breadcrumb: topics likely relevant next scene (refinement #11). Stored in message.extra, never injected/shown.
  * @property {{location:string, present:string[], goals:string[], newBeats:string[], name:string}|null} scene - Optional parsed #Scene block (null if absent)
  * @property {string} raw - Raw LLM response
  * @property {string|null} error - Error message if failed
