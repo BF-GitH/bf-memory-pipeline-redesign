@@ -125,6 +125,18 @@ const DEFAULT_SETTINGS = {
     // are ignored, no fields are written, and output is byte-for-byte unchanged. Absent (older
     // settings) → default false.
     biTemporal: false,
+    // TYPED-EDGE GRAPH MEMORY (Graphiti typed edges; audit F-ARCH-7). Default OFF. When ON, the
+    // Scribe may tag a fact with up to 3 typed relationship edges `| rel:<predicate>@<Category/key>`
+    // (e.g. `rel:employs@People/bob_name`), parsed in agent-memory.js into `fact.edges = [{p, t}]`
+    // — a (subject, predicate, object) triple where the fact's SUBJECT is the head, `p` the
+    // lowercase verb-ish predicate, and `t` a `Category/key` ref to an existing fact about the
+    // object. Edges merge additively in upsert (database.js), expand through the anti-hub
+    // admitter (fact-retrieval.js collectLinkCandidates), and render + answer simple
+    // relation-intent queries ("who employs X") in search_memory. Distinguishes "who employs X"
+    // from "who loves X" — the untyped `relationships` overlay cannot. Purely additive +
+    // back-compat: when OFF the marker falls through to the legacy `rel:` keyword-hint branch,
+    // no fields are written, and behavior is byte-identical. Absent (older settings) → false.
+    typedEdges: false,
     // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
     // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
     // before sending — the main model sees only those + our injected facts. Lets you
@@ -488,6 +500,8 @@ export function validateSettings(s) {
     if (typeof s.scribeTrimProcessedPriors !== 'boolean') s.scribeTrimProcessedPriors = false;
     // Bi-temporal fact validity (opt-in) — default OFF; absent (older settings) => false (back-compat).
     if (typeof s.biTemporal !== 'boolean') s.biTemporal = false;
+    // Typed-edge graph memory (opt-in, F-ARCH-7) — default OFF; absent (older settings) => false (back-compat).
+    if (typeof s.typedEdges !== 'boolean') s.typedEdges = false;
     // Moment echo (Resonance Part B) — default OFF; absent (older settings) => false (back-compat).
     if (typeof s.enableMomentEcho !== 'boolean') s.enableMomentEcho = false;
     s.momentEchoMaxTokens = Math.floor(clamp(s.momentEchoMaxTokens, 12, 120, 40));
@@ -2269,6 +2283,18 @@ export async function initSettings() {
         const next = $(this).prop('checked');
         extensionSettings.biTemporal = next;
         addDebugLog('info', `Bi-temporal fact validity ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'biTemporal' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Typed-edge graph memory toggle (Graphiti typed edges; audit F-ARCH-7). DEFAULT OFF, so the
+    // checkbox reflects `=== true`. Gates the Scribe's `rel:<predicate>@<Category/key>` marker
+    // grammar + parsing (agent-memory), edge-target graph expansion (fact-retrieval
+    // collectLinkCandidates), and the search_memory edge rendering / relation-intent path.
+    $('#bf_mem_typed_edges').prop('checked', extensionSettings.typedEdges === true).on('change', function () {
+        const before = extensionSettings.typedEdges === true;
+        const next = $(this).prop('checked');
+        extensionSettings.typedEdges = next;
+        addDebugLog('info', `Typed-edge graph memory ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'typedEdges' }, before, after: !!next });
         saveSettings();
     });
 

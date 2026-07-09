@@ -3044,9 +3044,11 @@ export function upsertFact(db, fact) {
             const mergedContext = mergeContext(existing.context, seqFact.context);
             const mergedAliases = mergeAliases(existing.aliases, seqFact.aliases);
             const mergedInvolved = mergeInvolved(existing.involved, seqFact.involved);
+            // Typed edges (F-ARCH-7): union additively like the other accumulating fields.
+            const mergedEdges = mergeEdges(existing.edges, seqFact.edges);
             const sal = mergeSalience(existing, seqFact);
             const oldSeqVal = existing.value;
-            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, seqFact, Date.now()), createdAt: existing.createdAt || new Date().toISOString(), lastUpdated: Date.now() };
+            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...mergeProvenance(existing, seqFact, Date.now()), createdAt: existing.createdAt || new Date().toISOString(), lastUpdated: Date.now() };
             if (!factValuesEqual(oldSeqVal, seqFact.value)) {
                 addDebugLog('debug', `Sequence step updated: [${db.category}] ${existing.key} (track ${seqFact.track}, ord ${ord})`, {
                     subsystem: 'db', event: 'fact.updated', reason: 'VALUE_CHANGED',
@@ -3129,6 +3131,11 @@ export function upsertFact(db, fact) {
         const mergedAliases = mergeAliases(existing.aliases, fact.aliases);
         // Involved feature: union participants so a bare re-mention can't wipe a prior list.
         const mergedInvolved = mergeInvolved(existing.involved, fact.involved);
+        // Typed edges (F-ARCH-7): union additively (dedupe by p+t, incoming wins ties, cap
+        // MAX_FACT_EDGES) so a re-mention accumulates relationship triples rather than wiping
+        // them. Only ever non-undefined when the opt-in typedEdges feature wrote edges, so the
+        // default path stays byte-identical (an undefined `edges` never survives JSON).
+        const mergedEdges = mergeEdges(existing.edges, fact.edges);
         // Merge salience: keep the HIGHER importance (a fact only grows more foundational
         // as it's re-mentioned, never wiped by a bare re-mention); prefer the incoming
         // kind if the writer provided one, else keep existing.
@@ -3190,7 +3197,7 @@ export function upsertFact(db, fact) {
             if (typeof fact?.sourceMsg === 'string' && fact.sourceMsg) liveSceneOverride.sourceMsg = fact.sourceMsg;
             db.facts[canonIdx] = {
                 ...existing, ...fact, key: existing.key, relationships: mergedRels,
-                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...liveSceneOverride, active: true,
+                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...liveSceneOverride, active: true,
                 ...mergeProvenance(existing, fact, now),
                 createdAt: existing.createdAt || new Date(now).toISOString(),
                 supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
@@ -3209,7 +3216,7 @@ export function upsertFact(db, fact) {
         // (renaming would orphan any relationship refs pointing at the old key).
         const oldValue = existing.value;
         const updNow = Date.now();
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
         if (factValuesEqual(oldValue, fact.value)) {
             addDebugLog('debug', `Fact unchanged: [${db.category}] ${existing.key}`, {
                 subsystem: 'db', event: 'fact.unchanged',
@@ -3774,6 +3781,43 @@ function mergeInvolved(existing, incoming) {
             if (seen.has(k)) continue;
             seen.add(k);
             out.push(s);
+        }
+    }
+    return out.length ? out : undefined;
+}
+
+// Hard cap on stored typed edges per fact (F-ARCH-7). The Scribe is capped at 3 per WRITE;
+// the STORED union across re-mentions may accumulate up to this many before the oldest
+// (existing) entries are dropped in favor of incoming ones.
+const MAX_FACT_EDGES = 6;
+
+/**
+ * Union TYPED EDGES across a re-mention (typed-edge graph memory, F-ARCH-7 / opt-in
+ * `typedEdges`). Each edge is `{p, t}` — predicate + `Category/key` target ref. Dedupes by
+ * p+t case-insensitively with the INCOMING side winning ties (a fresh write is the newer
+ * observation of the same edge), preserves order (incoming first, then surviving existing),
+ * drops malformed entries, and hard-caps the union at MAX_FACT_EDGES. Returns undefined when
+ * empty so a fact without edges stays lean (back-compat / byte-identical when the feature is
+ * off — the field is simply never present). Mirrors mergeAliases/mergeInvolved.
+ * @param {Array<{p:string, t:string}>|undefined} existing
+ * @param {Array<{p:string, t:string}>|undefined} incoming
+ * @returns {Array<{p:string, t:string}>|undefined}
+ */
+function mergeEdges(existing, incoming) {
+    const seen = new Set();
+    const out = [];
+    // INCOMING first so it wins ties AND keeps priority under the cap.
+    for (const list of [incoming, existing]) {
+        if (!Array.isArray(list)) continue;
+        for (const e of list) {
+            if (!e || typeof e !== 'object') continue;
+            const p = String(e.p ?? '').trim().toLowerCase();
+            const t = String(e.t ?? '').trim();
+            if (!p || !t) continue;
+            const id = `${p}|${t.toLowerCase()}`;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            if (out.length < MAX_FACT_EDGES) out.push({ p, t });
         }
     }
     return out.length ? out : undefined;
@@ -4500,6 +4544,14 @@ export async function deleteDebugLogFile(chatId) {
  *   (cf. Graphiti/Zep invalid_at). Emitted via the `until:` marker; ALSO auto-stamped on the OUTGOING
  *   snapshot at supersession (the incoming fact's `validFrom`, else current time) when not already
  *   set. DISTINCT from `supersededAt` (the RECORD-time end). Absent on older facts (back-compatible).
+ * @property {Array<{p:string, t:string}>} [edges] - OPTIONAL typed relationship edges (opt-in
+ *   `typedEdges` feature; audit F-ARCH-7, cf. Graphiti typed edges): (subject, predicate, object)
+ *   triples where this fact's SUBJECT is the head, `p` a lowercase verb-ish predicate (employs/
+ *   loves/fears/owns/parent_of/…) and `t` a `Category/key` ref to an existing fact about the
+ *   object. Emitted by Agent 3 via `rel:<predicate>@<Category/key>` (max 3 per write); unioned
+ *   additively at merge (mergeEdges: dedupe by p+t, incoming wins ties, cap 6). DISTINCT from the
+ *   untyped `relationships` overlay — edges carry a relation TYPE so retrieval can answer "who
+ *   employs X" vs "who loves X". Absent unless the feature wrote them (backward-compatible).
  * @property {number} [sceneNo] - OPTIONAL scene strand (Spiderweb 2): the monotonic scene NUMBER
  *   the fact was ESTABLISHED in (origin). Stamped at write from the current scene card; FIRST-WINS
  *   (a re-mention never moves it — mirrors validAt). The supersession path is the one exception:

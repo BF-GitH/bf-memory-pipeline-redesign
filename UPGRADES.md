@@ -1,14 +1,14 @@
 # Memory Upgrades — ported from mem0 / Letta / Graphiti / Zep
 
-Eight memory techniques adapted from the leading agent-memory systems and wired into the
+Nine memory techniques adapted from the leading agent-memory systems and wired into the
 pipeline. Every change is **additive and gated** behind a setting; nothing removes or renames an
 existing export, and each new behavior is `try/catch`-wrapped to degrade to prior behavior on error.
 
 **Defaults:** strictly-better, low-risk wins are **ON**; heavier/architectural features are **OFF**
 (opt-in) so they can be enabled and tested individually. All settings live in `DEFAULT_SETTINGS`
-(`src/settings.js`) with matching coercion in `validateSettings`; all eight features have UI
+(`src/settings.js`) with matching coercion in `validateSettings`; all nine features have UI
 controls in `templates/settings.html`. (Since the 0.43.0 tool-first flip, `remember_fact` is
-also ON by default — 4 ON / 4 opt-in.)
+also ON by default — 4 ON / 5 opt-in.)
 
 | Feature | Source system | Setting(s) | Default |
 |---|---|---|---|
@@ -20,6 +20,7 @@ also ON by default — 4 ON / 4 opt-in.)
 | User-level shared memory | Zep / mem0 user scoping | `userLevelMemory` | OFF |
 | Model-writable `remember_fact` tool | Letta `core_memory_append` | `enableWriterWriteTool` | **ON** (flipped in 0.43.0) |
 | Idle-time consolidation | Letta sleeptime agent | `idleConsolidation`, `idleConsolidationMs` | OFF |
+| Typed-edge graph memory | Graphiti typed edges | `typedEdges` | OFF |
 
 ---
 
@@ -98,6 +99,23 @@ a turn counter — so heavy maintenance happens during dead time.
 the existing `maybeRunReflection()` (which no-ops unless a reflection is armed and guards against
 `reflectionInFlight`, so it can't double-fire). Skips while a turn is mid-flight; cleared on
 `CHAT_CHANGED`. `src/pipeline.js`.
+
+### 9. Typed-edge graph memory — `typedEdges` (false)
+**What it does (ELI5):** teaches memory *what kind* of link connects two facts — who `employs`,
+`loves`, `fears`, or `owns` whom — instead of just "these are related", so "who employs Bob?"
+follows the exact `employs` link and never confuses Bob's boss with Bob's lover (audit F-ARCH-7).
+**How:** the Scribe may tag a fact with up to 3 `| rel:<predicate>@<Category/key>` markers
+(predicate = one lowercase verb-ish token; target = an existing fact's handle), appended to its
+system prompt as a STATIC suffix (cache-stable, like the temporal rule). Parsed into
+`fact.edges = [{p, t}]` — the fact's SUBJECT is the triple's head. Edges union additively at
+upsert (`mergeEdges`: dedupe by p+t, incoming wins ties, cap 6; supersession snapshots keep
+theirs). At retrieval, edge targets become expansion CANDIDATES through the unified admitter's
+anti-hub per-seed cap (candidacy only — ranking stays pure `retrievalSalience`, no degree term).
+`search_memory` renders matched facts' edges compactly (` [rel: employs->People/bob_name]`) and
+answers simple relation-intent queries ("who employs X" / "who does X employ") by deterministic
+predicate matching — no LLM. When OFF, the marker falls through to the legacy `rel:` keyword-hint
+branch and behavior is byte-identical. `src/agent-memory.js`, `src/database.js`,
+`src/fact-retrieval.js`.
 
 ---
 

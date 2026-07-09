@@ -1067,7 +1067,58 @@ function collectLinkCandidates(databases, seeds, alreadyFound) {
         }
     }
 
+    // DIRECTION 5 — TYPED EDGES (opt-in `typedEdges`, default OFF; audit F-ARCH-7). A seed fact
+    // carrying typed `edges` ([{p, t}] triples) pulls each edge's TARGET fact (`t` is a
+    // `Category/key` ref) as an expansion candidate. Every candidate is attributed to the SEED
+    // fact's own seedId (`edge:<cat>:<key>`), so the unified admitter's ANTI-HUB per-seed cap
+    // applies — a heavily-edged hub fact can't flood the tier. CANDIDACY-NOT-RANKING invariant
+    // honored: edges only decide ELIGIBILITY here; the admitter still orders by retrievalSalience
+    // with NO connectedness/degree term. Same emit() gate as every other direction (active +
+    // visible + deduped, tier 'secondary'). When the flag is OFF (or edges are absent — the
+    // default, since only the opt-in feature writes them) this block contributes nothing and the
+    // collector is byte-identical to today. Wrapped so a malformed edge can never break expansion.
+    try {
+        if (getSettings()?.typedEdges === true) {
+            for (const r of seeds) {
+                const fact = r.fact;
+                const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
+                if (factEdges.length === 0) continue;
+                const seedId = `edge:${r.category}:${fact.key}`;
+                for (const e of factEdges) {
+                    const target = resolveEdgeTarget(databases, e && e.t);
+                    if (target) emit(target.category, target.fact, seedId);
+                }
+            }
+        }
+    } catch { /* typed-edge expansion must never break the base collector (degrade to no edges) */ }
+
     return candidates;
+}
+
+/**
+ * Resolve a typed edge's `Category/key` target ref to the stored fact it names (typed-edge
+ * graph memory, F-ARCH-7). Case-insensitive on BOTH the category and the key so a Scribe
+ * casing drift ("people/Bob_name") still resolves; exact key identity otherwise (an edge is
+ * an IDENTITY reference to a real stored fact, mirroring the autoLinkRef contract). Returns
+ * `{category, fact}` or null (a hallucinated/stale ref simply resolves to nothing).
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {string} ref - `Category/key` target ref string (an edge's `t`)
+ * @returns {{category: string, fact: Object}|null}
+ */
+function resolveEdgeTarget(databases, ref) {
+    const s = String(ref || '').trim();
+    const slash = s.indexOf('/');
+    if (slash <= 0) return null;
+    const wantCat = s.slice(0, slash).trim().toLowerCase();
+    const wantKey = s.slice(slash + 1).trim().toLowerCase();
+    if (!wantCat || !wantKey) return null;
+    for (const [category, db] of Object.entries(databases)) {
+        if (category.toLowerCase() !== wantCat) continue;
+        for (const fact of (db.facts || [])) {
+            if (String(fact.key).toLowerCase() === wantKey) return { category, fact };
+        }
+    }
+    return null;
 }
 
 /**
@@ -1533,6 +1584,9 @@ function detectRelationshipQuery(query) {
         new RegExp(`\\bbetween\\s+${NAME}\\s+(?:and|&|\\+|with)\\s+${NAME}\\b`),
         // "A and B's history/relationship/past/story"
         new RegExp(`\\b${NAME}\\s+(?:and|&|\\+|with)\\s+${NAME}(?:'s)?\\s+(?:history|relationship|romance|story|past)\\b`),
+        // "A's relationship to B" / "A relationship with B" (typed-edge feature's minimal
+        // extension of the existing pair intent — same route, one more frame).
+        new RegExp(`\\b${NAME}(?:'s)?\\s+(?:history|relationship|romance|story|past)\\s+(?:to|with)\\s+${NAME}\\b`),
     ];
     for (const re of frames) {
         const m = lower.match(re);
@@ -1545,6 +1599,147 @@ function detectRelationshipQuery(query) {
         }
     }
     return null;
+}
+
+// ── TYPED-EDGE recall helpers (opt-in `typedEdges`, default OFF; audit F-ARCH-7) ────────────
+// Deterministic, bounded, zero-LLM helpers for (a) rendering a matched fact's typed edges
+// compactly on its search_memory output line and (b) answering simple relation-intent queries
+// ("who employs X") by matching a predicate token against stored edge predicates. Everything
+// here is only reachable when the typedEdges setting is ON (callers gate + try/catch), so the
+// default tool output is byte-identical.
+
+/**
+ * Compact edge tail for one fact's search_memory line: ` [rel: employs->People/bob_name, …]`.
+ * Renders at most 3 edges (the per-write cap) so a line can never balloon. Returns '' when the
+ * fact has no well-formed edges (the common case — output unchanged).
+ * @param {Object} fact
+ * @returns {string}
+ */
+function formatEdgeTail(fact) {
+    const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
+    const parts = [];
+    for (const e of factEdges) {
+        const p = String(e?.p ?? '').trim();
+        const t = String(e?.t ?? '').trim();
+        if (p && t) parts.push(`${p}->${t}`);
+        if (parts.length >= 3) break;
+    }
+    return parts.length ? ` [rel: ${parts.join(', ')}]` : '';
+}
+
+/**
+ * Append edge tails to the formatted search_memory text WITHOUT touching the shared
+ * formatFactsForWriter/buildFactLine contract (the push path + token estimator must stay
+ * byte-identical, so we post-process the TOOL output only). For each row whose fact carries
+ * edges, its exact line (rebuilt via the same buildFactLine the formatter used) is located in
+ * the text and the compact tail appended; a line that can't be located (defensive) is skipped.
+ * Deterministic; each output line is claimed at most once so duplicate lines stay stable.
+ * @param {string} text - formatFactsForWriter output
+ * @param {Array<{fact: Object, category: string}>} rows - the rows that produced `text`
+ * @returns {string}
+ */
+function appendEdgeTails(text, rows) {
+    let biTemporalOn = false;
+    try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
+    const lines = String(text ?? '').split('\n');
+    const claimed = new Set();
+    for (const { fact, category } of rows) {
+        const tail = formatEdgeTail(fact);
+        if (!tail) continue;
+        const line = buildFactLine(fact, category, biTemporalOn);
+        for (let i = 0; i < lines.length; i++) {
+            if (claimed.has(i) || lines[i] !== line) continue;
+            lines[i] = line + tail;
+            claimed.add(i);
+            break;
+        }
+    }
+    return lines.join('\n');
+}
+
+// Tokens that must never be mistaken for a relation predicate in "who <pred> <name>" frames
+// (auxiliaries/fillers a natural question contains). Small on purpose — the real gate is that
+// the predicate must ALSO match a stored edge predicate before the path activates.
+const EDGE_INTENT_STOP = new Set([
+    'is', 'are', 'was', 'were', 'does', 'did', 'has', 'had', 'have', 'the', 'and',
+    'will', 'would', 'can', 'could', 'should', 'not', 'about', 'with', 'that', 'this',
+]);
+
+/**
+ * Detect a simple RELATION-INTENT query (typed-edge feature): "who employs bob?" /
+ * "who loves the baker" / "who does bob employ" / "whom does mira fear". Returns
+ * `{p, name}` (predicate token + single-token name, both lowercased) or null for anything
+ * else — conservative, so ordinary keyword recall is unaffected. Deterministic, no LLM.
+ * @param {string} query
+ * @returns {{p: string, name: string}|null}
+ */
+function detectEdgeIntentQuery(query) {
+    const lower = String(query || '').trim().toLowerCase();
+    if (!lower) return null;
+    // "who <pred> <name>?" — e.g. "who employs bob".
+    let m = lower.match(/^\s*who\s+([a-z][a-z_'-]{2,})\s+(?:the\s+)?([a-z0-9][a-z0-9_'-]{1,})\s*\??\s*$/);
+    if (m && !EDGE_INTENT_STOP.has(m[1]) && !EDGE_INTENT_STOP.has(m[2])) return { p: m[1], name: m[2] };
+    // "who/whom does <name> <pred>?" — e.g. "who does bob employ".
+    m = lower.match(/^\s*whom?\s+does\s+(?:the\s+)?([a-z0-9][a-z0-9_'-]{1,})\s+([a-z][a-z_'-]{2,})\s*\??\s*$/);
+    if (m && !EDGE_INTENT_STOP.has(m[2]) && !EDGE_INTENT_STOP.has(m[1])) return { p: m[2], name: m[1] };
+    return null;
+}
+
+/** Predicate normalization for intent matching: lowercase + strip ONE trailing 's' so the
+ * query's "employ"/"employs" both match a stored `employs` (and vice versa). */
+function normalizeEdgePredicate(p) {
+    const s = String(p || '').trim().toLowerCase();
+    return s.endsWith('s') ? s.slice(0, -1) : s;
+}
+
+/** Does `name` (single lowercase token) name this subject/ref? Exact subject match, subject
+ * key-prefix match, or token membership in a `Category/key` ref's key part. Conservative. */
+function edgeNameMatches(name, subjectOrRef) {
+    const s = String(subjectOrRef || '').trim().toLowerCase();
+    if (!s || !name) return false;
+    if (s === name) return true;
+    // `Category/key` ref: match tokens of the key part; bare subject: match its underscore tokens.
+    const keyPart = s.includes('/') ? s.slice(s.indexOf('/') + 1) : s;
+    return keyPart === name || keyPart.split(/[^a-z0-9]+/).includes(name);
+}
+
+/**
+ * Collect facts answering a relation-intent query `{p, name}` (typed-edge feature). BOTH
+ * directions are matched deterministically over stored edges:
+ *   - HEAD answers ("who employs bob"): facts whose edge predicate matches `p` AND whose edge
+ *     TARGET ref names <name> — the matching fact's SUBJECT is the answer.
+ *   - TAIL answers ("who does bob employ"): facts whose SUBJECT is <name> with a `p`-matching
+ *     edge — the edge's target (rendered in the ` [rel: …]` tail) is the answer.
+ * Active facts only; visibility is filtered by the caller (same as the other recall paths).
+ * Bounded: one linear scan, results capped by the caller. Returns [{fact, category}].
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {{p: string, name: string}} intent
+ * @returns {Array<{fact: Object, category: string}>}
+ */
+function collectEdgeIntentMatches(databases, intent) {
+    const wantP = normalizeEdgePredicate(intent.p);
+    const name = String(intent.name || '').trim().toLowerCase();
+    const out = [];
+    if (!wantP || !name) return out;
+    for (const [category, db] of Object.entries(databases)) {
+        for (const fact of (db.facts || [])) {
+            if (!isActiveFact(fact)) continue;
+            const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
+            if (factEdges.length === 0) continue;
+            const subjIsName = edgeNameMatches(name, deriveSubject(fact));
+            for (const e of factEdges) {
+                if (normalizeEdgePredicate(e?.p) !== wantP) continue;
+                // HEAD direction: edge target names the queried person → this fact's subject
+                // answers "who <pred> <name>". TAIL direction: the queried person IS the
+                // subject → the edge target answers "who does <name> <pred>".
+                if (edgeNameMatches(name, e?.t) || subjIsName) {
+                    out.push({ fact, category });
+                    break; // one admission per fact
+                }
+            }
+        }
+    }
+    return out;
 }
 
 /**
@@ -1623,6 +1818,39 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     if (Object.keys(databases).length === 0) {
         return { text: 'No stored memory yet — nothing to search.', count: 0 };
     }
+
+    // RELATION-INTENT PATH (typed-edge graph memory, opt-in `typedEdges`; audit F-ARCH-7).
+    // A simple "who employs X" / "who does X employ" query is answered by matching the query's
+    // predicate token against the stored edge predicates of the resolved subject's facts —
+    // deterministic and bounded (one linear scan), no LLM. Only fires when the flag is ON, no
+    // scene/pair intent claimed the query first, AND at least one stored edge actually matches;
+    // otherwise it falls through to the normal keyword cascade below (zero regression risk).
+    // Wrapped so a failure here degrades to plain keyword recall.
+    try {
+        if (q && sceneTarget === null && relPair === null && getSettings()?.typedEdges === true) {
+            const edgeIntent = detectEdgeIntentQuery(q);
+            if (edgeIntent) {
+                let edgeRows = collectEdgeIntentMatches(databases, edgeIntent);
+                if (catFilter) edgeRows = edgeRows.filter(r => String(r.category).toLowerCase() === catFilter);
+                const ctxE = host.getCtx();
+                const namesE = ctxE ? { charName: ctxE.characters?.[ctxE.characterId]?.name || '', userName: ctxE.name1 || '' } : null;
+                edgeRows = edgeRows.filter(r => isFactVisible(r.fact, namesE));
+                if (edgeRows.length > 0) {
+                    const cappedEdge = edgeRows.slice(0, cap);
+                    addDebugLog('debug', `Relation-intent recall: "${edgeIntent.p}" ⇒ ${edgeIntent.name} → ${cappedEdge.length}/${edgeRows.length} edge-matched fact(s)`, {
+                        subsystem: 'retrieval', event: 'recall.edge_intent',
+                        data: { predicate: edgeIntent.p, name: edgeIntent.name, returned: cappedEdge.length, total: edgeRows.length },
+                    });
+                    const edgeText = appendEdgeTails(
+                        formatFactsForWriter(cappedEdge.map(r => ({ fact: r.fact, category: r.category, tier: 'primary' }))),
+                        cappedEdge,
+                    );
+                    return { text: edgeText, count: cappedEdge.length };
+                }
+                // No stored edge matched — fall through to the ordinary keyword cascade.
+            }
+        }
+    } catch { /* typed-edge intent must never break recall — degrade to keyword search */ }
 
     // RELATIONSHIP-THREAD PATH (Phase 0): return the couple's chronological moment-thread (cold +
     // superseded included), formatted like the push gist. Honors the optional category filter +
@@ -1757,7 +1985,15 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
 
     if (capped.length) {
         // Reuse the push formatter so the recalled lines look identical to the injected gist.
-        const text = formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })));
+        let text = formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })));
+        // TYPED EDGES (opt-in, F-ARCH-7): render each matched fact's edges compactly on its tool
+        // output line (` [rel: employs->People/bob_name]`) so the model sees the relation TYPE,
+        // not just that facts are related. Post-processes the TOOL output only — the shared
+        // buildFactLine/estimator contract (and the push injection) are untouched, and when the
+        // flag is OFF (or no fact carries edges) the text is byte-identical. Best-effort.
+        try {
+            if (getSettings()?.typedEdges === true) text = appendEdgeTails(text, capped);
+        } catch { /* never let edge rendering break recall output */ }
         return { text, count: capped.length };
     }
 

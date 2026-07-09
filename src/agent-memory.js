@@ -262,6 +262,17 @@ export const TEMPORAL_GROUNDING_RULE = `
 # OBSERVATION DATE (TIME GROUNDING)
 The user data block gives a \`## Observation date\` (the real-world time this message was observed). Resolve RELATIVE time expressions to ABSOLUTE dates relative to it — e.g. "yesterday" → the day before that date, "last week" → "the week of <date>", "two years ago" → the year. Store the absolute form (in the value or note), not the relative word, so the fact doesn't rot. If no observation date is given, leave time expressions as-is.`;
 
+// TYPED-EDGE GRAPH MEMORY rule (Graphiti typed edges; audit F-ARCH-7). Appended to the system
+// prompt ONLY when the `typedEdges` setting is ON (see buildMemoryPrompt). STATIC + BOUNDED by
+// design (cache-stability rule: the suffix never varies per-turn/per-character, so the cacheable
+// system prefix stays byte-stable for a given setting value — same contract as
+// TEMPORAL_GROUNDING_RULE). Teaches the OPTIONAL `rel:<predicate>@<Category/key>` edge marker;
+// the parser stores it as `fact.edges = [{p, t}]`, capped at 3 per fact.
+export const TYPED_EDGES_RULE = `
+
+# TYPED RELATIONSHIP EDGES (OPTIONAL)
+A fact MAY carry typed relationship edges: append \`| rel:<predicate>@<Category/key>\` linking this fact's SUBJECT to another stored fact — e.g. \`| rel:employs@People/bob_name\` means "this fact's subject employs bob". <predicate> is ONE lowercase verb-ish token (employs, loves, fears, owns, parent_of, works_for, rival_of, mentor_of, ...); <Category/key> is the key of an EXISTING fact about the target (prefer one shown under "Existing facts (scoped)"). Repeatable, MAX 3 per fact. Only emit an edge when the relationship is clearly stated in the message — never guess one. Plain keyword hints \`rel:key1,key2\` (no @) still work exactly as before.`;
+
 /**
  * Run Agent 3: Analyze message and update databases
  * @param {string} messageText - The message to analyze
@@ -435,6 +446,14 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUser
             systemPrompt = sysPrompt + TEMPORAL_GROUNDING_RULE;
         }
     } catch (_) { /* never block extraction on the temporal-grounding rule */ }
+    // TYPED EDGES (opt-in, default OFF): append the STATIC edge-marker rule. Same cache-stability
+    // contract as the temporal rule above — the suffix is a fixed constant that never varies
+    // per-turn, so the cacheable system prefix only changes when the rare setting is toggled.
+    try {
+        if (getSettingsSafe()?.typedEdges === true) {
+            systemPrompt = systemPrompt + TYPED_EDGES_RULE;
+        }
+    } catch (_) { /* never block extraction on the typed-edges rule */ }
 
     // User message: data to analyze
     const dataParts = [];
@@ -545,6 +564,13 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
     // Distinct from `validAt` (an ordering INTEGER) — these are story-world ISO/freeform stamps.
     let biTemporal = false;
     try { biTemporal = getSettingsSafe()?.biTemporal === true; } catch { /* default off */ }
+
+    // TYPED EDGES (feature, F-ARCH-7): the `rel:<predicate>@<Category/key>` edge marker is OPT-IN.
+    // When off we never match it, so the segment falls through to the legacy `rel:` keyword-hint
+    // branch exactly as today (byte-identical behavior; the Scribe is only taught the marker while
+    // the setting is on, so it should not appear anyway).
+    let typedEdges = false;
+    try { typedEdges = getSettingsSafe()?.typedEdges === true; } catch { /* default off */ }
 
     if (!response || !response.trim()) {
         result.error = 'Empty response from memory updater';
@@ -689,6 +715,7 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         let tone = '';         // Episodic-memory (feature): optional short emotional descriptor for a `moment` (`tone:` marker)
         let validFrom = '';    // Bi-temporal (feature): optional STORY-WORLD time the fact became true (`from:` marker)
         let validUntil = '';   // Bi-temporal (feature): optional STORY-WORLD time the fact stopped being true (`until:` marker)
+        let edges = [];        // Typed edges (feature, F-ARCH-7): optional [{p, t}] triples (`rel:<predicate>@<Category/key>` marker), cap 3
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
@@ -886,6 +913,38 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
                 continue;
             }
 
+            // rel:<predicate>@<Category/key> — OPTIONAL TYPED EDGE (feature, F-ARCH-7; gated by the
+            // `typedEdges` setting, default OFF). A (subject, predicate, object) triple: this fact's
+            // SUBJECT --<predicate>--> the fact referenced by <Category/key> (e.g.
+            // `rel:employs@People/bob_name`). Checked BEFORE the legacy `rel:` keyword-hint branch
+            // below and ONLY claims segments that contain an `@` — a plain `rel:key1,key2` hint
+            // still reaches the legacy branch unchanged, and when the flag is OFF this whole branch
+            // is skipped so parsing is byte-identical to today. Predicate: one lowercase verb-ish
+            // token; target: a `Category/key` ref string. Cap 3 per fact; malformed markers are
+            // silently ignored with a debug log (never an error — same degradation as unknown segs).
+            if (typedEdges && /^rel\s*:/i.test(seg) && seg.includes('@')) {
+                const edgeMatch = seg.match(/^rel\s*:\s*([A-Za-z][A-Za-z0-9_]{1,31})\s*@\s*([A-Za-z][A-Za-z0-9_]*\s*\/\s*[A-Za-z0-9_]+)\s*$/);
+                if (edgeMatch) {
+                    const p = edgeMatch[1].toLowerCase();
+                    const t = edgeMatch[2].replace(/\s+/g, ''); // canonical `Category/key` (no stray spaces)
+                    const dup = edges.some(e => e.p === p && e.t.toLowerCase() === t.toLowerCase());
+                    if (!dup && edges.length < 3) {
+                        edges.push({ p, t });
+                    } else if (!dup) {
+                        addDebugLog('debug', `Typed edge dropped (cap 3/fact): rel:${p}@${t}`, {
+                            subsystem: 'agent3', event: 'scribe.edge.capped', reason: 'EDGE_CAP',
+                            data: { p, t, line: pathPart },
+                        });
+                    }
+                } else {
+                    addDebugLog('debug', `Malformed typed-edge marker ignored: "${seg.slice(0, 80)}"`, {
+                        subsystem: 'agent3', event: 'scribe.edge.malformed', reason: 'GRAMMAR_DRIFT',
+                        data: { segment: seg.slice(0, 200), line: pathPart },
+                    });
+                }
+                continue;
+            }
+
             // rel:keywords (optional relationship hints)
             if (seg.startsWith('rel:')) {
                 relationships = seg.slice(4).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -1064,6 +1123,9 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         // lean and the field set is unchanged when the feature is off. DISTINCT from `validAt`.
         if (biTemporal && validFrom) update.validFrom = validFrom;
         if (biTemporal && validUntil) update.validUntil = validUntil;
+        // Typed edges (feature, F-ARCH-7): only attach when the opt-in marker parsed some, so
+        // back-compat facts stay lean and the field set is unchanged when the feature is off.
+        if (typedEdges && edges.length) update.edges = edges;
         // SCENE + SOURCE STRANDS (Spiderweb 2): stamp the scene the fact was established in, plus a
         // `sourceMsg` provenance handle (REUSES the existing source message index — no new id). Both
         // optional / only-when-present (lean / back-compat). First-wins is enforced at merge: a
@@ -1478,6 +1540,10 @@ async function applyUpdates(updates, existingDatabases) {
         // so back-compat facts simply lack these fields. DISTINCT from `validAt` (ordering integer).
         if (update.validFrom) factToWrite.validFrom = update.validFrom;
         if (update.validUntil) factToWrite.validUntil = update.validUntil;
+        // Typed edges (feature, F-ARCH-7): forward parsed edges so upsertFact can UNION them
+        // additively across re-mentions (mergeEdges in database.js — dedupe by p+t, cap 6,
+        // incoming wins ties). Only present when the opt-in typedEdges parsing produced some.
+        if (Array.isArray(update.edges) && update.edges.length) factToWrite.edges = update.edges;
         // SCENE + SOURCE STRANDS (Spiderweb 2): forward the origin scene + source-message handle so
         // upsertFact stores them. First-wins is enforced in mergeSalience (the origin scene is kept
         // across re-mentions, mirroring validAt). Only attached when present (lean / back-compat).
