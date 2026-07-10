@@ -3,6 +3,7 @@
 // Each database is a JSON file stored as a character attachment
 
 import { addDebugLog } from './settings.js';
+import { wordTokens } from './tokenize.js';
 import * as host from './host.js';
 
 const DB_PREFIX = 'bf_memory_db_';
@@ -1914,20 +1915,17 @@ export function invalidateMemoryIndex() {
 
 /**
  * Tokenize a fact's searchable text (key + value + tags + aliases) into lowercased word
- * tokens of length > 3. Mirrors the granularity searchFacts/fuzzyFallback already use so the
- * token index admits exactly the same facts a full scan would. Character-name words are NOT
- * filtered here (they're filtered at query time, where the current names are known); the index
- * is name-agnostic so it survives a mid-chat rename.
+ * tokens via the SHARED Unicode tokenizer (ASCII keeps the legacy length > 3 gate). This is
+ * the INDEX side; every query side (searchFactsIndexed / scopedScribeCandidates / expansion)
+ * routes through the same wordTokens so index and query tokens can never diverge. Character-
+ * name words are NOT filtered here (they're filtered at query time, where the current names
+ * are known); the index is name-agnostic so it survives a mid-chat rename.
  * @param {FactSchema} fact
  * @returns {string[]} unique tokens
  */
 function factTokens(fact) {
-    const text = `${fact.key || ''} ${fact.value || ''} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
-    const out = new Set();
-    for (const tok of text.split(/[^a-z0-9]+/)) {
-        if (tok.length > 3) out.add(tok);
-    }
-    return [...out];
+    const text = `${fact.key || ''} ${fact.value || ''} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`;
+    return wordTokens(text);
 }
 
 /**
@@ -2106,9 +2104,11 @@ export function searchFactsIndexed(index, databases, keywords) {
     const nameWords = getCharacterNameWords();
     const lowerKeywords = keywords.map(k => k.toLowerCase());
 
-    // Same keyword pre-processing as the original: split into words, drop char-name + short words.
+    // Same keyword pre-processing as the original, via the SHARED tokenizer (same function as
+    // the index side, so a non-ASCII keyword yields exactly the tokens byToken is keyed by):
+    // split into words, drop char-name words (short words are gated inside wordTokens).
     const keywordWordSets = lowerKeywords.map(kw =>
-        kw.split(/\s+/).filter(w => w.length > 3 && !nameWords.has(w))
+        wordTokens(kw).filter(w => !nameWords.has(w))
     ).filter(words => words.length > 0);
 
     // Gather the candidate set from the token index. Match a keyword word against an index token
@@ -2205,8 +2205,9 @@ export function searchFactsIndexed(index, databases, keywords) {
         ];
         for (const ref of relatedRefs) {
             const refLower = String(ref).toLowerCase();
-            // A ref names a key/tag/category token; pull candidates by each >3-char word of it.
-            for (const w of refLower.split(/[^a-z0-9]+/).filter(t => t.length > 3)) {
+            // A ref names a key/tag/category token; pull candidates by each word of it
+            // (shared tokenizer — same tokens the index is keyed by).
+            for (const w of wordTokens(refLower)) {
                 const bucket = index.byToken.get(w);
                 if (!bucket) continue;
                 for (const { fact, category } of bucket) {
@@ -2310,8 +2311,7 @@ export function scopedScribeCandidates(index, subjects, keywords, cap = 60) {
         if (bucket) for (const e of bucket) addEntry(e);
     }
     for (const kw of (keywords || [])) {
-        for (const w of String(kw || '').toLowerCase().split(/[^a-z0-9]+/)) {
-            if (w.length <= 3) continue;
+        for (const w of wordTokens(kw)) { // shared tokenizer — matches the byToken index keys
             const bucket = index.byToken.get(w);
             if (bucket) for (const e of bucket) addEntry(e);
         }
@@ -2675,7 +2675,9 @@ export async function getDatabase(category) {
  * deprioritized by retrieval/menu until re-mentioned/matched (which un-colds them).
  *
  * PROTECTED (never cold-tiered): sequence/track facts (ordered chains), superseded/inactive
- * history snapshots (already lowest priority, handled by isActiveFact), and high-importance
+ * history snapshots (already lowest priority, handled by isActiveFact), OPEN plot threads
+ * (thread === 'open' — an unresolved hook must stay recallable until Reflection resolves it;
+ * the protection lapses once thread flips to 'resolved'), and high-importance
  * facts (importance >= COLD_TIER_PROTECT_IMPORTANCE — foundational identity stays hot). Among
  * the remaining demotable facts we keep the HIGHEST-salience HOT_SET_SIZE hot and cold-tier the
  * rest, lowest salience first (importance + kind-modulated recency — same blend the old eviction
@@ -2696,6 +2698,7 @@ function coldTierOverflow(db) {
         if (!f || typeof f !== 'object') continue;
         if (!isActiveFact(f)) continue;                                  // history snapshots: not in the hot set
         if (isSequenceFact(f)) continue;                                 // ordered chains: never cold-tiered
+        if (f.thread === 'open') continue;                               // unresolved plot threads: stay hot until resolved
         if (clampImportance(f.importance) >= COLD_TIER_PROTECT_IMPORTANCE) continue; // foundational: stay hot
         demotable.push(f);
     }
@@ -3085,6 +3088,34 @@ export function upsertFact(db, fact) {
             if (existingIdx >= 0) matchVia = 'NORMALIZED_KEY';
         }
     }
+    // 2b) PAIR-KEY CANONICALIZER (relationship-status follow-up): the per-pair relationship
+    //    STATUS record's key is EXACTLY `<a>_<b>_status` (two distinct single name tokens +
+    //    the literal suffix — the same strict shape the Scribe prompt and the reflection
+    //    maintenance route validate). If a writer ever emits the REVERSED orientation
+    //    (`<b>_<a>_status`), neither the normalized match above (token order differs) nor the
+    //    parallel-state match below (subjects differ) catches it, so a duplicate contradictory
+    //    pair record would be minted. Deterministically adopt the STORED orientation instead:
+    //    key, subject, and partner all flip so the merged fact stays coherent
+    //    (subj:<a> + involved:[<b>] matches key `<a>_<b>_status`), and the write then rides
+    //    the normal update/supersession path below like any re-mention of the canonical key.
+    if (existingIdx < 0) {
+        const pairMatch = /^([a-z0-9]+)_([a-z0-9]+)_status$/.exec(String(fact.key || '').trim().toLowerCase());
+        if (pairMatch && pairMatch[1] !== pairMatch[2]) {
+            const reversedKey = `${pairMatch[2]}_${pairMatch[1]}_status`;
+            const revIdx = db.facts.findIndex(f => !isSequenceFact(f) && String(f.key || '').trim().toLowerCase() === reversedKey);
+            if (revIdx >= 0) {
+                existingIdx = revIdx;
+                matchVia = 'PAIR_KEY_REVERSED';
+                const fromKey = fact.key;
+                const stored = db.facts[revIdx];
+                fact = { ...fact, key: stored.key, subject: stored.subject || pairMatch[2], involved: [pairMatch[1]] };
+                addDebugLog('debug', `Canonicalized reversed pair-status key: [${db.category}] ${fromKey} → ${stored.key}`, {
+                    subsystem: 'db', event: 'fact.merged', reason: 'PAIR_KEY_REVERSED',
+                    data: { category: db.category, fromKey, intoKey: stored.key },
+                });
+            }
+        }
+    }
     // 3) STRONGER PARALLEL-KEY DEDUP (feature #5): if STILL no match and the incoming
     //    write is a changeable `state`, look for an existing CURRENT state fact with the
     //    SAME subject + SAME leading facet/aspect under a parallel key (the real-data bug:
@@ -3264,6 +3295,188 @@ function makeSupersededKey(db, canonicalKey) {
 /** Strip the superseded-snapshot suffix (and its numeric tail) back to the canonical key. */
 function stripSupersededSuffix(key) {
     return String(key || '').replace(new RegExp(`${SUPERSEDED_SUFFIX}\\d*$`), '');
+}
+
+// =============================================================================
+// CROSS-KEY SUPERSEDE RULES (community adoption Tier 1; NarrativeEngine timeline
+// prior art — report §1.6). The per-key supersession above only fires when the SAME
+// logical key is re-written; but some story events invalidate OTHER keys: a character
+// who dies no longer has a meaningful `current_location`, a destroyed heirloom has no
+// `ownership`. These rules are a small DETERMINISTIC table (no LLM): when a genuinely
+// NEW death/departure/loss fact lands, same-subject changeable-STATE facts under the
+// rule's target aspects are retired to `__was` history — the SAME snapshot-not-delete
+// provenance as per-key supersession, never a deletion. Applied at the genuine-new-write
+// CALLERS (Scribe applyUpdates, Writer remember_fact, review-popup edits), NOT inside
+// upsertFact, so migrations/rebuilds/merges that replay old facts can never re-fire them.
+// Gated by `crossKeySupersede` (default ON — free + deterministic; OFF restores
+// per-key-only behavior byte-for-byte).
+// =============================================================================
+
+// Deterministic rule table. A fact TRIGGERS a rule when its aspect is in `trigger.aspects`
+// (event-shaped keys like `death_event`), OR its aspect is in `trigger.valueAspects` AND it
+// is an explicit kind:'state' AND its value matches `trigger.valueRx` (state-shaped writes
+// like `status = "dead"`). Matching rule => same-subject active state facts whose aspect is
+// in `targetAspects` are retired. Departure deliberately has NO value regex — "left"/"gone"
+// prose is far too ambiguous; only the explicit event aspects fire it.
+const CROSS_KEY_RULES = [
+    {
+        id: 'death',
+        trigger: {
+            aspects: new Set(['death', 'death_event']),
+            valueAspects: new Set(['status', 'health']),
+            // Negation lookbehind keeps "almost died" / "not dead" / "nearly killed" from firing.
+            valueRx: /(?<!\b(?:almost|nearly|not)\s)\b(dead|died|dies|killed|deceased|slain|perished|passed away)\b/i,
+        },
+        // Alive-status + presence: where they are, what they're doing, who they're with (§1.6).
+        targetAspects: new Set(['current_location', 'current_activity', 'current_goal', 'companions_present', 'status', 'health']),
+    },
+    {
+        id: 'departure',
+        trigger: {
+            aspects: new Set(['departure', 'departure_event', 'relocation']),
+            valueAspects: new Set(),
+            valueRx: null,
+        },
+        // Presence only — a departed character keeps goals/health, just isn't HERE anymore.
+        targetAspects: new Set(['current_location', 'current_activity', 'companions_present']),
+    },
+    {
+        id: 'destroyed_lost',
+        trigger: {
+            aspects: new Set(['lost_status']),
+            valueAspects: new Set(['condition_of_item', 'lost_status', 'damage']),
+            valueRx: /\b(destroyed|shattered|burned|burnt|melted|disintegrated|lost|missing|gone for good)\b/i,
+        },
+        targetAspects: new Set(['ownership', 'previous_owner', 'location_of_item', 'hidden_location']),
+    },
+];
+
+// Blast-radius bound: one trigger may retire at most this many facts across ALL categories,
+// so a subject-collision misfire (see deriveSubject's key-prefix heuristic) stays contained.
+const MAX_CROSS_KEY_INVALIDATIONS = 8;
+
+/**
+ * Resolve a fact's aspect against its OWNING category's vocab. Stored facts usually do NOT
+ * carry a `category` field (only the owning db does), and deriveAspect(fact) alone would then
+ * validate against the Unsorted fallback vocab — collapsing e.g. `current_location` to `misc`
+ * and silently neutering the rule match. Prefer the fact's own field when present (migrated
+ * facts), else the owning db/category name.
+ * @param {FactSchema} fact
+ * @param {string} owningCategory - the category of the db the fact lives in (or is bound for)
+ * @returns {string}
+ */
+function aspectInCategory(fact, owningCategory) {
+    return normalizeAspect(fact?.aspect, fact?.category || owningCategory);
+}
+
+/**
+ * Apply the cross-key supersede rules for ONE genuinely-new fact write (feature:
+ * crossKeySupersede, default ON). Pure code, no LLM. When `fact` (just written into
+ * `category`) matches a rule, every ACTIVE non-sequence kind:'state' fact in ANY category
+ * with the SAME derived subject and a TARGET aspect is retired to `__was` history
+ * (invalidateFactCrossKey), up to MAX_CROSS_KEY_INVALIDATIONS. Callers must persist the
+ * returned categories (the maps are mutated in place, exactly like upsertFact).
+ *
+ * CALLER CONTRACT: call this ONLY on genuine new-information writes (Scribe commit, Writer
+ * remember_fact, review-popup edit) — never from migration/rebuild/merge replays.
+ * @param {Object<string, DatabaseSchema>} databases - the live category -> db map (mutated)
+ * @param {FactSchema} fact - the just-written trigger fact
+ * @param {string} category - the category `fact` was written into
+ * @returns {string[]} names of categories whose facts were modified (need saving)
+ */
+export function applyCrossKeySupersedeRules(databases, fact, category) {
+    // Setting gate: default ON when absent; explicit false restores per-key-only behavior.
+    try {
+        if (host.getExtensionSettings()?.crossKeySupersede === false) return [];
+    } catch { /* settings unavailable — default ON */ }
+    if (!fact || !isActiveFact(fact) || isSequenceFact(fact)) return [];
+
+    const aspect = aspectInCategory(fact, category);
+    const kind = normalizeKind(fact.kind);
+    const value = String(fact.value ?? '');
+    const rule = CROSS_KEY_RULES.find(r =>
+        r.trigger.aspects.has(aspect) ||
+        (r.trigger.valueAspects.has(aspect) && kind === 'state' && r.trigger.valueRx && r.trigger.valueRx.test(value)));
+    if (!rule) return [];
+
+    const subj = deriveSubject(fact);
+    if (!subj) return [];
+
+    const triggerRef = `${category}/${fact.key}`; // Category/key cross-ref (see FactSchema supersededBy)
+    const normTrigger = normalizeFactKey(fact.key);
+    const now = Date.now();
+    const touched = [];
+    let invalidated = 0;
+
+    for (const [cat, db] of Object.entries(databases || {})) {
+        if (invalidated >= MAX_CROSS_KEY_INVALIDATIONS) break;
+        if (!db || !Array.isArray(db.facts)) continue;
+        // Snapshot the candidate set FIRST — invalidateFactCrossKey reassigns db.facts (it
+        // drops older __was snapshots), so we never iterate the live array while mutating it.
+        // Targets must be: currently valid, not an append-only track step, an explicit
+        // changeable STATE (legacy kind-less facts default to 'trait' and are never swept),
+        // the SAME subject, a target aspect, not the trigger itself (self-guard), and not
+        // already saying the same thing as the trigger.
+        const candidates = db.facts.filter(f =>
+            isActiveFact(f) && !isSequenceFact(f)
+            && normalizeKind(f.kind) === 'state'
+            && deriveSubject(f) === subj
+            && rule.targetAspects.has(aspectInCategory(f, cat))
+            && normalizeFactKey(f.key) !== normTrigger
+            && !factValuesEqual(f.value, fact.value));
+        let dbTouched = false;
+        for (const target of candidates) {
+            if (invalidated >= MAX_CROSS_KEY_INVALIDATIONS) break;
+            invalidateFactCrossKey(db, target, triggerRef, rule.id, now);
+            invalidated++;
+            dbTouched = true;
+        }
+        if (dbTouched) touched.push(cat);
+    }
+    return touched;
+}
+
+/**
+ * Retire ONE fact to `__was` history because a cross-key rule fired (crossKeySupersede).
+ * Mirrors upsertFact's supersession branch MINUS the "advance the canonical fact" half —
+ * there is no incoming value for this key, the truth simply ENDED. The fact is renamed in
+ * place to a superseded snapshot key (so a later legitimate write to the canonical key
+ * creates a fresh ACTIVE fact instead of silently carrying `active:false` forward through
+ * the merge spread), stamped inactive with provenance, and any OLDER `__was` snapshot of
+ * the same logical key is dropped (keep just one — same policy as per-key supersession).
+ * Normal supersession provenance — NEVER a deletion.
+ * @param {DatabaseSchema} db - owning database (mutated)
+ * @param {FactSchema} target - the ACTIVE fact object to retire (mutated in place)
+ * @param {string} triggerRef - `Category/key` of the triggering fact (stored in supersededBy)
+ * @param {string} ruleId - which CROSS_KEY_RULES entry fired (for the debug log)
+ * @param {number} now - shared ms timestamp for the batch
+ * @returns {void}
+ */
+function invalidateFactCrossKey(db, target, triggerRef, ruleId, now) {
+    const canonicalKey = target.key;
+    const oldValue = target.value;
+    const snapshotKey = makeSupersededKey(db, canonicalKey);
+    target.key = snapshotKey;
+    target.active = false;
+    target.supersededAt = now;
+    target.supersededBy = triggerRef; // Category/key cross-ref form (no readers depend on bare keys)
+    // BI-TEMPORAL (opt-in): close the story-world window when the feature is on and the fact
+    // doesn't already carry an explicit end (same policy as upsertFact's supersession branch).
+    try {
+        if (host.getExtensionSettings()?.biTemporal === true && !target.validUntil) {
+            target.validUntil = new Date(now).toISOString();
+        }
+    } catch { /* settings unavailable — leave the story-world window open */ }
+    // Drop any prior superseded snapshot of this same logical key (keep just one).
+    const normCanon = normalizeFactKey(canonicalKey);
+    db.facts = db.facts.filter(f =>
+        !(f.active === false && f !== target && normalizeFactKey(stripSupersededSuffix(f.key)) === normCanon));
+    db.updatedAt = now;
+    addDebugLog('info', `Fact superseded: [${db.category}] ${canonicalKey} (cross-key rule "${ruleId}", kept as ${snapshotKey})`, {
+        subsystem: 'db', event: 'fact.superseded', reason: `CROSS_KEY_RULE:${ruleId}`,
+        data: { category: db.category, key: canonicalKey, snapshotKey, trigger: triggerRef, subject: deriveSubject(target), aspect: deriveAspect(target) },
+        before: oldValue,
+    });
 }
 
 /**
@@ -3845,8 +4058,49 @@ export function findFactMatch(db, key) {
     const exact = db.facts.find(f => f.key === key);
     if (exact) return exact;
     const norm = normalizeFactKey(key);
-    if (!norm) return null;
-    return db.facts.find(f => normalizeFactKey(f.key) === norm) || null;
+    if (norm) {
+        const normHit = db.facts.find(f => normalizeFactKey(f.key) === norm);
+        if (normHit) return normHit;
+    }
+    // Mirror upsertFact's reversed pair-status canonicalizer (2b) — key-shape-only, so the
+    // NEW/UPDATED classification and the post-write auto-link re-find stay accurate when a
+    // reversed `<b>_<a>_status` write gets re-keyed onto the stored orientation.
+    const pairMatch = /^([a-z0-9]+)_([a-z0-9]+)_status$/.exec(String(key || '').trim().toLowerCase());
+    if (pairMatch && pairMatch[1] !== pairMatch[2]) {
+        const reversedKey = `${pairMatch[2]}_${pairMatch[1]}_status`;
+        return db.facts.find(f => !isSequenceFact(f) && String(f.key || '').trim().toLowerCase() === reversedKey) || null;
+    }
+    return null;
+}
+
+/**
+ * Would writing `fact` into `db` materially change stored state (NEW or UPDATED), or is it
+ * a no-op re-upsert of what is already stored (SKIPPED)? Same classification applyUpdates
+ * (agent-memory.js) performs before committing a Scribe batch: match with the SAME rule
+ * upsertFact uses (sequence facts match by exact key only), then compare value + tags.
+ * Used by the review-popup / catch-up "Save edited" commits to gate the cross-key supersede
+ * rules on genuine new writes — the pending queue re-upserts ALREADY-SAVED items, and an
+ * unchanged death/departure/loss item must never re-fire a rule (it could wrongly retire
+ * same-subject state facts written AFTER the original trigger, e.g. a post-death
+ * current_location pinned via the Writer's remember_fact tool).
+ * @param {DatabaseSchema} db
+ * @param {FactSchema|Object} fact - incoming write (update/queue-item shaped is fine)
+ * @returns {boolean} true when the write is NEW or materially UPDATED
+ */
+export function isMaterialFactWrite(db, fact) {
+    if (!fact) return false;
+    const matched = fact.track
+        ? (db?.facts?.find(f => f.key === fact.key) || null)
+        : findFactMatch(db, fact.key);
+    if (!matched) return true; // NEW
+    if (!factValuesEqual(matched.value, fact.value)) return true; // UPDATED (value changed)
+    const norm = arr => (Array.isArray(arr) ? arr : [])
+        .map(t => String(t).trim().toLowerCase())
+        .filter(Boolean)
+        .sort();
+    const a = norm(matched.tags);
+    const b = norm(fact.tags);
+    return a.length !== b.length || a.some((t, i) => t !== b[i]); // UPDATED (tags) vs SKIPPED
 }
 
 /**
@@ -4001,8 +4255,8 @@ export function autoLinkFact(index, fact, category, runId) {
     if (myLoc || myInvolved.size > 0) {
         const structuralSeen = new Set();
         const structuralTokens = new Set();
-        if (myLoc) for (const w of myLoc.split(/[^a-z0-9]+/)) if (w.length > 3) structuralTokens.add(w);
-        for (const inv of myInvolved) for (const w of inv.split(/[^a-z0-9]+/)) if (w.length > 3) structuralTokens.add(w);
+        if (myLoc) for (const w of wordTokens(myLoc)) structuralTokens.add(w);
+        for (const inv of myInvolved) for (const w of wordTokens(inv)) structuralTokens.add(w);
         for (const tok of structuralTokens) {
             if (primaryRefs.size >= AUTOLINK_MAX_PRIMARY) break;
             for (const entry of (index.byToken.get(tok) || [])) {
@@ -4112,6 +4366,10 @@ function getCharacterNameWords() {
             for (const word of name.split(/\s+/)) {
                 if (word.length > 2) names.add(word.toLowerCase());
             }
+            // ALSO union in segmented word tokens (min 2): an unspaced CJK full name yields the
+            // whole string from the whitespace split above (fine), but the segmented pieces are
+            // what actually appear as per-token index buckets, so both forms must be filtered.
+            for (const tok of wordTokens(name, { min: 2 })) names.add(tok);
         }
     } catch (e) { /* ignore */ }
     return names;
@@ -4515,7 +4773,9 @@ export async function deleteDebugLogFile(chatId) {
  *   (i.e. when `active` was set false). Doubles as `validTo`. Absent while active.
  * @property {string} [supersededBy] - OPTIONAL key of the fact that replaced this value
  *   (history breadcrumb). For in-place supersession the key is unchanged, so this equals
- *   the fact's own key. Absent while active.
+ *   the fact's own key. When a cross-key supersede rule retired the fact (crossKeySupersede
+ *   feature) this is instead a `Category/key` CROSS-REF to the TRIGGERING fact (e.g.
+ *   `Events/mira_death_event`) — consumers must accept both forms. Absent while active.
  * @property {string} [aspect] - OPTIONAL Layer-2 aspect (3-layer model): a granular,
  *   character-agnostic sub-bucket WITHIN the fact's Layer-1 `category`, picked from a FIXED
  *   per-category vocab (see TAXONOMY). Emitted by Agent 3 via the `aspect:` marker; when
@@ -4588,6 +4848,16 @@ export async function deleteDebugLogFile(chatId) {
  *   `tone:` marker; normalized + hard-clamped to <=40 chars (see normalizeTone). Surfaced
  *   compactly to the Writer alongside the note so a moment reads with its feeling. Absent on
  *   ordinary facts and on facts from older versions (backward-compatible).
+ * @property {('open'|'resolved')} [thread] - OPTIONAL plot-thread state (open-threads feature).
+ *   `open` = a genuinely unresolved plot hook (promise, debt, mystery, unfired Chekhov gun) the
+ *   story must come back to — emitted by Agent 3 via the `thread:open` marker (mostly on
+ *   `kind:event` facts). Open threads are surfaced in the Big Picture block (getOpenThreads) and
+ *   PROTECTED from cold-tiering. `resolved` = the Reflection pass judged the thread concluded
+ *   (#THREADS verdict); protection + injection lapse. Merge-safe: upsertFact spreads only keys
+ *   present on the incoming fact, so a re-mention without the marker keeps the stored state.
+ *   Absent on ordinary facts and on facts from older versions (backward-compatible).
+ * @property {number} [threadResolvedAt] - OPTIONAL ms timestamp stamped when the Reflection pass
+ *   resolved this fact's thread (paired with thread === 'resolved'). Absent while open.
  * @property {boolean} [cold] - OPTIONAL hot/cold tier flag (infinite-facts feature). ABSENT or
  *   `false` => HOT (the default for every fact ever written). Set to `true` by coldTierOverflow
  *   when a category's active hot non-sequence facts exceed HOT_SET_SIZE — the LOWEST-salience
@@ -4618,6 +4888,47 @@ export function getTrackSteps(databases, track) {
     }
     steps.sort((a, b) => (Number(a.fact.ord) || 0) - (Number(b.fact.ord) || 0));
     return steps;
+}
+
+/**
+ * OPEN THREADS (open-threads feature): return the newest ACTIVE, non-cold facts flagged
+ * `thread:'open'` — the unresolved plot hooks (promises, debts, mysteries, unfired Chekhov guns)
+ * the pipeline surfaces in the Big Picture block until the Reflection pass resolves them.
+ * Newest-first by the same birth-order spine collectRecentMoments uses (validAt → sceneNo →
+ * lastUpdated), then capped, so on an over-full store the FRESHEST hooks win the line. Skips
+ * superseded snapshots and timeline (track) steps. Pure, deterministic, zero-API.
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {number} [limit=5] - max threads returned
+ * @returns {Array<{category: string, key: string, value: string, context: string}>}
+ */
+export function getOpenThreads(databases, limit = 5) {
+    const out = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (!fact || typeof fact !== 'object') continue;
+            if (fact.active === false || fact.track) continue; // skip history snapshots + timeline steps
+            if (fact.cold === true) continue;                  // defensively skip cold (open threads shouldn't be, but manual edits happen)
+            if (fact.thread !== 'open') continue;
+            out.push({ category, fact });
+        }
+    }
+    // Newest-first by birth-order spine: validAt → sceneNo → lastUpdated (mirrors collectRecentMoments).
+    out.sort((a, b) => {
+        const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : -1;
+        const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : -1;
+        if (av !== bv) return bv - av;
+        const as = Number.isInteger(a.fact.sceneNo) ? a.fact.sceneNo : -1;
+        const bs = Number.isInteger(b.fact.sceneNo) ? b.fact.sceneNo : -1;
+        if (as !== bs) return bs - as;
+        return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
+    });
+    const cap = Math.max(1, Math.floor(Number(limit) || 5));
+    return out.slice(0, cap).map(({ category, fact }) => ({
+        category,
+        key: String(fact.key || ''),
+        value: String(fact.value ?? ''),
+        context: (typeof fact.context === 'string') ? fact.context : '',
+    }));
 }
 
 /**

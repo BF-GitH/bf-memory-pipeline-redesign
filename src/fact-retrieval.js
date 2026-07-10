@@ -4,6 +4,8 @@
 
 import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sinceIso } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
+import { recencyTail, getTurnNowContext } from './recency.js';
+import { wordTokens, tokenSet, cleanWord, isCapitalizedWord, cjkTokens } from './tokenize.js';
 import * as host from './host.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -63,6 +65,12 @@ const FALLBACK_MAPPINGS = {
  * This widens the prior exact-string compare; it does not change which third-party names
  * fail to match — only that the active user/char are matched robustly across whitespace and
  * case differences a rename can introduce.
+ *
+ * TOGGLEABLE (`enforceKnownBy`, default ON): when the user turns enforcement OFF in settings,
+ * every fact is visible to every character regardless of its knownBy list (secrets will leak;
+ * escape hatch for users sharing one DB across characters). Gated HERE so every call site —
+ * push cascade, search_memory, scene/relationship rows, pipeline anchors — follows the toggle
+ * automatically. getSettings() returns a cached object, so the per-fact call is cheap.
  * @param {Object} fact
  * @param {{charName?:string, userName?:string}} [names] - precomputed current names (optional)
  * @returns {boolean}
@@ -70,6 +78,8 @@ const FALLBACK_MAPPINGS = {
 export function isFactVisible(fact, names = null) {
     const kb = (fact && fact.knownBy) || [];
     if (kb.length === 0) return true; // everyone knows
+    const s = getSettings();
+    if (s && s.enforceKnownBy === false) return true; // enforcement toggled OFF: everyone sees everything
     let charName = names?.charName;
     let userName = names?.userName;
     if (charName === undefined || userName === undefined) {
@@ -130,12 +140,20 @@ const EXACT_KEY_PRIMARY_CAP = 12;
  *   - degenerate (neither) keeps the key visible.
  * The bi-temporal tail only exists when the caller passes `biTemporalOn` (the opt-in setting);
  * when the feature is off the fields are never written, so output is unchanged.
+ *
+ * RECENCY LABELS (community adoption Tier 1): when the caller passes a non-null `nowCtx`
+ * (recency.js), a compact ` (~N turns ago[, scene S])` / in-story tail is appended AFTER the
+ * bi-temporal tail. The default `nowCtx = null` keeps output BYTE-IDENTICAL for every existing
+ * caller — formatFactsForWriter, appendEdgeTails (whose exact-line string match depends on it)
+ * and the search_memory tool paths all stay unchanged; only the per-turn injected block
+ * (pipeline.js formatChosenFacts) and the estimator opt in.
  * @param {Object} fact
  * @param {string} category
  * @param {boolean} [biTemporalOn=false] - settings.biTemporal, read ONCE by the caller
+ * @param {Object|null} [nowCtx=null] - per-turn now-context (recency.js); null = no recency tail
  * @returns {string}
  */
-export function buildFactLine(fact, category, biTemporalOn = false) {
+export function buildFactLine(fact, category, biTemporalOn = false, nowCtx = null) {
     const knownBy = (fact.knownBy || []).join(', ');
     const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
     const hasValue = String(fact.value ?? '').trim() !== '';
@@ -151,15 +169,18 @@ export function buildFactLine(fact, category, biTemporalOn = false) {
         const until = (typeof fact.validUntil === 'string' && fact.validUntil.trim()) ? fact.validUntil.trim() : '';
         if (from || until) temporal = ` {${from || '?'}→${until || 'now'}}`;
     }
+    // RECENCY LABEL (opt-in per call via nowCtx): fail-soft — a legacy fact without validAt
+    // yields '' (no tail), so old stores render exactly as before even with labels on.
+    const recency = nowCtx ? recencyTail(fact, nowCtx, biTemporalOn) : '';
     // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
     // only needs one. When a fact HAS a note, the note already carries the
     // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
     // showing both would be redundant. With no note, inject `Category/key = value`.
     // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
-    if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${temporal}`;
-    if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${temporal}`;
+    if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${temporal}${recency}`;
+    if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${temporal}${recency}`;
     // Degenerate: neither value nor note — keep the key so it's still visible.
-    return `${prefix} ${category}/${fact.key}${temporal}`;
+    return `${prefix} ${category}/${fact.key}${temporal}${recency}`;
 }
 
 /**
@@ -198,7 +219,15 @@ export function estimateInjectionTokens(r, seenSubjects = null) {
     // Read the bi-temporal flag the same way the formatter does (best-effort; default off).
     let biTemporalOn = false;
     try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
-    let chars = buildFactLine(f, r.category, biTemporalOn).length;
+    // RECENCY LABELS: when the injected block will carry per-fact recency tails, charge them
+    // here too (F-RETR-3 invariant — the budget must price the exact bytes the injected
+    // formatter emits). getTurnNowContext() is the SAME per-turn memoized object pipeline.js
+    // passes to formatChosenFacts, so estimator and formatter measure identical tails. (With
+    // bi-temporal ON the formatter may later fill storyNowMs and swap a turn phrase for a
+    // similarly-sized in-story phrase — an accepted ~few-chars estimate skew.)
+    let nowCtx = null;
+    try { if (getSettings()?.injectRecencyLabels === true) nowCtx = getTurnNowContext(); } catch { /* default off */ }
+    let chars = buildFactLine(f, r.category, biTemporalOn, nowCtx).length;
     if (seenSubjects && !seenSubjects.has(subjectGroupKey(f))) {
         // One `[Subject]` header line (brackets + label) plus its newline.
         chars += subjectGroupLabel(f).length + 3;
@@ -597,8 +626,8 @@ function fuzzyFallback(databases, neededInfo, results, seenIds) {
     // fact B, over-suppressed the fuzzy rescue.) Uncovered entries get the fuzzy rescue below.
     const primaries = results.filter(r => r.tier === 'primary');
     const primaryTokenSets = primaries.map(r => {
-        const text = `${r.fact.key} ${r.fact.value} ${(r.fact.tags || []).join(' ')} ${(r.fact.aliases || []).join(' ')}`.toLowerCase();
-        return new Set(text.split(/[^a-z0-9]+/).filter(t => t.length > 0));
+        const text = `${r.fact.key} ${r.fact.value} ${(r.fact.tags || []).join(' ')} ${(r.fact.aliases || []).join(' ')}`;
+        return tokenSet(text, { min: 1 }); // shared tokenizer; min 1 = the legacy length > 0 gate
     });
 
     let admitted = 0;
@@ -607,11 +636,11 @@ function fuzzyFallback(databases, neededInfo, results, seenIds) {
         if (!entry) continue;
         if (entry.indexOf('/') >= 0) continue; // Category/key request — Layer C's job
         const entryLower = entry.toLowerCase();
-        // Meaningful entry words for the trigram rescue below (whitespace split, as before)...
-        const words = entryLower.split(/\s+/).filter(w => w.length > 3);
-        // ...and word-boundary TOKENS for the coverage check (same tokenizer as the fact side,
-        // so "mira's" compares as "mira"/"s" instead of never matching a token).
-        const entryTokens = entryLower.split(/[^a-z0-9]+/).filter(w => w.length > 3);
+        // Meaningful entry words for the trigram rescue below AND word-boundary TOKENS for the
+        // coverage check — both from the SHARED tokenizer (same as the fact side, so "mira's"
+        // compares as "mira" on both sides and non-Latin entries tokenize at all).
+        const words = wordTokens(entryLower);
+        const entryTokens = words;
         // Covered = a SINGLE primary fact's token set contains a STRICT MAJORITY of the entry's
         // meaningful tokens. Per-entry AND per-fact — scattered one-word hits spread across
         // different primaries no longer count as coverage, and substring hits don't count at all.
@@ -633,7 +662,7 @@ function fuzzyFallback(databases, neededInfo, results, seenIds) {
                 const id = `${category}:${fact.key}`;
                 if (seenIds.has(id)) continue; // already found by exact/keyword path
                 const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
-                const tokens = factText.split(/[^a-z0-9]+/).filter(t => t.length > 2);
+                const tokens = wordTokens(factText, { min: 3 }); // min 3 = this site's legacy > 2 gate
                 let best = 0;
                 for (const ew of entryWords) {
                     for (const tok of tokens) {
@@ -771,6 +800,86 @@ export function retrievalSalience(fact, now) {
         }
     } catch { /* degrade to ungated base score */ }
     return isColdFact(fact) ? base - RETRIEVAL_COLD_PENALTY : base;
+}
+
+/**
+ * SEMANTIC SELECTION EXPANSION (selection-summary feature). Pure + deterministic given the
+ * picks: no I/O, no PRNG — the same Selector result always expands to the same rows (the
+ * nondeterminism lives entirely in the LLM pick upstream; since the merged rows land BEFORE
+ * the injection snapshot is cached, swipe reuse stays byte-identical — pipeline.js ~26-27).
+ *
+ * Shelf picks (`Category/aspect`): validated against index.byCatAspect (key
+ * `${category.toLowerCase()}||${aspect.toLowerCase()}` — exactly the map buildMemoryIndex
+ * builds; aspects are already normalized lowercase snake_case). A HALLUCINATED shelf simply
+ * misses the map and is silently dropped (anti-drift, mirroring the reflection pass's shelf
+ * snap). Each valid shelf contributes its top `maxPerShelf` active facts ranked by the same
+ * retrievalSalience the overflow tiers use.
+ *
+ * Fact picks (`Category/key`): resolved through resolveExactKeys — case-insensitive,
+ * isActiveFact-guarded, validated against the REAL store, so a hallucinated key matches
+ * nothing. Deliberately admitted as tier 'secondary' (NEVER the unbudgeted primary the exact
+ * path normally grants): selection rows must always compete under the caller's token budget
+ * (audit F-ARCH-2 failure class).
+ *
+ * Rows are ordered by pick confidence desc, then salience desc — the caller's budget loop
+ * admits the strongest picks first. The caller still dedups against already-chosen facts,
+ * filters isFactVisible, and charges estimateInjectionTokens against retrievalTokenBudget.
+ *
+ * @param {{shelfPicks?:Array<{shelf:string,confidence:number}>, factPicks?:Array<{fact:string,confidence:number}>}|null} selection - runSelectionPass result (null → [])
+ * @param {{byCatAspect: Map}} index - per-turn fact index
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {number} [maxPerShelf=4] - top-salience facts taken per valid shelf pick
+ * @returns {Array<{fact: Object, category: string, tier: string, via: string, confidence: number}>}
+ */
+export function expandSelectionPicks(selection, index, databases, maxPerShelf = 4) {
+    if (!selection || typeof selection !== 'object') return [];
+    const perShelf = Math.max(1, Math.floor(Number(maxPerShelf) || 4));
+    const clampConf = (c) => {
+        const n = Number(c);
+        return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0.5;
+    };
+    const now = Date.now();
+    const rows = [];
+    const seen = new Set(); // `category:key` — matches the caller's dedup id scheme
+
+    for (const pick of (Array.isArray(selection.shelfPicks) ? selection.shelfPicks : [])) {
+        const raw = String(pick?.shelf || '').trim();
+        const slash = raw.indexOf('/');
+        if (slash <= 0) continue; // not Category/aspect shaped — drop
+        const cat = raw.slice(0, slash).trim().toLowerCase();
+        const aspect = raw.slice(slash + 1).trim().toLowerCase();
+        if (!cat || !aspect) continue;
+        const entries = index?.byCatAspect?.get(`${cat}||${aspect}`);
+        if (!Array.isArray(entries) || entries.length === 0) continue; // hallucinated shelf → silent drop
+        const confidence = clampConf(pick.confidence);
+        const ranked = entries
+            .filter(({ fact }) => isActiveFact(fact)) // index is active-only; cheap defense anyway
+            .sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now))
+            .slice(0, perShelf);
+        for (const { fact, category } of ranked) {
+            const id = `${category}:${fact.key}`;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            rows.push({ fact, category, tier: 'secondary', via: 'selector', confidence });
+        }
+    }
+
+    for (const pick of (Array.isArray(selection.factPicks) ? selection.factPicks : [])) {
+        const raw = String(pick?.fact || '').trim();
+        if (raw.indexOf('/') < 0) continue; // not Category/key shaped — drop
+        const confidence = clampConf(pick.confidence);
+        for (const r of resolveExactKeys(databases, [raw])) {
+            const id = `${r.category}:${r.fact.key}`;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            rows.push({ fact: r.fact, category: r.category, tier: 'secondary', via: 'selector', confidence });
+        }
+    }
+
+    rows.sort((a, b) =>
+        (b.confidence - a.confidence) ||
+        (retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now)));
+    return rows;
 }
 
 /**
@@ -1425,17 +1534,32 @@ export function extractContextKeywords(messages) {
     const keywords = new Set();
 
     for (const word of words) {
-        const clean = word.replace(/[^a-zA-Z0-9]/g, '');
-        if (clean.length < 3) continue;
+        // Unicode-preserving clean (the old [^a-zA-Z0-9] strip deleted every non-ASCII letter,
+        // so Cyrillic/Greek names could never become keywords). Latin candidates keep the
+        // legacy >= 3 gate; other cased scripts admit at >= 2 (short non-Latin names are common).
+        const clean = cleanWord(word);
+        const minLen = /^[\p{sc=Latin}0-9]+$/u.test(clean) ? 3 : 2;
+        if (clean.length < minLen) continue;
 
-        // Must be capitalized (proper noun candidate)
-        if (clean[0] === clean[0].toUpperCase() && clean[0] !== clean[0].toLowerCase()) {
+        // Must be capitalized (proper noun candidate) — works for Cyrillic/Greek too now that
+        // cleanWord no longer deletes the letters. Caseless scripts (CJK) fail this test and
+        // are handled by the cjkTokens path below.
+        if (isCapitalizedWord(clean)) {
             const lower = clean.toLowerCase();
-            // Filter out stop words (common sentence starters)
+            // Filter out stop words (common sentence starters). STOP_WORDS is English-only —
+            // documented limitation: non-English sentence-starters can become keywords, which
+            // is bounded noise (keywords only ever SELECT existing facts).
             if (!STOP_WORDS.has(lower)) {
                 keywords.add(lower);
             }
         }
+    }
+
+    // Caseless-script path: CJK text carries no capitalization signal, so without this a
+    // Japanese/Chinese/Korean chat produces zero speculative keywords. Bounded segmenter
+    // tokens (capped at 15) minus common particles.
+    for (const tok of cjkTokens(originalText).slice(0, 15)) {
+        keywords.add(tok);
     }
 
     // Also check for fallback trigger words
@@ -1498,7 +1622,7 @@ export async function explainFactRetrieval(key, keywords = []) {
         const factText = `${match.fact.key} ${match.fact.value} ${(match.fact.tags || []).join(' ')} ${(match.fact.aliases || []).join(' ')}`.toLowerCase();
         const catLower = match.category.toLowerCase();
         const hit = kw.some(k => {
-            const words = String(k).toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            const words = wordTokens(k); // mirror the real matcher (searchFactsIndexed) exactly
             if (words.length === 0) return false;
             const n = words.filter(w => factText.includes(w) || catLower.includes(w)).length;
             return words.length === 1 ? n >= 1 : n >= 2;
@@ -1700,7 +1824,7 @@ function edgeNameMatches(name, subjectOrRef) {
     if (s === name) return true;
     // `Category/key` ref: match tokens of the key part; bare subject: match its underscore tokens.
     const keyPart = s.includes('/') ? s.slice(s.indexOf('/') + 1) : s;
-    return keyPart === name || keyPart.split(/[^a-z0-9]+/).includes(name);
+    return keyPart === name || wordTokens(keyPart, { min: 1 }).includes(name); // keys are short; no length gate (legacy)
 }
 
 /**

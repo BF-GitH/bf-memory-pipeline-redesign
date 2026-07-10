@@ -1,14 +1,14 @@
 # Memory Upgrades — ported from mem0 / Letta / Graphiti / Zep
 
-Nine memory techniques adapted from the leading agent-memory systems and wired into the
+Eleven memory techniques adapted from the leading agent-memory systems and wired into the
 pipeline. Every change is **additive and gated** behind a setting; nothing removes or renames an
 existing export, and each new behavior is `try/catch`-wrapped to degrade to prior behavior on error.
 
 **Defaults:** strictly-better, low-risk wins are **ON**; heavier/architectural features are **OFF**
 (opt-in) so they can be enabled and tested individually. All settings live in `DEFAULT_SETTINGS`
-(`src/settings.js`) with matching coercion in `validateSettings`; all nine features have UI
+(`src/settings.js`) with matching coercion in `validateSettings`; all eleven features have UI
 controls in `templates/settings.html`. (Since the 0.43.0 tool-first flip, `remember_fact` is
-also ON by default — 4 ON / 5 opt-in.)
+also ON by default — 6 ON / 5 opt-in.)
 
 | Feature | Source system | Setting(s) | Default |
 |---|---|---|---|
@@ -21,6 +21,8 @@ also ON by default — 4 ON / 5 opt-in.)
 | Model-writable `remember_fact` tool | Letta `core_memory_append` | `enableWriterWriteTool` | **ON** (flipped in 0.43.0) |
 | Idle-time consolidation | Letta sleeptime agent | `idleConsolidation`, `idleConsolidationMs` | OFF |
 | Typed-edge graph memory | Graphiti typed edges | `typedEdges` | OFF |
+| Reflection compression guard | prompt hygiene (community research) | `reflectionCompressionGuard` | **ON** |
+| Cross-key supersede rules | NarrativeEngine timeline | `crossKeySupersede` | **ON** |
 
 ---
 
@@ -116,6 +118,53 @@ answers simple relation-intent queries ("who employs X" / "who does X employ") b
 predicate matching — no LLM. When OFF, the marker falls through to the legacy `rel:` keyword-hint
 branch and behavior is byte-identical. `src/agent-memory.js`, `src/database.js`,
 `src/fact-retrieval.js`.
+
+### 10. Reflection compression guard — `reflectionCompressionGuard` (true) — **ON by default**
+**What it does (ELI5):** a shelf "summary" from the periodic reflection pass is supposed to be
+*shorter* than the facts it stands for. When the model hands back one that isn't (it enumerated or
+added detail instead of abstracting), the pass re-runs the consolidation once with a repair
+instruction; if the retry still won't shrink, the previous stored summary is kept.
+**How:** after `parseReflectResult` and **before** any apply/persist step, each answered queued
+shelf's `text.length` is compared to the joined length of the sample facts it was asked to
+summarize. On failure the reflection call is retried **once** with a byte-identical system prompt
+(the repair paragraph is appended to the *user* prompt only, so the per-agent prefix-stability
+check in `llm-call.js` never flags drift for agent `reflection`); only the failing buckets take the
+retry's shelves, and first-pass `#STORY`/`#OBS`/`#CALLBACK`/`#REEVAL` are kept to avoid
+re-adjudication drift. `MAX_SHELF_SUMMARY_CHARS` remains the final defensive cap. Trips are logged
+as `summary.compression_guard` (subsystem `reflection`). Ships alongside the delta-only prompt
+upgrades: the reflection prompt now feeds back the prior story summary and each queued shelf's
+prior summary (`prev:` lines) so both are **updated by integration**, never regenerated from
+scratch. `src/agent-reflect.js`.
+
+### 11. Cross-key supersede rules — `crossKeySupersede` (true) — **ON by default**
+**What it does (ELI5):** when a character dies or leaves, or an item is destroyed or lost, the
+facts that stopped being true along with it (their current location, what they're doing, who owns
+the item) are automatically retired to history — instead of being injected as present truth until
+someone happens to rewrite each one individually (NarrativeEngine timeline prior art; community
+research report §1.6).
+**How:** a small deterministic rule table (no LLM) in `database.js applyCrossKeySupersedeRules`,
+applied only at the genuine-new-write callers (Scribe `applyUpdates`, Writer `remember_fact`,
+review-popup edits — never migration/rebuild/merge replays). Three rules:
+- **death** — trigger: aspect `death`/`death_event`, OR a kind:`state` `status`/`health` write whose
+  value matches a death regex (with a "almost/nearly/not" negation lookbehind). Retires same-subject
+  `current_location`, `current_activity`, `current_goal`, `companions_present`, `status`, `health`.
+- **departure** — trigger: aspect `departure`/`departure_event`/`relocation` only (no value regex —
+  "left"/"gone" prose is too ambiguous). Retires `current_location`, `current_activity`,
+  `companions_present` (presence only).
+- **destroyed_lost** — trigger: aspect `lost_status`, OR a kind:`state`
+  `condition_of_item`/`lost_status`/`damage` write matching a destroyed/lost regex. Retires
+  `ownership`, `previous_owner`, `location_of_item`, `hidden_location`.
+
+Targets must be ACTIVE, non-sequence, explicit kind:`state` facts (legacy kind-less facts default
+to `trait` and are never swept) with the SAME derived subject; retirement reuses the standard
+supersession provenance — renamed to a `__was` snapshot, `active:false`, `supersededAt`, and
+`supersededBy` set to the trigger's `Category/key` cross-ref (logged as
+`fact.superseded` / `CROSS_KEY_RULE:<id>`) — **kept as history, never deleted**. Capped at 8
+invalidations per trigger. Caveat: append-only TRACK steps are exempt by design, so a
+`<char>_location` track still ends at its pre-death step — the track's last step can surface
+pre-death locations via track-reach injection; the retired *state* fact no longer does. OFF
+restores per-key-only supersession byte-for-byte. `src/database.js`, `src/agent-memory.js`,
+`src/agent-writer.js`, `src/pipeline.js`.
 
 ---
 

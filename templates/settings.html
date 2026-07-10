@@ -196,6 +196,11 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                             <span>Inject a Big Picture overview (story + relevant shelf summaries)</span>
                         </label>
                         <small class="bf-mem-hint">On by default. Gives the AI a short "story so far" recap plus quick summaries of the topics in play, instead of dumping hundreds of separate facts — a bird's-eye view. It stays small so it won't cost much, and the AI can still dig into details when it needs to. E.g. "Chapter so far: you and Mira escaped the city and are now hiding in the woods."</small>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_open_threads_enabled" />
+                            <span>Track open plot threads (Chekhov's guns)</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. Keeps a short list of unresolved story hooks — promises not yet kept, debts unpaid, mysteries unsolved — and shows it to the AI as one "Open threads:" line inside the Big Picture, so loose ends actually get picked up again instead of forgotten. Threads close automatically during memory maintenance once the story resolves them. E.g. "Open threads: Mira owes you a favor; the sealed letter is still unopened."</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -206,6 +211,24 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                             <span>Let one resonant past moment resurface when the present echoes it</span>
                         </label>
                         <small class="bf-mem-hint">Off by default. Once in a while, when the current moment between two characters mirrors something emotional from their past, it slips in one tiny reminder of that earlier moment — for a "remember when..." feeling. It's just one short line, and only on rare fitting turns. E.g. <i>[Echo: the last time you held her hand was at the harbor.]</i></small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-person-walking-arrow-loop-left"></i> Relationship re-entry pack</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_reentry_enabled" />
+                            <span>Refresh the AI on a relationship when a character returns</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When a character returns after being away for a while, their relationship status with those present plus 2-3 shared memories are guaranteed to be shown to the AI — so a reunion doesn't read like meeting a stranger. Only works with the "push" recall strategy (the scene tracker that spots returns only updates there); scene changes are counted by location moves, so a long chat in one room won't trigger it. E.g. Mira returns three scenes later and the AI still knows you two argued at the harbor and that she owes you a favor.</small>
+                        <div class="bf-mem-field">
+                            <label>Away for at least (scene changes) <span class="bf-mem-val" id="bf_mem_reentry_absence_val">2</span></label>
+                            <input type="range" id="bf_mem_reentry_absence" min="1" max="20" step="1" value="2" />
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>Shared memories to include <span class="bf-mem-val" id="bf_mem_reentry_moments_val">3</span></label>
+                            <input type="range" id="bf_mem_reentry_moments" min="1" max="5" step="1" value="3" />
+                        </div>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -221,6 +244,11 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-wand-magic-sparkles"></i> Retrieval &amp; extraction enhancements</div>
                     <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_knownby_enforced" checked />
+                            <span>Enforce who-knows-what (POV scoping)</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. Facts tagged with a who-knows list (@WhoKnows) are hidden from characters who aren't on it, so secrets stay secret. Facts with no list stay visible to everyone — but note the note-taker usually fills the list with whoever was present, so most facts are scoped. Turning this OFF restores full visibility: every character sees every fact (secrets <i>will</i> leak) — useful if you share one memory database across characters and facts seem to go missing.</small>
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_mmr_enabled" />
                             <span>Diversify injected facts (MMR)</span>
@@ -244,6 +272,20 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                             <span>Turn "yesterday" into real dates</span>
                         </label>
                         <small class="bf-mem-hint">On by default. Turns vague time words into real dates when saving a fact, so they still make sense later. E.g. "Mira left yesterday" gets saved as the actual date, so 100 messages on the AI doesn't think it was literally yesterday.</small>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_reflection_compression_guard" />
+                            <span>Retry summaries that didn't shrink</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. During the periodic tidy-up pass, each topic summary is supposed to be SHORTER than the facts it stands for. If the model hands one back that isn't, this re-runs that consolidation once ("rewrite the same memories more abstractly, don't add detail") and keeps the previous summary if it still won't shrink.</small>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_selection_enabled" />
+                            <span>Semantic shelf selection (1 cheap AI call per turn)</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. Uses the tidy-up pass's topic summaries as a menu: a small AI reads the recent chat and picks which memory drawers matter for the current scene, and a few top facts from those drawers join the normal recall (within the same token budget). Does nothing until the first tidy-up pass has written summaries, and falls back silently to normal retrieval on any failure. Costs one small AI call per turn and can add a few seconds of wait before each reply on slow providers.</small>
+                        <div class="bf-mem-field">
+                            <label>Max picks per turn <span class="bf-mem-val" id="bf_mem_selection_max_picks_val">6</span></label>
+                            <input type="range" id="bf_mem_selection_max_picks" min="1" max="20" step="1" value="6" />
+                        </div>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -264,6 +306,31 @@ Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, an
                             <span>Track when a fact is true in the story world</span>
                         </label>
                         <small class="bf-mem-hint">Off by default. Lets memory track <i>when</i> a fact is true inside the story, not just when you learned it. Helps a lot with flashbacks and time-skips. E.g. it can note "Mira was a soldier <code>until</code> age 20, then became a baker," so the AI doesn't mix up past and present.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-skull"></i> Cross-key supersede rules</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_cross_key_supersede" />
+                            <span>Auto-retire stale facts on death / departure / loss</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. When something big changes — a character dies or leaves, an item is destroyed or lost — related facts that stopped being true (their current location, what they're doing, who owns the item) are automatically retired to history. E.g. when Mira dies, her "current location" and alive-status facts stop being injected as present truth. Retired facts are kept as history, never deleted. Turn off to only update facts when the exact same fact is rewritten.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-hourglass-half"></i> Injected memory recency &amp; precedence</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_recency_labels" />
+                            <span>Label injected facts with how long ago they happened</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. Appends a small tail like <code>(~3 turns ago, scene 2)</code> to each injected fact so the AI can tell fresh developments from old news. Facts with no stored timing get no label (never a wrong one). Turn off to restore the plain fact lines.</small>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_truth_hierarchy" />
+                            <span>Split injected memory into CURRENT STATE vs CHRONOLOGY with precedence rules</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. Groups injected facts into <b>CURRENT STATE</b> (what is true right now — wins any conflict) and <b>CHRONOLOGY</b> (past events, oldest first — context only), so the AI stops replaying old events as if they were happening now. Turn off to restore the flat fact list.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -576,6 +643,27 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             </button>
                         </div>
                         <div id="bf_mem_full_chat_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
+                        <div class="bf-mem-field" style="margin-top:12px;">
+                            <label>Catch-up import (chunked)</label>
+                            <small class="bf-mem-hint">The cheaper way to onboard a long backlog: one AI call per <b>chunk</b> of messages instead of one per message, resumable if you cancel, and it shows the review popup at the end. Facts from a chunk get pinned to the chunk's last message, so the per-message brain icon is approximate for imported history. Don't chat while it runs.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:6px;">
+                            <label>Messages per call <span class="bf-mem-val" id="bf_mem_catchup_batch_val">8</span></label>
+                            <input type="range" id="bf_mem_catchup_batch" min="2" max="30" step="1" value="8" />
+                            <small class="bf-mem-hint">Bigger chunks = fewer, cheaper calls but coarser notes. 8 is a good default.</small>
+                        </div>
+                        <div class="bf-mem-db-actions" style="margin-top:6px;">
+                            <button id="bf_mem_catchup_run" class="menu_button">
+                                <i class="fa-solid fa-forward-fast"></i> Catch-up import
+                            </button>
+                            <button id="bf_mem_catchup_cancel" class="menu_button redWarningBG" style="display:none;">
+                                <i class="fa-solid fa-stop"></i> Cancel
+                            </button>
+                        </div>
+                        <div id="bf_mem_catchup_progress" style="display:none;margin-top:6px;">
+                            <div id="bf_mem_catchup_progress_text" class="bf-mem-hint" style="font-style:italic;"></div>
+                            <div class="bf-mem-catchup-bar"><div id="bf_mem_catchup_progress_fill" class="bf-mem-catchup-bar-fill"></div></div>
+                        </div>
                     </div>
                 </div>
 
@@ -677,6 +765,13 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                                 <i class="fa-solid fa-upload"></i> Import
                             </button>
                             <input type="file" id="bf_mem_import_file" accept="application/json,.json" style="display:none;" />
+                            <button id="bf_mem_export_wi" class="menu_button" title="Export facts as a SillyTavern World Info book (lorebook) with auto-generated trigger keywords.">
+                                <i class="fa-solid fa-book-atlas"></i> Export → World Info
+                            </button>
+                            <button id="bf_mem_import_wi" class="menu_button" title="Import a SillyTavern World Info book: each entry becomes a stored fact.">
+                                <i class="fa-solid fa-book-medical"></i> Import World Info
+                            </button>
+                            <input type="file" id="bf_mem_import_wi_file" accept="application/json,.json" style="display:none;" />
                             <button id="bf_mem_clear_db" class="menu_button redWarningBG">
                                 <i class="fa-solid fa-trash"></i> Clear All
                             </button>

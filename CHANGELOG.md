@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.61.0] - 2026-07-09
+
+### Added — community-features batch (adoption plan: `docs/COMMUNITY-RESEARCH-2026-07-09.md`)
+
+> Ten features adopted from community research (10 SillyTavern Reddit threads + competing memory extensions),
+> implemented against v0.60.0. All shipped complete; every changed file passes `node --input-type=module --check`.
+
+**Tier 1 — high impact, targets confirmed community pain**
+- **`knownBy` enforcement toggle** (`enforceKnownBy`, default **on**): the pre-existing knownBy/POV witness filter now has an escape hatch. The gate lives inside `isFactVisible()` (`src/fact-retrieval.js`), so every retrieval surface — push cascade, `search_memory`, scene/relationship rows, pipeline anchors, `/recall` — follows the toggle. Turning it off restores full visibility (secrets can leak); upgrades from older saves resolve to on (zero behavior change).
+- **Recency labels + hierarchy-of-truth header** (`injectRecencyLabels` + `injectTruthHierarchy`, both default **on**): new `src/recency.js` computes a per-turn now-context (message index / scene number / story time) and renders fail-soft recency tails on injected fact lines, plus a CURRENT STATE / CHRONOLOGY sectioned block with a precedence preamble. Push injection now formats through the same `buildFactLine` as everything else — also fixing a drifted-away `{from→until}` bi-temporal tail on the injected path — and the token estimator charges the identical tails.
+- **Relationship re-entry pack** (`enableRelationshipReentry`, default **off**, push mode): the scene card tracks per-character `lastSeen`; when a character returns after a configurable number of scene boundaries, the pipeline guarantees the pair's newest relationship-status record plus their last shared moment beats into the injection (deduped, charged against the retrieval budget). The Scribe and Reflection now maintain a single stable `Relationships/<a>_<b>_status` record per pair, and `upsertFact` canonicalizes reversed `<b>_<a>_status` keys so no duplicate pair records can be minted from any write path.
+- **Scribe/Reflection prompt upgrades**: enumerated ephemera stop-list with a YES/NO rubric, a delta-only rule against restating unchanged facts, and absolute limits replacing hedge phrasing in the Scribe prompt; the Reflection pass now *updates* its prior story/shelf summaries instead of regenerating from scratch; plus a compression guard (`reflectionCompressionGuard`, default **on**) that retries a shelf summary once when it comes back no shorter than its source facts.
+- **Open-threads tracking** (`enableOpenThreads`, default **on**): the Scribe marks unresolved plot hooks (`thread:open` on event facts), the Reflection pass resolves up to 5 per pass via a new `#THREADS` section, the Big Picture block gains a token-clamped "Open threads:" line, and the DB panel shows a thread-state chip. Replies without `#THREADS` (custom prompts) degrade to a silent no-op.
+- **Cross-key supersede rules** (`crossKeySupersede`, default **on**): a deterministic 3-rule table (death / departure / destroyed-or-lost) retires same-subject active state facts (e.g. `current_location`) to `__was` history when a triggering event is written — capped at 8 invalidations per trigger, with full debug-log audit trail. Fires only on genuine NEW/UPDATED writes at the three new-write callers (Scribe apply, `remember_fact`, review-popup edit commit); migrations, rebuilds, merges, and unchanged review-queue items never re-trigger it.
+
+**Tier 2 — adoption wedges + roadmap accelerants**
+- **Catch-up import** (`src/catchup-import.js`): chunked Scribe backfill over an existing chat's unprocessed backlog (Database-tab sub-block + `/bfmem catchup [N|cancel]`), with call-count confirm, progress bar, boundary-only cancel, per-chunk watermarks (cancel/fail is resumable), and abort-plus-snapshot guards on chat/character/profile switch. Configurable chunk size (`catchupBatchSize`, default 8, max 30).
+- **Selection-summary retrieval pass** (`selectionSummaryEnabled`, default **off**): an opt-in per-turn Selector LLM pass reads a shelf manifest built from the reflection summary pyramid and picks up to `selectionSummaryMaxPicks` (default 6) shelves/facts to admit as secondaries — a semantic layer without embeddings. Any failure leaves the deterministic cascade byte-identical; Selector tokens get their own Tokens-tab row.
+- **Unicode tokenization** (`src/tokenize.js`): a shared zero-dependency Unicode tokenizer (Intl.Segmenter with regex fallback, script-aware length gates) now feeds both the fact index and every query side, so index and query tokens can never diverge. Cyrillic/Greek/CJK chats now get working keyword extraction, fact keys, scene-location tokens, Big Picture shelf matching, entity promotion, and capitalized-entity detection; ASCII behavior is byte-identical to the legacy per-site splits. No settings, no migration.
+- **World Info interop** (`src/worldinfo-interop.js`): export the fact store as a standard ST World Info book (LLM-generated trigger keywords with a deterministic no-LLM fallback, explicit cost confirm) and import lorebooks from the three known dialects as idempotent `wi_` facts (1000-char value cap, merge-only, never resurrects deletions). Two new buttons beside the existing Export/Import.
+
+**Not adopted from the plan (this batch)**: Tier 2 items 2.5 (NPC agency line) and 2.6 (Reflection "internal truths") were not implemented; Tier 3 remains under evaluation.
+
 ## [0.60.0] - 2026-07-09
 
 ### Added / Changed / Removed — full audit implemented (PRs #3 + #4)

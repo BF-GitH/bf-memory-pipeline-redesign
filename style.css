@@ -381,6 +381,23 @@
     flex-wrap: wrap;
 }
 
+/* Catch-up import (chunked backlog onboarding) — thin progress bar under the text line. */
+.bf-mem-catchup-bar {
+    margin-top: 4px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--SmartThemeBorderColor, #333);
+    overflow: hidden;
+}
+
+.bf-mem-catchup-bar-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 2px;
+    background: var(--SmartThemeQuoteColor, #6cae75);
+    transition: width 0.3s ease;
+}
+
 .bf-mem-empty {
     color: #777;
     font-size: 12px;

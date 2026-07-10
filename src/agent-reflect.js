@@ -6,12 +6,16 @@
 //       to merge/supersede near-duplicate facts that accumulated over a long session, and
 //   (b) optionally writes 0-N high-value OBSERVATION facts (durable traits inferred across
 //       the session, e.g. "<CHARACTER> distrusts authority").
-// FIX #12: the rolling "story so far" #STORY summary has been REMOVED. It was no longer
-// injected anywhere (refinement #1 dropped the writer injection), so generating it — and
-// re-sending the prior summary back into the prompt each pass — was pure wasted output +
-// input tokens. We no longer ask for #STORY and no longer feed the prior summary back in.
+// FIX #12 (PARTIALLY REVERSED for the pyramid TOP): the rolling "story so far" #STORY summary
+// was once removed entirely because nothing consumed it. Since the summary pyramid landed, the
+// story IS consumed again — pipeline.js injects it via buildBigPictureBlock as the pyramid's
+// top level — so #STORY is requested again AND the PRIOR stored story is fed back into the
+// USER prompt (## Prior story summary) so the model UPDATES it by integration (delta-only)
+// instead of re-deriving it from scratch each pass. Prior SHELF summaries ride along the same
+// way ("prev:" lines under each queued shelf). The writer-injection removal (refinement #1)
+// itself stands: the story reaches the writer only through the Big Picture block.
 // The live UI panel (#bf_mem_reflection_view) still renders the synthesized OBSERVATIONS
-// (stored via setReflection with an empty summary), so no UI binding is broken.
+// (stored via setReflection), so no UI binding is broken.
 //
 // COST-AWARE: this is the ONE place a NEW LLM call is acceptable. It runs INFREQUENTLY
 // (every N successful pipeline runs, default 12) and OFF the latency-critical path
@@ -25,15 +29,17 @@
 // pipeline (mirrors the existing agent fallbacks).
 
 import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, markFactCold, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
+import { tokenSet, keyToken } from './tokenize.js';
 import { trackUpdate } from './review-popup.js';
 
 // Contradiction scan (atomic #7) tuning.
 const MAX_CONFLICT_PAIRS = 30;
 const NEAR_KEY_THRESHOLD = 0.72;
 
-/** Token-Jaccard similarity between two key strings (0..1). */
+/** Token-Jaccard similarity between two key strings (0..1). Shared Unicode tokenizer with
+ * min 1 — the legacy behavior kept ALL tokens after punctuation-stripping. */
 function keyJaccard(a, b) {
-    const tok = (s) => new Set(String(s).toLowerCase().replace(/[^a-z0-9]/g, ' ').split(/\s+/).filter(Boolean));
+    const tok = (s) => tokenSet(s, { min: 1 });
     const A = tok(a), B = tok(b);
     let inter = 0;
     for (const t of A) if (B.has(t)) inter++;
@@ -47,7 +53,7 @@ function findKeyConflicts(databases) {
     for (const [category, db] of Object.entries(databases || {})) {
         for (const fact of (db.facts || [])) {
             if (fact.active === false || !fact.key) continue;
-            const nk = String(fact.key).toLowerCase().replace(/[^a-z0-9_]/g, '_');
+            const nk = String(fact.key).toLowerCase().replace(/[^\p{L}\p{N}_]/gu, '_');
             if (!byKey.has(nk)) byKey.set(nk, []);
             byKey.get(nk).push({ category, fact });
         }
@@ -137,16 +143,27 @@ const MAX_MOMENTS_FOR_CALLBACK = 14;
 const MAX_CALLBACKS_PER_PASS = 2;
 // Cap a stored callback reason (chars) defensively, regardless of the model's compliance.
 const MAX_CALLBACK_REASON_CHARS = 120;
+// OPEN THREADS (open-threads feature) — bound how many unresolved `thread:open` plot hooks are
+// shown to the reflection pass (newest-first), and how many `resolved` verdicts it may apply per
+// pass. The Scribe opens threads; THIS pass is the only thing that closes them (no new LLM call —
+// the #THREADS section rides the existing reflection call). Bounded like the shelves/callbacks so
+// the call + apply stay cheap even when threads accumulate.
+const MAX_OPEN_THREADS = 12;
+const MAX_THREAD_RESOLUTIONS_PER_PASS = 5;
 
 export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, and to maintain short zoom-out summaries.
 
 Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
 
-Also produce a STORY summary: the whole-story "so far" in 2-4 short sentences (the top of a zoom-out pyramid — the cheapest big-picture recap). Keep it tight and factual.
+Among observations, ALSO maintain per-pair relationship STATUS records: when the stored facts show two characters with a real relationship but their single \`<a>_<b>_status\` record (Relationships, aspect status_of_relationship) is MISSING or CONTRADICTED by newer relationship facts, emit ONE observation that refreshes it — key EXACTLY \`<a>_<b>_status\` (both names lowercased, one underscore between the two names and before "status") and value = the current attitude in 1-4 words, optionally followed by open promises/debts and what last changed. Counts against the 0-5 cap; skip pairs whose stored record already matches.
 
-If a "## Shelves to summarize" list is given, write ONE short summary line per listed shelf (a shelf is a Category/aspect bucket of related facts). Each summary is one or two clauses (<= ~25 words) capturing the gist of that bucket so it can stand in for the raw facts. Only summarize the shelves in that list. If no list is given, put a single "." under #SHELVES.
+Also produce a STORY summary: the whole-story "so far" in 2-4 short sentences, at most 1200 characters (the top of a zoom-out pyramid — the cheapest big-picture recap). Keep it tight and factual. If a "## Prior story summary" block is given, UPDATE it: fold in only what is NEW since it was written, drop nothing that is still true, and NEVER re-derive it from scratch or restate unchanged parts at greater length. Your output is still the COMPLETE replacement text (it replaces the prior summary wholesale), but you build it by integrating the new material into the prior text, not by regenerating.
+
+If a "## Shelves to summarize" list is given, write ONE short summary line per listed shelf (a shelf is a Category/aspect bucket of related facts). Each summary is one or two clauses (at most 25 words) capturing the gist of that bucket so it can stand in for the raw facts — it MUST be shorter than the raw facts it stands for; abstract, never enumerate. When a shelf shows a "prev:" line (its prior stored summary), UPDATE that prior summary — integrate what the samples add or change; do not regenerate from scratch and do not restate it at greater length. Only summarize the shelves in that list. If no list is given, put a single "." under #SHELVES.
 
 If a "## Recent moments" list is given (the couple/character emotional beats — confessions, fights, betrayals, reunions — each shown with its exact id), you MAY name 0-2 CALLBACK links: a NEW recent beat that clearly ECHOES an EARLIER one (a confession that pays off an earlier hidden feeling; a betrayal that resurfaces an old wound; a reunion that answers a parting). Emit a link ONLY when the resonance is unmistakable — most passes name none. Each link points the EARLIER beat's id to the LATER beat's id with a one-clause reason. Use ONLY ids from the list (never invent one). If no clear echo exists (or no list was given), put a single "." under #CALLBACK.
+
+If an "## Open threads" list is given (unresolved plot hooks — promises, debts, mysteries, unfired Chekhov guns — each shown with its exact id), mark a thread \`resolved\` ONLY when the stored material clearly shows it concluded (the promise kept, the debt paid, the mystery answered, the gun fired). Most passes resolve none — when in doubt, leave it open. Reference each thread by its exact id shown in brackets; never invent an id.
 
 You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture:
 - PROMOTE — the evidence now supports it as a real, lasting fact: give its proper Layer-1 category (People/Places/Things/Relationships/Events/World) and the most-specific aspect. e.g. a recurring vice → People/vices; a confirmed home → People/home.
@@ -170,21 +187,27 @@ Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fac
 #CALLBACK
 + <earlier_id> <- <later_id> | <short reason this later beat echoes the earlier one>
 .
+#THREADS
++ <id> = resolved | <short reason the thread is concluded>
+.
 #REEVAL
 + <id> = promote | <Category> | <aspect>
 + <id> = drop
 + <id> = keep
 .
 
-If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no clear echo exists (or no recent-moments list was given), put a single "." under #CALLBACK. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (<= ~10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material.`;
+If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no clear echo exists (or no recent-moments list was given), put a single "." under #CALLBACK. If no open-threads list was given (or nothing is clearly concluded — the usual case), put a single "." under #THREADS. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (at most 10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material.`;
 
 /**
  * Build the compact, bounded input bundle for the reflection pass.
  * @param {object} args
  * @param {object|null} args.scene - current scene card
  * @param {object|null} [args.prevReflection] - DEPRECATED (FIX #12): retained in the signature
- *   for back-compat but NO LONGER fed into the prompt. The rolling story summary was dropped
- *   (it was never injected anywhere), so re-sending it each pass was wasted input tokens.
+ *   for back-compat but NO LONGER fed into the prompt. The PRIOR STORY now travels via the
+ *   dedicated `priorStory` arg instead (pyramid top — see the header note).
+ * @param {string} [args.priorStory] - the last STORED story summary (pyramid top). When
+ *   non-empty it is shown as a "## Prior story summary" block so the model UPDATES it
+ *   (delta-only integration) instead of re-deriving the whole story each pass.
  * @param {Object} args.databases - all fact databases
  * @returns {string} the user-prompt data block
  */
@@ -270,6 +293,39 @@ function collectRecentMoments(databases) {
 }
 
 /**
+ * OPEN THREADS (open-threads feature) — collect the unresolved `thread:open` plot hooks the
+ * reflection pass may close this run. The Scribe opens threads (`thread:open` marker); THIS pass
+ * is the only thing that resolves them, via #THREADS verdicts riding the same LLM call. Each
+ * candidate carries a stable id (`category::key`) the model echoes back so a verdict can be
+ * validated against a REAL fact (hallucinated ids are dropped, mirroring momentById/reevalById).
+ * Newest-first by the same birth-order spine collectRecentMoments uses (validAt → sceneNo →
+ * lastUpdated), bounded to MAX_OPEN_THREADS. Skips superseded snapshots + timeline steps.
+ * @param {Object} databases
+ * @returns {Array<{id:string, category:string, key:string, fact:object}>}
+ */
+function collectOpenThreads(databases) {
+    const out = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (!fact || fact.active === false || fact.track) continue; // skip superseded snapshots + timeline steps
+            if (fact.thread !== 'open') continue;
+            out.push({ id: `${category}::${fact.key}`, category, key: fact.key, fact });
+        }
+    }
+    // Newest-first by birth-order spine: validAt → sceneNo → lastUpdated (mirrors collectRecentMoments).
+    out.sort((a, b) => {
+        const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : -1;
+        const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : -1;
+        if (av !== bv) return bv - av;
+        const as = Number.isInteger(a.fact.sceneNo) ? a.fact.sceneNo : -1;
+        const bs = Number.isInteger(b.fact.sceneNo) ? b.fact.sceneNo : -1;
+        if (as !== bs) return bs - as;
+        return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
+    });
+    return out.slice(0, MAX_OPEN_THREADS);
+}
+
+/**
  * SUMMARY PYRAMID — pick which (category, aspect) shelves to (re)summarize THIS pass.
  * COST GUARD: only buckets that MATERIALLY CHANGED since their last stored summary are
  * candidates — a bucket changed if it has no stored shelf entry yet, or its current active
@@ -280,7 +336,7 @@ function collectRecentMoments(databases) {
  *
  * @param {{aspectCounts: Map, byCatAspect: Map}} index - prebuilt memory index (active facts)
  * @param {{shelves?: Object<string,{factCount:number}>}|null} priorPyramid - last stored pyramid
- * @returns {Array<{bucketKey:string, category:string, aspect:string, factCount:number, prevCount:number, samples:string[]}>}
+ * @returns {Array<{bucketKey:string, category:string, aspect:string, factCount:number, prevCount:number, prevText:string, samples:string[]}>}
  */
 function pickChangedShelves(index, priorPyramid) {
     const priorShelves = (priorPyramid && priorPyramid.shelves) || {};
@@ -303,7 +359,9 @@ function pickChangedShelves(index, priorPyramid) {
                 .sort((a, b) => (Number(b.lastUpdated) || 0) - (Number(a.lastUpdated) || 0))
                 .slice(0, MAX_SHELF_SAMPLE_FACTS)
                 .map(f => `${f.key} = ${String(f.value).slice(0, 120)}`);
-            candidates.push({ bucketKey, category, aspect, factCount: count, prevCount, samples });
+            // Carry the prior stored summary text forward so the prompt can show a "prev:" line —
+            // the model UPDATES the prior summary (delta-only) instead of regenerating it.
+            candidates.push({ bucketKey, category, aspect, factCount: count, prevCount, prevText: (prev && typeof prev.text === 'string') ? prev.text : '', samples });
         }
     }
     // Biggest change first (abs delta; brand-new buckets weigh their full count) — refresh the
@@ -312,11 +370,16 @@ function pickChangedShelves(index, priorPyramid) {
     return candidates.slice(0, MAX_SHELVES_PER_PASS);
 }
 
-function buildReflectInput({ scene, databases, reevalCandidates = [], changedShelves = [], recentMoments = [] }) {
+function buildReflectInput({ scene, databases, reevalCandidates = [], changedShelves = [], recentMoments = [], openThreads = [], priorStory = '' }) {
     const parts = [];
 
-    // FIX #12: the prior "story so far" summary is intentionally NOT prepended anymore — the
-    // pass now only synthesizes OBSERVATIONS, which reconcile against existing facts on write.
+    // FIX #12 partially reversed (see header): the story IS consumed now (pipeline.js
+    // buildBigPictureBlock injects it as the pyramid top), so the PRIOR stored story is fed
+    // back in so the model UPDATES it by integration instead of re-deriving it each pass.
+    // Lives in the USER prompt (variable per-chat content — never the static system prefix).
+    if (typeof priorStory === 'string' && priorStory.trim()) {
+        parts.push(`## Prior story summary (update this; do not restate unchanged parts at greater length)\n${priorStory.trim()}`);
+    }
 
     // Current scene + recent beats.
     if (scene && typeof scene === 'object') {
@@ -364,7 +427,9 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
     if (Array.isArray(changedShelves) && changedShelves.length) {
         const shelfLines = changedShelves.map(s => {
             const sample = s.samples && s.samples.length ? `\n    ${s.samples.join('\n    ')}` : '';
-            return `+ ${s.category}/${s.aspect} (${s.factCount} fact${s.factCount === 1 ? '' : 's'})${sample}`;
+            // Prior stored summary (when present) so the model UPDATES it rather than regenerating.
+            const prev = (typeof s.prevText === 'string' && s.prevText.trim()) ? `\n    prev: ${s.prevText.trim()}` : '';
+            return `+ ${s.category}/${s.aspect} (${s.factCount} fact${s.factCount === 1 ? '' : 's'})${sample}${prev}`;
         });
         parts.push(`## Shelves to summarize (one short summary per shelf, echo the exact Category/aspect label)\n${shelfLines.join('\n')}`);
     }
@@ -384,6 +449,20 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
         parts.push(`## Recent moments (name 0-2 #CALLBACK echo-links between these by exact id; newest first)\n${mLines.join('\n')}`);
     }
 
+    // OPEN THREADS (open-threads feature) — unresolved plot hooks the model may close via
+    // #THREADS. Each line is `[id] value (>context)` so the model can judge whether the stored
+    // material shows the thread concluded and reference it by exact id. Newest-first
+    // (collectOpenThreads order), bounded to MAX_OPEN_THREADS.
+    if (Array.isArray(openThreads) && openThreads.length) {
+        const tLines = openThreads.map(c => {
+            const f = c.fact;
+            const val = String(f.value ?? '').trim().slice(0, 140);
+            const note = (typeof f.context === 'string' && f.context.trim()) ? ` (>${f.context.trim().slice(0, 100)})` : '';
+            return `[${c.id}] ${val}${note}`;
+        });
+        parts.push(`## Open threads (mark one #THREADS resolved ONLY when the stored material clearly shows it concluded; newest first)\n${tLines.join('\n')}`);
+    }
+
     // Re-evaluation candidates (uncertain Unsorted/misc + stale states). Each line is
     // `[id] Category/key = value (note)` so the model can return a verdict per id.
     if (Array.isArray(reevalCandidates) && reevalCandidates.length) {
@@ -397,7 +476,7 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
         parts.push(`## Re-evaluate (give a verdict per id)\n${reLines.join('\n')}`);
     }
 
-    parts.push('\nNow output ONLY the #STORY, #SHELVES, #OBS, #CALLBACK and #REEVAL sections.');
+    parts.push('\nNow output ONLY the #STORY, #SHELVES, #OBS, #CALLBACK, #THREADS and #REEVAL sections.');
     return parts.join('\n\n');
 }
 
@@ -408,13 +487,13 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
  * @returns {{summary: string, observations: Array<{key:string,value:string}>}}
  */
 export function parseReflectResult(response) {
-    const out = { summary: '', shelves: [], observations: [], callbacks: [], reevals: [] };
+    const out = { summary: '', shelves: [], observations: [], callbacks: [], threads: [], reevals: [] };
     if (!response || !response.trim()) return out;
 
     let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim()).replace(/```/g, '');
 
     // #STORY ... (bounded before #SHELVES/#OBS — whichever comes first).
-    const storyMatch = text.match(/#STORY\s*([\s\S]*?)(?=\n\s*#(?:SHELVES|OBS|CALLBACK|REEVAL)\b|$)/i);
+    const storyMatch = text.match(/#STORY\s*([\s\S]*?)(?=\n\s*#(?:SHELVES|OBS|CALLBACK|THREADS|REEVAL)\b|$)/i);
     if (storyMatch) {
         let s = storyMatch[1].trim();
         // The grammar tells the model to terminate the section with a lone ".". Strip a
@@ -426,7 +505,7 @@ export function parseReflectResult(response) {
     }
 
     // #SHELVES lines: `+ Category/aspect = short summary`. Bounded before #OBS.
-    const shelvesMatch = text.match(/#SHELVES\s*([\s\S]*?)(?=\n\s*#(?:OBS|CALLBACK|REEVAL)\b|$)/i);
+    const shelvesMatch = text.match(/#SHELVES\s*([\s\S]*?)(?=\n\s*#(?:OBS|CALLBACK|THREADS|REEVAL)\b|$)/i);
     if (shelvesMatch) {
         const block = shelvesMatch[1].trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
@@ -452,8 +531,8 @@ export function parseReflectResult(response) {
         }
     }
 
-    // #OBS lines: `+ key = value`. Bounded BEFORE #CALLBACK/#REEVAL so it can't swallow them.
-    const obsMatch = text.match(/#OBS\s*([\s\S]*?)(?=\n\s*#CALLBACK|\n\s*#REEVAL|$)/i);
+    // #OBS lines: `+ key = value`. Bounded BEFORE #CALLBACK/#THREADS/#REEVAL so it can't swallow them.
+    const obsMatch = text.match(/#OBS\s*([\s\S]*?)(?=\n\s*#CALLBACK|\n\s*#THREADS|\n\s*#REEVAL|$)/i);
     if (obsMatch) {
         const block = obsMatch[1].trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
@@ -467,7 +546,7 @@ export function parseReflectResult(response) {
                 // Strip an optional Category/ prefix if the model added one.
                 const slashIdx = key.indexOf('/');
                 if (slashIdx >= 0) key = key.slice(slashIdx + 1).trim();
-                key = key.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+                key = keyToken(key); // Unicode-preserving — a non-Latin key no longer cleans to '' and drops the line
                 const value = line.slice(eqIdx + 1).trim();
                 if (!key || !value) continue;
                 out.observations.push({ key, value });
@@ -478,9 +557,9 @@ export function parseReflectResult(response) {
 
     // #CALLBACK lines (Resonance Part A): `+ <earlier_id> <- <later_id> | <reason>`. A typed,
     // cross-beat ECHO edge — the EARLIER beat pays off in the LATER one. Parsed leniently and
-    // bounded BEFORE #REEVAL. Graceful when absent (a lone "."): out.callbacks stays empty.
+    // bounded BEFORE #THREADS/#REEVAL. Graceful when absent (a lone "."): out.callbacks stays empty.
     // We accept `<-` (the documented arrow) and tolerate a few near-forms the model may emit.
-    const cbMatch = text.match(/#CALLBACK\s*([\s\S]*?)(?=\n\s*#REEVAL|$)/i);
+    const cbMatch = text.match(/#CALLBACK\s*([\s\S]*?)(?=\n\s*#THREADS|\n\s*#REEVAL|$)/i);
     if (cbMatch) {
         const block = cbMatch[1].trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
@@ -502,6 +581,33 @@ export function parseReflectResult(response) {
                 if (reason.length > MAX_CALLBACK_REASON_CHARS) reason = reason.slice(0, MAX_CALLBACK_REASON_CHARS).trimEnd() + '…';
                 out.callbacks.push({ earlierId, laterId, reason });
                 if (out.callbacks.length >= MAX_CALLBACKS_PER_PASS) break;
+            }
+        }
+    }
+
+    // #THREADS lines (open-threads feature): `+ <id> = resolved | <short reason>`. The id is the
+    // candidate's `category::key` token emitted in the "## Open threads" prompt list. Parsed
+    // leniently: any verdict that isn't "resolved" (e.g. "keep", the implicit default) is ignored
+    // — only resolutions are actionable. Bounded BEFORE #REEVAL and capped defensively at
+    // MAX_THREAD_RESOLUTIONS_PER_PASS. Graceful when absent (a lone "."): out.threads stays empty.
+    const thMatch = text.match(/#THREADS\s*([\s\S]*?)(?=\n\s*#REEVAL|$)/i);
+    if (thMatch) {
+        const block = thMatch[1].trim();
+        if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
+            for (const rawLine of block.split('\n')) {
+                let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
+                if (!line || line === '.' || !line.startsWith('+')) continue;
+                line = line.slice(1).trim();
+                const eqIdx = line.indexOf('=');
+                if (eqIdx < 0) continue;
+                // The id may be wrapped in [brackets] as printed in the prompt — strip them.
+                const id = line.slice(0, eqIdx).trim().replace(/^\[|\]$/g, '').trim();
+                const verdictPart = line.slice(eqIdx + 1).trim();
+                const segs = verdictPart.split('|').map(s => s.trim()).filter(Boolean);
+                const verdict = (segs[0] || '').toLowerCase();
+                if (!id || !verdict.startsWith('resolve')) continue; // default keep — only resolutions act
+                out.threads.push({ id, reason: (segs[1] || '').slice(0, MAX_CALLBACK_REASON_CHARS) });
+                if (out.threads.length >= MAX_THREAD_RESOLUTIONS_PER_PASS) break;
             }
         }
     }
@@ -657,6 +763,14 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const recentMoments = collectRecentMoments(databases);
         const momentById = new Map(recentMoments.map(c => [c.id, c]));
 
+        // OPEN THREADS (open-threads feature): gather the unresolved `thread:open` hooks so the
+        // SAME reflection LLM call can ALSO close the ones the stored material shows concluded
+        // (#THREADS verdicts). Bounded (MAX_OPEN_THREADS, newest-first). The id→candidate map
+        // validates the model's referenced ids against real facts (hallucinated ids are dropped,
+        // mirroring momentById/reevalById).
+        const openThreads = collectOpenThreads(databases);
+        const threadById = new Map(openThreads.map(c => [c.id, c]));
+
         // SUMMARY PYRAMID (middle layer): pick which (category, aspect) shelves changed since
         // their last summary and fold a bounded #SHELVES request into THIS same LLM call (no
         // extra call). Index is built from the post-dedupe databases. Cost-guarded: only
@@ -675,23 +789,87 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const dataParts = [];
         if (characterInfo) dataParts.push(`## Character Info ({{char}})\n${characterInfo}`);
         if (userPersona) dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
-        dataParts.push(buildReflectInput({ scene, databases, reevalCandidates, changedShelves, recentMoments }));
+        dataParts.push(buildReflectInput({ scene, databases, reevalCandidates, changedShelves, recentMoments, openThreads, priorStory: (priorPyramid && priorPyramid.story) || '' }));
         const userPrompt = substitute(dataParts.join('\n\n'));
 
         addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
         const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'reflection');
-        const tokensIn = await host.getTokenCount(systemPrompt + '\n' + userPrompt);
-        const tokensOut = await host.getTokenCount(resultStr);
+        let tokensIn = await host.getTokenCount(systemPrompt + '\n' + userPrompt);
+        let tokensOut = await host.getTokenCount(resultStr);
         addDebugLog('info', `[${runId}] Reflection LLM reply (${resultStr.length} chars):\n${resultStr}`);
 
         const parsed = parseReflectResult(resultStr);
 
-        // Persist reflection state (per-chat) for the live UI panel. FIX #12: the rolling
-        // #STORY summary is no longer requested, so parsed.summary is normally empty — we now
-        // store whenever there is EITHER a (legacy/custom-prompt) summary OR observations, so
-        // the panel keeps rendering the synthesized observation chips. normalizeReflection
-        // accepts an observations-only reflection (returns null only when BOTH are empty).
+        // COMPRESSION GUARD (reflectionCompressionGuard, default ON) — runs BEFORE any
+        // apply/persist step. A shelf "summary" that is not SHORTER than the raw sample facts
+        // it stands for is a compression failure (the model added detail instead of
+        // abstracting). When one or more queued shelves fail, re-run the call ONCE with the
+        // BYTE-IDENTICAL system prompt — the repair paragraph is appended to the USER prompt
+        // ONLY, so llm-call.js's per-agent prefix-stability check (cache.drift) never fires
+        // for agent 'reflection' — and take the retry's shelves for the FAILING buckets only.
+        // First-pass #STORY/#OBS/#CALLBACK/#REEVAL are kept (no re-adjudication drift). A
+        // retry shelf that STILL isn't smaller is dropped, so the stored prior summary is
+        // carried forward untouched (never loops — single retry, cost-capped). The
+        // MAX_SHELF_SUMMARY_CHARS clamp in parseReflectResult remains the final defensive cap.
+        try {
+            if (settings?.reflectionCompressionGuard !== false && changedShelves.length && (parsed.shelves || []).length) {
+                const queuedByKey = new Map(changedShelves.map(s => [s.bucketKey, s]));
+                const shelfInputLen = (queued) => (queued.samples || []).join('\n').length;
+                const failing = [];
+                for (const sh of parsed.shelves) {
+                    const bucketKey = `${String(sh.category).toLowerCase()}||${String(sh.aspect).toLowerCase()}`;
+                    const queued = queuedByKey.get(bucketKey);
+                    if (!queued) continue; // unqueued shelf — the merge loop ignores it anyway
+                    const inputLen = shelfInputLen(queued);
+                    if (inputLen > 0 && String(sh.text || '').length >= inputLen) failing.push(bucketKey);
+                }
+                if (failing.length) {
+                    addDebugLog('info', `[${runId}] Compression guard tripped: ${failing.length} shelf summary(ies) not shorter than their source facts — retrying once`, {
+                        subsystem: 'reflection', event: 'summary.compression_guard', reason: 'NOT_SMALLER',
+                        data: { failing, queued: changedShelves.length },
+                    });
+                    const repairUserPrompt = userPrompt + '\n\nYour #SHELVES summaries were not shorter than the source facts. Rewrite the SAME source memories more abstractly instead of adding detail; do not introduce new facts.';
+                    const retryStr = await callAgentLLM(systemPrompt, repairUserPrompt, profileId, 'reflection');
+                    tokensIn += await host.getTokenCount(systemPrompt + '\n' + repairUserPrompt);
+                    tokensOut += await host.getTokenCount(retryStr);
+                    const reparsed = parseReflectResult(retryStr);
+                    const retryByKey = new Map((reparsed.shelves || []).map(sh => [`${String(sh.category).toLowerCase()}||${String(sh.aspect).toLowerCase()}`, sh]));
+                    const failingSet = new Set(failing);
+                    // Keep first-pass shelves that passed; swap in the retry's version for each
+                    // failing bucket — but only when it actually compresses this time.
+                    const accepted = [];
+                    let stillFailing = 0;
+                    for (const bucketKey of failing) {
+                        const retrySh = retryByKey.get(bucketKey);
+                        const queued = queuedByKey.get(bucketKey);
+                        if (retrySh && queued && String(retrySh.text || '').length < shelfInputLen(queued)) {
+                            accepted.push(retrySh);
+                        } else {
+                            stillFailing++;
+                        }
+                    }
+                    parsed.shelves = parsed.shelves
+                        .filter(sh => !failingSet.has(`${String(sh.category).toLowerCase()}||${String(sh.aspect).toLowerCase()}`))
+                        .concat(accepted);
+                    addDebugLog(stillFailing ? 'info' : 'pass', `[${runId}] Compression guard retry: ${accepted.length} shelf(s) repaired, ${stillFailing} still too long (prior summary kept)`, {
+                        subsystem: 'reflection', event: 'summary.compression_guard', reason: stillFailing ? 'RETRY_PARTIAL' : 'RETRY_OK',
+                        data: { repaired: accepted.length, stillFailing },
+                    });
+                }
+            }
+        } catch (err) {
+            addDebugLog('fail', `[${runId}] Compression guard failed (non-fatal): ${err.message || err}`, {
+                subsystem: 'reflection', event: 'summary.compression_guard', reason: 'ERROR',
+            });
+        }
+
+        // Persist reflection state (per-chat) for the live UI panel. #STORY is requested again
+        // (pyramid top — FIX #12 partially reversed, see header) and is now built by UPDATING
+        // the prior stored story fed back in the user prompt. We store whenever there is EITHER
+        // a summary OR observations, so the panel keeps rendering the synthesized observation
+        // chips. normalizeReflection accepts an observations-only reflection (returns null only
+        // when BOTH are empty).
         if (parsed.summary || parsed.observations.length > 0) {
             setReflection({ summary: parsed.summary, observations: parsed.observations.map(o => o.value) }, runId);
         }
@@ -743,32 +921,46 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             // value honest if the vocab ever moves. The subject is derived from the observation
             // key's prefix exactly the way agent-memory's parser stamps it (deriveSubjectFromObsKey
             // below), so the bySubject index / focus filter treat these facts like Scribe-written ones.
-            const category = 'People';
-            const aspect = normalizeAspect('habits', category);
-            if (!databases[category]) databases[category] = createEmptyDatabase(category);
-            const db = databases[category];
+            //
+            // RELATIONSHIP STATUS maintenance (community adoption): an observation whose key is
+            // EXACTLY `<a>_<b>_status` (two distinct single name tokens + the literal suffix) is
+            // the per-pair record the Scribe maintains — route it to Relationships with aspect
+            // status_of_relationship + kind:state so it rides upsertFact's supersession path
+            // against the Scribe-written record instead of forking a People/habits duplicate.
+            // STRICT pair validation: any ambiguity (missing/extra underscore segments, identical
+            // names) falls back to the normal People/habits observation path.
             const charName = host.getCurrentCharacterName();
+            const savedCategories = new Set();
             for (const obs of parsed.observations) {
-                upsertFact(db, {
+                const pairMatch = /^([a-z0-9]+)_([a-z0-9]+)_status$/.exec(String(obs.key || '').trim().toLowerCase());
+                const isPairStatus = !!(pairMatch && pairMatch[1] !== pairMatch[2]);
+                const category = isPairStatus ? 'Relationships' : 'People';
+                const aspect = normalizeAspect(isPairStatus ? 'status_of_relationship' : 'habits', category);
+                if (!databases[category]) databases[category] = createEmptyDatabase(category);
+                upsertFact(databases[category], {
                     key: obs.key,
                     value: obs.value,
                     aspect,
-                    subject: deriveSubjectFromObsKey(obs.key),
+                    subject: isPairStatus ? pairMatch[1] : deriveSubjectFromObsKey(obs.key),
+                    ...(isPairStatus ? { involved: [pairMatch[2]] } : {}),
                     tags: ['observation', 'reflection'],
                     knownBy: charName ? [charName] : [],
                     relationships: { primary: [], secondary: [], tertiary: [] },
                     source: `reflection_${runId}`,
                     importance: 4,
-                    kind: 'trait',
+                    kind: isPairStatus ? 'state' : 'trait',
                 });
+                savedCategories.add(category);
                 written++;
             }
-            try {
-                await saveDatabase(db);
-                addDebugLog('pass', `[${runId}] Reflection wrote ${written} observation(s) to ${category}/${aspect}`);
-            } catch (err) {
-                addDebugLog('fail', `[${runId}] Reflection failed to save observations: ${err.message || err}`);
+            for (const category of savedCategories) {
+                try {
+                    await saveDatabase(databases[category]);
+                } catch (err) {
+                    addDebugLog('fail', `[${runId}] Reflection failed to save observations to "${category}": ${err.message || err}`);
+                }
             }
+            addDebugLog('pass', `[${runId}] Reflection wrote ${written} observation(s) (${[...savedCategories].join(', ')})`);
         }
 
         // CALLBACK LINKS (Resonance Part A): store the model's cross-beat echo edges as a typed,
@@ -804,6 +996,37 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         }
         if (callbacksWritten > 0) {
             addDebugLog('pass', `[${runId}] Reflection authored ${callbacksWritten} callback-link(s) (cap ${MAX_CALLBACKS_PER_PASS}, from ${recentMoments.length} recent moment(s))`);
+        }
+
+        // OPEN THREADS (open-threads feature): apply the model's `resolved` verdicts. VALIDATION:
+        // each id MUST resolve to a thread we actually showed this pass (threadById) — dangling/
+        // hallucinated ids are dropped exactly like momentById/reevalById. Resolving flips
+        // `thread` to 'resolved' and stamps `threadResolvedAt`; the fact's cold-tier protection
+        // and its Big Picture surfacing lapse (getOpenThreads only returns 'open'). NEVER deletes
+        // anything — the resolved event stays a normal durable fact. Bounded by the parser's
+        // MAX_THREAD_RESOLUTIONS_PER_PASS cap. Best-effort per category save.
+        let threadsResolved = 0;
+        const threadModified = new Set();
+        for (const tv of (parsed.threads || [])) {
+            const cand = threadById.get(tv.id);
+            if (!cand) continue; // dangling/hallucinated id — drop it
+            const fact = cand.fact;
+            if (fact.thread !== 'open') continue; // already resolved/cleared since collection
+            fact.thread = 'resolved';
+            fact.threadResolvedAt = Date.now();
+            threadModified.add(cand.category);
+            threadsResolved++;
+            addDebugLog('info', `[${runId}] Reflection resolved thread: [${cand.category}] ${cand.key} = "${String(fact.value ?? '').slice(0, 60)}"${tv.reason ? ` | ${tv.reason}` : ''}`, {
+                subsystem: 'reflection', event: 'thread.resolved',
+                data: { category: cand.category, key: cand.key, reason: tv.reason || '' },
+            });
+        }
+        for (const category of threadModified) {
+            try { await saveDatabase(databases[category]); }
+            catch (err) { addDebugLog('fail', `[${runId}] Thread resolution failed to save "${category}": ${err.message || err}`); }
+        }
+        if (threadsResolved > 0) {
+            addDebugLog('pass', `[${runId}] Reflection resolved ${threadsResolved} open thread(s) (cap ${MAX_THREAD_RESOLUTIONS_PER_PASS}, from ${openThreads.length} open)`);
         }
 
         // RE-EVALUATION: apply promote/drop verdicts on the uncertain candidates. PROMOTE
@@ -878,8 +1101,8 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             addDebugLog('pass', `[${runId}] Re-evaluation: promoted ${promoted}, dropped ${dropped} (from ${reevalCandidates.length} candidate(s))`);
         }
 
-        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, callbacks=${callbacksWritten}, reeval(+${promoted}/-${dropped})`);
-        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, callbacks: callbacksWritten, promoted, dropped, tokensIn, tokensOut };
+        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, callbacks=${callbacksWritten}, threads=${threadsResolved}, reeval(+${promoted}/-${dropped})`);
+        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, callbacks: callbacksWritten, threadsResolved, promoted, dropped, tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Reflection error (non-fatal): ${error.message || error}`);
         return { summary: '', observations: [], tokensIn: 0, tokensOut: 0, error: error.message || String(error) };

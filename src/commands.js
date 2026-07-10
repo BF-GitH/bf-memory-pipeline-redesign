@@ -13,6 +13,8 @@
 //   /bfmem status          — toast a one-line status (enabled? preset? fact count)
 //   /bfmem recall <query>  — search long-term memory, return the formatted facts (pipeable)
 //   /bfmem facts [N]       — list up to N (default 20) stored facts (pipeable)
+//   /bfmem catchup [N|cancel] — chunked catch-up import of this chat's unprocessed backlog
+//                            (optional batch-size override N; 'cancel' stops the running one)
 //
 // Macro:
 //   {{bf_facts}}           — a compact newline list of the current character's stored facts
@@ -101,6 +103,54 @@ async function actionFacts(n) {
     return lines.join('\n');
 }
 
+/**
+ * Chunked catch-up import over the current chat (community adoption §2.1; engine in
+ * src/catchup-import.js — shares its in-flight/cancel state with the Database-tab button).
+ *   /bfmem catchup            — run with the configured batch size (catchupBatchSize)
+ *   /bfmem catchup 15         — run with a one-off batch-size override (clamped 2-30)
+ *   /bfmem catchup cancel     — stop the running import at the next chunk boundary
+ * Returns a pipeable summary string.
+ */
+async function actionCatchup(rest) {
+    const arg = String(rest || '').trim().toLowerCase();
+    try {
+        const { runCatchupImport, cancelCatchupImport, isCatchupRunning } = await import('./catchup-import.js');
+        if (arg === 'cancel') {
+            const wasRunning = cancelCatchupImport();
+            const msg = wasRunning
+                ? 'Catch-up import cancelling (stops after the current chunk)…'
+                : 'No catch-up import is running.';
+            toast('info', msg);
+            return msg;
+        }
+        if (isCatchupRunning()) {
+            const msg = 'A catch-up import is already running (/bfmem catchup cancel to stop it).';
+            toast('warning', msg);
+            return msg;
+        }
+        const batchOverride = /^\d+$/.test(arg) ? parseInt(arg, 10) : undefined;
+        toast('info', 'Catch-up import started — progress in the Database tab / toasts.');
+        const result = await runCatchupImport({
+            batchSize: batchOverride,
+            onProgress: ({ chunk, chunks, msgsDone, msgsTotal, factsAdded }) => {
+                // Toast progress sparingly (every 5 chunks + the last) so a long import
+                // doesn't bury the UI in notifications.
+                if (chunk === chunks || chunk % 5 === 0) {
+                    toast('info', `Catch-up: chunk ${chunk}/${chunks} · ${msgsDone}/${msgsTotal} msgs · ${factsAdded} facts`);
+                }
+            },
+        });
+        if (result.refused) return `catch-up refused: ${result.refused}`;
+        const verb = result.cancelled ? 'cancelled' : result.aborted ? 'stopped' : 'done';
+        const msg = `catch-up ${verb}: ${result.processedChunks}/${result.chunks} chunks, ${result.msgsDone} msgs, ${result.factsAdded} facts${result.failedChunks ? ` (${result.failedChunks} chunk(s) failed — re-run to retry)` : ''}`;
+        toast(result.failedChunks ? 'warning' : 'success', msg);
+        return msg;
+    } catch (e) {
+        addDebugLog('fail', `Slash catchup failed: ${e?.message || e}`);
+        return '(catch-up import failed)';
+    }
+}
+
 // --- Registration -------------------------------------------------------------
 
 /** Register the `{{bf_facts}}` macro (feature-detected; no-op if the macro API is absent). */
@@ -175,8 +225,9 @@ async function dispatch(sub, rest) {
         case 'status': return await actionStatus();
         case 'recall': return await actionRecall(rest);
         case 'facts': return await actionFacts(rest);
+        case 'catchup': return await actionCatchup(rest);
         default:
-            toast('info', 'Usage: /bfmem on|off|toggle|status|recall <query>|facts [N]');
+            toast('info', 'Usage: /bfmem on|off|toggle|status|recall <query>|facts [N]|catchup [N|cancel]');
             return '';
     }
 }
@@ -202,7 +253,7 @@ export function initCommands() {
             const unnamedArgs = [];
             if (SCA && typeof SCA.fromProps === 'function') {
                 unnamedArgs.push(SCA.fromProps({
-                    description: 'subcommand: on | off | toggle | status | recall | facts',
+                    description: 'subcommand: on | off | toggle | status | recall | facts | catchup',
                     typeList: ARG ? [ARG.STRING] : undefined,
                     isRequired: false,
                 }));
@@ -214,7 +265,7 @@ export function initCommands() {
             }
             SCP.addCommandObject(SC.fromProps({
                 name: 'bfmem',
-                helpString: 'BF Memory control: <code>/bfmem on|off|toggle|status|recall &lt;query&gt;|facts [N]</code>.',
+                helpString: 'BF Memory control: <code>/bfmem on|off|toggle|status|recall &lt;query&gt;|facts [N]|catchup [N|cancel]</code>.',
                 unnamedArgumentList: unnamedArgs,
                 callback: async (_namedArgs, unnamed) => {
                     // unnamed may be a string (single arg) or an array (multiple). Normalize.
@@ -240,7 +291,7 @@ export function initCommands() {
                 const sub = sp >= 0 ? str.slice(0, sp) : str;
                 const rest = sp >= 0 ? str.slice(sp + 1).trim() : '';
                 return await dispatch(sub, rest);
-            }, [], 'BF Memory: /bfmem on|off|toggle|status|recall <query>|facts [N]', true, true);
+            }, [], 'BF Memory: /bfmem on|off|toggle|status|recall <query>|facts [N]|catchup [N|cancel]', true, true);
             addDebugLog('info', 'Registered /bfmem slash command (legacy API)', { subsystem: 'settings', event: 'slash.registered', data: { api: 'registerSlashCommand' } });
         }
     } catch (e) {

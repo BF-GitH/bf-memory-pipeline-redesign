@@ -6,12 +6,14 @@ import { runDraftAgent } from './agent-draft.js';
 import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPictureBlock, buildMomentEchoBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { retrieveFacts, extractContextKeywords, isFactVisible, retrievalSalience, estimateInjectionTokens } from './fact-retrieval.js';
-import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveAspect, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage, getRelationshipMomentThread } from './database.js';
+import { retrieveFacts, extractContextKeywords, isFactVisible, retrievalSalience, estimateInjectionTokens, buildFactLine, expandSelectionPicks } from './fact-retrieval.js';
+import { runSelectionPass, buildShelfManifest } from './agent-selector.js';
+import { getTurnNowContext, parseStoryDate, splitInjectionSections, buildPrecedencePreamble, STATE_SECTION_HEADER, CHRONO_SECTION_HEADER } from './recency.js';
+import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveAspect, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage, getRelationshipMomentThread, applyCrossKeySupersedeRules, isMaterialFactWrite, getOpenThreads } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, detectProfileForToolFirst } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, setLastInjection, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid, isTriviallyEmptyForExtraction } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, setLastInjection, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, getSceneReentries, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid, isTriviallyEmptyForExtraction } from './settings.js';
 import { detectAndRecord, showEntityPopup, runEntityResolution } from './agent-entities.js';
 
 // Pipeline state
@@ -263,6 +265,68 @@ function collectAnchorFacts(index, focus, perChar, alreadyChosen) {
 }
 
 /**
+ * RELATIONSHIP RE-ENTRY PACK (community adoption). For each character who just RETURNED to the
+ * scene after an absence (getSceneReentries), pair them with the OTHER present characters (cap 2
+ * partners per re-entrant — when exactly two are present the pair is unambiguous, mirroring the
+ * moment-echo cue) and pull from the pair's chronological relationship thread:
+ *   - the PAIR-STATE record: the NEWEST active Relationships kind:state fact — the maintained
+ *     `<a>_<b>_status` record the Scribe/reflection keep, degrading gracefully to any existing
+ *     trust/romance state fact in old chats; and
+ *   - the LAST `momentCount` active kind:moment beats the pair shares.
+ * Skips ids already chosen (`category:key` lowercased, the same id scheme collectAnchorFacts
+ * uses) so a pair fact retrieval/anchors already picked is never double-injected. Deterministic,
+ * no LLM. Token budgeting happens at the merge point (the caller) — this only collects candidates
+ * in admission order (each pair's state record first, then its moments oldest→newest).
+ * @param {Object} databases - all fact databases
+ * @param {string[]} reentrantNames - characters who just re-entered the scene
+ * @param {string[]} presentNames - the full present list (partners are drawn from here)
+ * @param {number} momentCount - shared moments to include per pair
+ * @param {Set<string>} alreadyChosen - ids (`category:key`, lowercased) already selected
+ * @returns {Array<{fact: Object, category: string, tier: string, isPairState: boolean}>}
+ */
+function collectReentryPack(databases, reentrantNames, presentNames, momentCount, alreadyChosen) {
+    const out = [];
+    const seen = new Set(alreadyChosen || []);
+    const present = (presentNames || []).map(p => String(p ?? '').trim()).filter(Boolean);
+    const presentLower = present.map(p => p.toLowerCase());
+    for (const rawName of (reentrantNames || [])) {
+        const name = String(rawName ?? '').trim();
+        if (!name) continue;
+        const nameLower = name.toLowerCase();
+        // Partners = the OTHER present characters, capped at 2 per re-entrant so a crowded scene
+        // can't fan out into many thread walks (a 2-person scene is exactly the one pair).
+        const partners = present.filter((p, i) => presentLower[i] !== nameLower).slice(0, 2);
+        for (const partner of partners) {
+            let thread = [];
+            try { thread = getRelationshipMomentThread(databases, name, partner) || []; } catch { thread = []; }
+            if (!thread.length) continue;
+            // The thread is chronological, so the LAST matching state fact is the newest.
+            let pairState = null;
+            const moments = [];
+            for (const entry of thread) {
+                const { fact, category } = entry;
+                if (!fact || fact.active === false || !isFactVisible(fact)) continue;
+                const kind = String(fact.kind || '').toLowerCase();
+                if (category === 'Relationships' && kind === 'state') pairState = entry;
+                else if (kind === 'moment') moments.push(entry);
+            }
+            const picks = [];
+            if (pairState) picks.push({ entry: pairState, isPairState: true });
+            for (const m of moments.slice(-Math.max(1, Math.floor(Number(momentCount)) || 1))) {
+                picks.push({ entry: m, isPairState: false });
+            }
+            for (const { entry, isPairState } of picks) {
+                const id = `${String(entry.category).toLowerCase()}:${String(entry.fact.key).toLowerCase()}`;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                out.push({ fact: entry.fact, category: entry.category, tier: 'primary', isPairState });
+            }
+        }
+    }
+    return out;
+}
+
+/**
  * Count tokens for a chat-completion message array (role wrappers included).
  * Uses ST's local tokenizer — approximate, but same tokenizer both sides so the delta holds.
  */
@@ -279,40 +343,59 @@ async function countChatTokens(arr) {
 }
 
 /**
- * Format the chosen facts for the writer, IDENTICAL in shape to fact-retrieval's
- * formatFactsForWriter so the injection stays uniform: `[knownBy] Category/key = value`
- * with the optional context note appended. Re-applies the rename-tolerant visibility filter
- * defensively (never inject a hidden fact). Moved here from the retired agent-finder.js —
- * the deterministic retrieval + anchor paths are its only remaining consumers.
+ * Format the chosen facts for the writer. Per-fact lines now DELEGATE to the shared
+ * buildFactLine (fact-retrieval.js) — single source of truth with formatFactsForWriter and
+ * estimateInjectionTokens, fixing the old hand-rolled copy's drift (it silently dropped the
+ * bi-temporal `{from→until}` tail its own comment claimed to include). Re-applies the
+ * rename-tolerant visibility filter defensively (never inject a hidden fact). Moved here from
+ * the retired agent-finder.js — the deterministic retrieval + anchor paths are its only
+ * remaining consumers.
+ *
+ * RECENCY LABELS (`injectRecencyLabels`, default ON): when the caller passes a non-null
+ * `nowCtx`, each line gains a compact ` (~N turns ago[, scene S])` / in-story tail. Before
+ * formatting, `nowCtx.storyNowMs` is filled ONCE as the latest parseable story-world stamp
+ * among the VISIBLE facts (bi-temporal on only) — no DB scan.
+ *
+ * TRUTH HIERARCHY (`injectTruthHierarchy`, default ON): the flat list is restructured into a
+ * one-line precedence preamble + CURRENT STATE (absolute present truth) + CHRONOLOGY
+ * (kind:event/moment, oldest first, context only) sections. Empty sections are omitted; when
+ * the toggle is OFF the flat line list renders exactly as before. The preamble/headers are
+ * NOT charged against retrievalTokenBudget — accepted as a small fixed overhead (~40 tokens).
+ * The '(No stored facts available)' empty sentinel is kept EXACTLY (buildWriterInjection's
+ * hasFacts check depends on it).
  * @param {Array<{fact: Object, category: string}>} results
+ * @param {Object|null} [nowCtx=null] - per-turn now-context (recency.js); null = no recency tails
  * @returns {string}
  */
-function formatChosenFacts(results) {
+function formatChosenFacts(results, nowCtx = null) {
     const visible = (results || []).filter(({ fact }) => isFactVisible(fact));
     if (visible.length === 0) return '(No stored facts available)';
-    const lines = [];
-    for (const { fact, category } of visible) {
-        const knownBy = (fact.knownBy || []).join(', ');
-        const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-        const hasValue = String(fact.value ?? '').trim() !== '';
-        const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
-        // Episodic-memory feature (mirror of formatFactsForWriter): append a `moment`'s short
-        // emotional `tone` compactly so the beat reads with its feeling, e.g. `Events/key: <note> (tense)`.
-        const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
-        // INJECTION DE-DUPLICATION (mirror of formatFactsForWriter): storage keeps
-        // BOTH value and note, but when a note exists it already carries the fact, so
-        // inject the NOTE IN PLACE OF the value. With no note, inject `key = value`.
-        let line;
-        if (note) {
-            line = `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}`;
-        } else if (hasValue) {
-            line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
-        } else {
-            line = `${prefix} ${category}/${fact.key}`;
+    const settings = getSettings();
+    const biTemporalOn = settings?.biTemporal === true;
+    // In-story "now" = the LATEST parseable story-world stamp among the visible facts. Filled
+    // once per turn on the SHARED nowCtx (the anchor re-render reuses the same object, so both
+    // renders match). Free-form stamps that don't parse are simply skipped.
+    if (nowCtx && biTemporalOn && nowCtx.storyNowMs == null) {
+        let latest = null;
+        for (const { fact } of visible) {
+            for (const stamp of [fact.validFrom, fact.validUntil]) {
+                const ms = parseStoryDate(stamp);
+                if (ms != null && (latest == null || ms > latest)) latest = ms;
+            }
         }
-        lines.push(line);
+        nowCtx.storyNowMs = latest;
     }
-    return lines.join('\n');
+    const line = ({ fact, category }) => buildFactLine(fact, category, biTemporalOn, nowCtx);
+    if (settings?.injectTruthHierarchy !== true) {
+        return visible.map(line).join('\n');
+    }
+    // Truth hierarchy: conservative split — only explicit kind:event/moment leave CURRENT
+    // STATE (a kind-less legacy fact is never demoted to "context only" by a guess).
+    const { state, chrono } = splitInjectionSections(visible);
+    const parts = [buildPrecedencePreamble(nowCtx)];
+    if (state.length) parts.push(STATE_SECTION_HEADER, ...state.map(line));
+    if (chrono.length) parts.push(CHRONO_SECTION_HEADER, ...chrono.map(line));
+    return parts.join('\n');
 }
 
 /**
@@ -321,7 +404,7 @@ function formatChosenFacts(results) {
  * MESSAGE_RECEIVED handler only attributes main-model output to a run that actually
  * recorded input this generation cycle (prevents swipe-driven counter desync).
  */
-function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult }) {
+function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult, selectionResult }) {
     try {
         setRunTokens({
             baselineInput: baselineInput || 0,
@@ -334,6 +417,9 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
             // Tokens-tab record shape stays stable for existing readers.
             finderInput: 0,
             finderOutput: 0,
+            // Selector (semantic shelf selection, opt-in) — 0 whenever the pass didn't run.
+            selectorInput: selectionResult?.tokensIn || 0,
+            selectorOutput: selectionResult?.tokensOut || 0,
             mainOutput: 0,
             // Writer tool-loop round-trips (search_memory / remember_fact) fire DURING the main
             // generation — i.e. AFTER this record is created — so they start at 0 here and
@@ -371,7 +457,7 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
  * @param {boolean} [a.cancelled]
  * @param {{NEW?:number,UPDATED?:number,SKIPPED?:number,EVICTED?:number}} [a.facts] count override
  */
-function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, reflectionTokens, agent1Skipped }) {
+function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, reflectionTokens, agent1Skipped, selectionResult }) {
     try {
         const duration = Date.now() - startTime;
         // When Agent 1 was intentionally skipped (hybrid/tool-only), it is neither "ok" nor "failed"
@@ -413,11 +499,15 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
         // TRUE extension overhead.
         const rIn = Number(reflectionTokens?.input) || 0;
         const rOut = Number(reflectionTokens?.output) || 0;
+        // Selector (semantic shelf selection, opt-in) tokens — folded into the NET so the
+        // per-run summary reflects the TRUE overhead of enabling the pass. 0 when it didn't run.
+        const selIn = Number(selectionResult?.tokensIn) || 0;
+        const selOut = Number(selectionResult?.tokensOut) || 0;
         // NOTE: Writer tool-loop round-trips (search_memory / remember_fact) are NOT in this
         // netIn — this summary runs at prompt-ready, BEFORE the main generation in which those
         // tools fire. Their estimated cost is attributed post-hoc to the run's token record
         // (settings.js addToolLoopTokens) and folded into the Tokens-tab NET row instead.
-        const netIn = (aIn + a1In + a3In + rIn) - bIn;
+        const netIn = (aIn + a1In + a3In + rIn + selIn) - bIn;
         const failed = !!cancelled || (agent1Ran && !agent1Ok) || (agent3Ran && !agent3Ok);
         // Observability: stamp the DB context this run executed against, so every per-turn
         // summary line says which profile/avatar it touched (read-only — no behavior change).
@@ -435,7 +525,7 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
             `Agent3 NEW=${nNew} UPDATED=${nUpd} SKIPPED=${nSkip} EVICTED=${nEvict} | ` +
             `tokens: baselineIn=${bIn} actualIn=${aIn} a1(in/out)=${a1In}/${a1Out} ` +
             `a3(in/out)=${a3In}/${a3Out}` +
-            `${rIn || rOut ? ` refl(in/out)=${rIn}/${rOut}` : ''}${mainOut ? ` mainOut=${mainOut}` : ''} net=${netIn >= 0 ? '+' : ''}${netIn}`,
+            `${rIn || rOut ? ` refl(in/out)=${rIn}/${rOut}` : ''}${selIn || selOut ? ` sel(in/out)=${selIn}/${selOut}` : ''}${mainOut ? ` mainOut=${mainOut}` : ''} net=${netIn >= 0 ? '+' : ''}${netIn}`,
             {
                 runId,
                 subsystem: 'pipeline',
@@ -449,7 +539,7 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
                         agent3: agent3Ran ? (agent3Ok ? 'ok' : 'failed') : 'skipped',
                     },
                     facts: { NEW: nNew, UPDATED: nUpd, SKIPPED: nSkip, EVICTED: nEvict },
-                    tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, reflectionIn: rIn, reflectionOut: rOut, mainOut, netIn },
+                    tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, reflectionIn: rIn, reflectionOut: rOut, selectorIn: selIn, selectorOut: selOut, mainOut, netIn },
                     // PER-STAGE TIMING BREAKDOWN (observability only — slowness hunt). Whatever the
                     // caller measured this run (blocking-path stages and/or post-reply agent3 etc).
                     // Null/absent when a path didn't supply it. Keeps the legacy fields intact.
@@ -795,6 +885,7 @@ async function runPipelineInline(data) {
     const stageMs = {
         agent1Ms: null,                 // Agent 1 draft + speculative retrieval (parallel) wall-clock
         speculativeRetrievalMs: null,   // covered by the agent1 parallel block; recorded for clarity
+        selectorMs: null,               // semantic selection pass (parallel sibling; opt-in — null when off)
         deterministicMs: null,          // deterministic-retrieval build
         sceneBuildMs: null,             // scene/big-picture block build
         injectMs: null,                 // buildWriterInjection + injectMemoryContext + token recount
@@ -852,6 +943,7 @@ async function runPipelineInline(data) {
 
     let draftResult = null;
     let speculativeRetrieval = null;
+    let selectionResult = null;
 
     // Start speculative fact retrieval using context keywords (no LLM needed)
     const contextKeywords = extractContextKeywords(recentMessages);
@@ -918,7 +1010,37 @@ async function runPipelineInline(data) {
                 .catch(err => { addDebugLog('info', `Speculative retrieval failed: ${err.message}`); return null; }),
         );
 
-        [draftResult, speculativeRetrieval] = await Promise.all(promises);
+        // SEMANTIC SHELF SELECTION (selection-summary, OPT-IN — default OFF). One small extra
+        // LLM call that reads the Reflection shelf summaries as a menu and picks which shelves
+        // matter for the current scene. Runs as a THIRD parallel sibling so it adds ~zero
+        // wall-clock beyond the slower of Agent 1 / speculative retrieval in push mode (in
+        // hybrid mode it IS the blocking LLM call the user opted back in — capped by the
+        // Selector's own ~10s abort). Skipped entirely (promise = null) when disabled OR when
+        // the manifest is empty (no reflection pass has written shelf summaries yet — calling
+        // with an empty menu just makes the model hallucinate shelves). .catch(() => null)
+        // swallows EVERYTHING (incl. AbortError) into the silent deterministic fallback.
+        let selectorManifest = '';
+        if (settings.selectionSummaryEnabled === true) {
+            try { selectorManifest = buildShelfManifest(getSummaryPyramid(), index); } catch { selectorManifest = ''; }
+            if (!selectorManifest) {
+                addDebugLog('info', 'Selector skipped: no shelf summaries yet (runs after the first reflection pass)', {
+                    subsystem: 'retrieval', event: 'retrieval.selector', reason: 'NO_SHELVES',
+                });
+            }
+        }
+        const runSelector = settings.selectionSummaryEnabled === true && !!selectorManifest;
+        if (runSelector) {
+            promises.push(
+                runSelectionPass(formattedChat, selectorManifest, agent1ProfileId)
+                    .catch(() => null),
+            );
+        } else {
+            promises.push(Promise.resolve(null));
+        }
+
+        [draftResult, speculativeRetrieval, selectionResult] = await Promise.all(promises);
+        // Selector shares the parallel block's wall-clock (only meaningful when it ran).
+        stageMs.selectorMs = runSelector ? Date.now() - agent1Start : null;
         // Agent 1 (when run) + speculative retrieval run in PARALLEL (single Promise.all), so the
         // reply waited the wall-clock of the slower of the two. Record that shared parallel
         // wall-clock for both. In hybrid/tool-only mode Agent 1 is skipped, so this measures just
@@ -1041,6 +1163,38 @@ async function runPipelineInline(data) {
         } else {
             addDebugLog('info', 'No delta keywords needed — speculative retrieval covered everything');
         }
+        // SEMANTIC SELECTION MERGE (selection-summary, opt-in). The Selector's shelf/fact picks
+        // expand (expandSelectionPicks — hallucination-validated, salience-ranked) into rows
+        // admitted as budget-charged SECONDARY: de-duped against everything already chosen,
+        // isFactVisible-filtered, and charged via the SAME estimateInjectionTokens accounting
+        // against the SAME retrievalTokenBudget the Unsorted overflow loop uses. Merged BEFORE
+        // the Unsorted admission so the shared token-charge sequence stays coherent AND the
+        // pinned-primary Unsorted guarantee below still wins its slots (guaranteed primaries
+        // are never budget-gated). Null selectionResult (disabled, no shelves yet, LLM failure,
+        // abort) → zero rows → the deterministic cascade below is byte-identical to OFF.
+        if (selectionResult) {
+            const selRows = expandSelectionPicks(selectionResult, index, databases);
+            const selKeys = new Set(det.facts.map(r => `${r.category}:${r.fact.key}`));
+            const selBudget = Number(settings.retrievalTokenBudget) || 800;
+            let selUsedTokens = det.facts.reduce((sum, r) => sum + estimateInjectionTokens(r), 0);
+            let selAdmitted = 0, selDropped = 0;
+            for (const r of selRows) {
+                const id = `${r.category}:${r.fact.key}`;
+                if (selKeys.has(id)) continue; // already retrieved — the pick is satisfied
+                if (!isFactVisible(r.fact)) { selDropped++; continue; }
+                const cost = estimateInjectionTokens(r);
+                if (selUsedTokens + cost > selBudget) { selDropped++; continue; }
+                det.facts.push(r);
+                selKeys.add(id);
+                selUsedTokens += cost;
+                selAdmitted++;
+            }
+            const selPicked = (selectionResult.shelfPicks?.length || 0) + (selectionResult.factPicks?.length || 0);
+            addDebugLog('info', `Selector merge: ${selPicked} pick(s) → ${selRows.length} candidate fact(s), ${selAdmitted} admitted as secondary, ${selDropped} dropped (budget/visibility) (${selUsedTokens}/${selBudget} tokens)`, {
+                subsystem: 'retrieval', event: 'retrieval.selector',
+                data: { picked: selPicked, candidates: selRows.length, admitted: selAdmitted, dropped: selDropped, usedTokens: selUsedTokens, budget: selBudget },
+            });
+        }
         // UNSORTED ADMISSION (audit F-ARCH-2). Invariant: Unsorted competes under the budget;
         // the newest/most salient few are guaranteed. The old path injected EVERY active
         // Unsorted fact as un-budgeted primary, so model-pinned facts (remember_fact defaults
@@ -1093,9 +1247,16 @@ async function runPipelineInline(data) {
         // that formatChosenFacts/formatFactsForWriter include. Reusing the shared formatter keeps
         // this path identical to the anchor path (which also uses formatChosenFacts) — single
         // source of truth, no drift.
-        det.formatted = formatChosenFacts(det.facts);
+        det.formatted = formatChosenFacts(det.facts, injectionNowCtx);
         return det;
     };
+
+    // RECENCY LABELS: one now-context per run, shared with estimateInjectionTokens via the
+    // recency.js per-turn memo (the estimator must charge the exact tails the formatter emits
+    // — F-RETR-3). null when the toggle is off → formatChosenFacts renders tail-free lines,
+    // byte-identical to before. The SAME object is reused by the anchor re-render below so
+    // both renders (and the storyNowMs fill) match.
+    const injectionNowCtx = settings.injectRecencyLabels === true ? getTurnNowContext() : null;
 
     const detStart = Date.now();
     const retrieval = await buildDeterministicRetrieval();
@@ -1117,11 +1278,64 @@ async function runPipelineInline(data) {
             };
             // Re-render the formatted block from the merged set so the injected anchors actually
             // reach the Writer (the formatted string, not just the facts array, is what's injected).
-            retrieval.formatted = formatChosenFacts(retrieval.facts);
+            retrieval.formatted = formatChosenFacts(retrieval.facts, injectionNowCtx);
             addDebugLog('info', `Injected ${anchors.length} guaranteed present-character anchor fact(s) (focus: ${draftResult.focus.join(', ')})`, {
                 subsystem: 'finder', event: 'finder.anchors',
                 data: { added: anchors.length, perCharacter: settings.finderAnchorsPerCharacter, focus: draftResult.focus, totalAfter: retrieval.facts.length },
             });
+        }
+    }
+
+    // RELATIONSHIP RE-ENTRY PACK (community adoption; default OFF — enableRelationshipReentry).
+    // When a character RETURNED to the scene this run (detected at setScene time — push mode
+    // only; hybrid/tool-only never produce a fresh #SCENE parse, so scene.present is stale there
+    // and re-entry deliberately never fires, see the FOCUS FALLBACK note above), GUARANTEE the
+    // pair's relationship-status record plus their last few shared moments into the injection.
+    // Budgeted with the SAME estimateInjectionTokens accounting the Unsorted admission uses,
+    // against the shared retrievalTokenBudget: each pair-state record is ALWAYS admitted (it IS
+    // the guarantee, ~1 line); moments are admitted only while the budget allows. De-duped via
+    // the anchor id scheme so a pair fact already retrieved/anchored is never doubled. Because
+    // the pack lands inside retrieval.formatted it automatically rides lastInjectionNoDraft, so
+    // swipes/regens reuse the identical pack.
+    if (settings.enableRelationshipReentry === true) {
+        try {
+            const reentry = getSceneReentries();
+            const reentryNames = (reentry && reentry.runId === runId && Array.isArray(reentry.names)) ? reentry.names : [];
+            if (reentryNames.length) {
+                const sceneNow = getScene();
+                const presentNow = (sceneNow && Array.isArray(sceneNow.present)) ? sceneNow.present : [];
+                const chosenIds = new Set(retrieval.facts.map(({ fact, category }) => `${String(category).toLowerCase()}:${String(fact.key).toLowerCase()}`));
+                const pack = collectReentryPack(databases, reentryNames, presentNow, settings.reentryMomentCount || 3, chosenIds);
+                if (pack.length) {
+                    const reentryBudget = Number(settings.retrievalTokenBudget) || 800;
+                    let reentryUsedTokens = retrieval.facts.reduce((sum, r) => sum + estimateInjectionTokens(r), 0);
+                    const admitted = [];
+                    let reentryDropped = 0;
+                    for (const r of pack) {
+                        const cost = estimateInjectionTokens(r);
+                        if (!r.isPairState && reentryUsedTokens + cost > reentryBudget) { reentryDropped++; continue; }
+                        admitted.push(r);
+                        reentryUsedTokens += cost;
+                    }
+                    if (admitted.length) {
+                        retrieval.facts = retrieval.facts.concat(admitted);
+                        retrieval.stats = {
+                            ...retrieval.stats,
+                            primary: (retrieval.stats.primary || 0) + admitted.length,
+                        };
+                        // Re-render from the merged set so the pack actually reaches the Writer
+                        // (the formatted string, not just the facts array, is what's injected).
+                        retrieval.formatted = formatChosenFacts(retrieval.facts, injectionNowCtx);
+                    }
+                    const pairs = admitted.filter(r => r.isPairState).length;
+                    addDebugLog('info', `Relationship re-entry pack: ${reentryNames.join(', ')} returned — ${admitted.length} fact(s) guaranteed (${pairs} pair-state), ${reentryDropped} moment(s) dropped over budget (${reentryUsedTokens}/${reentryBudget} tokens)`, {
+                        subsystem: 'retrieval', event: 'retrieval.reentry',
+                        data: { names: reentryNames, pairs, added: admitted.length, dropped: reentryDropped, usedTokens: reentryUsedTokens, budget: reentryBudget },
+                    });
+                }
+            }
+        } catch (err) {
+            addDebugLog('fail', `Relationship re-entry pack failed (non-fatal): ${err.message || err}`, { subsystem: 'retrieval', event: 'retrieval.reentry', reason: 'ERROR' });
         }
     }
 
@@ -1150,8 +1364,8 @@ async function runPipelineInline(data) {
         // so the Tokens tab stays in sync and the per-cycle main-output gate is armed.
         // Agent 3 no longer runs here, so memoryResult is null on the blocking path —
         // its tokens are recorded separately via addAgent3Tokens on MESSAGE_RECEIVED.
-        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null });
-        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, agent1Skipped: !runAgent1 });
+        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, selectionResult });
+        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, agent1Skipped: !runAgent1, selectionResult });
         hideWorkingIndicator();
         updateStatus('idle');
         // Cancelled inline: no post-reply work will run for this turn — disarm + clear ambient.
@@ -1184,12 +1398,23 @@ async function runPipelineInline(data) {
     if (settings.enableSummaryPyramid === true) {
         try {
             const pyramid = getSummaryPyramid();
-            const bp = buildBigPictureBlock(pyramid, scene, settings.summaryPyramidMaxTokens || 250);
+            // OPEN THREADS (open-threads feature, default ON): surface the newest unresolved
+            // `thread:open` plot hooks as one clamped "Open threads:" line inside the Big Picture
+            // block. Deterministic + zero-API (getOpenThreads over the already-loaded databases).
+            // Computed HERE — before the draft-less swipe cache below — so swipes/regens reuse
+            // the identical block. Each thread renders as its value (key as fallback).
+            let openThreadTexts = [];
+            if (settings.enableOpenThreads === true) {
+                try {
+                    openThreadTexts = getOpenThreads(databases, 5).map(t => (t.value || t.key));
+                } catch { openThreadTexts = []; }
+            }
+            const bp = buildBigPictureBlock(pyramid, scene, settings.summaryPyramidMaxTokens || 250, openThreadTexts, settings.openThreadsMaxTokens || 60);
             bigPictureBlock = bp.block || '';
             if (bigPictureBlock) {
-                addDebugLog('debug', `[${runId}] Big Picture block injected (${bigPictureBlock.length} chars, ${bp.shelvesIncluded.length} shelf summaries)`, {
+                addDebugLog('debug', `[${runId}] Big Picture block injected (${bigPictureBlock.length} chars, ${bp.shelvesIncluded.length} shelf summaries, ${bp.threadsIncluded} open thread(s))`, {
                     subsystem: 'writer', event: 'summary.injected',
-                    data: { chars: bigPictureBlock.length, approxTokens: Math.ceil(bigPictureBlock.length / 4), shelves: bp.shelvesIncluded },
+                    data: { chars: bigPictureBlock.length, approxTokens: Math.ceil(bigPictureBlock.length / 4), shelves: bp.shelvesIncluded, openThreads: bp.threadsIncluded },
                 });
             }
         } catch (err) {
@@ -1290,10 +1515,10 @@ async function runPipelineInline(data) {
     // (memoryResult: null) — its tokens are folded in later via addAgent3Tokens on
     // the MESSAGE_RECEIVED path, which updates lastRunTokens.agent3* without bumping
     // the run count or re-counting input.
-    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null });
+    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null, selectionResult });
     // FIX #10: consolidated per-run summary (after token recording — values in scope).
     // Thread the per-stage breakdown so ONE summary line carries the full timing picture.
-    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, agent1Skipped: !runAgent1 });
+    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, agent1Skipped: !runAgent1, selectionResult });
 
     // OBSERVABILITY: one concise per-stage timing line (debug level) for the slowness hunt.
     // Pure log — emitting it changes no state and runs after the blocking work is recorded.
@@ -1678,10 +1903,28 @@ async function runMemoryExtraction() {
                         addDebugLog('info', `User edited ${writable.length} items`);
                         appendLastInserted(writable.map(i => ({ ...i, status: 'UPDATED' })));
                         const dbs = await getAllDatabases();
+                        // Categories to persist: each edited item's own, PLUS any category the
+                        // cross-key supersede rules touched (a user-confirmed death/departure/loss
+                        // edit is a genuine new-information write, so the rules apply here exactly
+                        // like the Scribe commit — retired facts must reach disk too).
+                        // GENUINE-NEW-WRITE GATE (fix): the queue holds EVERY item from the last N
+                        // turns, all already saved at extraction time, so most re-upserts here are
+                        // no-ops. Classify BEFORE the write (mirrors applyUpdates' update.changed
+                        // gate) and only fire the rules on a material NEW/UPDATED write — an
+                        // unchanged trigger item re-firing could wrongly retire same-subject state
+                        // facts written AFTER the original trigger (e.g. via remember_fact).
+                        const toSave = new Set();
                         for (const item of writable) {
                             if (!dbs[item.category]) dbs[item.category] = createEmptyDatabase(item.category);
+                            const material = isMaterialFactWrite(dbs[item.category], item);
                             upsertFact(dbs[item.category], item);
-                            await saveDatabase(dbs[item.category]);
+                            toSave.add(item.category);
+                            if (material) {
+                                for (const cat of applyCrossKeySupersedeRules(dbs, item, item.category)) toSave.add(cat);
+                            }
+                        }
+                        for (const cat of toSave) {
+                            if (dbs[cat]) await saveDatabase(dbs[cat]);
                         }
                     },
                 );

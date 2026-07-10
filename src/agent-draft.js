@@ -189,8 +189,8 @@ function parseDraftResult(response) {
     // any useful keywords. The prompt allows an empty section — an obediently-empty list must
     // NOT trigger this, or sentence-starters pollute deterministic retrieval (audit F-DRAFT-1).
     if (!factsMatch && result.draft) {
-        // Extract capitalized words as fallback keywords
-        const words = result.draft.match(/[A-Z][a-z]+/g) || [];
+        // Extract capitalized words as fallback keywords (Unicode-aware capital+lowercase run)
+        const words = result.draft.match(/\p{Lu}\p{Ll}+/gu) || [];
         result.neededFacts = [...new Set(words)];
     }
 

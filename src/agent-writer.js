@@ -6,6 +6,7 @@
 // host.js is dependency-free (imports nothing from the extension), so a STATIC import
 // of it is cycle-safe even though this module dynamically imports settings/fact-retrieval
 // below to dodge their cycles.
+import { wordTokens } from './tokenize.js';
 import * as host from './host.js';
 
 // Lazy access to avoid circular dependency (settings imports our DEFAULT_WRITER_FORMAT)
@@ -25,7 +26,8 @@ export const DEFAULT_WRITER_FORMAT = `[Memory Context - established truth for th
 - Treat every fact as ESTABLISHED TRUTH. Weave the relevant ones into the scene naturally — through action, dialogue, and detail — rather than listing them.
 - PREFER these stored facts over inventing new details. When a fact covers something, use it instead of making something up.
 - Never contradict a fact. If the scene needs a detail a fact already defines, match the fact exactly.
-- A character only knows facts whose [bracketed] names include that character. Do not let a character act on facts they don't know.]`;
+- A character only knows facts whose [bracketed] names include that character. Do not let a character act on facts they don't know.
+- When the facts are split into CURRENT STATE and CHRONOLOGY sections and they conflict, CURRENT STATE wins.]`;
 
 /**
  * Build the compact always-on scene block (MemGPT-style core working memory).
@@ -73,22 +75,35 @@ export function buildSceneBlock(scene, maxTokens = 150) {
  * summary is always included (it's the single cheapest big-picture line). Hard token-capped via
  * the same char-budget truncation style as buildSceneBlock so it can never balloon the prompt.
  *
+ * OPEN THREADS (open-threads feature): when the caller passes `openThreads` (short strings — the
+ * unresolved `thread:open` plot hooks, prepared by pipeline.js from getOpenThreads), ONE
+ * "Open threads: t1; t2; …" line is appended after the shelf lines. It gets its OWN char budget
+ * (openThreadsMaxTokens, clamped BEFORE the whole-block cap) so a long thread list can't silently
+ * eat the shelf summaries — though the combined block can still hit the outer cap (documented).
+ *
  * @param {{story?:string, shelves?:Object<string,{text:string}>}|null} pyramid - stored pyramid
  * @param {object|null} scene - current scene card ({ location, present[], goals[], beats[] })
  * @param {number} [maxTokens=250] - approximate hard cap (1 token ≈ 4 chars heuristic)
- * @returns {{block:string, shelvesIncluded:string[]}} block text ('' when nothing usable) + which shelf keys were included
+ * @param {string[]} [openThreads=[]] - short open-thread strings (already newest-first + capped)
+ * @param {number} [openThreadsMaxTokens=60] - approximate hard cap for the threads line alone
+ * @returns {{block:string, shelvesIncluded:string[], threadsIncluded:number}} block text ('' when nothing usable) + which shelf keys were included + how many threads made the line
  */
-export function buildBigPictureBlock(pyramid, scene, maxTokens = 250) {
-    if (!pyramid || typeof pyramid !== 'object') return { block: '', shelvesIncluded: [] };
-    const story = typeof pyramid.story === 'string' ? pyramid.story.trim() : '';
-    const shelves = (pyramid.shelves && typeof pyramid.shelves === 'object') ? pyramid.shelves : {};
+export function buildBigPictureBlock(pyramid, scene, maxTokens = 250, openThreads = [], openThreadsMaxTokens = 60) {
+    // An open-threads line can render even before the first reflection pass stored a pyramid —
+    // treat a missing/malformed pyramid as empty instead of bailing when threads exist.
+    const threadTexts = (Array.isArray(openThreads) ? openThreads : [])
+        .map(t => String(t ?? '').trim()).filter(Boolean);
+    if ((!pyramid || typeof pyramid !== 'object') && threadTexts.length === 0) return { block: '', shelvesIncluded: [], threadsIncluded: 0 };
+    const pyr = (pyramid && typeof pyramid === 'object') ? pyramid : {};
+    const story = typeof pyr.story === 'string' ? pyr.story.trim() : '';
+    const shelves = (pyr.shelves && typeof pyr.shelves === 'object') ? pyr.shelves : {};
 
     // Build a lowercased relevance haystack from the current scene focus.
     const sceneTokens = new Set();
     if (scene && typeof scene === 'object') {
         const collect = (v) => {
             if (typeof v === 'string') {
-                for (const tok of v.toLowerCase().split(/[^a-z0-9]+/)) { if (tok.length >= 3) sceneTokens.add(tok); }
+                for (const tok of wordTokens(v, { min: 3 })) sceneTokens.add(tok);
             } else if (Array.isArray(v)) { for (const x of v) collect(x); }
         };
         collect(scene.location); collect(scene.present); collect(scene.goals); collect(scene.beats);
@@ -106,15 +121,26 @@ export function buildBigPictureBlock(pyramid, scene, maxTokens = 250) {
         if (sceneTokens.size) {
             if (sceneTokens.has(aspect)) relevant = true;
             if (!relevant) {
-                for (const tok of text.toLowerCase().split(/[^a-z0-9]+/)) {
-                    if (tok.length >= 4 && sceneTokens.has(tok)) { relevant = true; break; }
+                for (const tok of wordTokens(text, { min: 4 })) {
+                    if (sceneTokens.has(tok)) { relevant = true; break; }
                 }
             }
         }
         if (relevant) picked.push({ bucketKey, aspect, text });
     }
 
-    if (!story && picked.length === 0) return { block: '', shelvesIncluded: [] };
+    // OPEN THREADS line — its OWN char budget, clamped BEFORE the whole-block cap below so the
+    // thread list can never silently eat the shelf summaries (same truncation style).
+    let openThreadsLine = '';
+    if (threadTexts.length) {
+        openThreadsLine = `Open threads: ${threadTexts.join('; ')}`;
+        const threadBudget = Math.max(40, Math.floor((Number(openThreadsMaxTokens) || 60) * 4));
+        if (openThreadsLine.length > threadBudget) {
+            openThreadsLine = openThreadsLine.slice(0, threadBudget - 1).trimEnd() + '…';
+        }
+    }
+
+    if (!story && picked.length === 0 && !openThreadsLine) return { block: '', shelvesIncluded: [], threadsIncluded: 0 };
 
     const lines = ['[Big Picture]'];
     if (story) lines.push(`Story so far: ${story}`);
@@ -124,6 +150,7 @@ export function buildBigPictureBlock(pyramid, scene, maxTokens = 250) {
         const label = cat ? `${cat.charAt(0).toUpperCase()}${cat.slice(1)}/${asp}` : asp;
         lines.push(`- ${label}: ${p.text}`);
     }
+    if (openThreadsLine) lines.push(openThreadsLine);
     let block = lines.join('\n');
 
     // Hard cap (same heuristic + truncation style as buildSceneBlock): clip mid-string.
@@ -131,7 +158,7 @@ export function buildBigPictureBlock(pyramid, scene, maxTokens = 250) {
     if (block.length > charBudget) {
         block = block.slice(0, charBudget - 1).trimEnd() + '…';
     }
-    return { block, shelvesIncluded: picked.map(p => p.bucketKey) };
+    return { block, shelvesIncluded: picked.map(p => p.bucketKey), threadsIncluded: openThreadsLine ? threadTexts.length : 0 };
 }
 
 /**
@@ -247,6 +274,12 @@ export function buildMomentEchoBlock(scene, thread, injectedKeys, maxTokens = 40
  *     boilerplate) is skipped; only the scene/overview block remains, or '' when there is
  *     nothing meaningful at all. Callers handle '' (the pipeline skips injectMemoryContext;
  *     the swipe/frozen caches treat '' as "no cached injection").
+ * RECENCY/PRECEDENCE (community adoption Tier 1): `factsFormatted` may now carry the SECTIONED
+ * block from pipeline.js formatChosenFacts — a `[Memory precedence …]` preamble plus CURRENT
+ * STATE / CHRONOLOGY sections, with per-line "(~N turns ago)" recency tails — instead of the
+ * flat line list. It substitutes into {facts} exactly like the flat form (custom writerFormat
+ * templates keep working unchanged), and the '(No stored facts available)' empty sentinel is
+ * preserved, so the hasFacts check below is unaffected.
  * @param {string} draft - Draft from Agent 1
  * @param {string} factsFormatted - Formatted facts from retrieval
  * @param {string} [sceneBlock] - Optional compact scene block to prepend ABOVE facts
@@ -777,7 +810,7 @@ async function rememberFactAction({ key, value, category, subject, importance, a
 
         // Lazy import to dodge the static import cycle (database.js is heavy + pulls settings).
         const { getDatabase, createEmptyDatabase, upsertFact, saveDatabase, clampImportance,
-            getAllDatabases, buildMemoryIndex, autoLinkFact, findFactMatch } = await import('./database.js');
+            getAllDatabases, buildMemoryIndex, autoLinkFact, findFactMatch, applyCrossKeySupersedeRules } = await import('./database.js');
 
         // Get-or-create the category DB in the active per-character store. getDatabase reads through
         // getAllDatabases() (the same active store the recall tool searches).
@@ -826,6 +859,24 @@ async function rememberFactAction({ key, value, category, subject, importance, a
                 // the same invocation already logged below.
                 try { void rememberToolLog('debug', `Writer write: auto-link skipped (${linkErr?.message || linkErr})`, { subsystem: 'writer', event: 'tool.remember_fact.autolink', reason: 'AUTOLINK_SKIPPED' }); } catch { /* never block the save */ }
             }
+        }
+
+        // CROSS-KEY SUPERSEDE RULES (feature, default ON): a pinned death/departure/loss fact
+        // retires the subject's now-stale state facts to `__was` history — a genuine
+        // new-information write path, so the rules apply here exactly like the Scribe commit.
+        // Best-effort like auto-link: a failure NEVER blocks the main save below. Categories
+        // OTHER than the trigger's own are saved inside the try (the trigger's db — which
+        // getAllDatabases serves as the SAME cached object — is saved unconditionally below,
+        // carrying any own-category invalidations with it).
+        try {
+            const dbs = await getAllDatabases();
+            const touchedCats = applyCrossKeySupersedeRules(dbs, factToWrite, cat);
+            for (const c of touchedCats) {
+                if (c !== cat && dbs[c]) await saveDatabase(dbs[c]);
+            }
+        } catch (ruleErr) {
+            // Event deliberately NOT 'tool.remember_fact' (same rationale as the auto-link skip).
+            try { void rememberToolLog('debug', `Writer write: cross-key supersede skipped (${ruleErr?.message || ruleErr})`, { subsystem: 'writer', event: 'tool.remember_fact.crosskey', reason: 'CROSS_KEY_SKIPPED' }); } catch { /* never block the save */ }
         }
 
         // Persist the touched category DB. This MUST run even if auto-linking above failed.

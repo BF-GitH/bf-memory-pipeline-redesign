@@ -2,8 +2,9 @@
 // Runs AFTER the response is displayed, processes N-1 message
 // Updates fact databases, tracks who knows what, manages cross-references
 
-import { getAllDatabases, getMemoryIndex, buildMemoryIndex, autoLinkFact, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES, groupedTaxonomySubAreas } from './database.js';
+import { getAllDatabases, getMemoryIndex, buildMemoryIndex, autoLinkFact, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES, groupedTaxonomySubAreas, applyCrossKeySupersedeRules } from './database.js';
 import { addDebugLog, getScene } from './settings.js';
+import { wordTokens, cleanWord, isCapitalizedWord, keyToken } from './tokenize.js';
 import { callAgentLLM } from './llm-call.js';
 import * as host from './host.js';
 
@@ -26,7 +27,7 @@ function _cheapHashScribeSys(str) {
     return h;
 }
 
-export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Many ordinary back-and-forth messages have ZERO facts — but a high-signal turn (introductions, backstory, biographical reveals, world lore) can be DENSE. Capture all of it: aim for ~5 facts on a normal turn, but go higher (up to ~12) when a message genuinely discloses that much. Missing a clearly-stated reveal is worse than one extra fact.
+export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Many ordinary back-and-forth messages have ZERO facts — but a high-signal turn (introductions, backstory, biographical reveals, world lore) can be DENSE. Capture all of it: aim for 5 facts on a normal turn, and go higher when a message discloses that much — but NEVER output more than 12 facts. Missing a clearly-stated reveal is worse than one extra fact.
 
 # READ THE WHOLE MESSAGE — INCLUDING DIALOGUE
 
@@ -36,7 +37,7 @@ Read the ENTIRE message, narration AND spoken dialogue. Do NOT skim the narratio
 
 ATOMIC VALUES ONLY:
 - Normal facts: value is 1–5 words. NO sentences. NO connectives (and / with / who / that).
-- EXCEPTION — genuine backstory / biographical reveals may use a short clause (up to ~10 words) when atomizing would lose meaning (e.g. \`origin = orphaned at <AGE>, raised by <RELATION>\`). Still split where you cleanly can.
+- EXCEPTION — genuine backstory / biographical reveals may use a short clause (at most 10 words) when atomizing would lose meaning (e.g. \`origin = orphaned at <AGE>, raised by <RELATION>\`). Still split where you cleanly can.
 - One property per fact. Multi-attribute statements → multiple facts.
 - Encode verbs in the KEY, not the value:
     BAD:  some_thing = uses a red one that smells nice
@@ -51,17 +52,25 @@ ROLEPLAY MARKUP:
 - [OOC: ...] is meta-commentary. NEVER extract.
 - Quoted historical text ("Remember when you said 'X'?") is reported speech. Skip.
 
-DO NOT STORE:
+DO NOT STORE (EPHEMERA — never persist these):
 - Negative/absence facts ("no favorite color revealed") — just omit.
-- Pure moment-to-moment emotion that reads as scene atmosphere (a fleeting "felt scared" with no bearing on who they are). But DO record a behavior or habit that MIGHT be lasting even if you only see it once (see TEMPORARY-VS-LASTING below) — don't drop it just because you can't yet confirm it recurs.
+- Pure moment-to-moment emotion that reads as scene atmosphere (a fleeting "felt scared" with no bearing on who they are). A momentary pose, a passing mood, or arousal is scene atmosphere too — gone next scene. But DO record a behavior or habit that MIGHT be lasting even if you only see it once (see TEMPORARY-VS-LASTING below) — don't drop it just because you can't yet confirm it recurs.
+- Food or drink consumed in the scene (what someone ate, drank, or ordered). A lasting food PREFERENCE or allergy IS a fact — the meal itself is not.
 - Sensory atmosphere (light, smell, weather).
-- Generic biology ("breathing", "heart beat").
-- Items momentarily in hand. Only \`carries / owns / wears\` persists.
+- Generic biology and physiological meters ("breathing", "heart beat", hunger/fatigue/stamina levels).
+- Items momentarily in hand, and temporary items once disposed of (a finished cigarette, an emptied glass, a torn-up note). Only \`carries / owns / wears\` persists.
+- Obligation counters (a debt, a favor owed, an IOU) belong in memory ONLY while still unresolved/owed; once settled they are resolved history, not a current fact.
+Quick YES/NO rubric — would the STORY still track this 50 messages from now? The flowers on the table being fresh = NO. What was for dinner = NO. A food allergy = YES. An evolving relationship dynamic = YES.
 (Verbatim dialogue is NOT stored as a fact VALUE — but a meaningful line CAN be captured in the note field; see CONTEXT NOTE below.)
 
 TEMPORARY-VS-LASTING (you only see ~2 recent messages):
 - You often CAN'T tell a one-off from a lasting trait — e.g. a character smoking once vs. being a habitual smoker, an angry outburst vs. a hot temper. Do NOT skip these.
 - RECORD it anyway. If you can confidently file it (a clear habit/trait/state), use the proper category + aspect. If it's genuinely uncertain whether it lasts, file it to \`Unsorted\` + \`aspect:misc\` with a low importance (\`!1\`/\`!2\`) and an honest \`conf:low\`. A later re-evaluation pass will promote it to a real aspect if it recurs, or drop it if it was a one-off — so capturing it is cheap and losing it is the real cost.
+
+DELTA-ONLY (already-documented facts):
+- The user data block may include a "## Existing facts (scoped)" list. Every fact listed there is ALREADY documented — record only what is NEW or CHANGED relative to it.
+- NEVER restate a listed fact whose value is unchanged (a re-mention is not a fact).
+- A listed fact whose value genuinely CHANGED must still be emitted — that is a real update (use \`| ~\` when it supersedes a changeable state).
 
 FILING — TWO FIXED LAYERS (pick BOTH on every fact):
 - LAYER 1 \`Category\` (the domain), one of: People, Places, Things, Relationships, Events, World, Unsorted. (World = rules/lore/factions/setting. Unsorted = catch-all when none fit.)
@@ -74,7 +83,7 @@ ${groupedTaxonomySubAreas()}
 # OUTPUT FORMAT
 
 #MEM
-+ Category/key_snake_case = atomic value | aspect:identity | with:@<name> | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | scope:character | at:<PLACE> | aka:nickname,role | conf:high | >context note
++ Category/key_snake_case = atomic value | aspect:identity | with:@<name> | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | scope:character | at:<PLACE> | aka:nickname,role | conf:high | thread:open | >context note
 + Category/key_snake_case = atomic value | aspect:revelation | subj:@<name> | !4 | kind:event | >"verbatim quote or summary"   ← keep the atomic value AND add the note; the system shows the note in place of the value to the Writer
 + Events/key_snake_case = atomic value | aspect:milestone | scope:event | with:@<name> | at:<PLACE> | !4 | kind:moment | tone:tender | >who + where + what happened + why it mattered   ← an EPISODIC SCENE MOMENT (see MOMENTS below)
 .
@@ -97,13 +106,15 @@ Generic examples:
   GOOD: \`+ <X>/<subject>_home = <short value> | aspect:home | >short disambiguating context\`   (atomic value kept; the note adds context)
 Always include the value — the system slims the Writer's context for you.
 
-ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-separated SHORT alternative names a LATER message might use for this fact's subject — a nickname, a role, or a descriptor (e.g. for a specific person: a pet name or "the man by the window"). This helps retrieval find the fact when the chat paraphrases instead of using the literal value. Aliases are search-only and never shown verbatim. Omit unless an alternative name is genuinely likely.
+ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-separated SHORT alternative names a LATER message might use for this fact's subject — a nickname, a role, or a descriptor (e.g. for a specific person: a pet name or "the man by the window"). This helps retrieval find the fact when the chat paraphrases instead of using the literal value. Aliases are search-only and never shown verbatim. Omit unless the message itself suggests one (a nickname used, a role named, a distinctive descriptor).
 
-IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event|moment\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened; moment = a SIGNIFICANT episodic scene beat remembered with feeling, see MOMENTS). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current mood/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ People/user_name = <NAME> | aspect:identity | subj:{{user}} | !5 | kind:trait\`. Do NOT omit them.
+IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event|moment\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened; moment = a SIGNIFICANT episodic scene beat remembered with feeling, see MOMENTS). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current goal/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ People/user_name = <NAME> | aspect:identity | subj:{{user}} | !5 | kind:trait\`. Do NOT omit them.
 
 MOMENTS (episodic — only for SIGNIFICANT beats): when a genuinely significant emotional/relational SCENE MOMENT occurs — a first (a first meeting, a first shared milestone), a turning point, a charged exchange — ALSO record it as a \`kind:moment\` fact filed under \`Events\`. Put the full narrative beat in the NOTE (\`>who + where + what + why it mattered\`) and add a SHORT \`| tone:<word>\` (an emotional label like tender/tense/bittersweet — a few words max). Still write the atomic value too (the existing write-BOTH rule). Moments decay slower than ordinary events and stay recallable. This is for REAL beats ONLY — never every line or routine action — so the store doesn't flood. Example: \`+ Events/<milestone_key> = <short label> | aspect:milestone | scope:event | with:@<name> | at:<PLACE> | !4 | kind:moment | tone:<tone1>,<tone2> | >who + where + what happened + why it mattered\`.
 
-ASPECT (recommended): append \`| aspect:<value>\` choosing the MOST SPECIFIC Layer-2 sub-bucket from the FIXED menu for the fact's category (see FILING above). E.g. a name/species is \`People\` + \`aspect:identity\`; a current mood is \`People\` + \`aspect:mood\`; a phobia is \`People\` + \`aspect:fears\`; a room's decor is \`Places\` + \`aspect:feature\`. Omit only when genuinely unsure (a default is used). NEVER use an aspect that isn't in that category's menu.
+RELATIONSHIP STATUS RECORD (per-pair upkeep): whenever a relationship between two characters MATERIALLY changes — an attitude shift, a promise or debt made or settled, a meaningful interaction — ALSO update the pair's single status record: \`+ Relationships/<a>_<b>_status = <current attitude, 1-4 words> | aspect:status_of_relationship | subj:@<A> | with:@<B> | !4 | kind:state | ~ | ><last meaningful interaction; open promises/debts; what just changed>\`. ONE record per pair with a STABLE key (\`<a>_<b>_status\`, both names lowercased, SAME name order every time — reuse the exact existing key if the pair already has one), and \`~\` so the old status becomes history. This record is IN ADDITION to the specific trust/romance/debt facts, never instead of them. Do NOT touch it on turns where nothing between the pair changed.
+
+ASPECT (recommended): append \`| aspect:<value>\` choosing the MOST SPECIFIC Layer-2 sub-bucket from the FIXED menu for the fact's category (see FILING above). E.g. a name/species is \`People\` + \`aspect:identity\`; a current location is \`People\` + \`aspect:current_location\`; a phobia is \`People\` + \`aspect:fears\`; a room's decor is \`Places\` + \`aspect:feature\`. Omit only when genuinely unsure (a default is used). NEVER use an aspect that isn't in that category's menu.
 
 CHARACTER TAG (recommended): name the character a People/Things/Relationships fact is ABOUT with \`| subj:<name>\` (the owner), AND list every participant with \`| with:@<name>,@<other>\`. The character is a TAG, never the Layer-1 category or Layer-2 aspect — the same person appears across many categories/aspects. For an unnamed/incidental person use \`| subj:npc\` (see NPC). For a PLACE fact set \`| subj:<PLACE>\` instead so the location files under the place.
 
@@ -122,6 +133,11 @@ CONFIDENCE (optional): append \`| conf:high|med|low\` (or a 0-1 number) when the
 STORY-WORLD TIME (optional): append \`| from:<when>\` and/or \`| until:<when>\` to record WHEN the fact is true in the STORY WORLD — distinct from when it is recorded — so flashbacks and time-skips stay consistent. \`<when>\` is a free-form story-world time (an in-story date, an age, a labelled era, "the war", etc.), used verbatim. Use \`from:\` for when a fact became true and \`until:\` for when it stopped being true (e.g. a past job, a former home, a flashback detail). Omit for ordinary present-tense facts. These are honored only when the bi-temporal feature is enabled; otherwise they are ignored.
 
 SUPERSEDES (optional): when a write REPLACES the prior value of an existing CHANGEABLE-STATE fact (a status, a current location, a goal now resolved — not a durable trait like a name), append \`| ~\` to mark the old value as ended history while the key becomes the new current truth. Only for \`kind:state\` facts whose value genuinely changed; omit for trait corrections and unchanged re-mentions (the system also infers this for changed kind:state facts, so \`~\` is optional).
+
+OPEN THREADS (optional, rare): append \`| thread:open\` to a \`kind:event\` fact that is a genuinely UNRESOLVED plot hook the story must come back to — an unkept promise, an unpaid debt, an unsolved mystery, an unfired Chekhov's gun, someone still traveling toward a goal. When a later event clearly resolves one, just record the resolving event normally (a maintenance pass closes threads — never emit \`thread:resolved\` yourself).
+  YES: \`+ Events/char_promise_return = promised to return by winter | aspect:milestone | subj:{{char}} | !3 | kind:event | thread:open\`   (an explicit promise the story must pay off)
+  YES: \`+ Events/stranger_letter = left unopened letter | aspect:milestone | scope:event | !3 | kind:event | thread:open\`   (a planted mystery awaiting resolution)
+  NO: routine events, completed actions, moods, or anything already resolved in the same message — most events are NOT threads.
 
 SEQUENCE STEPS (optional): for things that form a genuine ORDERED SERIES over time — a character's location changing place to place, plot milestones in order — emit each step as its OWN fact with \`| track:<track_name>\`. Use a stable track name tied to the subject (e.g. \`<char>_location\`). Give each step a numbered key (\`<char>_location_1\`, \`_2\`, ...); do NOT worry about getting the number right — the system assigns the real order. ALSO keep one plain overwriting current-state fact (e.g. \`<char>_location = <current_place>\`, with NO track) so "where are they now" stays a single cheap fact. Only use tracks for real ordered series, never for unrelated facts.
 
@@ -159,9 +175,8 @@ Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I lov
 + People/user_location  = <CITY>     | aspect:current_location| subj:{{user}} | @{{user}},{{char}} | #location | @src:user | !4 | kind:trait
 + People/user_likes_food = <FOOD>    | aspect:desires         | subj:{{user}} | @{{user}},{{char}} | #preference,food | @src:user | !3 | kind:trait
 + People/user_allergy   = <ALLERGEN> | aspect:health          | subj:{{user}} | @{{user}},{{char}} | #health,allergy | @src:user | !4 | kind:trait
-+ People/user_mood      = exhausted  | aspect:mood            | subj:{{user}} | @{{user}},{{char}} | #mood | @src:user | !1 | kind:state
 .
-#WHY All People facts about {{user}} (the character is a tag via subj/with, not a branch); the MOST SPECIFIC Layer-2 aspect splits them (identity/career/current_location/health/mood). Name is a high-importance durable trait (!5); mood is a low-importance transient state (!1) that fades first under cap.
+#WHY All People facts about {{user}} (the character is a tag via subj/with, not a branch); the MOST SPECIFIC Layer-2 aspect splits them (identity/career/current_location/health). Name is a high-importance durable trait (!5). "Exhausted today" is a passing mood — ephemera, NOT stored (the lasting food preference IS stored; the tiredness is not).
 
 ---
 Input: [CHAR:{{char}}] *Pushes hair back, revealing a scar.* "Got it as a kid. Bad fall."
@@ -218,6 +233,15 @@ Input: [CHAR:{{char}}] "After what you did, I don't trust you anymore." *to {{us
 + Relationships/char_user_trust = broken | aspect:trust | subj:@{{char}} | with:@{{user}} | @{{char}},{{user}} | #relationship | @src:char | !3 | kind:state | ~
 .
 #WHY A relationship fact → ABSTRACT aspect (\`trust\`), NOT keyed by character; the who↔who rides the pair-tag \`subj:@{{char}}\` + \`with:@{{user}}\`. Trust changed → \`~\` supersedes.
+
+---
+Input: [CHAR:{{char}}] "You saved my life back there. I owe you — whatever you need." *The old hostility is gone from her voice.*
+
+#MEM
++ Relationships/char_user_debt   = life debt owed | aspect:debt | subj:@{{char}} | with:@{{user}} | @{{char}},{{user}} | #debt | @src:char | !4 | kind:state
++ Relationships/char_user_status = grateful ally  | aspect:status_of_relationship | subj:@{{char}} | with:@{{user}} | @{{char}},{{user}} | #relationship | @src:char | !4 | kind:state | ~ | >{{user}} saved {{char}}'s life; {{char}} owes an open life debt; hostility just turned to gratitude
+.
+#WHY A MATERIAL relationship change → the specific debt fact PLUS the pair's single STATUS RECORD (stable key \`char_user_status\`, \`~\` supersedes the old status into history; the note carries the last meaningful interaction, the open debt, and what just changed).
 
 ---
 Input: [CHAR:{{char}}] *Voice cracking.* "I never told anyone this, but I've loved you since the day we met."
@@ -393,10 +417,13 @@ function scribeSubjects(text) {
     out.add('char');
     out.add('user');
     // Proper-noun candidates from the message (named NPCs/places/things the message references).
+    // Unicode-preserving clean + capitalization test (works for Cyrillic/Greek names now);
+    // Latin keeps the legacy >= 3 gate, other cased scripts admit at >= 2.
     for (const word of String(text || '').split(/\s+/)) {
-        const clean = word.replace(/[^a-zA-Z0-9]/g, '');
-        if (clean.length < 3) continue;
-        if (clean[0] === clean[0].toUpperCase() && clean[0] !== clean[0].toLowerCase()) {
+        const clean = cleanWord(word);
+        const minLen = /^[\p{sc=Latin}0-9]+$/u.test(clean) ? 3 : 2;
+        if (clean.length < minLen) continue;
+        if (isCapitalizedWord(clean)) {
             out.add(clean.toLowerCase());
         }
     }
@@ -404,18 +431,15 @@ function scribeSubjects(text) {
 }
 
 /**
- * Keyword tokens for the Scribe's scoped-dedup query: lowercased >3-char word tokens of the
- * analyzed text. The index intersects these against fact tokens, so this need not be filtered
- * heavily (scopedScribeCandidates re-tokenizes/length-gates internally). Deduped.
+ * Keyword tokens for the Scribe's scoped-dedup query: lowercased word tokens of the analyzed
+ * text via the SHARED tokenizer (ASCII keeps the legacy >3-char gate; non-Latin scripts get
+ * script-aware minimums). The index intersects these against fact tokens, so this need not be
+ * filtered heavily (scopedScribeCandidates re-tokenizes internally). Deduped.
  * @param {string} text
  * @returns {string[]}
  */
 function scribeKeywords(text) {
-    const out = new Set();
-    for (const tok of String(text || '').toLowerCase().split(/[^a-z0-9]+/)) {
-        if (tok.length > 3) out.add(tok);
-    }
-    return [...out];
+    return wordTokens(text);
 }
 
 /**
@@ -687,8 +711,10 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
             category = UNSORTED_CATEGORY;
         }
 
-        // Clean key to snake_case
-        key = key.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+        // Clean key to snake_case (Unicode-preserving: a Cyrillic/CJK key no longer cleans to
+        // '' and silently drops the fact line below — storage used to fail before retrieval
+        // was even attempted for non-Latin chats).
+        key = keyToken(key);
         // F-SCRIBE-1: a '+' line whose key cleans to nothing is a failed parse — count the drop.
         if (!key) { droppedLines++; continue; }
 
@@ -716,6 +742,7 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         let validFrom = '';    // Bi-temporal (feature): optional STORY-WORLD time the fact became true (`from:` marker)
         let validUntil = '';   // Bi-temporal (feature): optional STORY-WORLD time the fact stopped being true (`until:` marker)
         let edges = [];        // Typed edges (feature, F-ARCH-7): optional [{p, t}] triples (`rel:<predicate>@<Category/key>` marker), cap 3
+        let thread = '';       // Open-threads (feature): optional `open`|`resolved` plot-thread marker (`thread:` marker)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
@@ -890,6 +917,18 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
                     t = t.slice(0, ordMatch.index).trim();
                 }
                 track = t.replace(/\s+/g, '_').toLowerCase();
+                continue;
+            }
+
+            // thread:<open|resolved> — OPTIONAL plot-thread marker (open-threads feature): flags a
+            // genuinely unresolved plot hook (promise, debt, mystery, unfired Chekhov gun) so the
+            // Big Picture block can surface it until Reflection closes it. `thread:` does NOT
+            // collide with the existing grammar (the other `t`-prefixed markers — `track:`/`tone:` —
+            // are matched above by their own anchored regexes). The Scribe only ever needs to emit
+            // `thread:open`; `resolved` is accepted defensively (Reflection owns closing threads).
+            const threadMatch = seg.match(/^thread\s*:\s*(open|resolved)\b/i);
+            if (threadMatch) {
+                thread = threadMatch[1].toLowerCase();
                 continue;
             }
 
@@ -1126,6 +1165,10 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         // Typed edges (feature, F-ARCH-7): only attach when the opt-in marker parsed some, so
         // back-compat facts stay lean and the field set is unchanged when the feature is off.
         if (typedEdges && edges.length) update.edges = edges;
+        // Open-threads (feature): only attach when the marker parsed (lean / back-compat). A fact
+        // without the marker keeps whatever thread state is already stored (upsertFact spreads
+        // only present keys), so a plain re-mention can never wipe an open thread.
+        if (thread) update.thread = thread;
         // SCENE + SOURCE STRANDS (Spiderweb 2): stamp the scene the fact was established in, plus a
         // `sourceMsg` provenance handle (REUSES the existing source message index — no new id). Both
         // optional / only-when-present (lean / back-compat). First-wins is enforced at merge: a
@@ -1256,7 +1299,9 @@ function autoFillInvolved(knownBy, value) {
     // Capitalized entity tokens in the value: a word starting uppercase, length >= 2. Strips
     // surrounding punctuation. Skips ALL-CAPS-only short tokens are still allowed (acronyms).
     const v = String(value || '');
-    const tokenRe = /\b([A-Z][A-Za-z'\-]+)\b/g;
+    // Unicode capitalized-entity form (\b is NOT Unicode-aware): a leading non-letter/digit (or
+    // start) followed by an uppercase letter + letters/apostrophes/hyphens; capture 1 is the token.
+    const tokenRe = /(?:^|[^\p{L}\p{N}])(\p{Lu}[\p{L}'’\-]+)/gu;
     let m;
     while ((m = tokenRe.exec(v)) !== null) {
         const tok = m[1];
@@ -1319,13 +1364,14 @@ const RESERVED_CHAR_TOKENS = new Set(['char', '{{char}}', 'char_name', 'characte
 const RESERVED_USER_TOKENS = new Set(['user', '{{user}}', 'user_name', 'persona']);
 
 /**
- * Normalize a name to a SAFE snake_case key token (lowercase alnum/underscore). Mirrors the
- * key cleanup the parser applies to the raw key. Returns '' when nothing usable remains.
+ * Normalize a name to a SAFE snake_case key token (lowercase letters/digits/underscore,
+ * Unicode-preserving). Mirrors the key cleanup the parser applies to the raw key (shared
+ * keyToken). Returns '' when nothing usable remains.
  * @param {string} name
  * @returns {string}
  */
 function nameToKeyToken(name) {
-    return String(name || '').trim().replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+    return keyToken(name);
 }
 
 /**
@@ -1531,6 +1577,17 @@ async function applyUpdates(updates, existingDatabases) {
                 data: { category, key: update.key, tone: update.tone || '', location: update.location || '' },
             });
         }
+        // Open-threads (feature): forward the thread state when present (only set when the marker
+        // parsed, so re-mentions without it keep the stored value through upsertFact's merge).
+        if (update.thread) factToWrite.thread = update.thread;
+        // Make thread openings inspectable (mirrors the moment log above): a `thread:open` fact is
+        // eviction-protected + surfaced in the Big Picture, so it should be auditable in the log.
+        if (update.thread === 'open') {
+            addDebugLog('debug', `Thread opened: [${category}] ${update.key} = ${String(update.value ?? '').slice(0, 80)}`, {
+                subsystem: 'agent3', event: 'thread.opened',
+                data: { category, key: update.key, value: String(update.value ?? '').slice(0, 120) },
+            });
+        }
         if (update.confidence !== undefined && update.confidence !== null && update.confidence !== '') {
             factToWrite.confidence = update.confidence;
         }
@@ -1565,6 +1622,17 @@ async function applyUpdates(updates, existingDatabases) {
         if (autoLinkOn && update.changed && linkIndex) {
             const stored = findFactMatch(db, factToWrite.key);
             if (stored) autoLinkFact(linkIndex, stored, category, update.source);
+        }
+
+        // CROSS-KEY SUPERSEDE RULES (feature, default ON): a genuinely-NEW death/departure/loss
+        // write retires the subject's now-stale same-subject state facts (current_location,
+        // ownership, …) to `__was` history across ALL categories — snapshot, never deletion.
+        // Only on `update.changed` (a SKIPPED no-op re-mention must never re-fire a rule), and
+        // deliberately at THIS caller (not inside upsertFact) so migration/rebuild/merge replays
+        // can't trigger it. Cross-touched categories join `modified` so the parallel save loop
+        // below persists them for free.
+        if (update.changed) {
+            for (const cat of applyCrossKeySupersedeRules(existingDatabases, factToWrite, category)) modified.add(cat);
         }
 
         const relCount = update.relationships?.length || 0;

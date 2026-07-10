@@ -177,13 +177,13 @@ function looksLikeNamedEntity(token) {
     // Descriptor phrases ("the man by the window", "a waiter") are NOT names.
     if (/^(the|a|an|some|that|this|one|another)\b/i.test(s)) return false;
     // Multi-word phrase whose first word is lowercase = a description, not a proper name.
-    if (/\s/.test(s) && /^[a-z]/.test(s)) return false;
+    if (/\s/.test(s) && /^\p{Ll}/u.test(s)) return false;
     // Each word must be Capitalized + alphabetic (allow apostrophes/hyphens inside names).
     const words = s.split(/\s+/).filter(Boolean);
     if (words.length === 0 || words.length > 3) return false; // a 4+ word "name" is prose
     for (const w of words) {
         if (STOPWORDS.has(w.toLowerCase())) return false;
-        if (!/^[A-Z][A-Za-z'’-]*$/.test(w)) return false; // must start uppercase, letters only
+        if (!/^\p{Lu}[\p{L}'’\-]*$/u.test(w)) return false; // must start uppercase, letters only (Unicode-aware)
     }
     return true;
 }
@@ -448,9 +448,11 @@ function rekeyForSubject(oldKey, subjectToken) {
     return `${subjectToken}_${key}`;
 }
 
-/** Sanitize a display name into a subject token (lowercase, alnum + underscore). */
+/** Sanitize a display name into a subject token (lowercase, Unicode letters/digits +
+ * underscore — non-Latin names like Cyrillic/Greek/CJK must survive, otherwise a
+ * promotion degenerates to the 'npc' token and silently no-ops). */
 function subjectTokenFor(name) {
-    return String(name || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'npc';
+    return String(name || '').trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, '') || 'npc';
 }
 
 /** Case-insensitive membership test against an involved/about value. */
@@ -480,6 +482,12 @@ export async function promoteEntity(name) {
     if (!display) return { moved: 0, dbs: 0 };
     const lowerName = display.toLowerCase();
     const subjectToken = subjectTokenFor(display);
+    if (subjectToken === NPC_SUBJECT) {
+        // Name degenerated to the drawer token itself (e.g. all-symbol "name") — promoting
+        // would rewrite nothing yet delete `about`, silently orphaning the facts. Refuse.
+        addDebugLog('fail', `Character registry: cannot promote "${display}" — name yields no usable subject token`);
+        return { moved: 0, dbs: 0 };
+    }
 
     const databases = await getAllDatabases();
     let moved = 0;

@@ -6,7 +6,7 @@ Works best with a **tool-calling-capable main model** (e.g. Claude) — the pull
 
 ## Install
 
-Drop into `SillyTavern/public/scripts/extensions/third-party/bf-memory-pipeline-redesign/` (or clone there). Enable in the Extensions panel. The drawer header shows the installed version, read live from `manifest.json` (e.g. `v0.60.0`) — handy for confirming you're testing the latest after a `git pull`.
+Drop into `SillyTavern/public/scripts/extensions/third-party/bf-memory-pipeline-redesign/` (or clone there). Enable in the Extensions panel. The drawer header shows the installed version, read live from `manifest.json` (e.g. `v0.61.0`) — handy for confirming you're testing the latest after a `git pull`.
 
 ---
 
@@ -54,18 +54,25 @@ In **every** mode the Scribe extracts facts *after* the reply arrives (on `MESSA
 | **Review interval** (`reviewInterval`) | 10 | Fact-review popup every N messages (0 = never show it). Higher = fewer interruptions. |
 | **Memory lookups** (`enableWriterRecallTool`) | ON | Registers the `search_memory` pull tool. Read-only; no-ops on non-tool models. |
 | **Memory notes** (`enableWriterWriteTool`) | ON | Registers the `remember_fact` pin tool. Add-only; no-ops on non-tool models. |
+| **POV scoping** (`enforceKnownBy`) | ON | Facts tagged with a who-knows list are hidden from characters not on it (empty list = visible to all). Applies to injection, `search_memory`, and `/recall`. OFF = every character sees every fact. |
 
 **Opt-in extras** (details in [UPGRADES.md](UPGRADES.md)) — each behind its own toggle, OFF unless noted:
 
 | Feature | Default | One line |
 |---|---|---|
 | Temporal grounding | ON | "yesterday" is saved as an actual date. |
+| Recency labels | ON | Injected facts say how long ago they happened — `(~3 turns ago, scene 2)`. |
+| Truth hierarchy | ON | Injected memory splits into CURRENT STATE (wins conflicts) vs CHRONOLOGY (context only), so old events aren't replayed as now. |
 | MMR diversity rerank | ON | Injected facts cover more ground instead of repeating. |
 | Confidence ranking | ON | Shaky facts lose scarce slots to solid ones. |
 | Bi-temporal validity | OFF | Track *when in the story* a fact was true (flashbacks/time-skips). |
 | Entity merge | OFF | "Bobby"/"Robert"/"Rob" become one character (conservative, logged). |
 | Shared user memory | OFF | Facts about *you* are known to every character. |
 | Idle consolidation | OFF | The tidy-up pass also runs while you're away. |
+
+## Catching up an existing chat
+
+Installed mid-story? **Database tab → Process Existing Chat → Catch-up import** reads your backlog in chunks of N messages (default 8, `catchupBatchSize`) with **one** Scribe call per chunk — far cheaper than the per-message "Run the Scribe on full chat" button on a long thread. It shows a call estimate before starting, a progress bar while running, and the fact-review popup at the end. Cancel anytime: processed chunks are watermarked, so re-running resumes where it stopped (a failed chunk is retried automatically on the next run). Also available as `/bfmem catchup [N|cancel]`. Two honest caveats: don't keep chatting while it runs, and imported facts get pinned to each chunk's *last* message, so the per-message brain icon is approximate for imported history.
 
 ## Removed features
 

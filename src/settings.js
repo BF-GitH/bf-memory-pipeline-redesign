@@ -50,7 +50,7 @@ export {
 export {
     setLastGenerated, setLastInserted, setLastInjection, appendLastInserted, reloadFactsFromChat,
     setRunTokens, addAgent3Tokens, addReflectionTokens, setMainOutputTokens, reloadTokensFromChat,
-    getScene, setScene, reloadSceneFromChat,
+    getScene, setScene, getSceneReentries, reloadSceneFromChat,
     getReflection, setReflection, reloadReflectionFromChat,
     getSummaryPyramid, setSummaryPyramid, reloadPyramidFromChat,
 } from './turn-state.js';
@@ -116,6 +116,15 @@ const DEFAULT_SETTINGS = {
     // facts don't rot. Default ON. The date goes in the USER prompt block (system prefix stays
     // cache-stable); the resolution rule is appended to the system prompt only while this is on.
     temporalGrounding: true,
+    // REFLECTION COMPRESSION GUARD (prompt-upgrades): when a reflection #SHELVES "summary"
+    // comes back NOT SHORTER than the raw sample facts it summarizes (compression failure —
+    // the model added detail instead of abstracting), re-run the reflection call ONCE with an
+    // identical system prompt (the repair paragraph rides the USER prompt only, preserving
+    // prefix-stability/prompt caching for agent 'reflection') and take the retry's shelves for
+    // the failing buckets only; a still-too-long retry keeps the prior stored summary. Default
+    // ON — costs nothing until tripped; the single-retry cap bounds the worst case at one
+    // extra reflection call per pass. Never loops.
+    reflectionCompressionGuard: true,
     // BI-TEMPORAL FACT VALIDITY (Graphiti/Zep valid_at/invalid_at). Default OFF. When ON, the
     // Scribe may tag a fact with story-world validity markers `| from:<when>` / `| until:<when>`
     // (free-form in-story time), parsed in agent-memory.js into the DISTINCT `validFrom`/`validUntil`
@@ -125,6 +134,14 @@ const DEFAULT_SETTINGS = {
     // are ignored, no fields are written, and output is byte-for-byte unchanged. Absent (older
     // settings) → default false.
     biTemporal: false,
+    // CROSS-KEY SUPERSEDE RULES (community adoption Tier 1; NarrativeEngine timeline prior art,
+    // report §1.6). Default ON — deterministic table-driven code, no LLM call. When a genuinely
+    // NEW death/departure/loss fact is written (Scribe commit, Writer remember_fact, review-popup
+    // edit — never migration/rebuild/merge replays), same-subject changeable-STATE facts under the
+    // rule's target aspects (current_location, ownership, …) are retired to `__was` history across
+    // categories — the SAME snapshot-not-delete provenance as per-key supersession, capped at 8
+    // invalidations per trigger. Disable to restore per-key-only supersession behavior.
+    crossKeySupersede: true,
     // TYPED-EDGE GRAPH MEMORY (Graphiti typed edges; audit F-ARCH-7). Default OFF. When ON, the
     // Scribe may tag a fact with up to 3 typed relationship edges `| rel:<predicate>@<Category/key>`
     // (e.g. `rel:employs@People/bob_name`), parsed in agent-memory.js into `fact.edges = [{p, t}]`
@@ -137,6 +154,26 @@ const DEFAULT_SETTINGS = {
     // back-compat: when OFF the marker falls through to the legacy `rel:` keyword-hint branch,
     // no fields are written, and behavior is byte-identical. Absent (older settings) → false.
     typedEdges: false,
+    // INJECTED-MEMORY RECENCY LABELS (community adoption Tier 1; formatter-only, no LLM).
+    // Default ON. Each fact line in the per-turn injected block gains a compact "how long ago"
+    // tail — ` (~3 turns ago, scene 2)` derived from `validAt`/`sceneNo`, or an in-story phrase
+    // (` (~2 in-story months ago)`) when bi-temporal validity is ON and the fact's `validFrom`
+    // parses as a date. Fail-soft: a legacy fact without `validAt` gets NO tail (never a wrong
+    // one). Injected block only — search_memory tool output and the appendEdgeTails exact-line
+    // contract are untouched. OFF restores the old per-line format byte-for-byte. NOTE: the
+    // labels change as turns pass, so with `injectionFreezeTurns` > 0 a frozen (cached)
+    // injection reuses labels up to N turns stale — same staleness contract as the frozen
+    // facts themselves — and the injected block is no longer byte-stable across turns for
+    // server-side prompt-prefix caching.
+    injectRecencyLabels: true,
+    // INJECTED-MEMORY TRUTH HIERARCHY (community adoption Tier 1; formatter-only, no LLM).
+    // Default ON. The injected fact block is split under a one-line precedence preamble into a
+    // CURRENT STATE section (absolute present truth, wins conflicts) and a CHRONOLOGY section
+    // (kind:event/moment only, oldest first, context-only) — so the Writer stops replaying old
+    // events as happening now. Conservative: ONLY explicit kind:event/moment facts move to
+    // CHRONOLOGY; kind-less legacy facts stay in CURRENT STATE. Empty sections are omitted.
+    // OFF restores the flat line list byte-for-byte.
+    injectTruthHierarchy: true,
     // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
     // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
     // before sending — the main model sees only those + our injected facts. Lets you
@@ -207,6 +244,17 @@ const DEFAULT_SETTINGS = {
     // Hard cap on the injected moment-echo line, in approx tokens (reuses the buildSceneBlock
     // char-budget truncation style). Deliberately tiny — ONE short beat, never a recap.
     momentEchoMaxTokens: 40,
+    // Relationship re-entry pack (community adoption) — default OFF. When a character RETURNS to
+    // the scene after >= reentryAbsenceScenes scene-boundaries away, their per-pair relationship
+    // status record plus the last few shared kind:moment beats with those present are GUARANTEED
+    // into the injection (budget-charged against retrievalTokenBudget, de-duped against retrieval
+    // + anchors). Detection rides the push-mode #SCENE parse — hybrid/tool-only have no fresh
+    // present list, so re-entry never fires there (documented in the settings hint + debug log).
+    enableRelationshipReentry: false,
+    // How many scene-boundaries a character must have been away before their return counts.
+    reentryAbsenceScenes: 2,
+    // How many shared past moments (kind:moment) to include per re-entering pair.
+    reentryMomentCount: 3,
     // Automatic associative linking (A-MEM style, lexical, DETERMINISTIC, zero-API). When ON, a
     // freshly-written fact is auto-connected to related EXISTING facts (same subject / shared
     // location / shared participants / lexical token overlap) by recording links into its
@@ -216,6 +264,18 @@ const DEFAULT_SETTINGS = {
     // Hard cap on the injected Big Picture block, in approx tokens (reuses the buildSceneBlock
     // char-budget truncation style). Bounds prompt growth even with a huge store.
     summaryPyramidMaxTokens: 250,
+    // Open plot threads (open-threads feature) — default ON (deterministic, no extra LLM call,
+    // tiny token cost). When ON (and the Big Picture block is enabled), the newest unresolved
+    // `thread:open` hooks (promises, debts, mysteries, unfired Chekhov guns) are appended as ONE
+    // clamped "Open threads:" line inside the Big Picture block. The Scribe opens threads
+    // (`thread:open` marker on kind:event facts); the reflection pass closes them (#THREADS
+    // verdicts, riding the existing call — no new LLM call anywhere). Absent (older settings)
+    // => true.
+    enableOpenThreads: true,
+    // Hard cap on the "Open threads:" line alone, in approx tokens — its OWN sub-clamp applied
+    // BEFORE the whole-block summaryPyramidMaxTokens cap, so a long thread list can't silently
+    // eat the shelf summaries.
+    openThreadsMaxTokens: 60,
     reviewInterval: 10,
     // Contradiction scan (atomic #7): every N reflection passes, flag facts that appear to
     // contradict (same/near key, different value) into the review popup. Heuristic, no LLM call.
@@ -250,9 +310,24 @@ const DEFAULT_SETTINGS = {
     // (1 - confidenceWeight), so a small weight nudges ordering without ever zeroing a fact out:
     // effectiveMult = 1 - confidenceWeight * (1 - confidenceFactor). Clamp 0..1; small default.
     confidenceWeight: 0.3,
+    // SEMANTIC SHELF SELECTION (selection-summary, community adoption) — DEFAULT OFF (opt-in:
+    // it re-adds ONE small blocking LLM call to the reply-critical path, even in hybrid mode,
+    // capped by the Selector's own ~10s abort). When ON, a cheap "Selector" pass reads the
+    // Reflection shelf summaries as a menu and picks which shelves matter for the current
+    // scene; picks expand into budget-charged SECONDARY facts merged into the deterministic
+    // retrieval (never unbudgeted primary). Any failure — no shelves yet, timeout, bad JSON —
+    // falls back silently to the plain deterministic cascade, byte-identical to OFF.
+    selectionSummaryEnabled: false,
+    // Max Selector picks kept per turn (shelves + exact facts combined; the model is asked for
+    // up to 2x candidates so the confidence gate has slack to cut). Clamp 1..20.
+    selectionSummaryMaxPicks: 6,
     // Full-chat rebuild concurrency (atomic #17): max parallel Scribe calls during a
     // "Run on current chat" backfill (shared DB object → no lost writes). Clamp 1..6.
     rebuildConcurrency: 3,
+    // Catch-up import (community adoption §2.1): messages per Scribe call when chunk-importing
+    // an existing chat's backlog (src/catchup-import.js). Bigger = fewer/cheaper calls but
+    // coarser per-message fact attribution. Clamp 2..30.
+    catchupBatchSize: 8,
     // RETIRED (v0.50.x): the vector/embedding stack was removed; kept inert for stored-settings
     // back-compat only — nothing reads it anymore.
     semanticRetrieval: false,
@@ -333,6 +408,13 @@ const DEFAULT_SETTINGS = {
     // per present character to always inject alongside the retrieved facts, so the in-focus
     // character's anchors surface even if retrieval misses them. 0 disables.
     finderAnchorsPerCharacter: 3,
+    // WHO-KNOWS-WHAT (POV) ENFORCEMENT: when ON (default), facts carrying a knownBy list are
+    // hidden from characters not on that list at every retrieval surface (push cascade,
+    // search_memory, scene/relationship rows, anchors). Facts with an EMPTY knownBy stay visible
+    // to all. OFF = every character sees every fact (secrets leak; escape hatch for users
+    // sharing one DB across characters). Enforcement itself pre-dates this toggle — the gate
+    // lives in isFactVisible() (fact-retrieval.js) so all call sites follow it automatically.
+    enforceKnownBy: true,
     // USER-LEVEL SHARED MEMORY (Zep/mem0 user-scoping). Default OFF. When ON, facts whose SUBJECT
     // resolves to the user persona ({{user}}) are ALSO routed into a single shared, durable
     // "global user" store (a fixed pseudo-avatar record reusing the same IDB+attachment layer), and
@@ -427,7 +509,12 @@ export function validateSettings(s) {
     // Confidence-gated retrieval (default ON): boolean toggle + small 0..1 blend weight.
     if (typeof s.confidenceRanking !== 'boolean') s.confidenceRanking = true;
     s.confidenceWeight = clamp(s.confidenceWeight, 0, 1, 0.3);
+    // Semantic shelf selection (default OFF — adds an LLM call per turn): toggle + picks cap.
+    if (typeof s.selectionSummaryEnabled !== 'boolean') s.selectionSummaryEnabled = false;
+    s.selectionSummaryMaxPicks = Math.floor(clamp(s.selectionSummaryMaxPicks, 1, 20, 6));
     s.rebuildConcurrency = Math.floor(clamp(s.rebuildConcurrency, 1, 6, 3));
+    // Catch-up import chunk size: whole messages per Scribe call (src/catchup-import.js).
+    s.catchupBatchSize = Math.floor(clamp(s.catchupBatchSize, 2, 30, 8));
     // RETIRED vector stack (v0.50.x): coerced inert for stored-settings back-compat; nothing reads it.
     if (typeof s.semanticRetrieval !== 'boolean') s.semanticRetrieval = false;
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
@@ -481,6 +568,9 @@ export function validateSettings(s) {
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
     // Guaranteed present-character anchors (live; the retired Finder's other knobs are gone).
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
+    // knownBy (POV) enforcement: absent key (older saves) resolves to ON, matching the
+    // previously-UNCONDITIONAL filtering — zero behavior change on upgrade.
+    if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = true;
     // Coercion matches the tool-first DEFAULT (true): an absent key (older saved settings) resolves
     // to ON, consistent with DEFAULT_SETTINGS, instead of contradicting it. Users who explicitly
@@ -496,17 +586,32 @@ export function validateSettings(s) {
     if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = true; // matches DEFAULT_SETTINGS (tool-first flip)
     // Temporal grounding defaults ON (free, deterministic): absent/invalid => true (back-compat).
     if (typeof s.temporalGrounding !== 'boolean') s.temporalGrounding = true;
+    // Reflection compression guard — default ON; absent/invalid => true (back-compat).
+    if (typeof s.reflectionCompressionGuard !== 'boolean') s.reflectionCompressionGuard = true;
     // B3 safe slice — default OFF (absent/garbage => false = unchanged behavior).
     if (typeof s.scribeTrimProcessedPriors !== 'boolean') s.scribeTrimProcessedPriors = false;
     // Bi-temporal fact validity (opt-in) — default OFF; absent (older settings) => false (back-compat).
     if (typeof s.biTemporal !== 'boolean') s.biTemporal = false;
+    // Cross-key supersede rules — default ON (free + deterministic); absent (older settings) => true.
+    if (typeof s.crossKeySupersede !== 'boolean') s.crossKeySupersede = true;
+    // Injected-memory recency labels (formatter-only) — default ON; absent (older settings) => true.
+    if (typeof s.injectRecencyLabels !== 'boolean') s.injectRecencyLabels = true;
+    // Injected-memory truth hierarchy (formatter-only) — default ON; absent (older settings) => true.
+    if (typeof s.injectTruthHierarchy !== 'boolean') s.injectTruthHierarchy = true;
     // Typed-edge graph memory (opt-in, F-ARCH-7) — default OFF; absent (older settings) => false (back-compat).
     if (typeof s.typedEdges !== 'boolean') s.typedEdges = false;
     // Moment echo (Resonance Part B) — default OFF; absent (older settings) => false (back-compat).
     if (typeof s.enableMomentEcho !== 'boolean') s.enableMomentEcho = false;
     s.momentEchoMaxTokens = Math.floor(clamp(s.momentEchoMaxTokens, 12, 120, 40));
+    // Relationship re-entry pack — default OFF; absent (older settings) => false (back-compat).
+    if (typeof s.enableRelationshipReentry !== 'boolean') s.enableRelationshipReentry = false;
+    s.reentryAbsenceScenes = Math.floor(clamp(s.reentryAbsenceScenes, 1, 20, 2));
+    s.reentryMomentCount = Math.floor(clamp(s.reentryMomentCount, 1, 5, 3));
     // Auto-linking defaults ON (free + deterministic): absent/invalid => true (back-compat).
     if (typeof s.enableAutoLinking !== 'boolean') s.enableAutoLinking = true;
+    // Open plot threads — default ON (free + deterministic); absent (older settings) => true.
+    if (typeof s.enableOpenThreads !== 'boolean') s.enableOpenThreads = true;
+    s.openThreadsMaxTokens = Math.floor(clamp(s.openThreadsMaxTokens, 20, 200, 60));
     s.summaryPyramidMaxTokens = Math.floor(clamp(s.summaryPyramidMaxTokens, 50, 1000, 250));
     // C1 — usability preset id. One of the known ids or 'custom'; anything else (absent / garbage /
     // a renamed preset) coerces to 'custom' so the dropdown falls back safely. The actual knob
@@ -856,6 +961,163 @@ async function importDatabasesFromJson(text) {
         data: { categories: incomingCats, incomingFacts, applied: merged, mode: replace ? 'replace' : 'merge' },
     });
     toastr.success(`Imported ${merged} fact(s) (${replace ? 'replaced' : 'merged'})`, 'BF Memory');
+    refreshDatabaseView();
+}
+
+/**
+ * Export the fact store as a SillyTavern World Info book (lorebook). MANUAL flow behind the
+ * Database-tab button: options popup (granularity + AI keywords) -> explicit cost confirm
+ * spelling out the LLM call count (mirrors the run_full_chat confirm) -> bounded keyword
+ * generation (worldinfo-interop.js: capped batches, semaphore, unconditional sanitizer,
+ * deterministic fallback on ANY model failure) -> standard book-file download (same
+ * Blob/objectURL pattern as the #bf_mem_export_db handler). Read-only against the store.
+ */
+async function exportWorldInfoFlow() {
+    const wi = await import('./worldinfo-interop.js');
+    const { getAllDatabases } = await import('./database.js');
+    const { getAgent3ProfileId } = await import('./profiler.js');
+
+    const databases = await getAllDatabases();
+    const factUnits = wi.collectWorldInfoUnits(databases, { mode: 'fact' });
+    const shelfUnits = wi.collectWorldInfoUnits(databases, { mode: 'shelf' });
+    if (factUnits.length === 0) {
+        toastr.info('No active facts to export', 'BF Memory');
+        return;
+    }
+
+    // Options: granularity (per fact | per shelf) + AI keywords (default ON).
+    let mode = 'fact';
+    let useAI = true;
+    const popupOk = await ensurePopup();
+    if (popupOk && Popup) {
+        const html = `
+            <div class="bf-mem-wi-export-popup">
+                <h3>Export → World Info</h3>
+                <p>Turns your stored facts into a SillyTavern lorebook. Each entry gets ${wi.KEYWORDS_MIN}-${wi.KEYWORDS_MAX} concrete trigger keywords (never character names or abstract themes).</p>
+                <div style="display:flex;flex-direction:column;gap:6px;">
+                    <label class="checkbox_label"><input type="radio" name="bf_mem_wi_mode" value="fact" checked /> <span>One entry per fact (${factUnits.length} entries)</span></label>
+                    <label class="checkbox_label"><input type="radio" name="bf_mem_wi_mode" value="shelf" /> <span>One entry per shelf — category/aspect group (${shelfUnits.length} entries)</span></label>
+                    <label class="checkbox_label" style="margin-top:6px;"><input type="checkbox" id="bf_mem_wi_use_ai" checked /> <span>Generate keywords with AI (recommended)</span></label>
+                </div>
+            </div>`;
+        const popup = new Popup(html, POPUP_TYPE.TEXT, '', { okButton: 'Export', cancelButton: 'Cancel' });
+        const popupResult = await popup.show();
+        if (!popupResult) return;
+        const root = popup.dlg || popup.content || document;
+        mode = root.querySelector('input[name="bf_mem_wi_mode"]:checked')?.value === 'shelf' ? 'shelf' : 'fact';
+        useAI = !!root.querySelector('#bf_mem_wi_use_ai')?.checked;
+    } else {
+        // Popup module unavailable — degrade to confirms (per-fact + AI keywords).
+        if (!confirm(`Export ${factUnits.length} fact(s) as a World Info book (one entry per fact)?`)) return;
+    }
+
+    const units = mode === 'shelf' ? shelfUnits : factUnits;
+    const llmCalls = useAI ? Math.min(Math.ceil(units.length / wi.UNITS_PER_KEYWORD_CALL), wi.MAX_KEYWORD_CALLS) : 0;
+    // FIX #9 discipline: spell the cost out BEFORE any call is made (mirrors run_full_chat).
+    const costLine = useAI
+        ? `This will make ~${llmCalls} LLM call(s) to generate trigger keywords (${wi.UNITS_PER_KEYWORD_CALL} entries per call, hard cap ${wi.MAX_KEYWORD_CALLS}; anything beyond the cap gets offline keywords). Each call costs tokens.`
+        : 'Keywords will be generated offline (no LLM calls, lower quality).';
+    if (!confirm(`Export ${units.length} World Info entr${units.length === 1 ? 'y' : 'ies'} (one per ${mode})?\n\n${costLine}\n\nProceed?`)) return;
+
+    const profileId = getAgent3ProfileId(extensionSettings);
+    const banned = wi.buildBannedNames(databases);
+    const { llmCalls: madeCalls, aiUnits, fallbackUnits } = await wi.generateKeywords({ units, profileId, useAI, banned });
+    const book = wi.buildWorldInfoBook(units);
+
+    const json = JSON.stringify(book, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `bf-memory-worldinfo-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    addDebugLog('info', `World Info exported (${units.length} entries, mode=${mode}, ${madeCalls} keyword call(s))`, {
+        subsystem: 'import', event: 'wi.exported', actor: 'USER',
+        data: { entries: units.length, mode, aiKeywords: useAI, llmCalls: madeCalls, aiUnits, fallbackUnits },
+    });
+    toastr.success(`World Info book exported (${units.length} entries)`, 'BF Memory');
+}
+
+/**
+ * Import a SillyTavern World Info book: each enabled entry becomes a stored fact. Parses the
+ * three known lorebook dialects (worldinfo-interop.parseWorldInfoBook — throws a clear error
+ * on anything else, including a bf-memory export picked by mistake), shows a confirm popup
+ * (entry count, disabled skips, Unsorted-vs-heuristic target), converts, then persists via
+ * EXACTLY the importDatabasesFromJson MERGE contract: cancelPendingSnapshot -> upsertFact/
+ * saveDatabase per category -> saveCurrentToActiveProfile(allowEmpty) -> flushSnapshotNow —
+ * the documented anti-resurrection sequence. MERGE-only: WI import is additive by definition,
+ * it never wipes anything.
+ * @param {string} text - raw JSON file contents
+ * @param {string} fileName - book name (file name sans .json) used for provenance
+ */
+async function importWorldInfoFromJson(text, fileName) {
+    const wi = await import('./worldinfo-interop.js');
+    const entries = wi.parseWorldInfoBook(text); // throws on non-lorebook input (caller toasts)
+    const bookName = String(fileName || 'import').trim() || 'import';
+    const enabledCount = entries.filter(e => !e.disabled).length;
+    const disabledCount = entries.length - enabledCount;
+    if (enabledCount === 0) {
+        toastr.warning(`"${bookName}": all ${entries.length} entries are disabled — nothing to import`, 'BF Memory');
+        return;
+    }
+
+    // Confirm + target choice (default: everything into Unsorted; heuristic filing is opt-in).
+    let target = 'Unsorted';
+    const popupOk = await ensurePopup();
+    if (popupOk && Popup) {
+        const html = `
+            <div class="bf-mem-wi-import-popup">
+                <h3>Import World Info "${escapeHtml(bookName)}"</h3>
+                <p>${enabledCount} enabled entr${enabledCount === 1 ? 'y' : 'ies'} found${disabledCount ? ` (${disabledCount} disabled will be skipped)` : ''}. Each entry becomes a stored fact. This MERGES into your current store — nothing is deleted, and re-importing the same book updates instead of duplicating.</p>
+                <div style="display:flex;flex-direction:column;gap:6px;">
+                    <label class="checkbox_label"><input type="radio" name="bf_mem_wi_target" value="Unsorted" checked /> <span>File everything under Unsorted (safe default — refile later)</span></label>
+                    <label class="checkbox_label"><input type="radio" name="bf_mem_wi_target" value="heuristic" /> <span>Guess categories from titles/keywords (Places/Things/Events/World; never People)</span></label>
+                </div>
+            </div>`;
+        const popup = new Popup(html, POPUP_TYPE.TEXT, '', { okButton: 'Import', cancelButton: 'Cancel' });
+        const popupResult = await popup.show();
+        if (!popupResult) return;
+        const root = popup.dlg || popup.content || document;
+        target = root.querySelector('input[name="bf_mem_wi_target"]:checked')?.value === 'heuristic' ? 'heuristic' : 'Unsorted';
+    } else {
+        if (!confirm(`Import ${enabledCount} World Info entr${enabledCount === 1 ? 'y' : 'ies'} from "${bookName}" as facts (into Unsorted, merge-only)?`)) return;
+    }
+
+    const { factsByCategory, factCount, skippedDisabled, truncated } = wi.worldInfoEntriesToFacts(entries, { target, bookName });
+    if (factCount === 0) {
+        toastr.warning(`"${bookName}": no usable entries to import`, 'BF Memory');
+        return;
+    }
+
+    // Persistence — byte-for-byte the importDatabasesFromJson MERGE contract.
+    const {
+        getAllDatabases, saveDatabase, flushSnapshotNow, cancelPendingSnapshot,
+        upsertFact, createEmptyDatabase,
+    } = await import('./database.js');
+
+    cancelPendingSnapshot();
+
+    let upserted = 0;
+    const touchedCategories = [];
+    const live = await getAllDatabases();
+    for (const [category, facts] of Object.entries(factsByCategory)) {
+        if (facts.length === 0) continue;
+        const targetDb = live[category] ? { ...live[category], category } : createEmptyDatabase(category);
+        for (const fact of facts) { upsertFact(targetDb, fact); upserted++; }
+        await saveDatabase(targetDb);
+        touchedCategories.push(category);
+    }
+
+    await saveCurrentToActiveProfile(null, { allowEmpty: true });
+    await flushSnapshotNow();
+
+    addDebugLog('pass', `World Info "${bookName}" imported: ${upserted} fact(s) into ${touchedCategories.join(', ')} (${skippedDisabled} disabled skipped, ${truncated} truncated)`, {
+        subsystem: 'import', event: 'wi.imported', actor: 'USER',
+        data: { entries: entries.length, factsUpserted: upserted, skippedDisabled, truncated, categories: touchedCategories, target },
+    });
+    toastr.success(`Imported ${upserted} fact(s) from World Info "${bookName}"`, 'BF Memory');
     refreshDatabaseView();
 }
 
@@ -2105,7 +2367,7 @@ export async function initSettings() {
         const governedSelector = [
             '#bf_mem_pyramid_enabled',
             '#bf_mem_recall_tool_enabled', '#bf_mem_agent2_context', '#bf_mem_reflection_interval',
-            '#bf_mem_retrieval_budget',
+            '#bf_mem_retrieval_budget', '#bf_mem_reentry_moments',
         ].join(',');
         $('#bf_memory_settings').on('change input', governedSelector, function () {
             if (isApplyingPreset()) return;
@@ -2221,6 +2483,16 @@ export async function initSettings() {
         import('./agent-writer.js').then(m => m.syncWriterWriteTool?.()).catch(() => {});
     });
 
+    // knownBy (POV) enforcement toggle. Default ON. Read lazily per call inside
+    // isFactVisible() (fact-retrieval.js), so no re-wiring is needed on change.
+    $('#bf_mem_knownby_enforced').prop('checked', extensionSettings.enforceKnownBy !== false).on('change', function () {
+        const before = extensionSettings.enforceKnownBy !== false;
+        const next = $(this).prop('checked');
+        extensionSettings.enforceKnownBy = next;
+        addDebugLog('info', `knownBy enforcement ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enforceKnownBy' }, before, after: !!next });
+        saveSettings();
+    });
+
     // Tool-first redesign — RECALL STRATEGY (memoryMode). Chooses how stored memory reaches the
     // main model: 'hybrid' (default) and 'tool-only' skip the blocking Drafter LLM call and let the
     // model pull facts via search_memory; 'push' restores the classic always-plan Drafter. Pure
@@ -2244,6 +2516,18 @@ export async function initSettings() {
         saveSettings();
     });
 
+    // Open plot threads toggle (open-threads feature). Default ON. Gates ONLY whether the
+    // "Open threads:" line is appended to the Big Picture block — the Scribe still records
+    // `thread:open` markers and the reflection pass still resolves them regardless (the DB
+    // stays complete either way). No registration side-effect.
+    $('#bf_mem_open_threads_enabled').prop('checked', extensionSettings.enableOpenThreads === true).on('change', function () {
+        const before = extensionSettings.enableOpenThreads === true;
+        const next = $(this).prop('checked');
+        extensionSettings.enableOpenThreads = next;
+        addDebugLog('info', `Open plot threads line ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableOpenThreads' }, before, after: !!next });
+        saveSettings();
+    });
+
     // Moment echo (Resonance Part B) injection toggle. Default OFF. Gates ONLY whether a single
     // narrow `[Echo: …]` line (one resonant past moment for the present pair) is injected; emits
     // nothing on most turns even when on. No registration side-effect.
@@ -2252,6 +2536,37 @@ export async function initSettings() {
         const next = $(this).prop('checked');
         extensionSettings.enableMomentEcho = next;
         addDebugLog('info', `Moment echo injection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableMomentEcho' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Relationship re-entry pack (community adoption). Default OFF. Gates ONLY whether a returning
+    // character's pair-status record + shared moments are guaranteed into the injection. Detection
+    // rides the push-mode #SCENE parse (see turn-state.js setScene) — pure settings, read per turn.
+    $('#bf_mem_reentry_enabled').prop('checked', extensionSettings.enableRelationshipReentry === true).on('change', function () {
+        const before = extensionSettings.enableRelationshipReentry === true;
+        const next = $(this).prop('checked');
+        extensionSettings.enableRelationshipReentry = next;
+        addDebugLog('info', `Relationship re-entry pack ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableRelationshipReentry' }, before, after: !!next });
+        saveSettings();
+    });
+    $('#bf_mem_reentry_absence').val(extensionSettings.reentryAbsenceScenes);
+    $('#bf_mem_reentry_absence_val').text(extensionSettings.reentryAbsenceScenes);
+    $('#bf_mem_reentry_absence').on('input', function () {
+        const val = parseInt($(this).val(), 10) || 2;
+        const before = extensionSettings.reentryAbsenceScenes;
+        extensionSettings.reentryAbsenceScenes = val;
+        $('#bf_mem_reentry_absence_val').text(val);
+        if (before !== val) addDebugLog('debug', `Re-entry absence threshold: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reentryAbsenceScenes' }, before, after: val });
+        saveSettings();
+    });
+    $('#bf_mem_reentry_moments').val(extensionSettings.reentryMomentCount);
+    $('#bf_mem_reentry_moments_val').text(extensionSettings.reentryMomentCount);
+    $('#bf_mem_reentry_moments').on('input', function () {
+        const val = parseInt($(this).val(), 10) || 3;
+        const before = extensionSettings.reentryMomentCount;
+        extensionSettings.reentryMomentCount = val;
+        $('#bf_mem_reentry_moments_val').text(val);
+        if (before !== val) addDebugLog('debug', `Re-entry shared-moment count: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reentryMomentCount' }, before, after: val });
         saveSettings();
     });
 
@@ -2283,6 +2598,41 @@ export async function initSettings() {
         const next = $(this).prop('checked');
         extensionSettings.biTemporal = next;
         addDebugLog('info', `Bi-temporal fact validity ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'biTemporal' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Cross-key supersede rules toggle (NarrativeEngine timeline; report §1.6). DEFAULT ON
+    // (validateSettings coerces absent → true), so the checkbox reflects `!== false`. Gates the
+    // deterministic death/departure/loss rule table (database.js applyCrossKeySupersedeRules)
+    // applied at the genuine-new-write callers; OFF restores per-key-only supersession.
+    $('#bf_mem_cross_key_supersede').prop('checked', extensionSettings.crossKeySupersede !== false).on('change', function () {
+        const before = extensionSettings.crossKeySupersede !== false;
+        const next = $(this).prop('checked');
+        extensionSettings.crossKeySupersede = next;
+        addDebugLog('info', `Cross-key supersede rules ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'crossKeySupersede' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Injected-memory recency labels toggle (formatter-only). DEFAULT ON (validateSettings
+    // coerces absent → true), so the checkbox reflects `=== true`. Gates ONLY the per-turn
+    // injected block's per-fact "(~N turns ago)" tails (pipeline.js formatChosenFacts + the
+    // matching estimator charge) — never the search_memory tool output.
+    $('#bf_mem_recency_labels').prop('checked', extensionSettings.injectRecencyLabels === true).on('change', function () {
+        const before = extensionSettings.injectRecencyLabels === true;
+        const next = $(this).prop('checked');
+        extensionSettings.injectRecencyLabels = next;
+        addDebugLog('info', `Injected-memory recency labels ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'injectRecencyLabels' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Injected-memory truth hierarchy toggle (formatter-only). DEFAULT ON (validateSettings
+    // coerces absent → true). Gates ONLY the CURRENT STATE / CHRONOLOGY restructuring of the
+    // injected fact block; OFF restores the flat line list byte-for-byte.
+    $('#bf_mem_truth_hierarchy').prop('checked', extensionSettings.injectTruthHierarchy === true).on('change', function () {
+        const before = extensionSettings.injectTruthHierarchy === true;
+        const next = $(this).prop('checked');
+        extensionSettings.injectTruthHierarchy = next;
+        addDebugLog('info', `Injected-memory truth hierarchy ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'injectTruthHierarchy' }, before, after: !!next });
         saveSettings();
     });
 
@@ -2354,12 +2704,46 @@ export async function initSettings() {
         });
     }
 
+    // Semantic shelf selection (agent-selector). OPT-IN (default OFF — unlike its neighbors):
+    // checkbox reflects `=== true` so a legacy blob without the key shows disabled, matching
+    // the registered default. Adds one small LLM call to the reply-critical path when on.
+    $('#bf_mem_selection_enabled').prop('checked', extensionSettings.selectionSummaryEnabled === true).on('change', function () {
+        const before = extensionSettings.selectionSummaryEnabled === true;
+        const next = $(this).prop('checked');
+        extensionSettings.selectionSummaryEnabled = next;
+        addDebugLog('info', `Semantic shelf selection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'selectionSummaryEnabled' }, before, after: !!next });
+        saveSettings();
+    });
+    // Selector max-picks slider (integer 1..20; shelves + exact facts combined per turn).
+    {
+        const mp = Math.min(20, Math.max(1, Math.floor(Number(extensionSettings.selectionSummaryMaxPicks) || 6)));
+        $('#bf_mem_selection_max_picks').val(mp);
+        $('#bf_mem_selection_max_picks_val').text(mp);
+        $('#bf_mem_selection_max_picks').on('input', function () {
+            const v = Math.min(20, Math.max(1, parseInt($(this).val(), 10) || 6));
+            extensionSettings.selectionSummaryMaxPicks = v;
+            $('#bf_mem_selection_max_picks_val').text(v);
+            addDebugLog('info', `Selector max picks set to ${v}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'selectionSummaryMaxPicks' }, after: v });
+            saveSettings();
+        });
+    }
+
     // Temporal grounding at extraction (agent-memory + pipeline). Off = store relative dates verbatim.
     $('#bf_mem_temporal_grounding').prop('checked', extensionSettings.temporalGrounding !== false).on('change', function () {
         const before = extensionSettings.temporalGrounding !== false;
         const next = $(this).prop('checked');
         extensionSettings.temporalGrounding = next;
         addDebugLog('info', `Temporal grounding ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'temporalGrounding' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Reflection compression guard (agent-reflect). Off = accept a shelf summary that didn't
+    // actually compress its source facts, instead of re-running the consolidation once.
+    $('#bf_mem_reflection_compression_guard').prop('checked', extensionSettings.reflectionCompressionGuard !== false).on('change', function () {
+        const before = extensionSettings.reflectionCompressionGuard !== false;
+        const next = $(this).prop('checked');
+        extensionSettings.reflectionCompressionGuard = next;
+        addDebugLog('info', `Reflection compression guard ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionCompressionGuard' }, before, after: !!next });
         saveSettings();
     });
 
@@ -2703,6 +3087,38 @@ export async function initSettings() {
         }
     });
 
+    // World Info interop: export the store as an ST lorebook / import a lorebook as facts.
+    // Busy-guard mirrors onSuggestLabelsClick (db-panel.js) — the keyword pass is slow and
+    // costs tokens, so a double-click must not start a second run.
+    $('#bf_mem_export_wi').on('click', async function () {
+        if (this.dataset.busy === '1') return; // guard against double-click while the export is in flight
+        this.dataset.busy = '1'; this.disabled = true;
+        try {
+            await exportWorldInfoFlow();
+        } catch (err) {
+            addDebugLog('fail', `WI export failed: ${err.message || err}`, {
+                subsystem: 'import', event: 'wi.exportFailed', actor: 'USER', reason: 'ERROR', data: { error: String(err.message || err) },
+            });
+            toastr.error(`World Info export failed: ${err.message || err}`, 'BF Memory');
+        } finally {
+            this.dataset.busy = '0'; this.disabled = false;
+        }
+    });
+    $('#bf_mem_import_wi').on('click', () => $('#bf_mem_import_wi_file').trigger('click'));
+    $('#bf_mem_import_wi_file').on('change', async function () {
+        const file = this.files && this.files[0];
+        this.value = ''; // reset so re-picking the same file fires change again
+        if (!file) return;
+        try {
+            await importWorldInfoFromJson(await file.text(), file.name.replace(/\.json$/i, ''));
+        } catch (err) {
+            addDebugLog('fail', `WI import failed: ${err.message || err}`, {
+                subsystem: 'import', event: 'wi.importFailed', actor: 'USER', reason: 'ERROR', data: { error: String(err.message || err) },
+            });
+            toastr.error(`World Info import failed: ${err.message || err}`, 'BF Memory');
+        }
+    });
+
     $('#bf_mem_clear_db').on('click', async () => {
         if (!confirm('Reset memory to EMPTY for this character? This wipes every stored fact across all storage layers. This cannot be undone.')) return;
         const { getAllDatabases, deleteDatabase, flushSnapshotNow, cancelPendingSnapshot } = await import('./database.js');
@@ -2737,6 +3153,7 @@ export async function initSettings() {
 
     // --- Run Agent 3 on full chat (retroactive extraction) ---
     let fullChatCancel = false;
+    let fullChatRunning = false; // cross-guard: catch-up import refuses/disables while this runs (and vice versa)
     $('#bf_mem_run_full_chat').on('click', async () => {
         const skipDone = $('#bf_mem_skip_processed').is(':checked');
         // FIX #9: estimate LLM calls (post-skip, post-prefilter) so the user sees cost.
@@ -2751,6 +3168,7 @@ export async function initSettings() {
         const cancelBtn = $('#bf_mem_run_full_chat_cancel');
 
         fullChatCancel = false;
+        fullChatRunning = true;
         btn.prop('disabled', true).text('Running...');
         cancelBtn.show();
         progress.show().text('Starting…');
@@ -2770,6 +3188,7 @@ export async function initSettings() {
             toastr.error(`Full-chat failed: ${err.message}`, 'BF Memory');
             progress.text(`Failed: ${err.message}`);
         } finally {
+            fullChatRunning = false;
             btn.prop('disabled', false).text('Run the Scribe on full chat');
             cancelBtn.hide();
         }
@@ -2778,6 +3197,91 @@ export async function initSettings() {
     $('#bf_mem_run_full_chat_cancel').on('click', () => {
         fullChatCancel = true;
         $('#bf_mem_run_full_chat_cancel').prop('disabled', true).text('Cancelling…');
+    });
+
+    // --- Catch-up import (chunked backlog onboarding, src/catchup-import.js) ---
+    // One Scribe call per CHUNK of messages instead of per message — the cheap way to onboard a
+    // long pre-existing chat. Not preset-governed; the run/cancel pair shares one flag with the
+    // /bfmem catchup slash command via the module's exported cancel/inFlight state.
+    $('#bf_mem_catchup_batch').val(extensionSettings.catchupBatchSize);
+    $('#bf_mem_catchup_batch_val').text(extensionSettings.catchupBatchSize);
+    $('#bf_mem_catchup_batch').on('input', function () {
+        const val = parseInt($(this).val(), 10) || 8;
+        const before = extensionSettings.catchupBatchSize;
+        extensionSettings.catchupBatchSize = val;
+        $('#bf_mem_catchup_batch_val').text(val);
+        if (before !== val) addDebugLog('debug', `Catch-up batch size: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'catchupBatchSize' }, before, after: val });
+        saveSettings();
+    });
+
+    $('#bf_mem_catchup_run').on('click', async () => {
+        const btn = $('#bf_mem_catchup_run');
+        const cancelBtn = $('#bf_mem_catchup_cancel');
+        const progress = $('#bf_mem_catchup_progress');
+        const progressText = $('#bf_mem_catchup_progress_text');
+        const progressFill = $('#bf_mem_catchup_progress_fill');
+        try {
+            const { planCatchupChunks, runCatchupImport, isCatchupRunning } = await import('./catchup-import.js');
+            if (isCatchupRunning()) {
+                toastr.warning('A catch-up import is already running.', 'BF Memory');
+                return;
+            }
+            if (fullChatRunning) {
+                // Both share the DB map safely, but running them at once interleaves the
+                // Last Generated/Inserted views confusingly — one bulk run at a time.
+                toastr.warning('"Run the Scribe on full chat" is still running — wait for it to finish.', 'BF Memory');
+                return;
+            }
+            // Cost estimate up front (FIX #9 pattern): calls = chunks. planCatchupChunks reads the
+            // live chat without spending anything.
+            const chat = getContext().chat || [];
+            const { chunks, eligibleCount, totalMsgs } = planCatchupChunks(chat, extensionSettings.catchupBatchSize);
+            if (chunks.length === 0) {
+                toastr.info(`Nothing to catch up: all ${totalMsgs} message(s) are already done or trivially empty.`, 'BF Memory');
+                return;
+            }
+            if (!confirm(`Catch-up import this chat in chunks?\n\nThis will make ~${chunks.length} LLM call(s) (one per chunk of ≤${extensionSettings.catchupBatchSize} messages; ${eligibleCount} unprocessed message(s) out of ${totalMsgs} total). Per-chunk prompts are bigger than per-message ones.\n\nDon't chat in this conversation while it runs. Proceed?`)) return;
+
+            btn.prop('disabled', true).text('Importing...');
+            $('#bf_mem_run_full_chat').prop('disabled', true); // no full-chat Scribe run while importing
+            cancelBtn.show().prop('disabled', false);
+            progress.show();
+            progressText.text('Starting…');
+            progressFill.css('width', '0%');
+
+            const result = await runCatchupImport({
+                batchSize: extensionSettings.catchupBatchSize,
+                onProgress: ({ chunk, chunks, msgsDone, msgsTotal, factsAdded }) => {
+                    progressText.text(`Chunk ${chunk}/${chunks} · ${msgsDone}/${msgsTotal} messages · ${factsAdded} facts`);
+                    progressFill.css('width', `${Math.round((chunk / Math.max(1, chunks)) * 100)}%`);
+                },
+            });
+            if (result.refused) {
+                progressText.text('Not started (see toast).');
+                return;
+            }
+            const verb = result.cancelled ? 'cancelled' : result.aborted ? 'stopped' : 'finished';
+            toastr.success(`Catch-up ${verb}: ${result.processedChunks}/${result.chunks} chunk(s), ${result.msgsDone} message(s), ${result.factsAdded} facts${result.failedChunks ? `, ${result.failedChunks} failed (re-run to retry)` : ''}`, 'BF Memory');
+            progressText.text(`${verb}: ${result.processedChunks}/${result.chunks} chunks · ${result.msgsDone} msgs · ${result.factsAdded} facts`);
+            refreshDatabaseView();
+        } catch (err) {
+            toastr.error(`Catch-up import failed: ${err.message || err}`, 'BF Memory');
+            progressText.text(`Failed: ${err.message || err}`);
+        } finally {
+            btn.prop('disabled', false).html('<i class="fa-solid fa-forward-fast"></i> Catch-up import');
+            // Safe unconditionally: the fullChatRunning guard above means a full-chat run can
+            // never be the one holding this button disabled while we're in this handler.
+            $('#bf_mem_run_full_chat').prop('disabled', false);
+            cancelBtn.hide().prop('disabled', false).html('<i class="fa-solid fa-stop"></i> Cancel');
+        }
+    });
+
+    $('#bf_mem_catchup_cancel').on('click', async () => {
+        const { cancelCatchupImport } = await import('./catchup-import.js');
+        if (cancelCatchupImport()) {
+            // Cancel lands at the NEXT chunk boundary — the in-flight chunk still finishes.
+            $('#bf_mem_catchup_cancel').prop('disabled', true).text('Cancelling (finishing current chunk)…');
+        }
     });
 
     // --- Tokens Tab ---

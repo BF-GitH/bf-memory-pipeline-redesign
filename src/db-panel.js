@@ -552,6 +552,10 @@ function renderFactRows(facts, limit, isColdFact, deriveAspect) {
         const note = fact.context || '';
         const coldBadge = cold ? ' <span class="bf-mem-custom-chip" title="Cold-tiered: kept but deprioritized by retrieval">cold</span>' : '';
         const superseded = fact.active === false ? ' <span class="bf-mem-custom-chip" title="Superseded (historical)">old</span>' : '';
+        // Open-threads feature: make plot-thread state visible/auditable (editable-memory doctrine).
+        const threadChip = fact.thread === 'open'
+            ? ' <span class="bf-mem-custom-chip" title="Open plot thread: unresolved hook — surfaced in the Big Picture and protected from cold-tiering until resolved">thread: open</span>'
+            : (fact.thread === 'resolved' ? ' <span class="bf-mem-custom-chip" title="Plot thread resolved by the maintenance (reflection) pass">thread: resolved</span>' : '');
         // Spiderweb 2: the fact's origin scene (No + name) + source-message provenance.
         const sceneLine = Number.isInteger(fact.sceneNo)
             ? `<div class="bf-mem-fact-source">scene: #${fact.sceneNo}${fact.sceneName ? ` · ${escapeHtml(fact.sceneName)}` : ''}${fact.sourceMsg ? ` · from ${escapeHtml(fact.sourceMsg)}` : ''}</div>`
@@ -561,7 +565,7 @@ function renderFactRows(facts, limit, isColdFact, deriveAspect) {
                 <div style="display:flex;gap:8px;align-items:flex-start;">
                     <input type="checkbox" class="bf-mem-fact-check" data-key="${escapeHtml(fact.key)}" style="margin-top:4px;" />
                     <div style="flex:1 1 auto;min-width:0;">
-                        <div><b>${escapeHtml(fact.key)}</b>${coldBadge}${superseded}
+                        <div><b>${escapeHtml(fact.key)}</b>${coldBadge}${superseded}${threadChip}
                             <span class="bf-mem-fact-source"> [${escapeHtml(aspect)} · imp ${importance}]</span></div>
                         <div class="bf-mem-fact-value">${escapeHtml(fact.value)}</div>
                         ${note ? `<div class="bf-mem-fact-source">note: ${escapeHtml(note)}</div>` : ''}

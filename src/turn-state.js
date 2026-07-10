@@ -10,6 +10,11 @@
 
 import { estimateToolSchemaTokens } from './agent-writer.js';
 import { addDebugLog, getCurrentRunId } from './debug-log.js';
+// Intentional ESM cycle (same class as the debug-log one above): settings.js re-exports this
+// module's scene API. getSettings is a hoisted function declaration and is only ever called
+// inside function bodies at CALL time, which ESM resolves safely.
+import { getSettings } from './settings.js';
+import { wordTokens } from './tokenize.js';
 import { getContext, escapeHtml, fmt, getCurrentChatId, isBranchChat } from './ui-util.js';
 
 let lastGenerated = { runId: null, timestamp: null, updates: [] };
@@ -19,12 +24,18 @@ let lastInserted = { runId: null, timestamp: null, updates: [] };
 // pipeline.js right after a successful injection; rendered on the Tokens tab so a user can SEE, at a
 // glance, what memory the reply was given and roughly what it cost.
 let lastInjection = { runId: null, timestamp: null, facts: [], approxTokens: 0 };
-let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, finderInput, finderOutput, reflectionInput, reflectionOutput, mainOutput, toolCalls, toolLoopIn, ts, approx}
+let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, finderInput, finderOutput, selectorInput, selectorOutput, reflectionInput, reflectionOutput, mainOutput, toolCalls, toolLoopIn, ts, approx}
 let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
 // Scene card — the always-injected "what is true right now" core working-memory block.
 // Persisted per-chat in chat_metadata.bf_mem_scene, reloaded on CHAT_CHANGED.
 // null = no scene yet (back-compatible: absent scene behaves as no scene card).
-let sceneCard = null; // { location, present[], goals[], beats[], sceneNo, sceneName, ownerChatId, updatedAt, runId }
+let sceneCard = null; // { location, present[], goals[], beats[], sceneNo, sceneName, lastSeen{}, ownerChatId, updatedAt, runId }
+// Relationship re-entry (community adoption): the characters who just RETURNED to the scene
+// after a long absence, detected inside setScene() from the persisted per-character lastSeen
+// stamps. Per-turn signal keyed by runId — deliberately NOT persisted (a swipe of the same turn
+// reuses the cached injection; a NEW turn after an aborted one won't re-fire, which is fine
+// because the lastSeen stamps already advanced). Read via getSceneReentries().
+let lastReentries = { runId: '', names: [] };
 // Reflection / consolidation summary — the rolling "story so far" + last synthesized
 // observations. Persisted per-chat in chat_metadata.bf_mem_reflection, reloaded on
 // CHAT_CHANGED. null = none yet (back-compatible: absent reflection = no injection).
@@ -248,10 +259,11 @@ export function setRunTokens(run) {
     // can't poison the running session totals (they'd become NaN and stop adding up).
     const baselineInput = Number(run?.baselineInput) || 0;
     const actualInput   = Number(run?.actualInput) || 0;
-    // Agent overhead now includes the Stage-2 finder (Agent 4). Scribe (agent3) is still folded
+    // Agent overhead now includes the Stage-2 finder (Agent 4) and the opt-in Selector
+    // (semantic shelf selection — 0 when the pass is off). Scribe (agent3) is still folded
     // in later via addAgent3Tokens, and reflection via addReflectionTokens (both post-reply).
-    const agentInput    = (Number(run?.agent1Input) || 0) + (Number(run?.agent3Input) || 0) + (Number(run?.finderInput) || 0);
-    const agentOutput   = (Number(run?.agent1Output) || 0) + (Number(run?.agent3Output) || 0) + (Number(run?.finderOutput) || 0);
+    const agentInput    = (Number(run?.agent1Input) || 0) + (Number(run?.agent3Input) || 0) + (Number(run?.finderInput) || 0) + (Number(run?.selectorInput) || 0);
+    const agentOutput   = (Number(run?.agent1Output) || 0) + (Number(run?.agent3Output) || 0) + (Number(run?.finderOutput) || 0) + (Number(run?.selectorOutput) || 0);
 
     lastRunTokens = { ...run, ts: Date.now(), approx: true };
     // accumulate session
@@ -365,16 +377,17 @@ const SCENE_BEATS_MAX = 3; // rolling window: keep the last N one-line beats
 // scene number is held. Sticky on omission (a turn with no location keeps the current scene).
 const SCENE_SIM_THRESHOLD = 0.5; // Jaccard token-overlap >= this => "same place" (hold the counter)
 const SCENE_NAME_MAX = 60;       // hard clamp on a derived/refined scene name (lean storage)
+const SCENE_LASTSEEN_MAX = 40;   // cap the per-character lastSeen map (oldest dropped — lean chat_metadata)
 
-/** Normalize a location string into a lowercased token set for similarity comparison. */
+/** Normalize a location string into a lowercased token set for similarity comparison.
+ * Shared Unicode tokenizer (ASCII path identical to the old [^a-z0-9] split + >=3 gate) —
+ * without it every CJK/Cyrillic location normalized to the EMPTY set and the scene counter
+ * could never advance for non-Latin chats. */
 function sceneLocTokens(loc) {
     return new Set(
-        String(loc || '')
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, ' ')
-            .split(/\s+/)
-            // Drop tiny stop-ish tokens so "the bar" vs "bar" reads as identical.
-            .filter(t => t.length >= 3 && !/^(the|and|for|with|near|into|onto)$/.test(t)),
+        wordTokens(loc, { min: 3 })
+            // Drop tiny stop-ish tokens so "the bar" vs "bar" reads as identical (English-only).
+            .filter(t => !/^(the|and|for|with|near|into|onto)$/.test(t)),
     );
 }
 
@@ -425,6 +438,25 @@ function normalizeScene(raw) {
     let sceneName = typeof raw.sceneName === 'string' ? raw.sceneName.trim() : '';
     if (sceneName.length > SCENE_NAME_MAX) sceneName = sceneName.slice(0, SCENE_NAME_MAX).trim();
     if (!sceneName) sceneName = deriveSceneName(loc);
+    // Relationship re-entry: per-character last-seen stamps (lowercased name -> {sceneNo, updatedAt}).
+    // Coerced fully defensively — a bad/corrupt lastSeen entry is DROPPED, never allowed to nuke the
+    // whole scene card — and capped at SCENE_LASTSEEN_MAX entries (oldest updatedAt evicted first)
+    // so chat_metadata stays bounded even in a chat with a huge cast.
+    const lastSeen = {};
+    if (raw.lastSeen && typeof raw.lastSeen === 'object' && !Array.isArray(raw.lastSeen)) {
+        for (const [name, v] of Object.entries(raw.lastSeen)) {
+            const key = String(name ?? '').trim().toLowerCase();
+            if (!key || !v || typeof v !== 'object' || Array.isArray(v)) continue;
+            const sn = Math.floor(Number(v.sceneNo));
+            if (!Number.isInteger(sn) || sn < 1) continue;
+            lastSeen[key] = { sceneNo: sn, updatedAt: Number(v.updatedAt) || 0 };
+        }
+        const names = Object.keys(lastSeen);
+        if (names.length > SCENE_LASTSEEN_MAX) {
+            names.sort((a, b) => lastSeen[b].updatedAt - lastSeen[a].updatedAt);
+            for (const stale of names.slice(SCENE_LASTSEEN_MAX)) delete lastSeen[stale];
+        }
+    }
     return {
         location: loc,
         present,
@@ -432,6 +464,7 @@ function normalizeScene(raw) {
         beats,
         sceneNo,
         sceneName,
+        lastSeen,
         // Branch-safe ownership stamp (mirrors the token-tab fix): the chatId that owns this record.
         ownerChatId: typeof raw.ownerChatId === 'string' ? raw.ownerChatId : '',
         updatedAt: Number(raw.updatedAt) || Date.now(),
@@ -487,6 +520,16 @@ export function getScene() {
 }
 
 /**
+ * Per-turn relationship re-entry signal: `{runId, names[]}` — the characters who RETURNED to the
+ * scene on the run that last called setScene() (empty most turns). Consumed by pipeline.js
+ * (runId-matched) to build the guaranteed re-entry pack. NOT persisted — see lastReentries above.
+ * @returns {{runId: string, names: string[]}}
+ */
+export function getSceneReentries() {
+    return lastReentries;
+}
+
+/**
  * Update the scene card from an Agent 1 #SCENE parse. Merges defensively:
  *   - location / present / goals: replaced when the new value is non-empty,
  *     otherwise the prior value is kept (Agent 1 may omit a field on a given turn).
@@ -535,12 +578,47 @@ export function setScene(patch, runId = '') {
     else if (boundary) sceneName = deriveSceneName(location);
     else sceneName = prev.sceneName || deriveSceneName(location);
 
+    // RELATIONSHIP RE-ENTRY DETECTION (community adoption). A character RE-ENTERS when they are
+    // in the NEW present list, were NOT in the previous one, and were last seen at least
+    // `reentryAbsenceScenes` scene-boundaries ago (per the persisted lastSeen stamps). Detected
+    // here at #SCENE-parse time — PUSH mode only (hybrid/tool-only never produce a fresh parse,
+    // so present is stale there and re-entry deliberately never fires; see pipeline.js). Coarse
+    // by design: sceneNo only advances on a MATERIAL location change, so a long single-room chat
+    // never triggers this — deterministic beats clever. Every present name is then re-stamped at
+    // the new sceneNo so the map rides the scene card (normalizeScene coerces + caps it).
+    const prevSeen = (prev.lastSeen && typeof prev.lastSeen === 'object' && !Array.isArray(prev.lastSeen)) ? prev.lastSeen : {};
+    const prevPresentSet = new Set((prev.present || []).map(p => String(p ?? '').trim().toLowerCase()).filter(Boolean));
+    let absenceScenes = 2;
+    try { absenceScenes = Math.max(1, Math.floor(Number(getSettings()?.reentryAbsenceScenes)) || 2); } catch { /* settings not ready — default holds */ }
+    const reentries = [];
+    const stampNow = Date.now();
+    const lastSeen = { ...prevSeen };
+    for (const rawName of present) {
+        const name = String(rawName ?? '').trim();
+        const nameLower = name.toLowerCase();
+        if (!nameLower) continue;
+        const seen = prevSeen[nameLower];
+        if (!prevPresentSet.has(nameLower) && seen && (sceneNo - seen.sceneNo) >= absenceScenes) {
+            reentries.push(name);
+        }
+        lastSeen[nameLower] = { sceneNo, updatedAt: stampNow };
+    }
+
     const next = normalizeScene({
-        location, present, goals, beats, sceneNo, sceneName,
+        location, present, goals, beats, sceneNo, sceneName, lastSeen,
         ownerChatId: getCurrentChatId() || '',
         updatedAt: Date.now(), runId,
     });
     if (!next) return; // nothing meaningful to store
+
+    // Publish the per-turn re-entry signal (only once the card is actually storable) and log it.
+    lastReentries = { runId: runId || '', names: reentries };
+    if (reentries.length) {
+        addDebugLog('info', `Scene re-entry: ${reentries.join(', ')} returned after >=${absenceScenes} scene(s) away`, {
+            subsystem: 'settings', event: 'scene.reentry', actor: 'SYSTEM', reason: 'REENTRY',
+            data: { names: reentries, sceneNo, absenceScenes },
+        });
+    }
 
     if (boundary) {
         addDebugLog('info', `Scene advanced: ${prevNo} "${prev.sceneName || ''}" → ${next.sceneNo} "${next.sceneName}"`, {
@@ -768,10 +846,11 @@ function renderTokens() {
     // PLUS the estimated Writer tool-loop round-trips (each search_memory / remember_fact call
     // re-bills the whole prompt; see addToolLoopTokens), so the NET row reflects them.
     const fIn = L.finderInput || 0, fOut = L.finderOutput || 0;
+    const selIn = L.selectorInput || 0, selOut = L.selectorOutput || 0;
     const rIn = L.reflectionInput || 0, rOut = L.reflectionOutput || 0;
     const tIn = L.toolLoopIn || 0, tCalls = L.toolCalls || 0;
-    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0) + fIn + rIn + tIn;
-    const extOut = (L.mainOutput || 0) + (L.agent1Output || 0) + (L.agent3Output || 0) + fOut + rOut;
+    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0) + fIn + selIn + rIn + tIn;
+    const extOut = (L.mainOutput || 0) + (L.agent1Output || 0) + (L.agent3Output || 0) + fOut + selOut + rOut;
     const netIn = extIn - (L.baselineInput || 0);   // negative = saved
     const netOut = extOut - (L.mainOutput || 0);     // agent output overhead (always >= 0)
 
@@ -800,6 +879,7 @@ function renderTokens() {
                 <tr><td>— Main model</td><td>${fmt(L.actualInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
                 <tr><td>— Drafter</td><td>${fmt(L.agent1Input)}</td><td>${fmt(L.agent1Output)}</td></tr>
                 ${(fIn || fOut) ? `<tr><td>— Librarian (finder)</td><td>${fmt(fIn)}</td><td>${fmt(fOut)}</td></tr>` : ''}
+                ${(selIn || selOut) ? `<tr><td>— Selector (semantic pass)</td><td>${fmt(selIn)}</td><td>${fmt(selOut)}</td></tr>` : ''}
                 <tr><td>— Scribe</td><td>${fmt(L.agent3Input)}</td><td>${fmt(L.agent3Output)}</td></tr>
                 <tr><td>— Reflection</td><td>${fmt(rIn)}</td><td>${fmt(rOut)}</td></tr>
                 ${(tCalls || tIn) ? `<tr><td title="Each search_memory / remember_fact call makes SillyTavern re-send the whole prompt as an extra billed round-trip. Estimated as calls × this turn's measured prompt input (ST doesn't expose per-round usage).">— Tool round-trips (est., ${tCalls} call${tCalls === 1 ? '' : 's'})</td><td>~${fmt(tIn)}</td><td>—</td></tr>` : ''}

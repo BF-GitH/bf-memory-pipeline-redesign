@@ -31,7 +31,7 @@ const GOVERNED_KEYS = [
     'agent2ContextMessages',
     'enableSummaryPyramid', 'enableWriterRecallTool',
     'retrievalTokenBudget', 'finderAnchorsPerCharacter',
-    'reflectionInterval',
+    'reflectionInterval', 'reentryMomentCount',
 ];
 
 // Preset signatures.
@@ -45,6 +45,7 @@ const PRESETS = {
         retrievalTokenBudget: 300,
         finderAnchorsPerCharacter: 2,
         reflectionInterval: 20,
+        reentryMomentCount: 2,
     },
     // BALANCED — the recommended default: modest history trim, overview + recall tool on,
     // default caps.
@@ -55,6 +56,7 @@ const PRESETS = {
         retrievalTokenBudget: 800,
         finderAnchorsPerCharacter: 3,
         reflectionInterval: 12,
+        reentryMomentCount: 3,
     },
     // MAX RECALL — quality over cost: full history (no trim), wide caps, more anchors, frequent
     // consolidation. The most expensive option.
@@ -65,6 +67,7 @@ const PRESETS = {
         retrievalTokenBudget: 1600,
         finderAnchorsPerCharacter: 4,
         reflectionInterval: 10,
+        reentryMomentCount: 3,
     },
 };
 
@@ -114,6 +117,9 @@ function syncPresetControls() {
     // Retrieval token budget (F-UX-4): governed AND on-screen (Writer tab), so keep it in sync.
     $('#bf_mem_retrieval_budget').val(getSettings().retrievalTokenBudget);
     $('#bf_mem_retrieval_budget_val').text(getSettings().retrievalTokenBudget);
+    // Re-entry shared-moment count: governed AND on-screen (relationship re-entry pack section).
+    $('#bf_mem_reentry_moments').val(getSettings().reentryMomentCount);
+    $('#bf_mem_reentry_moments_val').text(getSettings().reentryMomentCount);
     // NOTE: finderAnchorsPerCharacter is governed by presets but has NO on-screen control
     // (no slider in settings.html) — nothing to sync for it. It's still written by
     // applyPreset() and consumed by the pipeline; it simply can't be hand-edited from the
