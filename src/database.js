@@ -4453,14 +4453,6 @@ export async function deleteDebugLogFile(chatId) {
  *   (cf. Graphiti/Zep invalid_at). Emitted via the `until:` marker; ALSO auto-stamped on the OUTGOING
  *   snapshot at supersession (the incoming fact's `validFrom`, else current time) when not already
  *   set. DISTINCT from `supersededAt` (the RECORD-time end). Absent on older facts (back-compatible).
- * @property {Array<{p:string, t:string}>} [edges] - OPTIONAL typed relationship edges (opt-in
- *   `typedEdges` feature; audit F-ARCH-7, cf. Graphiti typed edges): (subject, predicate, object)
- *   triples where this fact's SUBJECT is the head, `p` a lowercase verb-ish predicate (employs/
- *   loves/fears/owns/parent_of/…) and `t` a `Category/key` ref to an existing fact about the
- *   object. Emitted by Agent 3 via `rel:<predicate>@<Category/key>` (max 3 per write); unioned
- *   additively at merge (mergeEdges: dedupe by p+t, incoming wins ties, cap 6). DISTINCT from the
- *   untyped `relationships` overlay — edges carry a relation TYPE so retrieval can answer "who
- *   employs X" vs "who loves X". Absent unless the feature wrote them (backward-compatible).
  * @property {number} [sceneNo] - OPTIONAL scene strand (Spiderweb 2): the monotonic scene NUMBER
  *   the fact was ESTABLISHED in (origin). Stamped at write from the current scene card; FIRST-WINS
  *   (a re-mention never moves it — mirrors validAt). The supersession path is the one exception:

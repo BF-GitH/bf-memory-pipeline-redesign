@@ -132,24 +132,23 @@ const EXACT_KEY_PRIMARY_CAP = 12;
  * estimateInjectionTokens (the budget math) so the token estimate can never drift from the real
  * output again. Before this, the estimator charged `[kb] Cat/key = value [— context]` (context
  * only for primary) while the formatter injected the NOTE in place of the value for ALL tiers and
- * appended tone + bi-temporal tails — so budgets were computed against a line that was never sent.
+ * appended tone tails — so budgets were computed against a line that was never sent.
  *
- * Behavior is byte-identical to the formatter's old inline `formatLine` + `temporalTail`:
- *   - a fact WITH a note injects `[kb] Category/key: note (tone)?{from→until}?` (note replaces value),
- *   - a fact with only a value injects `[kb] Category/key = value{from→until}?`,
+ * Behavior:
+ *   - a fact WITH a note injects `[kb] Category/key: note (tone)?` (note replaces value),
+ *   - a fact with only a value injects `[kb] Category/key = value`,
  *   - degenerate (neither) keeps the key visible.
- * The bi-temporal tail only exists when the caller passes `biTemporalOn` (the opt-in setting);
- * when the feature is off the fields are never written, so output is unchanged.
+ * (redesign-v2 S1: the opt-in bi-temporal `{from→until}` tail was removed with the biTemporal
+ * feature; `biTemporalOn` is retained as a now-ignored parameter for call-site compatibility.)
  *
  * RECENCY LABELS (community adoption Tier 1): when the caller passes a non-null `nowCtx`
- * (recency.js), a compact ` (~N turns ago[, scene S])` / in-story tail is appended AFTER the
- * bi-temporal tail. The default `nowCtx = null` keeps output BYTE-IDENTICAL for every existing
- * caller — formatFactsForWriter, appendEdgeTails (whose exact-line string match depends on it)
+ * (recency.js), a compact ` (~N turns ago[, scene S])` tail is appended. The default
+ * `nowCtx = null` keeps output BYTE-IDENTICAL for every existing caller — formatFactsForWriter
  * and the search_memory tool paths all stay unchanged; only the per-turn injected block
  * (pipeline.js formatChosenFacts) and the estimator opt in.
  * @param {Object} fact
  * @param {string} category
- * @param {boolean} [biTemporalOn=false] - settings.biTemporal, read ONCE by the caller
+ * @param {boolean} [biTemporalOn=false] - vestigial (always false); no longer consulted
  * @param {Object|null} [nowCtx=null] - per-turn now-context (recency.js); null = no recency tail
  * @returns {string}
  */
@@ -161,14 +160,9 @@ export function buildFactLine(fact, category, biTemporalOn = false, nowCtx = nul
     // Episodic-memory feature: a `moment`-kind fact carries a short emotional `tone` we append
     // compactly so the beat reads WITH its feeling, e.g. `Events/key: <note> (tender)`.
     const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
-    // BI-TEMPORAL (feature, opt-in): annotate a fact carrying `validFrom`/`validUntil` with a
-    // compact `{from→until}` tail so the Writer sees WHEN the fact is true in-story.
-    let temporal = '';
-    if (biTemporalOn) {
-        const from = (typeof fact.validFrom === 'string' && fact.validFrom.trim()) ? fact.validFrom.trim() : '';
-        const until = (typeof fact.validUntil === 'string' && fact.validUntil.trim()) ? fact.validUntil.trim() : '';
-        if (from || until) temporal = ` {${from || '?'}→${until || 'now'}}`;
-    }
+    // redesign-v2 (S1): the opt-in bi-temporal `{from→until}` tail was removed with the biTemporal
+    // feature. `biTemporalOn` is now always false (see callers), so no story-world tail is emitted;
+    // stale validFrom/validUntil fields on old facts are simply ignored by the formatter.
     // RECENCY LABEL (opt-in per call via nowCtx): fail-soft — a legacy fact without validAt
     // yields '' (no tail), so old stores render exactly as before even with labels on.
     const recency = nowCtx ? recencyTail(fact, nowCtx, biTemporalOn) : '';
@@ -177,10 +171,10 @@ export function buildFactLine(fact, category, biTemporalOn = false, nowCtx = nul
     // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
     // showing both would be redundant. With no note, inject `Category/key = value`.
     // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
-    if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${temporal}${recency}`;
-    if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${temporal}${recency}`;
+    if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${recency}`;
+    if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${recency}`;
     // Degenerate: neither value nor note — keep the key so it's still visible.
-    return `${prefix} ${category}/${fact.key}${temporal}${recency}`;
+    return `${prefix} ${category}/${fact.key}${recency}`;
 }
 
 /**
@@ -217,18 +211,15 @@ function subjectGroupLabel(fact) {
 export function estimateInjectionTokens(r, seenSubjects = null) {
     const f = r.fact;
     // redesign-v2 (S1): the biTemporal setting was removed — no bi-temporal tails are charged.
-    const biTemporalOn = false;
     // RECENCY LABELS: when the injected block will carry per-fact recency tails, charge them
     // here too (F-RETR-3 invariant — the budget must price the exact bytes the injected
     // formatter emits). getTurnNowContext() is the SAME per-turn memoized object pipeline.js
-    // passes to formatChosenFacts, so estimator and formatter measure identical tails. (With
-    // bi-temporal ON the formatter may later fill storyNowMs and swap a turn phrase for a
-    // similarly-sized in-story phrase — an accepted ~few-chars estimate skew.)
+    // passes to formatChosenFacts, so estimator and formatter measure identical tails.
     // redesign-v2 (G4): recency labels are HARDCODED ON (injectRecencyLabels setting deleted), so
     // the estimator always prices the per-fact recency tails the formatter now always emits.
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { /* best-effort */ }
-    let chars = buildFactLine(f, r.category, biTemporalOn, nowCtx).length;
+    let chars = buildFactLine(f, r.category, false, nowCtx).length;
     if (seenSubjects && !seenSubjects.has(subjectGroupKey(f))) {
         // One `[Subject]` header line (brackets + label) plus its newline.
         chars += subjectGroupLabel(f).length + 3;
@@ -1258,7 +1249,6 @@ export function formatFactsForWriter(results) {
     // group, so it degrades cleanly when subject is missing or mixed.
     // redesign-v2 (S1): the biTemporal setting was removed — no `{from→until}` tails are emitted
     // (stale validFrom/validUntil fields on old facts are simply ignored by the formatter).
-    const biTemporalOn = false;
 
     // Per-fact lines come from the SHARED buildFactLine (audit F-RETR-3): the estimator charges
     // the exact same bytes this formatter emits, so budget math can never drift from the output.
@@ -1273,7 +1263,7 @@ export function formatFactsForWriter(results) {
             groups.set(key, { label: subjectGroupLabel(fact), lines: [] });
             order.push(key);
         }
-        groups.get(key).lines.push(buildFactLine(fact, category, biTemporalOn));
+        groups.get(key).lines.push(buildFactLine(fact, category, false));
     }
 
     // Emit "Misc" last (a trailing catch-all reads better than leading with un-grouped rows).

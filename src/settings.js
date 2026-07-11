@@ -174,6 +174,13 @@ function clamp(value, lo, hi, fallback) {
 export function validateSettings(s) {
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 10));
     s.bufferHoldBack = Math.floor(clamp(s.bufferHoldBack, 0, 10, 4));
+    // Overlap guard: the writer window must exceed the holdback, else a settled message can leave
+    // the writer's view before it's eligible for extraction (memory gap). 0 = full history = always safe.
+    if (s.agent2ContextMessages !== 0 && s.bufferHoldBack >= s.agent2ContextMessages) {
+        const clamped = Math.max(0, s.agent2ContextMessages - 1);
+        addDebugLog('fail', 'bufferHoldBack (' + s.bufferHoldBack + ') >= agent2ContextMessages (' + s.agent2ContextMessages + '); clamped to ' + clamped + ' to prevent a memory gap');
+        s.bufferHoldBack = clamped;
+    }
     s.graphExtrasCount = Math.floor(clamp(s.graphExtrasCount, 0, 8, 3));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  0, 100, 10)); // 0 = never show the review popup (F-UX-6)
     s.retrievalTokenBudget = Math.floor(clamp(s.retrievalTokenBudget, 50, 8000, 800));

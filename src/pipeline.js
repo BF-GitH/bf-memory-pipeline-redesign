@@ -7,14 +7,13 @@
 //      chats) and splice it before the last user message, optionally trimming the visible
 //      chat history to the last agent2ContextMessages user/AI turns (skipped while the
 //      sheet is still the seed — no memory yet to replace history with).
-//  (2) SETTLE AGENT RUN — MESSAGE_RECEIVED (behind the swipe-aware 1.8s settle debounce)
-//      selects the newest SETTLED unprocessed messages honoring the bufferHoldBack
-//      hold-back window (§7), hands the held-back tail to the Memory Agent as clearly
-//      labeled TENTATIVE planning context, and on success stores the rebuilt sheet +
-//      promotes the per-message bf_mem_processed watermarks. A failed run keeps the prior
-//      sheet and never watermarks (F-SCRIBE-1).
-//  (3) LIFECYCLE — Stop/chat-change/swipe/delete handlers: cancel, watermark
-//      invalidation, per-chat state resets.
+//  (2) SETTLE AGENT RUN — MESSAGE_RECEIVED selects the newest SETTLED unprocessed messages
+//      honoring the bufferHoldBack hold-back window (§7), hands the held-back tail to the
+//      Memory Agent as clearly labeled TENTATIVE planning context, and on success stores the
+//      rebuilt sheet + promotes the per-message bf_mem_processed watermarks. A failed run keeps
+//      the prior sheet and never watermarks (F-SCRIBE-1). The hold-back window is what keeps us
+//      off the still-swipable newest messages — no swipe/settle debounce is needed.
+//  (3) LIFECYCLE — Stop/chat-change/delete handlers: cancel, per-chat state resets.
 
 import { injectMemoryContext } from './agent-writer.js';
 import { runMemoryAgent } from './agent-memory.js';
@@ -54,56 +53,6 @@ let cancelledRetryArmed = false;
 // Character registry cadence (deterministic scan, no LLM). Per-chat: reset on CHAT_CHANGED.
 let runsSinceEntityCheck = 0;
 let entityCheckInFlight = false;
-// FIX #8b / FIX #12: single debounce timer for SETTLE extraction. Both generating a NEW swipe
-// (MESSAGE_RECEIVED) and navigating onto an EXISTING swipe (MESSAGE_SWIPED) feed it, so the
-// expensive extraction runs ONCE on the settled (kept) swipe. Cleared on chat change.
-let swipeSettleTimer = null;
-// Debounce window before a settled extraction fires. Short enough that a normal turn extracts
-// promptly, long enough that back-to-back swipe regenerations / navigation coalesce into one.
-const SETTLE_EXTRACTION_DELAY_MS = 1800;
-
-/**
- * FIX #12: schedule the post-reply extraction on the shared settle-debounce instead of
- * running it eagerly. Resets any pending timer so only the FINAL settled message extracts
- * (a heavily-swiped turn extracts ~once, not once per swipe). After extraction completes we
- * chain the armed reflection pass and the entity-check. Fully try/catch'd: a scheduling/
- * extraction failure must never break the turn.
- *
- * @param {string} reason - short tag for the debug log (e.g. 'message-received', 'swipe').
- * @param {boolean} [runPostPasses=false] - when true, chain maybeRunReflection +
- *   maybeRunEntityCheck after the extraction (the MESSAGE_RECEIVED path owns those passes).
- */
-function scheduleSettleExtraction(reason, runPostPasses = false) {
-    try {
-        if (swipeSettleTimer) {
-            clearTimeout(swipeSettleTimer);
-            addDebugLog('info', `Memory agent run coalesced (${reason}) — resetting settle timer, deferring until settled`);
-        } else {
-            addDebugLog('info', `Memory agent run deferred (${reason}) — will run after ${SETTLE_EXTRACTION_DELAY_MS}ms settle window`);
-        }
-        swipeSettleTimer = setTimeout(async () => {
-            swipeSettleTimer = null;
-            try {
-                await runMemoryExtraction();
-                if (runPostPasses) {
-                    // Reflection / consolidation + character-registry detection, off the
-                    // critical path. Self-guarded + try/catch'd internally. Reflection carries
-                    // its own runId via reflectionPending, so it stays grouped with the turn.
-                    maybeRunReflection();
-                    maybeRunEntityCheck();
-                }
-            } catch (err) {
-                addDebugLog('fail', `Settle extraction failed (non-fatal): ${err.message || err}`);
-            } finally {
-                // The turn's post-reply work has now been dispatched — disarm the pendingRun so a
-                // later swipe/turn mints/reuses its own id and can't inherit this run's id.
-                if (runPostPasses) consumePendingRun();
-            }
-        }, SETTLE_EXTRACTION_DELAY_MS);
-    } catch (err) {
-        addDebugLog('fail', `Scheduling settle extraction failed (non-fatal): ${err.message || err}`);
-    }
-}
 
 /**
  * Return the first message-ARRAY container on a CHAT_COMPLETION_PROMPT_READY payload (same
@@ -301,8 +250,8 @@ function toAgentMessage(m, index) {
 }
 
 /**
- * Post-reply Memory Agent run — fires on the settle debounce OFF the latency-critical
- * pre-generation path. SETTLED BUFFER (§7): facts may only be extracted from messages at
+ * Post-reply Memory Agent run — fires OFF the latency-critical pre-generation path.
+ * SETTLED BUFFER (§7): facts may only be extracted from messages at
  * index <= chat.length-1-bufferHoldBack; the held-back tail is passed ONLY as clearly
  * labeled TENTATIVE planning context (the agent must not write_fact from it). The agent
  * runs on EVERY settled reply — even with zero settled messages it refreshes the sheet
@@ -333,7 +282,10 @@ async function runMemoryExtraction() {
         if (!cancelledRetryArmed) {
             cancelledRetryArmed = true;
             addDebugLog('info', 'Memory agent (post-reply): skipped — generation was stopped/cancelled; scheduling ONE retry so the completed exchange isn\'t silently dropped');
-            scheduleSettleExtraction('retry-cancelled', false);
+            // ONE-SHOT retry (no post-passes), deferred to the next tick so the cancel can clear
+            // (MESSAGE_RECEIVED resets pipelineCancelled). If still cancelled at fire time,
+            // cancelledRetryArmed being set drops it without re-arming — no retry loop.
+            setTimeout(() => { runMemoryExtraction(); }, 0);
         } else {
             addDebugLog('info', 'Memory agent (post-reply): still cancelled on retry — exchange left unprocessed (no further retries)');
         }
@@ -373,7 +325,6 @@ async function runMemoryExtraction() {
         if (!isGenuineMessage(m)) continue;
         // bf_mem_processed gating (source of truth): true = done; a stuck 'in-flight' from a
         // crashed run is terminal (don't blindly re-extract a possibly half-written exchange).
-        // MESSAGE_SWIPED clears the flag so an accepted swipe re-enters the window.
         if (m.extra?.bf_mem_processed) continue;
         if (isTriviallyEmptyForExtraction(m.mes)) { trivialIndices.push(i); continue; }
         settledMessages.push(toAgentMessage(m, i));
@@ -659,11 +610,12 @@ async function runMemoryExtraction() {
         // F-ORCH-2: decrement (never assign false) — clamped, see the counter's declaration.
         internalCallDepth = Math.max(0, internalCallDepth - 1);
         hideWorkingIndicator();
-        // F-ORCH-3: consume a busy-drop retry chained to THIS run — re-schedule the settle
-        // extraction ONCE now that the store is free; every guard re-evaluates at fire time.
+        // F-ORCH-3: consume a busy-drop retry chained to THIS run — re-run the extraction ONCE
+        // now that the store is free (memoryExtractionInFlight was cleared above). Deferred to
+        // the next tick (no post-passes); every guard re-evaluates at fire time.
         if (extractionRetryAfterBusy) {
             extractionRetryAfterBusy = false;
-            scheduleSettleExtraction('retry-busy', false);
+            setTimeout(() => { runMemoryExtraction(); }, 0);
         }
         // OBSERVABILITY: one concise post-reply timing line (debug level).
         try {
@@ -930,11 +882,23 @@ export function initPipeline() {
         // One run = one input record = one output attribution. Disarm until the next run.
         runRecordedInput = false;
 
-        // PER-SWIPE GATING: schedule the extraction on the shared settle debounce. Each new
-        // swipe (MESSAGE_RECEIVED) or navigation (MESSAGE_SWIPED) resets the timer, so the
-        // expensive extraction runs ONCE on the settled/kept swipe. The reflection +
-        // entity-check passes are chained AFTER the (single) settled extraction.
-        scheduleSettleExtraction('message-received', true);
+        // Post-reply work, off the latency-critical path. The bufferHoldBack window (§7) guarantees
+        // we never extract the newest (still-swipable) messages, so we run the settled extraction
+        // directly — no settle debounce needed. Fully try/catch'd: this must never break the turn.
+        try {
+            await runMemoryExtraction();
+            // Reflection / consolidation + character-registry detection, off the critical path.
+            // Self-guarded + try/catch'd internally. Reflection carries its own runId via
+            // reflectionPending, so it stays grouped with the turn.
+            maybeRunReflection();
+            maybeRunEntityCheck();
+        } catch (err) {
+            addDebugLog('fail', `Settle extraction failed (non-fatal): ${err.message || err}`);
+        } finally {
+            // The turn's post-reply work has now been dispatched — disarm the pendingRun so a
+            // later turn mints/reuses its own id and can't inherit this run's id.
+            consumePendingRun();
+        }
     });
 
     // Also reset on generation stop/failure (user clicks Stop, or error).
@@ -950,24 +914,9 @@ export function initPipeline() {
         addDebugLog('info', 'Message deleted — per-message watermarks remain the extraction source of truth');
     });
 
-    // Reset on swipe/regenerate: clear the swiped AI message's bf_mem_processed flag — its
-    // content just changed, so any prior extraction is stale and the settled extraction must
-    // be allowed to re-process it (FIX #1 / FIX #8b).
-    eventSource.on(eventTypes.MESSAGE_SWIPED, (mesId) => {
-        const currentChat = SillyTavern.getContext().chat;
-        // Invalidate extraction on the swiped message (content replaced).
-        const swipedIdx = Number.isInteger(mesId) ? mesId : (currentChat ? currentChat.length - 1 : -1);
-        if (currentChat && currentChat[swipedIdx]?.extra?.bf_mem_processed) {
-            currentChat[swipedIdx].extra.bf_mem_processed = false;
-            SillyTavern.getContext().saveChatDebounced?.();
-        }
-        addDebugLog('info', `Message swiped (idx ${swipedIdx}) — cleared bf_mem_processed`);
-
-        // FIX #8b / FIX #12: (re)schedule the shared settle-extraction. We do NOT run the
-        // reflection/entity-check passes from the swipe path (runPostPasses=false): those are
-        // owned by the MESSAGE_RECEIVED path so navigation alone can't re-arm a consolidation.
-        scheduleSettleExtraction('swipe', false);
-    });
+    // Swipes only ever affect the NEWEST message, which lives inside the bufferHoldBack window
+    // and is therefore never extracted or watermarked — so there is nothing to invalidate and
+    // no MESSAGE_SWIPED handler is needed.
 
     // Reset on chat change
     eventSource.on(eventTypes.CHAT_CHANGED, async () => {
@@ -981,8 +930,6 @@ export function initPipeline() {
         // negative afterwards.
         internalCallDepth = 0;
         clearInjectedGuard();
-        // Drop any pending swipe-settle extraction so it can't fire against the new chat.
-        if (swipeSettleTimer) { clearTimeout(swipeSettleTimer); swipeSettleTimer = null; }
         // F-ORCH-3: drop armed extraction retries too — they belong to the OLD chat's exchange
         // and must not schedule/consume a retry against the new chat.
         extractionRetryAfterBusy = false;

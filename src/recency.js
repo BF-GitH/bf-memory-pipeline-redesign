@@ -78,47 +78,26 @@ export function getTurnNowContext() {
 }
 
 /**
- * Compact "how long ago" tail for one injected fact line, e.g. ` (~3 turns ago, scene 2)` or
- * ` (~2 in-story months ago)`. Returns '' when nothing is known (legacy facts without validAt
- * get NO tail — never a wrong one). Priority:
- *   (a) in-story phrase when biTemporalOn AND fact.validFrom parses AND nowCtx.storyNowMs is
- *       set — units: "earlier today" (< 1 day), days, months, years; rounded, prefixed `~`;
- *   (b) else turn phrase from validAt: delta = msgIndex - validAt, turns = ceil(delta/2).
- * A `, scene N` hop is appended only when the fact's sceneNo differs from the current one.
- * All phrases are hedged with `~` — validAt is a message index, so trimmed/branched chats can
- * overstate age; the tail is a hint, not a claim.
+ * Compact "how long ago" tail for one injected fact line, e.g. ` (~3 turns ago, scene 2)`.
+ * Returns '' when nothing is known (legacy facts without validAt get NO tail — never a wrong
+ * one). The phrase is the turn phrase from validAt: delta = msgIndex - validAt, turns =
+ * ceil(delta/2). A `, scene N` hop is appended only when the fact's sceneNo differs from the
+ * current one. All phrases are hedged with `~` — validAt is a message index, so trimmed/branched
+ * chats can overstate age; the tail is a hint, not a claim.
+ * (redesign-v2 S1: the bi-temporal in-story phrase was removed; `biTemporalOn` is retained as a
+ * now-ignored parameter for call-site compatibility and is always false.)
  * @param {Object} fact
  * @param {{msgIndex: number|null, sceneNo: number|null, storyNowMs: number|null}|null} nowCtx
- * @param {boolean} [biTemporalOn=false]
+ * @param {boolean} [biTemporalOn=false] - vestigial (always false); no longer consulted
  * @returns {string}
  */
 export function recencyTail(fact, nowCtx, biTemporalOn = false) {
     if (!fact || !nowCtx) return '';
     let phrase = '';
-    // (a) In-story phrase — only when bi-temporal is on, the stamp parses AND a story "now"
-    // exists. A freeform validFrom ("the winter festival") fails parseStoryDate and falls
-    // through to the turn phrase — never a wrong month count.
-    if (biTemporalOn && nowCtx.storyNowMs != null) {
-        const fromMs = parseStoryDate(fact.validFrom);
-        if (fromMs != null) {
-            const days = (nowCtx.storyNowMs - fromMs) / 86400000;
-            if (days >= 0) {
-                if (days < 1) {
-                    phrase = 'earlier today';
-                } else if (days < 60) {
-                    const d = Math.round(days);
-                    phrase = `~${d} in-story day${d === 1 ? '' : 's'} ago`;
-                } else if (days < 730) {
-                    const m = Math.round(days / 30.44);
-                    phrase = `~${m} in-story month${m === 1 ? '' : 's'} ago`;
-                } else {
-                    const y = Math.round(days / 365.25);
-                    phrase = `~${y} in-story year${y === 1 ? '' : 's'} ago`;
-                }
-            }
-        }
-    }
-    // (b) Turn phrase from validAt (integer source message index; ~2 messages per turn).
+    // redesign-v2 (S1): the opt-in in-story phrase (bi-temporal validFrom vs nowCtx.storyNowMs)
+    // was removed with the biTemporal feature. `biTemporalOn` is now always false, so only the
+    // turn-based phrase below is emitted; freeform validFrom stamps are no longer consulted.
+    // Turn phrase from validAt (integer source message index; ~2 messages per turn).
     if (!phrase && fact.validAt != null && Number.isInteger(nowCtx.msgIndex)) {
         const validAt = Number(fact.validAt);
         if (Number.isInteger(validAt)) {
