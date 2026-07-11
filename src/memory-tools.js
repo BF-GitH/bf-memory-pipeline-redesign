@@ -246,7 +246,7 @@ function execReadFacts(args, ctx) {
             lines.push(`${category}/${key}: (not found)`);
             continue;
         }
-        lines.push(buildFactLine(fact, category, false, nowCtx));
+        lines.push(buildFactLine(fact, category, nowCtx));
     }
     return lines.join('\n');
 }

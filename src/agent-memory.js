@@ -491,7 +491,7 @@ export function composeSheet({ summary = '', sceneLine = '', notes = '', need = 
     const renderSection = (header, sectionRows) => {
         const admitted = [];
         for (const r of sectionRows) {
-            admitted.push(buildFactLine(r.fact, r.category, false, nowCtx)); // recency labels always on
+            admitted.push(buildFactLine(r.fact, r.category, nowCtx)); // recency labels always on
         }
         if (admitted.length > 0) {
             lines.push(header);

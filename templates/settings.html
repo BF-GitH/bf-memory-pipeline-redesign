@@ -181,115 +181,11 @@
                     </div>
                     <div class="bf-mem-section-body">
                         <div id="bf_mem_db_stats" class="bf-mem-db-stats">Loading...</div>
-                        <div class="bf-mem-field" style="margin:6px 0;">
-                            <input type="text" id="bf_mem_db_search" class="text_pole" placeholder="Search facts across all categories (key / value / note)…" style="width:100%;" />
-                        </div>
-                        <div id="bf_mem_db_search_results" class="bf-mem-fact-list" style="display:none;"></div>
-
-                        <!-- Graph view (Spiderweb): pick a fact -> see its linked neighbors (the "true
-                             graphline memory"). Reuses the same relationship + scope-graph links recall walks. -->
-                        <details class="bf-mem-graph-wrap" style="margin:8px 0;">
-                            <summary style="cursor:pointer;font-weight:bold;">🕸️ Graph view — a fact and its linked neighbors</summary>
-                            <div class="bf-mem-field" style="display:flex;gap:6px;margin:6px 0;">
-                                <input type="text" id="bf_mem_graph_key" class="text_pole" placeholder="Category/key or key (e.g. People/Mira)…" style="flex:1;" />
-                                <button id="bf_mem_graph_btn" class="menu_button" title="Show this fact's linked neighbors"><i class="fa-solid fa-diagram-project"></i> Show links</button>
-                            </div>
-                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">Pick one fact and see everything connected to it — the same person, place, or event. Click any connected fact to hop to its connections. E.g. start at "Mira" and see her home, her job, and who she knows.</small>
-                            <div id="bf_mem_graph_result" class="bf-mem-graph-result"></div>
-                        </details>
-
-                        <!-- Recurring characters: the entity registry (named / NPC / deferred). Lets you
-                             see who memory is tracking and promote a recurring NPC to a first-class subject. -->
-                        <details class="bf-mem-entities-wrap" style="margin:8px 0;">
-                            <summary style="cursor:pointer;font-weight:bold;">👥 Recurring characters — entity registry</summary>
-                            <div class="bf-mem-debug-actions" style="margin:4px 0;">
-                                <button id="bf_mem_entities_refresh" class="menu_button" title="Refresh the entity list"><i class="fa-solid fa-rotate"></i> Refresh</button>
-                                <span id="bf_mem_entities_summary" class="bf-mem-log-count"></span>
-                            </div>
-                            <small class="bf-mem-hint" style="display:block;margin:-2px 0 6px;">The people and things memory is tracking in this chat. <b>Named</b> = a main recurring character; <b>NPC</b> = a background extra; <b>deferred</b> = not decided yet. "Promote" an NPC to turn it into a full character with its own memory. E.g. promote "the innkeeper" once he becomes important.</small>
-                            <div id="bf_mem_entities_list" class="bf-mem-entities-list"></div>
-                        </details>
-
-                        <!-- Character registry (always on: new names detected every 10 replies, no AI call). -->
-                        <details class="bf-mem-charreg-wrap" style="margin:8px 0;">
-                            <summary style="cursor:pointer;font-weight:bold;">🪪 Character registry — recurring / NPC / later</summary>
-                            <small class="bf-mem-hint" style="display:block;margin:4px 0 6px;">Always on: new names in your story are detected every 10 replies (free — no AI call) and you decide once whether each is a <b>Recurring</b> character, a one-off <b>NPC</b>, or <b>Later</b>.</small>
-                            <div id="bf_mem_charreg_list" class="bf-mem-fact-list">
-                                <div class="bf-mem-summary-empty">No characters tracked yet. They are discovered automatically as facts accumulate.</div>
-                            </div>
-                            <div class="bf-mem-db-actions" style="margin-top:6px;">
-                                <button id="bf_mem_charreg_scan" class="menu_button" title="Scan the fact store now and prompt for any new names">
-                                    <i class="fa-solid fa-magnifying-glass"></i> Scan now
-                                </button>
-                            </div>
-                        </details>
-
-                        <div id="bf_mem_db_list" class="bf-mem-db-list"></div>
-
-                        <!-- Add your own taxonomy labels (user overlay, global across chats) -->
-                        <details class="bf-mem-addlabel" style="margin-top:8px;">
-                            <summary style="cursor:pointer;font-weight:bold;">
-                                <i class="fa-solid fa-tags"></i> Add your own label
-                            </summary>
-                            <small class="bf-mem-hint">Make your own folders for facts on top of the built-in ones, so things get filed your way. They work across all your chats. The built-in ones stay. E.g. add a "Factions" folder for a political story.</small>
-
-                            <!-- Add a Layer-2 leaf -->
-                            <div class="bf-mem-field" style="margin-top:6px;">
-                                <label>New sub-folder (inside a category)</label>
-                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
-                                    <select id="bf_mem_addleaf_category" class="text_pole" style="flex:0 0 auto;min-width:120px;"></select>
-                                    <input type="text" id="bf_mem_addleaf_subarea" class="text_pole" placeholder="Sub-area (optional)" style="flex:1 1 120px;min-width:100px;" />
-                                    <input type="text" id="bf_mem_addleaf_name" class="text_pole" placeholder="Leaf name, e.g. bioluminescence" style="flex:1 1 160px;min-width:120px;" />
-                                    <button id="bf_mem_addleaf_btn" class="menu_button" style="flex:0 0 auto;">
-                                        <i class="fa-solid fa-plus"></i> Add aspect
-                                    </button>
-                                </div>
-                            </div>
-
-                            <!-- Add a Layer-1 category -->
-                            <div class="bf-mem-field" style="margin-top:6px;">
-                                <label>New top-level folder (category)</label>
-                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
-                                    <input type="text" id="bf_mem_addcat_name" class="text_pole" placeholder="Category name, e.g. Factions" style="flex:1 1 160px;min-width:120px;" />
-                                    <button id="bf_mem_addcat_btn" class="menu_button" style="flex:0 0 auto;">
-                                        <i class="fa-solid fa-plus"></i> Add category
-                                    </button>
-                                </div>
-                            </div>
-
-                            <!-- AI: scan homeless facts and propose new labels (manual, on-demand) -->
-                            <div class="bf-mem-field" style="margin-top:8px;">
-                                <label>Let AI suggest labels</label>
-                                <small class="bf-mem-hint">Looks at facts that never got a good folder and suggests new folders for them. You approve each suggestion before anything is added, so it can't surprise you. It only runs when you click — one AI call, no ongoing cost.</small>
-                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px;">
-                                    <button id="bf_mem_suggest_labels_btn" class="menu_button" style="flex:0 0 auto;">
-                                        <i class="fa-solid fa-wand-magic-sparkles"></i> Suggest new labels (AI)
-                                    </button>
-                                </div>
-                            </div>
-                        </details>
 
                         <div class="bf-mem-db-actions">
-                            <button id="bf_mem_browse_db" class="menu_button">
-                                <i class="fa-solid fa-eye"></i> View All Facts
-                            </button>
                             <button id="bf_mem_view_web" class="menu_button" title="Visualize the fact graph — every fact as a dot, every link (primary/secondary/tertiary) as a line.">
                                 <i class="fa-solid fa-circle-nodes"></i> View Web
                             </button>
-                            <button id="bf_mem_export_db" class="menu_button">
-                                <i class="fa-solid fa-download"></i> Export
-                            </button>
-                            <button id="bf_mem_import_db" class="menu_button">
-                                <i class="fa-solid fa-upload"></i> Import
-                            </button>
-                            <input type="file" id="bf_mem_import_file" accept="application/json,.json" style="display:none;" />
-                            <button id="bf_mem_export_wi" class="menu_button" title="Export facts as a SillyTavern World Info book (lorebook) with auto-generated trigger keywords.">
-                                <i class="fa-solid fa-book-atlas"></i> Export → World Info
-                            </button>
-                            <button id="bf_mem_import_wi" class="menu_button" title="Import a SillyTavern World Info book: each entry becomes a stored fact.">
-                                <i class="fa-solid fa-book-medical"></i> Import World Info
-                            </button>
-                            <input type="file" id="bf_mem_import_wi_file" accept="application/json,.json" style="display:none;" />
                             <button id="bf_mem_clear_db" class="menu_button redWarningBG">
                                 <i class="fa-solid fa-trash"></i> Clear All
                             </button>
@@ -301,16 +197,6 @@
             <!-- Tab: Tokens -->
             <div id="bf_mem_tab_tokens" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
                 <div id="bf_mem_tokens_banner" class="bf-mem-hint" style="display:none;padding:8px 10px;border-left:3px solid #ff9800;border-radius:4px;margin-bottom:8px;"></div>
-                <!-- A4: Injection Viewer — what the Writer was actually given last turn. -->
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header"><i class="fa-solid fa-syringe"></i> Injected Last Turn</div>
-                    <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">The memory sheet the AI was actually shown for the last reply, plus a rough cost. This is what the AI <i>read</i> — different from what got <i>saved</i> to memory.</small>
-                        <div id="bf_mem_injection_view" class="bf-mem-fact-list">
-                            <div class="bf-mem-summary-empty">Nothing injected yet. After a reply, the memory sheet the Writer was given appears here.</div>
-                        </div>
-                    </div>
-                </div>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-coins"></i> Last Run</div>
                     <div class="bf-mem-section-body">

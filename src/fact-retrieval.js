@@ -139,7 +139,7 @@ const EXACT_KEY_PRIMARY_CAP = 12;
  *   - a fact with only a value injects `[kb] Category/key = value`,
  *   - degenerate (neither) keeps the key visible.
  * (redesign-v2 S1: the opt-in bi-temporal `{from→until}` tail was removed with the biTemporal
- * feature; `biTemporalOn` is retained as a now-ignored parameter for call-site compatibility.)
+ * feature.)
  *
  * RECENCY LABELS (community adoption Tier 1): when the caller passes a non-null `nowCtx`
  * (recency.js), a compact ` (~N turns ago[, scene S])` tail is appended. The default
@@ -148,11 +148,10 @@ const EXACT_KEY_PRIMARY_CAP = 12;
  * (pipeline.js formatChosenFacts) and the estimator opt in.
  * @param {Object} fact
  * @param {string} category
- * @param {boolean} [biTemporalOn=false] - vestigial (always false); no longer consulted
  * @param {Object|null} [nowCtx=null] - per-turn now-context (recency.js); null = no recency tail
  * @returns {string}
  */
-export function buildFactLine(fact, category, biTemporalOn = false, nowCtx = null) {
+export function buildFactLine(fact, category, nowCtx = null) {
     const knownBy = (fact.knownBy || []).join(', ');
     const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
     const hasValue = String(fact.value ?? '').trim() !== '';
@@ -161,11 +160,11 @@ export function buildFactLine(fact, category, biTemporalOn = false, nowCtx = nul
     // compactly so the beat reads WITH its feeling, e.g. `Events/key: <note> (tender)`.
     const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
     // redesign-v2 (S1): the opt-in bi-temporal `{from→until}` tail was removed with the biTemporal
-    // feature. `biTemporalOn` is now always false (see callers), so no story-world tail is emitted;
-    // stale validFrom/validUntil fields on old facts are simply ignored by the formatter.
+    // feature — no story-world tail is emitted; stale validFrom/validUntil fields on old facts
+    // are simply ignored by the formatter.
     // RECENCY LABEL (opt-in per call via nowCtx): fail-soft — a legacy fact without validAt
     // yields '' (no tail), so old stores render exactly as before even with labels on.
-    const recency = nowCtx ? recencyTail(fact, nowCtx, biTemporalOn) : '';
+    const recency = nowCtx ? recencyTail(fact, nowCtx) : '';
     // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
     // only needs one. When a fact HAS a note, the note already carries the
     // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
@@ -219,7 +218,7 @@ export function estimateInjectionTokens(r, seenSubjects = null) {
     // the estimator always prices the per-fact recency tails the formatter now always emits.
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { /* best-effort */ }
-    let chars = buildFactLine(f, r.category, false, nowCtx).length;
+    let chars = buildFactLine(f, r.category, nowCtx).length;
     if (seenSubjects && !seenSubjects.has(subjectGroupKey(f))) {
         // One `[Subject]` header line (brackets + label) plus its newline.
         chars += subjectGroupLabel(f).length + 3;
@@ -1327,7 +1326,7 @@ export function formatFactsForWriter(results) {
             groups.set(key, { label: subjectGroupLabel(fact), lines: [] });
             order.push(key);
         }
-        groups.get(key).lines.push(buildFactLine(fact, category, false));
+        groups.get(key).lines.push(buildFactLine(fact, category));
     }
 
     // Emit "Misc" last (a trailing catch-all reads better than leading with un-grouped rows).

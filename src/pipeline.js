@@ -18,13 +18,8 @@
 import { injectMemoryContext } from './agent-writer.js';
 import { runMemoryAgent } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { getAllDatabases } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getScene, getReflection, getMemorySheet, setMemorySheet, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
-import { detectAndRecord, showEntityPopup } from './agent-entities.js';
-
-// G4 hardcoded-on (redesign-v2): the character-registry scan no longer has settings keys.
-const CHARACTER_CHECK_INTERVAL = 10;
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getScene, getReflection, getMemorySheet, setMemorySheet, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
 
 // Pipeline state
 // F-ORCH-2 (overlapping internal-call windows): a REFERENCE COUNT (never a boolean) —
@@ -49,9 +44,6 @@ let memoryExtractionInFlight = false;
 // busy / cancelled early-returns in runMemoryExtraction (see the comments at each use).
 let extractionRetryAfterBusy = false;
 let cancelledRetryArmed = false;
-// Character registry cadence (deterministic scan, no LLM). Per-chat: reset on CHAT_CHANGED.
-let runsSinceEntityCheck = 0;
-let entityCheckInFlight = false;
 
 /**
  * Return the first message-ARRAY container on a CHAT_COMPLETION_PROMPT_READY payload (same
@@ -663,58 +655,6 @@ async function maybeRunReflection() {
     }
 }
 
-/**
- * Character registry detection — runs after the settled extraction, OFF the critical path,
- * gated to fire at most once every CHARACTER_CHECK_INTERVAL successful extraction runs
- * (G4: hardcoded ON at 10). Performs a DETERMINISTIC scan of the fact store (no LLM call)
- * for newly-seen NAMED entities not yet classified; when there are candidates, opens ONE
- * batched popup (deferred, never blocking). Fully self-guarded + try/catch'd.
- */
-async function maybeRunEntityCheck() {
-    if (entityCheckInFlight) return;
-    const settings = getSettings();
-    if (!settings || !settings.enabled) return;
-    if (pipelineCancelled) return;
-    const ctx = SillyTavern.getContext();
-    if (ctx.groupId || ctx.selected_group) return; // group chats unsupported
-
-    runsSinceEntityCheck++;
-    if (runsSinceEntityCheck < CHARACTER_CHECK_INTERVAL) return;
-    runsSinceEntityCheck = 0; // reset cadence regardless of outcome
-
-    entityCheckInFlight = true;
-    try {
-        const databases = await getAllDatabases();
-        const candidates = detectAndRecord(databases);
-        // Refresh the settings-panel list so newly-detected names show even before the popup.
-        try { reloadEntitiesUI(); } catch { /* ignore */ }
-        if (!candidates || candidates.length === 0) {
-            addDebugLog('info', 'Character check: no new named candidates');
-            return;
-        }
-        addDebugLog('info', `Character check: ${candidates.length} new named candidate(s) — opening popup`);
-        // Defer the popup so it never lands mid-generation: capture the chat id and only
-        // show if we're still in the same chat after a short settle window.
-        const targetChatId = ctx.chatId;
-        setTimeout(async () => {
-            try {
-                if (SillyTavern.getContext().chatId !== targetChatId) {
-                    addDebugLog('info', 'Character popup skipped: chat changed since detection');
-                    return;
-                }
-                await showEntityPopup(candidates);
-                try { reloadEntitiesUI(); } catch { /* ignore */ }
-            } catch (err) {
-                addDebugLog('fail', `Character popup failed (non-fatal): ${err.message || err}`);
-            }
-        }, 2200);
-    } catch (err) {
-        addDebugLog('fail', `Character check failed (non-fatal): ${err.message || err}`);
-    } finally {
-        entityCheckInFlight = false;
-    }
-}
-
 // --- Main Pipeline Init ---
 
 export function initPipeline() {
@@ -842,11 +782,10 @@ export function initPipeline() {
         // directly — no settle debounce needed. Fully try/catch'd: this must never break the turn.
         try {
             await runMemoryExtraction();
-            // Reflection / consolidation + character-registry detection, off the critical path.
-            // Self-guarded + try/catch'd internally. Reflection carries its own runId via
-            // reflectionPending, so it stays grouped with the turn.
+            // Reflection / consolidation, off the critical path. Self-guarded + try/catch'd
+            // internally. Reflection carries its own runId via reflectionPending, so it stays
+            // grouped with the turn.
             maybeRunReflection();
-            maybeRunEntityCheck();
         } catch (err) {
             addDebugLog('fail', `Settle extraction failed (non-fatal): ${err.message || err}`);
         } finally {
@@ -898,8 +837,6 @@ export function initPipeline() {
         // switch can't leak the prior chat's runId onto the new chat's logs.
         setPendingRun(null);
         endRun();
-        // Character-registry cadence is per-chat too.
-        runsSinceEntityCheck = 0;
         hideWorkingIndicator();
         updateStatus('idle');
         // Memory-sheet reload rides settings.js's CHAT_CHANGED handler (reloadSheetFromChat,

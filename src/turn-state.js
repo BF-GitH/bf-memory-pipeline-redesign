@@ -1,6 +1,6 @@
 // BF Memory Pipeline - per-chat turn state (F-UX-8 split from settings.js)
-// Scene card, reflection summary, summary pyramid, the Last Generated / Last Inserted /
-// Injection Viewer panels, and the token-comparison records — each persisted in chat_metadata
+// Scene card, reflection summary, summary pyramid, the Last Generated / Last Inserted
+// panels, and the token-comparison records — each persisted in chat_metadata
 // and reloaded on CHAT_CHANGED. The mutable state moved HERE together with the functions that
 // close over it — settings.js re-exports the public API so importers keep using './settings.js'.
 //
@@ -8,7 +8,7 @@
 // (debug-log.js imports token accessors from this module). Every cross-module use happens
 // inside a function body at CALL time, which ESM resolves safely via hoisted declarations.
 
-import { addDebugLog, getCurrentRunId } from './debug-log.js';
+import { addDebugLog } from './debug-log.js';
 // Intentional ESM cycle (same class as the debug-log one above): settings.js re-exports this
 // module's scene API. getSettings is a hoisted function declaration and is only ever called
 // inside function bodies at CALL time, which ESM resolves safely.
@@ -18,13 +18,8 @@ import { getContext, escapeHtml, fmt, getCurrentChatId, isBranchChat } from './u
 
 let lastGenerated = { runId: null, timestamp: null, updates: [] };
 let lastInserted = { runId: null, timestamp: null, updates: [] };
-// A4 — Injection Viewer state: the facts ACTUALLY injected into the Writer this turn (distinct from
-// lastInserted, which is what the Scribe EXTRACTED to the DB). Populated by setLastInjection() from
-// pipeline.js right after a successful injection; rendered on the Tokens tab so a user can SEE, at a
-// glance, what memory the reply was given and roughly what it cost.
-let lastInjection = { runId: null, timestamp: null, facts: [], approxTokens: 0 };
-let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, finderInput, finderOutput, selectorInput, selectorOutput, reflectionInput, reflectionOutput, mainOutput, toolCalls, toolLoopIn, ts, approx}
-let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
+let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, finderInput, finderOutput, selectorInput, selectorOutput, reflectionInput, reflectionOutput, mainOutput, ts, approx}
+let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
 // Scene card — the always-injected "what is true right now" core working-memory block.
 // Persisted per-chat in chat_metadata.bf_mem_scene, reloaded on CHAT_CHANGED.
 // null = no scene yet (back-compatible: absent scene behaves as no scene card).
@@ -89,54 +84,6 @@ export function setLastInserted(updates) {
     };
     saveFactsToMeta(INSERTED_META_KEY, lastInserted);
     renderInserted();
-}
-
-/**
- * A4 — record what was INJECTED into the Writer this turn (the facts the reply was actually given,
- * plus an approximate token cost) and refresh the Injection Viewer. Called from pipeline.js right
- * after a successful injection. `facts` is the chosen `{fact, category, tier?}[]` (finder /
- * deterministic / speculative all share this shape). Best-effort + never throws.
- * @param {Array<{fact:Object, category:string, tier?:string}>} facts
- * @param {number} approxTokens - rough injected token cost (chars/4 of the injection block)
- */
-export function setLastInjection(facts, approxTokens) {
-    try {
-        lastInjection = {
-            runId: getCurrentRunId() || null,
-            timestamp: Date.now(),
-            facts: Array.isArray(facts) ? facts : [],
-            approxTokens: Number(approxTokens) || 0,
-        };
-        renderInjectionViewer();
-    } catch { /* viewer is best-effort — never break the turn */ }
-}
-
-// Cap rows rendered in the viewer so a huge injection can't bloat the DOM.
-const INJECTION_VIEWER_MAX_ROWS = 60;
-
-/**
- * A4 — render the Injection Viewer panel: a glanceable list of the facts injected last turn with a
- * one-line headline (count + approx tokens). Pure DOM render; no-ops if the panel isn't present.
- */
-function renderInjectionViewer() {
-    const el = document.getElementById('bf_mem_injection_view');
-    if (!el) return;
-    const facts = Array.isArray(lastInjection.facts) ? lastInjection.facts : [];
-    if (facts.length === 0) {
-        el.innerHTML = '<div class="bf-mem-summary-empty">Nothing injected yet. After a reply, the facts the Writer was given appear here.</div>';
-        return;
-    }
-    const head = `<div class="bf-mem-hint" style="margin-bottom:6px;"><b>${facts.length}</b> fact(s) injected last turn · ≈<b>${lastInjection.approxTokens.toLocaleString()}</b> tokens</div>`;
-    const rows = facts.slice(0, INJECTION_VIEWER_MAX_ROWS).map(({ fact, category, tier }) => {
-        const t = (tier && typeof tier === 'string') ? tier[0].toUpperCase() : '';
-        const badge = t ? `<span class="bf-mem-action-badge" title="${escapeHtml(tier)}">${t}</span> ` : '';
-        const val = String(fact?.value ?? '').trim();
-        const valHtml = val ? ` = ${escapeHtml(val.slice(0, 120))}` : '';
-        return `<div class="bf-mem-fact-item">${badge}<span class="bf-mem-category">${escapeHtml(category)}</span> <strong>${escapeHtml(String(fact?.key ?? ''))}</strong>${valHtml}</div>`;
-    }).join('');
-    const more = facts.length > INJECTION_VIEWER_MAX_ROWS
-        ? `<div class="bf-mem-hint">(+${facts.length - INJECTION_VIEWER_MAX_ROWS} more)</div>` : '';
-    el.innerHTML = head + rows + more;
 }
 
 export function appendLastInserted(updates) {
@@ -223,7 +170,7 @@ function loadTokensFromMeta() {
             const inherited = !!currentChatId && owner !== null && owner !== currentChatId;
             if (inherited) {
                 lastRunTokens = null;
-                sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
+                sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
                 addDebugLog('info', `Tokens reset for inherited/branch chat ${currentChatId} (record owned by ${owner})`, {
                     subsystem: 'settings', event: 'tokens.reset', actor: 'SYSTEM', reason: 'BRANCH_INHERITED',
                     data: { chatId: currentChatId, ownerChatId: owner, isBranch: isBranchChat(currentChatId) },
@@ -235,7 +182,7 @@ function loadTokensFromMeta() {
             lastRunTokens = (stored.lastRun && typeof stored.lastRun === 'object') ? stored.lastRun : null;
             sessionTokens = (stored.session && typeof stored.session === 'object')
                 ? stored.session
-                : { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
+                : { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
         }
     } catch { /* ignore */ }
 }
@@ -334,7 +281,7 @@ export function setMainOutputTokens(n) {
 
 export function reloadTokensFromChat() {
     lastRunTokens = null;
-    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
+    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
     loadTokensFromMeta();
     renderTokens();
 }
@@ -1021,17 +968,12 @@ export function getLastInserted() {
     return lastInserted;
 }
 
-/** Last Writer-injection record (facts + approx tokens). */
-export function getLastInjection() {
-    return lastInjection;
-}
-
 /**
  * Reset the session token totals (Tokens tab "Reset" button). Moved verbatim from the
  * settings.js click handler during the F-UX-8 split: zero the totals, persist, re-render.
  */
 export function resetSessionTokens() {
-    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
+    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
     saveTokensToMeta();
     renderTokens();
 }

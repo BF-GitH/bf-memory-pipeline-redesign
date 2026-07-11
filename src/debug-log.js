@@ -13,7 +13,7 @@ import { getSettings } from './settings.js';
 import { getContext, escapeHtml, safeStringify } from './ui-util.js';
 import {
     getLastRunTokens, getSessionTokens,
-    getLastGenerated, getLastInserted, getLastInjection, getScene,
+    getLastGenerated, getLastInserted, getScene,
 } from './turn-state.js';
 
 // debugLog is the RAM RING BUFFER: holds ALL kept entries (incl. debug/verbose when
@@ -414,7 +414,7 @@ export function addDebugLog(type, message, opts = {}) {
 /**
  * "Copy Diagnostics" (Debug tab). Bundles EVERYTHING needed to debug the extension into one JSON
  * blob — settings, the full debug log (inputs/outputs/events), the entire fact database INCLUDING
- * each fact's relationships (the graph/web), the current scene, the entity registry, and any pending
+ * each fact's relationships (the graph/web), the current scene, and any pending
  * review — then downloads it as a file AND copies it to the clipboard so the user can paste it for
  * support. Best-effort throughout: a failure in any one section is captured inline, never aborts the
  * export. NOTE: this contains roleplay content (facts/logs); it does NOT include API keys (those
@@ -424,11 +424,10 @@ export async function copyDiagnostics() {
     let payload;
     try {
         const ctx = getContext();
-        let databases = {}, scene = null, entities = {}, review = null, extVersion = null;
+        let databases = {}, scene = null, review = null, extVersion = null;
         try { const m = await (await fetch(new URL('../manifest.json', import.meta.url))).json(); extVersion = m.version; } catch { /* version best-effort */ }
         try { const dbm = await import('./database.js'); databases = await dbm.getAllDatabases(); } catch (e) { databases = { __error: String(e?.message || e) }; }
         try { scene = getScene(); } catch { /* none */ }
-        try { const ent = await import('./agent-entities.js'); entities = ent.getEntities() || {}; } catch { /* none */ }
         try { review = (ctx.chatMetadata || ctx.chat_metadata || {}).bf_mem_review || null; } catch { /* none */ }
         let factCount = 0, linkCount = 0;
         for (const cdb of Object.values(databases || {})) {
@@ -448,25 +447,21 @@ export async function copyDiagnostics() {
                 counts: {
                     categories: Object.keys(databases || {}).length,
                     facts: factCount, links: linkCount,
-                    entities: Object.keys(entities || {}).length,
                     logEntries: debugLog.length,
                 },
                 // Honesty note: this is EVERYTHING the extension itself holds. The model's full
                 // assembled prompt (chat history + persona + ST's own additions) is built by
-                // SillyTavern, not this extension, so it is not captured here — but the memory block
-                // this extension injected IS (see `lastInjection`).
-                note: 'Complete extension state. The model\'s full ST-assembled prompt is outside this extension; the memory block it injected is in lastInjection.',
+                // SillyTavern, not this extension, so it is not captured here.
+                note: 'Complete extension state. The model\'s full ST-assembled prompt is outside this extension.',
             },
             settings: getSettings(),   // all extension settings (no API keys)
             tokens: {                      // "tokens used" — per-run breakdown + session totals
                 lastRun: getLastRunTokens(),
                 session: getSessionTokens(),
             },
-            lastInjection: getLastInjection(), // the memory CONTEXT block injected into the writer last turn (facts + approx tokens)
             lastGenerated: getLastGenerated(), // the Scribe's extracted updates last turn (agent OUTPUT)
             lastInserted: getLastInserted(),  // what was actually written to the DB last turn
             scene,
-            entities,                      // recurring-characters registry
             reviewPending: review,
             databases,                     // facts INCLUDE their relationships = the graph/web
             debugLog,                      // all inputs/outputs/events (newest-first ring buffer)

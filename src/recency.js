@@ -13,27 +13,12 @@
 import { getScene } from './turn-state.js';
 
 /**
- * Best-effort parse of a story-world date stamp ("2024-05-01", "May 3 2024", ISO, ...) into
- * epoch ms. Free-form labels that aren't dates return null. Never throws.
- * @param {*} str
- * @returns {number|null}
- */
-export function parseStoryDate(str) {
-    try {
-        const s = String(str ?? '').trim();
-        if (!s) return null;
-        const ms = Date.parse(s);
-        return Number.isFinite(ms) ? ms : null;
-    } catch { return null; }
-}
-
-/**
  * Compute the current-turn "now" anchors the recency tails are measured against.
  *   - msgIndex: index of the NEWEST chat message (chat.length - 1), or null when no chat is
  *     available (mirrors the defensive chat-length read in agent-reflect.js).
  *   - sceneNo: the current scene card's number (turn-state getScene), or null.
- *   - storyNowMs: ALWAYS null here — the caller (pipeline.js formatChosenFacts) fills it as the
- *     max parseStoryDate over the visible facts' validFrom/validUntil, so no DB scan is needed.
+ *   - storyNowMs: ALWAYS null — vestigial since the bi-temporal (in-story date) feature was
+ *     removed; retained in the shape so existing callers/readers stay unchanged.
  * @returns {{msgIndex: number|null, sceneNo: number|null, storyNowMs: number|null}}
  */
 export function computeNowContext() {
@@ -84,19 +69,18 @@ export function getTurnNowContext() {
  * ceil(delta/2). A `, scene N` hop is appended only when the fact's sceneNo differs from the
  * current one. All phrases are hedged with `~` — validAt is a message index, so trimmed/branched
  * chats can overstate age; the tail is a hint, not a claim.
- * (redesign-v2 S1: the bi-temporal in-story phrase was removed; `biTemporalOn` is retained as a
- * now-ignored parameter for call-site compatibility and is always false.)
+ * (redesign-v2 S1: the bi-temporal in-story phrase was removed; only the turn-based phrase below
+ * is ever emitted.)
  * @param {Object} fact
  * @param {{msgIndex: number|null, sceneNo: number|null, storyNowMs: number|null}|null} nowCtx
- * @param {boolean} [biTemporalOn=false] - vestigial (always false); no longer consulted
  * @returns {string}
  */
-export function recencyTail(fact, nowCtx, biTemporalOn = false) {
+export function recencyTail(fact, nowCtx) {
     if (!fact || !nowCtx) return '';
     let phrase = '';
     // redesign-v2 (S1): the opt-in in-story phrase (bi-temporal validFrom vs nowCtx.storyNowMs)
-    // was removed with the biTemporal feature. `biTemporalOn` is now always false, so only the
-    // turn-based phrase below is emitted; freeform validFrom stamps are no longer consulted.
+    // was removed with the biTemporal feature; only the turn-based phrase below is emitted and
+    // freeform validFrom stamps are no longer consulted.
     // Turn phrase from validAt (integer source message index; ~2 messages per turn).
     if (!phrase && fact.validAt != null && Number.isInteger(nowCtx.msgIndex)) {
         const validAt = Number(fact.validAt);

@@ -5,10 +5,6 @@
 // MECHANICALLY from this module. settings.js remains the public facade: every symbol it
 // exported before the split is still exported here (see the re-export block below).
 
-import {
-    getEntities, setEntityStatus, reloadEntitiesFromChat,
-    scanForNamedCandidates, showEntityPopup, promoteEntity,
-} from './agent-entities.js';
 import { explainFactRetrieval } from './fact-retrieval.js';
 // F-UX-8 split modules (see the header note above).
 import {
@@ -29,8 +25,7 @@ import {
     reloadSheetFromChat,
 } from './turn-state.js';
 import {
-    refreshDatabaseView, showAllDatabases, showSpiderwebPopup, runDatabaseSearch,
-    addUserLeaf, addUserCategory, onSuggestLabelsClick, renderGraphView, renderEntityPanel,
+    refreshDatabaseView, showSpiderwebPopup,
 } from './db-panel.js';
 
 // --- F-UX-8 re-exports ----------------------------------------------------------------------
@@ -42,7 +37,7 @@ export {
     reloadDebugLogFromChat, addDebugLog, exportLogsJSON,
 } from './debug-log.js';
 export {
-    setLastGenerated, setLastInserted, setLastInjection, appendLastInserted, reloadFactsFromChat,
+    setLastGenerated, setLastInserted, appendLastInserted, reloadFactsFromChat,
     setRunTokens, addAgent3Tokens, addReflectionTokens, setMainOutputTokens, reloadTokensFromChat,
     getScene, setScene, getSceneReentries, reloadSceneFromChat,
     getReflection, setReflection, reloadReflectionFromChat,
@@ -276,77 +271,6 @@ export function updateStatus(status, message = '') {
     }
 }
 
-// --- Character Registry (live list in the Agent 3 tab) ---
-// Read-only-ish list of known entities + their status, with a way to re-decide each
-// (toggle status / re-scan). Storage + detection live in agent-entities.js; this is
-// just the settings-panel surface. Persistence is per-chat (bf_mem_entities), reloaded
-// on CHAT_CHANGED via reloadEntitiesFromChat() (wired in initSettings).
-
-const ENTITY_STATUS_LABEL = { named: 'Recurring', npc: 'NPC', later: 'Later', pending: 'Pending' };
-
-/** Render the Characters list (if the panel is present). */
-function renderEntities() {
-    const el = document.getElementById('bf_mem_charreg_list');
-    if (!el) return;
-    let reg = {};
-    try { reg = getEntities() || {}; } catch { reg = {}; }
-    const items = Object.values(reg)
-        .filter(e => e && e.name)
-        .sort((a, b) => (b.count || 0) - (a.count || 0) || String(a.name).localeCompare(String(b.name)));
-
-    if (items.length === 0) {
-        el.innerHTML = '<div class="bf-mem-summary-empty">No characters tracked yet. They are discovered automatically as facts accumulate.</div>';
-        return;
-    }
-
-    el.innerHTML = items.map(e => {
-        const nm = escapeHtml(e.name);
-        const status = ENTITY_STATUS_LABEL[e.status] || e.status || 'Pending';
-        const sclass = `bf-mem-fact-status bf-mem-fact-status-${escapeHtml(String(e.status || 'pending').toLowerCase())}`;
-        const count = Number(e.count) || 0;
-        return `
-            <div class="bf-mem-charreg-item bf-mem-fact-row" data-name="${nm}">
-                <div class="bf-mem-fact-line">
-                    <span class="bf-mem-fact-key">${nm}</span>
-                    <span class="${sclass}" style="margin-left:6px;">${escapeHtml(status)}</span>
-                    <span class="bf-mem-fact-source" style="margin-left:6px;">${count}×</span>
-                </div>
-                <div class="bf-mem-fact-meta">
-                    <button class="bf-mem-charreg-set menu_button" data-name="${nm}" data-status="named" title="Mark recurring (promotes facts out of the NPC drawer)">Recurring</button>
-                    <button class="bf-mem-charreg-set menu_button" data-name="${nm}" data-status="npc" title="Mark as one-off NPC">NPC</button>
-                    <button class="bf-mem-charreg-set menu_button" data-name="${nm}" data-status="later" title="Defer">Later</button>
-                </div>
-            </div>`;
-    }).join('');
-
-    // Bind re-decide buttons (delegated rebind each render — list is small).
-    el.querySelectorAll('.bf-mem-charreg-set').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            const name = btn.dataset.name;
-            const status = btn.dataset.status;
-            if (!name || !status) return;
-            try {
-                setEntityStatus(name, status);
-                if (status === 'named') {
-                    const res = await promoteEntity(name);
-                    if (typeof toastr !== 'undefined') {
-                        toastr.success(`"${name}" promoted (${res.moved} fact(s) moved)`, 'BF Memory');
-                    }
-                }
-            } catch (err) {
-                addDebugLog('fail', `Character re-decide for "${name}" failed: ${err.message || err}`);
-            }
-            renderEntities();
-        });
-    });
-}
-
-/** Re-load registry from chat + re-render. Called on CHAT_CHANGED. */
-export function reloadEntitiesUI() {
-    try { reloadEntitiesFromChat(); } catch { /* ignore */ }
-    renderEntities();
-}
-
 // --- Profile Dropdown ---
 
 function reloadProfiles() {
@@ -447,239 +371,6 @@ function unlinkCurrentChat() {
         data: { chatId, profiles: linkedTo },
     });
     toastr.success('Current chat unlinked', 'BF Memory');
-}
-
-/**
- * Import databases from an exported JSON blob. Accepts the export shape ({ category: DatabaseSchema })
- * — i.e. exactly what the Export button produces. Validates the shape, then on user choice either
- * REPLACES the store (clear-all first) or MERGES (upsert each fact into the live categories). Either
- * way the result is persisted through Layer A+B (saveDatabase) and Layer C (saveCurrentToActiveProfile)
- * so it survives a CHAT_CHANGED reload, mirroring the delete/edit anti-resurrection contract.
- * @param {string} text - raw JSON file contents
- */
-async function importDatabasesFromJson(text) {
-    let parsed;
-    try { parsed = JSON.parse(text); } catch { throw new Error('not valid JSON'); }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        throw new Error('expected an object of { category: { facts: [...] } }');
-    }
-    // Shape-validate: every value must look like a DatabaseSchema with a facts array.
-    const incoming = {};
-    let incomingFacts = 0;
-    for (const [category, db] of Object.entries(parsed)) {
-        if (!db || typeof db !== 'object' || !Array.isArray(db.facts)) continue;
-        // Keep only well-formed facts (must have a string key + value).
-        const facts = db.facts.filter(f => f && typeof f === 'object' && typeof f.key === 'string' && f.key);
-        incoming[category] = { ...db, category, facts };
-        incomingFacts += facts.length;
-    }
-    const incomingCats = Object.keys(incoming);
-    if (incomingCats.length === 0 || incomingFacts === 0) {
-        throw new Error('no valid databases/facts found in file');
-    }
-
-    // REPLACE (OK) vs MERGE (Cancel) — explicit confirm with the irreversibility called out.
-    const replace = confirm(`Import ${incomingFacts} fact(s) across ${incomingCats.length} categor(ies).\n\nOK = REPLACE the current store with the file (wipes existing facts first).\nCancel = MERGE the file into the current store (keeps existing, adds/updates).`);
-
-    const {
-        getAllDatabases, saveDatabase, deleteDatabase, flushSnapshotNow, cancelPendingSnapshot,
-        upsertFact, createEmptyDatabase,
-    } = await import('./database.js');
-
-    cancelPendingSnapshot();
-
-    if (replace) {
-        // Wipe Layer A+B (every existing category) and Layer C (profile snapshot) first.
-        const existing = await getAllDatabases();
-        for (const category of Object.keys(existing)) await deleteDatabase(category);
-        pruneActiveProfile(null);
-    }
-
-    // Apply the incoming categories.
-    let merged = 0;
-    if (replace) {
-        for (const [category, db] of Object.entries(incoming)) {
-            if (db.facts.length === 0) continue;
-            await saveDatabase({ ...db, category });
-            merged += db.facts.length;
-        }
-    } else {
-        // MERGE: upsert each incoming fact into the live category (dedup/reconcile via upsertFact).
-        const live = await getAllDatabases();
-        for (const [category, db] of Object.entries(incoming)) {
-            if (db.facts.length === 0) continue;
-            const target = live[category] ? { ...live[category], category } : createEmptyDatabase(category);
-            for (const fact of db.facts) { upsertFact(target, fact); merged++; }
-            await saveDatabase(target);
-        }
-    }
-
-    // Persist Layer C from the now-current working store (allowEmpty not needed: store is populated).
-    await saveCurrentToActiveProfile(null, { allowEmpty: true });
-    await flushSnapshotNow();
-
-    addDebugLog('pass', `Imported ${merged} fact(s) across ${incomingCats.length} categor(ies) (${replace ? 'REPLACE' : 'MERGE'})`, {
-        subsystem: 'import', event: 'db.imported', actor: 'USER', reason: replace ? 'REPLACE' : 'MERGE',
-        data: { categories: incomingCats, incomingFacts, applied: merged, mode: replace ? 'replace' : 'merge' },
-    });
-    toastr.success(`Imported ${merged} fact(s) (${replace ? 'replaced' : 'merged'})`, 'BF Memory');
-    refreshDatabaseView();
-}
-
-/**
- * Export the fact store as a SillyTavern World Info book (lorebook). MANUAL flow behind the
- * Database-tab button: options popup (granularity + AI keywords) -> explicit cost confirm
- * spelling out the LLM call count (mirrors the run_full_chat confirm) -> bounded keyword
- * generation (worldinfo-interop.js: capped batches, semaphore, unconditional sanitizer,
- * deterministic fallback on ANY model failure) -> standard book-file download (same
- * Blob/objectURL pattern as the #bf_mem_export_db handler). Read-only against the store.
- */
-async function exportWorldInfoFlow() {
-    const wi = await import('./worldinfo-interop.js');
-    const { getAllDatabases } = await import('./database.js');
-
-    const databases = await getAllDatabases();
-    const factUnits = wi.collectWorldInfoUnits(databases, { mode: 'fact' });
-    const shelfUnits = wi.collectWorldInfoUnits(databases, { mode: 'shelf' });
-    if (factUnits.length === 0) {
-        toastr.info('No active facts to export', 'BF Memory');
-        return;
-    }
-
-    // Options: granularity (per fact | per shelf) + AI keywords (default ON).
-    let mode = 'fact';
-    let useAI = true;
-    const popupOk = await ensurePopup();
-    if (popupOk && Popup) {
-        const html = `
-            <div class="bf-mem-wi-export-popup">
-                <h3>Export → World Info</h3>
-                <p>Turns your stored facts into a SillyTavern lorebook. Each entry gets ${wi.KEYWORDS_MIN}-${wi.KEYWORDS_MAX} concrete trigger keywords (never character names or abstract themes).</p>
-                <div style="display:flex;flex-direction:column;gap:6px;">
-                    <label class="checkbox_label"><input type="radio" name="bf_mem_wi_mode" value="fact" checked /> <span>One entry per fact (${factUnits.length} entries)</span></label>
-                    <label class="checkbox_label"><input type="radio" name="bf_mem_wi_mode" value="shelf" /> <span>One entry per shelf — category/aspect group (${shelfUnits.length} entries)</span></label>
-                    <label class="checkbox_label" style="margin-top:6px;"><input type="checkbox" id="bf_mem_wi_use_ai" checked /> <span>Generate keywords with AI (recommended)</span></label>
-                </div>
-            </div>`;
-        const popup = new Popup(html, POPUP_TYPE.TEXT, '', { okButton: 'Export', cancelButton: 'Cancel' });
-        const popupResult = await popup.show();
-        if (!popupResult) return;
-        const root = popup.dlg || popup.content || document;
-        mode = root.querySelector('input[name="bf_mem_wi_mode"]:checked')?.value === 'shelf' ? 'shelf' : 'fact';
-        useAI = !!root.querySelector('#bf_mem_wi_use_ai')?.checked;
-    } else {
-        // Popup module unavailable — degrade to confirms (per-fact + AI keywords).
-        if (!confirm(`Export ${factUnits.length} fact(s) as a World Info book (one entry per fact)?`)) return;
-    }
-
-    const units = mode === 'shelf' ? shelfUnits : factUnits;
-    const llmCalls = useAI ? Math.min(Math.ceil(units.length / wi.UNITS_PER_KEYWORD_CALL), wi.MAX_KEYWORD_CALLS) : 0;
-    // FIX #9 discipline: spell the cost out BEFORE any call is made (mirrors run_full_chat).
-    const costLine = useAI
-        ? `This will make ~${llmCalls} LLM call(s) to generate trigger keywords (${wi.UNITS_PER_KEYWORD_CALL} entries per call, hard cap ${wi.MAX_KEYWORD_CALLS}; anything beyond the cap gets offline keywords). Each call costs tokens.`
-        : 'Keywords will be generated offline (no LLM calls, lower quality).';
-    if (!confirm(`Export ${units.length} World Info entr${units.length === 1 ? 'y' : 'ies'} (one per ${mode})?\n\n${costLine}\n\nProceed?`)) return;
-
-    const profileId = extensionSettings?.agent3Profile || null;
-    const banned = wi.buildBannedNames(databases);
-    const { llmCalls: madeCalls, aiUnits, fallbackUnits } = await wi.generateKeywords({ units, profileId, useAI, banned });
-    const book = wi.buildWorldInfoBook(units);
-
-    const json = JSON.stringify(book, null, 2);
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `bf-memory-worldinfo-${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-
-    addDebugLog('info', `World Info exported (${units.length} entries, mode=${mode}, ${madeCalls} keyword call(s))`, {
-        subsystem: 'import', event: 'wi.exported', actor: 'USER',
-        data: { entries: units.length, mode, aiKeywords: useAI, llmCalls: madeCalls, aiUnits, fallbackUnits },
-    });
-    toastr.success(`World Info book exported (${units.length} entries)`, 'BF Memory');
-}
-
-/**
- * Import a SillyTavern World Info book: each enabled entry becomes a stored fact. Parses the
- * three known lorebook dialects (worldinfo-interop.parseWorldInfoBook — throws a clear error
- * on anything else, including a bf-memory export picked by mistake), shows a confirm popup
- * (entry count, disabled skips, Unsorted-vs-heuristic target), converts, then persists via
- * EXACTLY the importDatabasesFromJson MERGE contract: cancelPendingSnapshot -> upsertFact/
- * saveDatabase per category -> saveCurrentToActiveProfile(allowEmpty) -> flushSnapshotNow —
- * the documented anti-resurrection sequence. MERGE-only: WI import is additive by definition,
- * it never wipes anything.
- * @param {string} text - raw JSON file contents
- * @param {string} fileName - book name (file name sans .json) used for provenance
- */
-async function importWorldInfoFromJson(text, fileName) {
-    const wi = await import('./worldinfo-interop.js');
-    const entries = wi.parseWorldInfoBook(text); // throws on non-lorebook input (caller toasts)
-    const bookName = String(fileName || 'import').trim() || 'import';
-    const enabledCount = entries.filter(e => !e.disabled).length;
-    const disabledCount = entries.length - enabledCount;
-    if (enabledCount === 0) {
-        toastr.warning(`"${bookName}": all ${entries.length} entries are disabled — nothing to import`, 'BF Memory');
-        return;
-    }
-
-    // Confirm + target choice (default: everything into Unsorted; heuristic filing is opt-in).
-    let target = 'Unsorted';
-    const popupOk = await ensurePopup();
-    if (popupOk && Popup) {
-        const html = `
-            <div class="bf-mem-wi-import-popup">
-                <h3>Import World Info "${escapeHtml(bookName)}"</h3>
-                <p>${enabledCount} enabled entr${enabledCount === 1 ? 'y' : 'ies'} found${disabledCount ? ` (${disabledCount} disabled will be skipped)` : ''}. Each entry becomes a stored fact. This MERGES into your current store — nothing is deleted, and re-importing the same book updates instead of duplicating.</p>
-                <div style="display:flex;flex-direction:column;gap:6px;">
-                    <label class="checkbox_label"><input type="radio" name="bf_mem_wi_target" value="Unsorted" checked /> <span>File everything under Unsorted (safe default — refile later)</span></label>
-                    <label class="checkbox_label"><input type="radio" name="bf_mem_wi_target" value="heuristic" /> <span>Guess categories from titles/keywords (Places/Things/Events/World; never People)</span></label>
-                </div>
-            </div>`;
-        const popup = new Popup(html, POPUP_TYPE.TEXT, '', { okButton: 'Import', cancelButton: 'Cancel' });
-        const popupResult = await popup.show();
-        if (!popupResult) return;
-        const root = popup.dlg || popup.content || document;
-        target = root.querySelector('input[name="bf_mem_wi_target"]:checked')?.value === 'heuristic' ? 'heuristic' : 'Unsorted';
-    } else {
-        if (!confirm(`Import ${enabledCount} World Info entr${enabledCount === 1 ? 'y' : 'ies'} from "${bookName}" as facts (into Unsorted, merge-only)?`)) return;
-    }
-
-    const { factsByCategory, factCount, skippedDisabled, truncated } = wi.worldInfoEntriesToFacts(entries, { target, bookName });
-    if (factCount === 0) {
-        toastr.warning(`"${bookName}": no usable entries to import`, 'BF Memory');
-        return;
-    }
-
-    // Persistence — byte-for-byte the importDatabasesFromJson MERGE contract.
-    const {
-        getAllDatabases, saveDatabase, flushSnapshotNow, cancelPendingSnapshot,
-        upsertFact, createEmptyDatabase,
-    } = await import('./database.js');
-
-    cancelPendingSnapshot();
-
-    let upserted = 0;
-    const touchedCategories = [];
-    const live = await getAllDatabases();
-    for (const [category, facts] of Object.entries(factsByCategory)) {
-        if (facts.length === 0) continue;
-        const targetDb = live[category] ? { ...live[category], category } : createEmptyDatabase(category);
-        for (const fact of facts) { upsertFact(targetDb, fact); upserted++; }
-        await saveDatabase(targetDb);
-        touchedCategories.push(category);
-    }
-
-    await saveCurrentToActiveProfile(null, { allowEmpty: true });
-    await flushSnapshotNow();
-
-    addDebugLog('pass', `World Info "${bookName}" imported: ${upserted} fact(s) into ${touchedCategories.join(', ')} (${skippedDisabled} disabled skipped, ${truncated} truncated)`, {
-        subsystem: 'import', event: 'wi.imported', actor: 'USER',
-        data: { entries: entries.length, factsUpserted: upserted, skippedDisabled, truncated, categories: touchedCategories, target },
-    });
-    toastr.success(`Imported ${upserted} fact(s) from World Info "${bookName}"`, 'BF Memory');
-    refreshDatabaseView();
 }
 
 // --- DB Profiles ---
@@ -1886,28 +1577,6 @@ export async function initSettings() {
     // Render the current live reflection summary (read-only)
     renderReflection();
 
-    // --- Character Registry (hardcoded ON, interval 10 — G4; only the manual scan remains) ---
-    // Manual "scan now": run the deterministic scan and, if there are unclassified named
-    // candidates, open the batched popup immediately (off the normal interval gate).
-    $('#bf_mem_charreg_scan').on('click', async () => {
-        try {
-            const { getAllDatabases } = await import('./database.js');
-            const databases = await getAllDatabases();
-            const candidates = scanForNamedCandidates(databases);
-            if (candidates.length === 0) {
-                toastr.info('No new named characters found.', 'BF Memory');
-                renderEntities();
-                return;
-            }
-            await showEntityPopup(candidates);
-            renderEntities();
-        } catch (err) {
-            addDebugLog('fail', `Manual character scan failed: ${err.message || err}`);
-        }
-    });
-    // Render the current live registry list.
-    renderEntities();
-
     // --- Prompts ---
     // redesign-v2 (S3): memoryPrompt is now an OVERRIDE — extra instructions APPENDED to the
     // Memory Agent's user prompt (agent-memory.js buildAgentUserPrompt), never a replacement
@@ -1987,98 +1656,11 @@ export async function initSettings() {
 
     // --- Database Tab ---
     $('#bf_mem_refresh_db').on('click', () => refreshDatabaseView());
-    $('#bf_mem_browse_db').on('click', () => showAllDatabases());
     $('#bf_mem_view_web').on('click', () => showSpiderwebPopup());
-
-    // Cross-category live search: filters the whole store by key/value/note substring. Hides the
-    // per-category cards while a query is active and shows matching facts grouped by category, each
-    // with an "Open" link into that category's manager (where it can be edited/deleted).
-    $('#bf_mem_db_search').on('input', () => runDatabaseSearch());
 
     // Unlink the CURRENT chat from its profile (one-click, on the main tab). Detaches so it won't
     // auto-relink on the next CHAT_CHANGED — makes unlink actually stick.
     $('#bf_mem_db_unlink_current').on('click', () => unlinkCurrentChat());
-
-    // Add-label (user taxonomy overlay) controls.
-    $('#bf_mem_addleaf_btn').on('click', () => {
-        addUserLeaf(
-            $('#bf_mem_addleaf_category').val(),
-            $('#bf_mem_addleaf_name').val(),
-            $('#bf_mem_addleaf_subarea').val(),
-        );
-    });
-    $('#bf_mem_addleaf_name').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#bf_mem_addleaf_btn').trigger('click'); } });
-    $('#bf_mem_addcat_btn').on('click', () => addUserCategory($('#bf_mem_addcat_name').val()));
-    $('#bf_mem_addcat_name').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#bf_mem_addcat_btn').trigger('click'); } });
-    // AI suggest-new-labels (manual, on-demand — mines homeless facts, one LLM call, approval gate).
-    $('#bf_mem_suggest_labels_btn').on('click', () => onSuggestLabelsClick());
-    $('#bf_mem_export_db').on('click', async () => {
-        const { getAllDatabases } = await import('./database.js');
-        const databases = await getAllDatabases();
-        const json = JSON.stringify(databases, null, 2);
-        const blob = new Blob([json], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `bf-memory-export-${Date.now()}.json`;
-        a.click();
-        URL.revokeObjectURL(url);
-        const dbCount = Object.keys(databases).length;
-        const totalFacts = Object.values(databases).reduce((s, db) => s + (db.facts?.length || 0), 0);
-        addDebugLog('info', `Databases exported (${dbCount} dbs, ${totalFacts} facts)`, {
-            subsystem: 'import', event: 'db.exported', actor: 'USER', data: { dbCount, totalFacts },
-        });
-        toastr.success('Databases exported', 'BF Memory');
-    });
-
-    // IMPORT: file-picker -> validate JSON shape -> merge or replace -> persist Layer A+B+C.
-    $('#bf_mem_import_db').on('click', () => $('#bf_mem_import_file').trigger('click'));
-    $('#bf_mem_import_file').on('change', async function () {
-        const file = this.files && this.files[0];
-        this.value = ''; // reset so re-picking the same file fires change again
-        if (!file) return;
-        try {
-            const text = await file.text();
-            await importDatabasesFromJson(text);
-        } catch (err) {
-            addDebugLog('fail', `DB import failed: ${err.message || err}`, {
-                subsystem: 'import', event: 'db.importFailed', actor: 'USER', reason: 'ERROR', data: { error: String(err.message || err) },
-            });
-            toastr.error(`Import failed: ${err.message || err}`, 'BF Memory');
-        }
-    });
-
-    // World Info interop: export the store as an ST lorebook / import a lorebook as facts.
-    // Busy-guard mirrors onSuggestLabelsClick (db-panel.js) — the keyword pass is slow and
-    // costs tokens, so a double-click must not start a second run.
-    $('#bf_mem_export_wi').on('click', async function () {
-        if (this.dataset.busy === '1') return; // guard against double-click while the export is in flight
-        this.dataset.busy = '1'; this.disabled = true;
-        try {
-            await exportWorldInfoFlow();
-        } catch (err) {
-            addDebugLog('fail', `WI export failed: ${err.message || err}`, {
-                subsystem: 'import', event: 'wi.exportFailed', actor: 'USER', reason: 'ERROR', data: { error: String(err.message || err) },
-            });
-            toastr.error(`World Info export failed: ${err.message || err}`, 'BF Memory');
-        } finally {
-            this.dataset.busy = '0'; this.disabled = false;
-        }
-    });
-    $('#bf_mem_import_wi').on('click', () => $('#bf_mem_import_wi_file').trigger('click'));
-    $('#bf_mem_import_wi_file').on('change', async function () {
-        const file = this.files && this.files[0];
-        this.value = ''; // reset so re-picking the same file fires change again
-        if (!file) return;
-        try {
-            await importWorldInfoFromJson(await file.text(), file.name.replace(/\.json$/i, ''));
-        } catch (err) {
-            addDebugLog('fail', `WI import failed: ${err.message || err}`, {
-                subsystem: 'import', event: 'wi.importFailed', actor: 'USER', reason: 'ERROR', data: { error: String(err.message || err) },
-            });
-            toastr.error(`World Info import failed: ${err.message || err}`, 'BF Memory');
-        }
-    });
 
     $('#bf_mem_clear_db').on('click', async () => {
         if (!confirm('Reset memory to EMPTY for this character? This wipes every stored fact across all storage layers. This cannot be undone.')) return;
@@ -2225,14 +1807,6 @@ export async function initSettings() {
     $(document).on('change', '.bf-mem-log-level', () => renderDebugLog());
     $('#bf_mem_log_subsystem').on('change', () => renderDebugLog());
     $('#bf_mem_log_search').on('input', () => renderDebugLog());
-
-    // Graph view (Database tab): show a fact's linked neighbors; Enter or button triggers it.
-    $('#bf_mem_graph_btn').on('click', () => renderGraphView($('#bf_mem_graph_key').val()));
-    $('#bf_mem_graph_key').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); renderGraphView($('#bf_mem_graph_key').val()); } });
-
-    // Recurring-characters entity panel (Database tab): manual refresh + initial paint.
-    $('#bf_mem_entities_refresh').on('click', () => renderEntityPanel());
-    renderEntityPanel();
 
     // Ring-buffer state moved to debug-log.js (F-UX-8 split); clearDebugLog() performs the exact
     // same buffer + metadata-slice + attachment-file + re-render sequence this handler inlined.
@@ -2400,7 +1974,6 @@ export async function initSettings() {
         reloadReflectionFromChat();
         reloadPyramidFromChat();
         reloadSheetFromChat();
-        reloadEntitiesUI();
 
         // Remember which chat we're now on so the NEXT switch can report an accurate
         // "from -> to". Logging-only state; never read by storage/profile logic.
@@ -2419,7 +1992,6 @@ export async function initSettings() {
     reloadReflectionFromChat();
     reloadPyramidFromChat();
     reloadSheetFromChat();
-    reloadEntitiesUI();
 
     // Save to active profile on page close/refresh
     window.addEventListener('beforeunload', () => {
