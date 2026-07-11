@@ -9,7 +9,7 @@ second model.
 Works with **any backend**. The background agent talks to its tools over a plain text protocol, so
 it does not need a function-calling API — a cheap local or hosted model works fine.
 
-> **Status:** redesign-v2 (v0.70.0). This is a large architectural rewrite. `node --check` passes on
+> **Status:** redesign-v2 (v0.71.0). This is a large architectural rewrite. `node --check` passes on
 > every module, but it is **not yet runtime-tested inside SillyTavern** — the host globals
 > (`SillyTavern`, IndexedDB, connection profiles) can only be exercised in the app. Smoke-test on
 > this branch before relying on it.
@@ -44,7 +44,8 @@ seed with `Story just beginning — no memories yet.` It contains:
 - the **facts the current scene needs**, rendered with recency labels and split into
   **CURRENT STATE** (established truth, wins conflicts) vs **CHRONOLOGY** (older context),
 - a one-line **scene card** (location; who's present; current goal/tension),
-- a few **graph-connected bonus facts** pulled through the deterministic 1-hop link expansion.
+- a few **graph-connected bonus facts** gathered by a random walk over the memory graph
+  (restaurant → Luigi's → first date) — a different connected chain each turn.
 
 Injecting the sheet is pure code reading stored text — deterministic, cache-friendly, stable across
 swipes and regens. The sheet is *rebuilt in the background* by the Memory Agent after each settled
@@ -105,8 +106,8 @@ settled message is extracted at most once.
 
 ## Token economics, honestly
 
-- **The sheet is budgeted.** Its facts section can't exceed `retrievalTokenBudget` (default ~800
-  tokens); the bonus connected facts are capped by `graphExtrasCount` (default 3).
+- **The sheet stays compact.** It renders the facts the scene needs plus a few bonus connected
+  memories, capped by `graphExtrasCount` (default 3).
 - **The win is trimming.** Because a compact sheet carries the memory, `agent2ContextMessages` can
   trim old turns out of the Writer's context — stored facts replace raw history. The **Tokens** tab
   shows what was injected, roughly what it cost, and how that compares to sending the whole chat.
@@ -115,7 +116,8 @@ settled message is extracted at most once.
 
 ## Settings reference
 
-The settings panel has four tabs: **Memory** (the knobs), **Database**, **Tokens**, **Debug**.
+The settings panel has five tabs: **Memory** (the knobs), **Sheet** (the live memory sheet),
+**Database**, **Tokens**, **Debug**.
 
 | Setting | Default | Range | What it does |
 |---|---|---|---|
@@ -124,20 +126,17 @@ The settings panel has four tabs: **Memory** (the knobs), **Database**, **Tokens
 | **Extra instructions** (`memoryPrompt`) | — | text | Optional text appended to the agent's prompt. Blank = stock behavior. |
 | **Writer history limit** (`agent2ContextMessages`) | 10 | 0–50 | How many recent messages the main model sees. **0 = full history** (no trim). |
 | **Buffer hold-back** (`bufferHoldBack`) | 4 | 0–10 | How many newest messages are held back as TENTATIVE (not yet extracted). |
-| **Retrieval token budget** (`retrievalTokenBudget`) | 800 | 50–8000 | Hard cap on the facts section of the sheet. |
-| **Graph extras** (`graphExtrasCount`) | 3 | 0–8 | Bonus graph-connected facts added to the sheet. |
-| **Review interval** (`reviewInterval`) | 10 | 0–100 | Fact-review popup every N messages (0 = never). |
+| **Bonus connected memories** (`graphExtrasCount`) | 3 | 0–8 | Extra memories added to the sheet by a random walk over the memory graph — a different connected chain each turn (0 = off). |
 | **POV scoping** (`enforceKnownBy`) | on | — | Facts tagged with a who-knows list are hidden from characters not on it (empty list = visible to all). Off = every character sees every fact. |
 | **Catch-up batch size** (`catchupBatchSize`) | 8 | 2–30 | Messages per chunk when back-filling an existing chat. |
 | **Show toasts** (`showToast`) | on | — | Status toasts. |
 | **Debug** (`debugMode`, `debugVerbose`) | off | — | Debug logging in the Debug tab. |
 
-*(Plus data, not knobs: `dbProfiles`, `activeDbProfile`, `unlinkedChats`, `taxonomyOverlay`,
-`onboardingDone`.)*
+*(Plus data, not knobs: `dbProfiles`, `activeDbProfile`, `unlinkedChats`, `taxonomyOverlay`.)*
 
 **Hardcoded on** (no longer settings — they're always active): temporal grounding, recency labels,
 truth hierarchy (CURRENT STATE / CHRONOLOGY split), MMR diversity rerank, confidence ranking,
-cross-key supersede, auto-linking + 1-hop graph expansion, periodic reflection, the character
+cross-key supersede, auto-linking + random-walk graph expansion, periodic reflection, the character
 registry, and the reflection compression guard. See [UPGRADES.md](UPGRADES.md).
 
 ## Catching up an existing chat

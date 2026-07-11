@@ -336,7 +336,9 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     const MAX_TERTIARY = 6;
     const now = Date.now();
     const cfg = (() => { try { return getSettings(); } catch { return null; } })() || {};
-    const budget = Number(cfg.retrievalTokenBudget) || 800;
+    // retrievalTokenBudget setting was removed — the retrieval-path token budget is now the
+    // fixed former default (800). The count caps (MAX_SECONDARY/MAX_TERTIARY) remain the backstop.
+    const budget = 800;
     const cutoffDays = Number(cfg.recencyCutoffDays) || 0;
     const cutoffIso = cutoffDays > 0 ? sinceIso(cutoffDays) : null;
     const passesRecency = (r) => !cutoffIso || !r.fact.createdAt || r.fact.createdAt >= cutoffIso;
@@ -893,6 +895,68 @@ export function expandLinks(databases, results, alreadyFound) {
     if (pulled > 0) {
         addDebugLog('info', `Link expansion (Phase 4b): pulled ${pulled} linked fact(s) as secondary`);
     }
+}
+
+/**
+ * RANDOM GRAPH WALK for the memory sheet's "Connected memories" strand. Instead of expanding
+ * the seed facts' links and keeping the top-N by salience (which always surfaces the same
+ * highest-ranked neighbors), this WANDERS the memory graph at random from the NEED rows,
+ * collecting up to `count` connected facts and CHAINING through them so a different connected
+ * run appears each turn (restaurant -> Luigi's -> first date).
+ *
+ * Neighbor resolution reuses expandLinks' internals: `collectLinkCandidates` traverses the
+ * scope graph ONE hop from a row and returns already-filtered (active + visible) neighbor
+ * candidates. From the current fact we pick ONE random UNSEEN neighbor, add it to the extras,
+ * and make it the new current fact so the walk chains. When the current fact has no unseen
+ * neighbor we restart from a random already-collected fact (or a random seed row). The walk
+ * stops when `count` is reached or no further progress is possible. Math.random is fine here —
+ * this is browser code and the sheet is intentionally non-deterministic per turn.
+ *
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {Array<{fact: Object, category: string, tier?: string}>} seedRows - resolved NEED rows
+ * @param {Set<string>} alreadySeen - `category:key` ids already on the sheet (never revisited)
+ * @param {number} count - graphExtrasCount: max extras to collect (0 = off)
+ * @returns {Array<{fact: Object, category: string, tier: string}>}
+ */
+export function randomWalkExtras(databases, seedRows, alreadySeen, count) {
+    const max = Math.max(0, Math.floor(Number(count) || 0));
+    if (max <= 0) return [];
+    const seeds = (Array.isArray(seedRows) ? seedRows : []).filter(r => r && r.fact);
+    if (seeds.length === 0) return [];
+
+    // Seen ledger: seeds + anything already on the sheet + everything we collect. Passed to
+    // collectLinkCandidates as its `alreadyFound` so it never re-emits a fact we've walked to.
+    const seen = new Set(alreadySeen instanceof Set ? alreadySeen : []);
+    for (const r of seeds) seen.add(`${r.category}:${r.fact.key}`);
+
+    const extras = [];       // {fact, category, tier} rows to return
+    const collected = [];     // restart pool (rows we've added)
+
+    const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+    // UNSEEN, active+visible scope-graph neighbors of one row (expandLinks' neighbor internals).
+    const neighborsOf = (row) => collectLinkCandidates(databases, [row], seen);
+
+    let current = pick(seeds);
+    let stalls = 0;
+    // Bound restart-only spinning: once we can make no progress from any restart point, stop.
+    const maxStalls = seeds.length + max + 4;
+    while (extras.length < max) {
+        const neighbors = neighborsOf(current);
+        if (neighbors.length > 0) {
+            const chosen = pick(neighbors);
+            seen.add(`${chosen.category}:${chosen.fact.key}`);
+            const row = { fact: chosen.fact, category: chosen.category, tier: chosen.tier || 'secondary' };
+            extras.push(row);
+            collected.push(row);
+            current = row; // CHAIN: walk continues from the fact we just reached
+            stalls = 0;
+        } else {
+            // Dead end — restart from a random collected fact, else a random seed row.
+            if (++stalls > maxStalls) break;
+            current = pick(collected.length > 0 ? collected : seeds);
+        }
+    }
+    return extras;
 }
 
 /**

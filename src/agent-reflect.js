@@ -30,7 +30,6 @@
 
 import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, markFactCold, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
 import { tokenSet, keyToken } from './tokenize.js';
-import { trackUpdate } from './review-popup.js';
 
 // Contradiction scan (atomic #7) tuning.
 const MAX_CONFLICT_PAIRS = 30;
@@ -730,16 +729,9 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
                             return true;
                         })
                         .slice(0, MAX_CONFLICT_PAIRS);
-                    for (const p of pairs) {
-                        trackUpdate({
-                            action: 'conflict',
-                            category: p.a.category,
-                            key: p.a.fact.key,
-                            value: `"${p.a.fact.value}"  vs  ${p.b.category}/${p.b.fact.key} = "${p.b.fact.value}"`,
-                            knownBy: p.a.fact.knownBy || [],
-                        });
-                    }
-                    if (pairs.length > 0) addDebugLog('info', `[${runId}] Contradiction scan queued ${pairs.length} conflict(s) for review`);
+                    // Review popup removed (redesign): the contradiction scan now only LOGS the
+                    // conflicts it detects instead of queueing them into a review UI.
+                    if (pairs.length > 0) addDebugLog('info', `[${runId}] Contradiction scan detected ${pairs.length} conflict(s) (logged only — review popup removed)`);
                 }
             }
         } catch (err) {

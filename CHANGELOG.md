@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.71.0] - 2026-07-11 — settings cleanup + random-walk memories
+
+> Trims the extension toward its core: removes several stale settings/UI and the features behind
+> them, gives the memory sheet its own tab, and reworks "connected memories" from a ranked top-N into
+> a random graph walk. `node --check` passes on every module; **still not runtime-tested inside
+> SillyTavern**.
+
+### Removed (settings + their code)
+
+- **Retrieval token budget** — the slider, the `retrievalTokenBudget` setting, and the per-line token
+  cap in `composeSheet` are gone. The sheet now renders all NEED facts + walk extras (the count caps
+  remain the backstop).
+- **Review interval** — the slider, the `reviewInterval` setting, **and the entire review-popup
+  feature**: `review-popup.js` is deleted; the `trackUpdate` import + contradiction-scan queueing is
+  removed from `agent-reflect.js`; popup blocks removed from `pipeline.js`, `memory-tools.js`, and
+  `catchup-import.js`. Facts are still stored — only the review UI is gone.
+- **Setup walkthrough / onboarding** — `onboarding.js` deleted, its init removed, and the "Re-run
+  setup guide" button + handler + `onboardingDone` setting removed.
+- **"How this works" ELI5 box** and the **"What actually gets sent (assembly order)"** box removed
+  from the settings panel.
+- **Scene card** — the stale live scene-card widget (it was never populated; `setScene()` is never
+  called) is removed, along with the always-empty `## Current scene` block in the Memory Agent prompt
+  and `renderScene()`'s DOM code. Scene *state* is retained as a stub because `recency.js` reads
+  `sceneNo`.
+
+### Changed
+
+- **Memory sheet has its own tab.** Tabs are now Memory / **Sheet** / Database / Tokens / Debug; the
+  live memory sheet moved out of the Memory tab into the new Sheet tab.
+- **"Bonus connected memories" is now a random graph walk.** Instead of ranking a fact's neighbors by
+  salience and taking the top N, `randomWalkExtras` (in `fact-retrieval.js`) starts from the scene's
+  needed facts and wanders the memory graph at random, hop by hop (e.g. restaurant → Luigi's → first
+  date), chaining through unseen/active/visible neighbors and restarting on dead ends. The
+  `graphExtrasCount` slider (0–8, default 3) now sets how many random connected memories to collect.
+  The walk is bounded (no infinite loop) and never surfaces superseded, invisible, or already-shown
+  facts.
+
 ## [0.70.0] - 2026-07-11 — redesign-v2
 
 > A large architectural rewrite that collapses the extension to **one** memory architecture: the

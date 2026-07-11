@@ -20,6 +20,7 @@
             <!-- Tabs (redesign-v2 S5: Memory / Database / Tokens / Debug) -->
             <div class="bf-mem-tabs" role="tablist">
                 <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_memory" tabindex="0">Memory</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_sheet" tabindex="-1">Sheet</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_tokens" tabindex="-1">Tokens</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
@@ -27,15 +28,6 @@
 
             <!-- Tab: Memory (all the knobs) -->
             <div id="bf_mem_tab_memory" role="tabpanel" class="bf-mem-tabpanel">
-                <details class="bf-mem-eli5">
-                    <summary>🧠 How this works — click for a simple explanation</summary>
-                    <div class="bf-mem-eli5-body">
-                        <p><b>In plain words:</b> a background <b>Memory Agent</b> reads what just happened after each reply and saves the lasting facts — names, promises, injuries, secrets. It keeps a compact <b>memory sheet</b> up to date: the story so far, the current scene, and the facts the next reply needs.</p>
-                        <p>Before each reply, that sheet is handed to your main AI by pure code — no extra AI call, so your replies are never slowed down. Your main AI never uses tools; it just reads the sheet.</p>
-                        <p><b>Just want it to work?</b> Tick Enable and pick a cheap model below for the Memory Agent. Leave everything else at its default.</p>
-                    </div>
-                </details>
-
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Memory Agent model</div>
                     <div class="bf-mem-section-body">
@@ -66,19 +58,9 @@
                             <small class="bf-mem-hint">The newest N messages are never mined for facts — you might still swipe or edit them. The Memory Agent only sees them as clearly-labeled tentative context for planning. <b>4</b> is the default.</small>
                         </div>
                         <div class="bf-mem-field" style="margin-top:10px;">
-                            <label>Retrieval token budget <span class="bf-mem-val" id="bf_mem_retrieval_budget_val">800</span></label>
-                            <input type="range" id="bf_mem_retrieval_budget" min="50" max="8000" step="50" value="800" />
-                            <small class="bf-mem-hint">How much room (in tokens) the facts section of the memory sheet may take up. Bigger = more facts every turn (better memory, costs more); smaller = leaner and cheaper. The most relevant facts always go in first.</small>
-                        </div>
-                        <div class="bf-mem-field" style="margin-top:10px;">
-                            <label>Bonus connected facts <span class="bf-mem-val" id="bf_mem_graph_extras_val">3</span></label>
+                            <label>Bonus connected memories <span class="bf-mem-val" id="bf_mem_graph_extras_val">3</span></label>
                             <input type="range" id="bf_mem_graph_extras" min="0" max="8" step="1" value="3" />
-                            <small class="bf-mem-hint">Extra facts pulled onto the sheet because they are linked to the ones the scene needs — same person, place, or event. <b>0</b> turns the "Connected memories" section off.</small>
-                        </div>
-                        <div class="bf-mem-field" style="margin-top:10px;">
-                            <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
-                            <input type="range" id="bf_mem_review_interval" min="0" max="100" step="1" value="10" />
-                            <small class="bf-mem-hint">How often a pop-up shows the facts the agent <b>already saved</b>, so you can edit or delete any that are wrong. E.g. 10 means a check-in every 10 messages. <b>0 = never show</b> the pop-up.</small>
+                            <small class="bf-mem-hint">The Memory Agent staples on a few EXTRA memories connected to the scene's facts. Instead of always the top-ranked ones, it wanders the memory graph at random — restaurant → Luigi's → first date — surfacing a different connected chain each time. This sets how many to collect. <b>0</b> turns it off.</small>
                         </div>
                         <label class="checkbox_label" style="margin-top:10px;">
                             <input type="checkbox" id="bf_mem_knownby_enforced" checked />
@@ -89,12 +71,6 @@
                             <input type="checkbox" id="bf_mem_toast" />
                             <span>Show toast notifications</span>
                         </label>
-                        <div class="bf-mem-field" style="margin-top:8px;">
-                            <button type="button" id="bf_mem_rerun_onboarding" class="menu_button">
-                                <i class="fa-solid fa-graduation-cap"></i> Re-run setup guide
-                            </button>
-                            <small class="bf-mem-hint">Reopens the short first-run walkthrough (enable + pick the background memory model). It only changes what you actively pick in it.</small>
-                        </div>
                     </div>
                 </div>
 
@@ -108,25 +84,6 @@
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="6" placeholder="Optional extra instructions appended to the Memory Agent's task (leave blank for none)..."></textarea>
                         <small class="bf-mem-hint">Appended to the background Memory Agent's task each run — e.g. genre-specific things to track. The built-in rulebook itself is fixed (cache-stable) and is not edited here.</small>
-                        <details id="bf_mem_scribe_assembly" class="bf-mem-assembly">
-                            <summary>What actually gets sent (assembly order)</summary>
-                            <div class="bf-mem-assembly-body">
-                                <p>The Memory Agent runs a background tool-loop session. The <b>SYSTEM</b> message is the fixed built-in rulebook (tool protocol + extraction rules). The <b>USER</b> message carries the live data:</p>
-<pre><span class="bf-mem-asm-label">[SYSTEM]</span> built-in Memory Agent rulebook (fixed)
-
-<span class="bf-mem-asm-label">[USER]</span>
-## Task <span class="bf-mem-asm-ph">(full run or extract-only)</span>
-## Observation date / Character Info / User Persona
-## Current scene + Story so far (reflection)
-## Prior memory sheet
-## Memory database overview <span class="bf-mem-asm-ph">(drawers + key inventory)</span>
-## Taxonomy menu
-## SETTLED messages <span class="bf-mem-asm-ph">(extraction sources)</span>
-## TENTATIVE messages <span class="bf-mem-asm-ph">(planning context only)</span>
-## Additional instructions from the user <span class="bf-mem-asm-ph">(the field above)</span></pre>
-                                <p>The agent then calls tools (list_categories → list_keys → read_facts → write_fact / search, max 6 rounds / 20 calls) and finishes with the #SHEET block that becomes the memory sheet.</p>
-                            </div>
-                        </details>
                     </div>
                 </div>
 
@@ -154,18 +111,16 @@
                     </div>
                 </div>
 
+            </div>
+
+            <!-- Tab: Sheet (the live memory sheet, moved out of the Memory tab) -->
+            <div id="bf_mem_tab_sheet" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-file-lines"></i> Memory sheet (live)</div>
                     <div class="bf-mem-section-body">
                         <small class="bf-mem-hint">The persistent memory sheet handed to your AI before each reply — story so far, current scene, and the facts the scene needs. Rebuilt in the background after each settled reply.</small>
                         <div id="bf_mem_sheet_view" class="bf-mem-fact-list">
                             <div class="bf-mem-summary-empty">No memory sheet yet. It is rebuilt in the background after each reply.</div>
-                        </div>
-                        <div class="bf-mem-field" style="margin-top:8px;">
-                            <label>Scene card (live)</label>
-                            <div id="bf_mem_scene_view" class="bf-mem-fact-list">
-                                <div class="bf-mem-summary-empty">No scene yet. It updates each turn once the pipeline runs.</div>
-                            </div>
                         </div>
                     </div>
                 </div>

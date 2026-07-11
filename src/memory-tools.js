@@ -34,7 +34,6 @@ import {
 } from './database.js';
 import { isFactVisible, buildFactLine, retrieveFacts, formatFactsForWriter, extractContextKeywords } from './fact-retrieval.js';
 import { getTurnNowContext } from './recency.js';
-import { trackUpdate } from './review-popup.js';
 import { addDebugLog } from './settings.js';
 import { wordTokens, keyToken } from './tokenize.js';
 import * as host from './host.js';
@@ -321,7 +320,7 @@ function scopeFromCategory(category) {
 /**
  * write_fact — validate + normalize the agent's arguments, then route the write through the
  * SAME upsert path the Scribe used: upsertFact (reconcile-on-write, salience merge, per-key
- * supersession) + applyCrossKeySupersedeRules + autoLinkFact + review-popup trackUpdate.
+ * supersession) + applyCrossKeySupersedeRules + autoLinkFact.
  * Mutates ctx.databases in place and records the change on ctx.applied /
  * ctx.touchedCategories — the CALLER persists (one saveDatabase per touched category).
  *
@@ -442,25 +441,6 @@ function execWriteFact(args, ctx) {
             ctx.touchedCategories.add(cat);
         }
         ctx.touchedCategories.add(category);
-
-        // Review queue: same pending-review flow every other write path feeds. F-UX-6:
-        // reviewInterval 0 = popup disabled — skip queueing so pendingReviewItems can't grow
-        // unboundedly (the fact itself is already stored above).
-        if (Math.floor(Number(ctx.settings?.reviewInterval ?? 10)) > 0) trackUpdate({
-            action: 'add',
-            category,
-            key: fact.key,
-            value,
-            context: note || undefined,
-            knownBy,
-            tags,
-            importance,
-            kind,
-            aspect,
-            source: fact.source,
-            status,
-            changed: true,
-        });
 
         ctx.applied.push({ category, key: fact.key, fact: stored || fact, status });
     }

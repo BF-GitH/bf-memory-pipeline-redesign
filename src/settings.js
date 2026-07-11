@@ -23,7 +23,7 @@ import {
 import {
     setLastGenerated, setLastInserted, reloadFactsFromChat,
     reloadTokensFromChat, resetSessionTokens,
-    reloadSceneFromChat, renderScene,
+    reloadSceneFromChat,
     reloadReflectionFromChat, renderReflection,
     reloadPyramidFromChat,
     reloadSheetFromChat,
@@ -89,9 +89,6 @@ function getCurrentProfileId() {
 // stored key not listed here.
 const DEFAULT_SETTINGS = {
     enabled: false,
-    // First-run onboarding wizard (src/onboarding.js): true once the user has FINISHED or
-    // SKIPPED it - either way it never auto-shows again.
-    onboardingDone: false,
     // The background Memory Agent's connection profile (blank = current connection).
     agent3Profile: '',
     // Extra instructions APPENDED to the Memory Agent's user prompt ('' = none).
@@ -102,10 +99,6 @@ const DEFAULT_SETTINGS = {
     // SETTLED BUFFER hold-back (§7): the newest N messages are never fact-extracted (they may
     // still be swiped/edited) — they reach the Memory Agent only as TENTATIVE planning context.
     bufferHoldBack: 4,
-    // Approx-token budget for the facts section of the injected memory sheet.
-    retrievalTokenBudget: 800,
-    // Review popup cadence (messages). 0 = never show the review popup (F-UX-6).
-    reviewInterval: 10,
     // WHO-KNOWS-WHAT (POV) ENFORCEMENT: when ON (default), facts carrying a knownBy list are
     // hidden from characters not on that list at every retrieval surface.
     enforceKnownBy: true,
@@ -182,8 +175,6 @@ export function validateSettings(s) {
         s.bufferHoldBack = clamped;
     }
     s.graphExtrasCount = Math.floor(clamp(s.graphExtrasCount, 0, 8, 3));
-    s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  0, 100, 10)); // 0 = never show the review popup (F-UX-6)
-    s.retrievalTokenBudget = Math.floor(clamp(s.retrievalTokenBudget, 50, 8000, 800));
     s.catchupBatchSize = Math.floor(clamp(s.catchupBatchSize, 2, 30, 8));
     if (typeof s.enabled !== 'boolean') {
         // FIX #10: log when a coercion silently flips a previously-true enable off.
@@ -197,7 +188,6 @@ export function validateSettings(s) {
     if (typeof s.debugVerbose !== 'boolean')     s.debugVerbose = false;
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
     if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
-    if (typeof s.onboardingDone !== 'boolean') s.onboardingDone = false;
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
     if (typeof s.activeDbProfile !== 'string')   s.activeDbProfile = '';
     if (!s.dbProfiles || typeof s.dbProfiles !== 'object' || Array.isArray(s.dbProfiles)) {
@@ -246,7 +236,7 @@ function migrateLegacySettings(s) {
     }
 
     // redesign-v2 SWEEP: every key that survives carries the same name as before, so the
-    // carried-over knobs (agent2ContextMessages, retrievalTokenBudget, reviewInterval,
+    // carried-over knobs (agent2ContextMessages, graphExtrasCount,
     // enforceKnownBy, catchupBatchSize, memoryPrompt, agent3Profile, dbProfiles /
     // activeDbProfile / unlinkedChats / taxonomyOverlay, ...) are simply KEPT — and every
     // stored key NOT in the final DEFAULT_SETTINGS list is DELETED (removed features and
@@ -1840,21 +1830,6 @@ export async function initSettings() {
         saveSettings();
     });
 
-    // Retrieval token budget slider (F-UX-4). PRESET-GOVERNED: this key is written by the
-    // Cheap/Balanced/Max Recall presets, so the control is also listed in the delegated
-    // governed-control listener (initSettings) that flips the preset dropdown to "Custom" on a
-    // manual edit, and re-synced by presets.js syncPresetControls() when a preset is applied.
-    $('#bf_mem_retrieval_budget').val(extensionSettings.retrievalTokenBudget);
-    $('#bf_mem_retrieval_budget_val').text(extensionSettings.retrievalTokenBudget);
-    $('#bf_mem_retrieval_budget').on('input', function () {
-        const val = parseInt($(this).val(), 10) || 800;
-        const before = extensionSettings.retrievalTokenBudget;
-        extensionSettings.retrievalTokenBudget = val;
-        $('#bf_mem_retrieval_budget_val').text(val);
-        if (before !== val) addDebugLog('debug', `Retrieval token budget: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'retrievalTokenBudget' }, before, after: val });
-        saveSettings();
-    });
-
     // Settled buffer hold-back slider (§7): the newest N messages are never mined for facts.
     $('#bf_mem_buffer_holdback').val(extensionSettings.bufferHoldBack);
     $('#bf_mem_buffer_holdback_val').text(extensionSettings.bufferHoldBack);
@@ -1899,26 +1874,11 @@ export async function initSettings() {
     // toggles/sliders were removed — every one of those behaviors is now HARDCODED ON (G4) and
     // its setting key deleted from DEFAULT_SETTINGS. The modules that used them read a local const.
 
-    // Review interval slider
-    $('#bf_mem_review_interval').val(extensionSettings.reviewInterval);
-    $('#bf_mem_review_val').text(extensionSettings.reviewInterval);
-    $('#bf_mem_review_interval').on('input', function () {
-        const val = parseInt($(this).val());
-        const before = extensionSettings.reviewInterval;
-        extensionSettings.reviewInterval = val;
-        $('#bf_mem_review_val').text(val);
-        if (before !== val) addDebugLog('debug', `Review interval: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reviewInterval' }, before, after: val });
-        saveSettings();
-    });
-
     // Toast
     $('#bf_mem_toast').prop('checked', extensionSettings.showToast).on('change', function () {
         extensionSettings.showToast = $(this).prop('checked');
         saveSettings();
     });
-
-    // Render the current live scene card (read-only; no-op when the panel is absent)
-    renderScene();
 
     // redesign-v2 (S5): reflection is HARDCODED ON (G4 — interval 12, maxTokens 200); its
     // enable/interval/prompt controls were removed. agent-reflect.js falls back to
@@ -2486,19 +2446,6 @@ export async function initSettings() {
     // pipeline.js now persists via saveCurrentToActiveProfile(capturedDbProfile)
     // after every Agent 3 write, with capture-at-write semantics. The old
     // unprotected handler here was a residual leak path (same class as Issue #2).
-
-    // --- First-run onboarding wizard ---
-    // Shown ONCE, only after the whole UI above is bound: every wizard write routes through
-    // the live controls (.val().trigger('change')) so the existing handlers persist it.
-    // Dynamic import + guards mean a wizard failure can never break extension load.
-    try {
-        $('#bf_mem_rerun_onboarding').on('click', () => {
-            import('./onboarding.js').then(m => m.showOnboarding(true)).catch(() => { /* wizard is best-effort */ });
-        });
-        if (extensionSettings.onboardingDone !== true) {
-            import('./onboarding.js').then(m => m.maybeShowOnboarding()).catch(() => { /* wizard is best-effort */ });
-        }
-    } catch { /* onboarding must never block init */ }
 
     // --- Initial state ---
     updateStatus('idle');

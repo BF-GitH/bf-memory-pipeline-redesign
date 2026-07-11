@@ -20,7 +20,6 @@ import { runMemoryAgent } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { getAllDatabases } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
-import { tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getScene, getReflection, getMemorySheet, setMemorySheet, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
 import { detectAndRecord, showEntityPopup } from './agent-entities.js';
 
@@ -442,7 +441,6 @@ async function runMemoryExtraction() {
             profileId: agent3ProfileId,
             priorSheetText: getMemorySheet()?.text || '',
             reflection: getReflection(),
-            scene: getScene(),
             observationDate,
             runId,
             extractOnly: false,
@@ -517,9 +515,6 @@ async function runMemoryExtraction() {
             },
         });
         setLastInserted(committed);
-        // F-UX-6: reviewInterval 0 = never show the review popup. write_fact already queued the
-        // changed writes for review (gated on reviewInterval inside memory-tools.js).
-        const reviewEvery = Math.floor(settings.reviewInterval ?? 10);
 
         // PERSISTENT MEMORY SHEET: store the freshly-composed sheet so the pure-code injection
         // path reads it on the next prompt. A failed run never reaches here, so the prior
@@ -531,46 +526,6 @@ async function runMemoryExtraction() {
         // Promote the in-flight watermark to committed (true). setWatermark only saves when a
         // value actually changes (no redundant full-chat write).
         setWatermark(true);
-
-        // Review popup (deferred), capturing the chat id so it can't pop in the wrong chat.
-        if (reviewEvery > 0 && tickMessageCounter(reviewEvery)) {
-            addDebugLog('info', `[${runId}] Review interval reached, will show popup shortly`);
-            const targetChatIdForPopup = SillyTavern.getContext().chatId;
-            setTimeout(async () => {
-                if (SillyTavern.getContext().chatId !== targetChatIdForPopup) {
-                    addDebugLog('info', 'Skipping review popup: chat changed since extraction finished');
-                    return;
-                }
-                await showReviewPopup(
-                    () => addDebugLog('info', 'User confirmed reviewed facts (Looks good)'),
-                    async (editedItems) => {
-                        // Defensive: never upsert informational contradiction items (atomic #7).
-                        const writable = editedItems.filter(i => i.action !== 'conflict');
-                        addDebugLog('info', `User edited ${writable.length} items`);
-                        const { appendLastInserted } = await import('./settings.js');
-                        appendLastInserted(writable.map(i => ({ ...i, status: 'UPDATED' })));
-                        const { getAllDatabases: getDbs, createEmptyDatabase, upsertFact, saveDatabase, applyCrossKeySupersedeRules, isMaterialFactWrite } = await import('./database.js');
-                        const dbs = await getDbs();
-                        // Categories to persist: each edited item's own, PLUS any category the
-                        // cross-key supersede rules touched. GENUINE-NEW-WRITE GATE: classify
-                        // BEFORE the write and only fire the rules on a material NEW/UPDATED write.
-                        const toSave = new Set();
-                        for (const item of writable) {
-                            if (!dbs[item.category]) dbs[item.category] = createEmptyDatabase(item.category);
-                            const material = isMaterialFactWrite(dbs[item.category], item);
-                            upsertFact(dbs[item.category], item);
-                            toSave.add(item.category);
-                            if (material) {
-                                for (const cat of applyCrossKeySupersedeRules(dbs, item, item.category)) toSave.add(cat);
-                            }
-                        }
-                        for (const cat of toSave) {
-                            if (dbs[cat]) await saveDatabase(dbs[cat]);
-                        }
-                    },
-                );
-            }, 2000);
-        }
 
         // Persist to the captured DB profile slot (capture-at-write). runMemoryAgent already
         // saved each touched category (including use-it-or-lose-it bump categories) — this is

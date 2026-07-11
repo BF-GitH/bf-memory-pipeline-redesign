@@ -754,26 +754,12 @@ export function reloadSceneFromChat() {
     renderScene();
 }
 
-/** Render the read-only live scene card in the Agent 1 tab (if present). */
-export function renderScene() {
-    const el = document.getElementById('bf_mem_scene_view');
-    if (!el) return;
-    if (!sceneCard) {
-        el.innerHTML = '<div class="bf-mem-summary-empty">No scene yet. It updates each turn once the pipeline runs.</div>';
-        return;
-    }
-    const s = sceneCard;
-    const row = (label, val) => val ? `<div class="bf-mem-fact-line"><span class="bf-mem-fact-cat">${escapeHtml(label)}</span> ${escapeHtml(val)}</div>` : '';
-    // Scene No + name (Spiderweb 2): the monotonic scene number + its (location-derived or
-    // Drafter-refined) name, so the boundary detector is visible in the Agent 1 tab.
-    const sceneLabel = Number.isInteger(s.sceneNo) ? `#${s.sceneNo}${s.sceneName ? ` · ${s.sceneName}` : ''}` : '';
-    el.innerHTML =
-        row('Scene', sceneLabel) +
-        row('Location', s.location) +
-        row('Present', (s.present || []).join(', ')) +
-        row('Goals', (s.goals || []).join('; ')) +
-        row('Recently', (s.beats || []).join('; '));
-}
+/**
+ * No-op: the live scene-card UI was removed in the redesign. Scene STATE is still tracked
+ * (setScene/getScene/reloadSceneFromChat) because recency.js reads sceneNo — but there is no
+ * longer a card to render. Kept as an export so the existing internal call sites stay valid.
+ */
+export function renderScene() { /* scene card removed — nothing to render */ }
 
 // --- Reflection / Consolidation (persistent — stored in chat_metadata.bf_mem_reflection) ---
 // Rolling "story so far" summary + last synthesized observations. Mirrors the scene-card

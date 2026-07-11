@@ -30,7 +30,7 @@ import {
     summarizeMenuIndexed,
     groupedTaxonomyMenu,
 } from './database.js';
-import { isFactVisible, buildFactLine, expandLinks, retrievalSalience } from './fact-retrieval.js';
+import { isFactVisible, buildFactLine, randomWalkExtras } from './fact-retrieval.js';
 import {
     getTurnNowContext, splitInjectionSections, buildPrecedencePreamble,
     STATE_SECTION_HEADER, CHRONO_SECTION_HEADER,
@@ -140,7 +140,6 @@ Messages in the block marked "TENTATIVE" may still be swiped/edited. They may in
  * @param {string|null} [opts.profileId=null] - Memory Agent connection profile (CMRS)
  * @param {string} [opts.priorSheetText='']   - the sheet the writer currently sees
  * @param {Object|null} [opts.reflection=null] - turn-state getReflection() record
- * @param {Object|null} [opts.scene=null]     - turn-state getScene() card
  * @param {string} [opts.observationDate='']  - ISO real-world timestamp of the newest message
  * @param {string} [opts.runId='']            - correlation id for logs / write attribution
  * @param {boolean} [opts.extractOnly=false]  - catchup/backfill mode: writes only, #DONE final
@@ -156,7 +155,6 @@ export async function runMemoryAgent({
     profileId = null,
     priorSheetText = '',
     reflection = null,
-    scene = null,
     observationDate = '',
     runId = '',
     extractOnly = false,
@@ -203,7 +201,7 @@ export async function runMemoryAgent({
 
     const userPrompt = buildAgentUserPrompt({
         settledMessages, tentativeMessages, characterInfo, userPersona,
-        priorSheetText, reflection, scene, observationDate, extractOnly,
+        priorSheetText, reflection, observationDate, extractOnly,
         databases, index, settings,
     });
 
@@ -302,18 +300,6 @@ function renderMessageLine(m) {
     return `${idx}[${role}${name ? `: ${name}` : ''}] ${String(m?.text || '').trim()}`;
 }
 
-/** Render the scene card compactly for the prompt ('' when absent). */
-function renderSceneCard(scene) {
-    if (!scene || typeof scene !== 'object') return '';
-    const bits = [];
-    if (Number.isInteger(scene.sceneNo)) bits.push(`Scene #${scene.sceneNo}${scene.sceneName ? ` "${scene.sceneName}"` : ''}`);
-    if (scene.location) bits.push(`Location: ${scene.location}`);
-    if (Array.isArray(scene.present) && scene.present.length) bits.push(`Present: ${scene.present.join(', ')}`);
-    if (Array.isArray(scene.goals) && scene.goals.length) bits.push(`Goals: ${scene.goals.join('; ')}`);
-    if (Array.isArray(scene.beats) && scene.beats.length) bits.push(`Recently: ${scene.beats.join('; ')}`);
-    return bits.join('\n');
-}
-
 /** Cap a multi-line block at `max` lines with a "+N more" footer. */
 function capLines(text, max, footer) {
     const lines = String(text || '').split('\n').filter(Boolean);
@@ -323,7 +309,7 @@ function capLines(text, max, footer) {
 
 function buildAgentUserPrompt({
     settledMessages, tentativeMessages, characterInfo, userPersona,
-    priorSheetText, reflection, scene, observationDate, extractOnly,
+    priorSheetText, reflection, observationDate, extractOnly,
     databases, index, settings,
 }) {
     const parts = [];
@@ -336,9 +322,6 @@ function buildAgentUserPrompt({
     if (observationDate) parts.push(`## Observation date: ${observationDate}`);
     if (characterInfo) parts.push(`## Character Info ({{char}})\n${characterInfo}`);
     if (userPersona) parts.push(`## User Persona ({{user}})\n${userPersona}`);
-
-    const sceneBlock = renderSceneCard(scene);
-    if (sceneBlock) parts.push(`## Current scene\n${sceneBlock}`);
 
     const reflSummary = (reflection && typeof reflection.summary === 'string') ? reflection.summary.trim() : '';
     if (reflSummary) parts.push(`## Story so far (rolling reflection summary)\n${reflSummary}`);
@@ -454,10 +437,9 @@ function clampNum(v, min, max, dflt) {
  * Render the persistent MEMORY SHEET from the agent's parsed final block (G3). PURE CODE —
  * no LLM: NEED refs resolve via findFactMatch (missing skipped, knownBy/POV enforced), split
  * into CURRENT STATE / CHRONOLOGY (recency.js truth hierarchy) with always-on recency tails,
- * then up to graphExtrasCount deterministically link-expanded bonus facts ("Connected
- * memories", anti-hub caps inside expandLinks, ordered by retrievalSalience which folds in
- * confidence). The fact lines are token-capped by retrievalTokenBudget (~4 chars/token,
- * matching estimateInjectionTokens' approximation).
+ * then up to graphExtrasCount bonus facts collected by a RANDOM GRAPH WALK out from the NEED
+ * rows ("Connected memories" — a different connected chain each turn, see randomWalkExtras).
+ * All resolved NEED facts + the walk extras are rendered (no per-line token cap).
  * @param {{summary?:string, sceneLine?:string, notes?:string,
  *          need?:Array<{category:string,key:string}>, settings?:Object, databases?:Object}} opts
  * @returns {string} the rendered sheet (never empty when summary is non-empty)
@@ -485,31 +467,19 @@ export function composeSheet({ summary = '', sceneLine = '', notes = '', need = 
         } catch { /* one bad ref must never break the sheet */ }
     }
 
-    // 2) Graph extras: deterministic 1-hop link expansion off the chosen facts, ordered by
-    //    retrievalSalience (importance + recency + use + confidence), first N admitted.
+    // 2) Graph extras: a RANDOM WALK out from the NEED rows through the memory graph, surfacing
+    //    up to graphExtrasCount connected memories — a different connected chain each turn
+    //    (restaurant -> Luigi's -> first date) instead of always the top-ranked neighbors.
     const extrasMax = Math.floor(clampNum(settings?.graphExtrasCount ?? 3, 0, 8, 3));
     let extras = [];
     if (extrasMax > 0 && rows.length > 0) {
         try {
-            const expanded = rows.slice();
-            const already = new Set(seen);
-            expandLinks(databases, expanded, already); // anti-hub caps live inside
-            extras = expanded.slice(rows.length);
-            const now = Date.now();
-            extras.sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
-            extras = extras.slice(0, extrasMax);
+            extras = randomWalkExtras(databases, rows, seen, extrasMax);
         } catch { extras = []; }
     }
 
-    // 3) Truth-hierarchy split + budget-capped rendering (~4 chars/token, the shared
-    //    estimator approximation). Once the budget runs out no further fact lines are added.
-    let budget = Math.floor(clampNum(settings?.retrievalTokenBudget ?? 800, 50, 8000, 800));
-    const admit = (line) => {
-        const cost = Math.ceil(line.length / 4);
-        if (cost > budget) return false;
-        budget -= cost;
-        return true;
-    };
+    // 3) Truth-hierarchy split + rendering. retrievalTokenBudget was removed — every resolved
+    //    NEED fact + walk extra is rendered (still split into the same sections).
     const { state, chrono } = splitInjectionSections(rows);
 
     const lines = [];
@@ -521,9 +491,7 @@ export function composeSheet({ summary = '', sceneLine = '', notes = '', need = 
     const renderSection = (header, sectionRows) => {
         const admitted = [];
         for (const r of sectionRows) {
-            const line = buildFactLine(r.fact, r.category, false, nowCtx); // recency labels always on
-            if (!admit(line)) break; // budget spent — later (lower-priority) sections get nothing
-            admitted.push(line);
+            admitted.push(buildFactLine(r.fact, r.category, false, nowCtx)); // recency labels always on
         }
         if (admitted.length > 0) {
             lines.push(header);

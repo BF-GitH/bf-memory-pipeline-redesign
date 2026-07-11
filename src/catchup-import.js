@@ -22,25 +22,21 @@
 //     button keeps its truthy test — no regression there.
 //   - Per-chunk watermark stamp = the RESUME point: cancel/fail mid-import and re-running picks
 //     up exactly where it stopped (failed chunks stay unstamped → retried).
-//   - The Review popup shows UNCONDITIONALLY at the end (explicit user action, independent of
-//     reviewInterval). NOTE: it drains ALL pendingReviewItems, so it may include facts queued
-//     earlier by normal turns — acceptable, they were pending for review anyway.
 //
 // KNOWN COARSENESS (documented, inherent to chunking): every fact from a chunk carries the
 // chunk TARGET's sourceMsgIndex, so the per-message brain icon shows mid-chunk facts on the
 // chunk's last message, not the exact line they came from.
 //
 // Self-contained module (keeps settings.js from growing): statically imports only the settings
-// facade + review popup; the heavy agent/DB modules are dynamically imported inside the runner,
+// facade; the heavy agent/DB modules are dynamically imported inside the runner,
 // mirroring runAgent3OnFullChat's pattern (and avoiding import cycles).
 // =============================================================================
 
 import {
-    getSettings, addDebugLog, setLastGenerated, setLastInserted, appendLastInserted,
+    getSettings, addDebugLog, setLastGenerated, setLastInserted,
     saveCurrentToActiveProfile, isTriviallyEmptyForExtraction, getPendingRun,
-    getMemorySheet, setMemorySheet, getScene, getReflection,
+    getMemorySheet, setMemorySheet, getReflection,
 } from './settings.js';
-import { showReviewPopup, getPendingItems } from './review-popup.js';
 
 /** Resolve the live ST context, null-safe (same helper shape as commands.js). */
 function ctx() {
@@ -337,7 +333,6 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
                     profileId,
                     priorSheetText: getMemorySheet()?.text || '',
                     reflection: getReflection(),
-                    scene: getScene(),
                     observationDate: new Date().toISOString(),
                     runId: sheetRunId,
                     extractOnly: false,
@@ -396,41 +391,6 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
         subsystem: 'import', event: 'catchup.complete', actor: 'USER',
         data: { chunks: plan.chunks.length, processedChunks, failedChunks, msgsDone, msgsTotal: plan.eligibleCount, factsAdded, cancelled: catchupCancelled, aborted, durationMs: Date.now() - startMs },
     });
-
-    // Review popup — UNCONDITIONAL for this explicit user action (independent of reviewInterval).
-    // NOTE: getPendingItems() drains the WHOLE pending queue, so items queued by normal turns
-    // before this import may ride along — acceptable, they were pending for review anyway.
-    // Guarded on the captured chat so it can't pop over a different chat after an abort.
-    if (ctx()?.chatId === capturedChatId && getPendingItems().length > 0) {
-        await showReviewPopup(
-            () => addDebugLog('info', 'Catch-up: user confirmed reviewed facts (Looks good)'),
-            async (editedItems) => {
-                // Same edit-commit body as pipeline.js's review popup: never upsert informational
-                // conflict items; cross-key supersede rules apply ONLY to a material NEW/UPDATED
-                // write (isMaterialFactWrite — mirrors applyUpdates' update.changed gate). The
-                // queue re-upserts ALREADY-SAVED items, and an unchanged death/departure/loss
-                // item must never re-fire a rule against facts written after the original trigger.
-                const { getAllDatabases, createEmptyDatabase, upsertFact, saveDatabase, applyCrossKeySupersedeRules, isMaterialFactWrite } = await import('./database.js');
-                const writable = editedItems.filter(i => i.action !== 'conflict');
-                addDebugLog('info', `Catch-up: user edited ${writable.length} items`);
-                appendLastInserted(writable.map(i => ({ ...i, status: 'UPDATED' })));
-                const dbs = await getAllDatabases();
-                const toSave = new Set();
-                for (const item of writable) {
-                    if (!dbs[item.category]) dbs[item.category] = createEmptyDatabase(item.category);
-                    const material = isMaterialFactWrite(dbs[item.category], item);
-                    upsertFact(dbs[item.category], item);
-                    toSave.add(item.category);
-                    if (material) {
-                        for (const cat of applyCrossKeySupersedeRules(dbs, item, item.category)) toSave.add(cat);
-                    }
-                }
-                for (const cat of toSave) {
-                    if (dbs[cat]) await saveDatabase(dbs[cat]);
-                }
-            },
-        );
-    }
 
     return {
         chunks: plan.chunks.length, processedChunks, failedChunks,
