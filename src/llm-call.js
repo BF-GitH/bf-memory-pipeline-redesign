@@ -7,6 +7,9 @@
 // fail, the call returns '' and callers degrade to deterministic retrieval instead.
 
 import { addDebugLog } from './settings.js';
+// Text-protocol parser for the Memory Agent tool loop (redesign-v2 S2). IMPORT DIRECTION:
+// llm-call.js -> memory-tools.js only; memory-tools NEVER imports llm-call (cycle guard).
+import { parseAgentReply } from './memory-tools.js';
 import * as host from './host.js';
 
 // LATENCY BUDGET (latency/abort fix). The agent LLM calls sit on the user's reply-critical
@@ -243,11 +246,34 @@ async function callViaCMRS(profileId, messages, signal) {
  * @returns {Promise<string>} The LLM response text
  */
 export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, agent = 'unknown', externalSignal = null) {
+    return callAgentLLMMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+    ], profileId, agent, externalSignal);
+}
+
+/**
+ * Generalized agent call over an ARBITRARY messages array (redesign-v2 S2). Same retry /
+ * wall-clock budget / abort-registry / cache-eligibility machinery as callAgentLLM (which is
+ * now a 2-message wrapper over this). Used by the Memory Agent tool loop, whose conversation
+ * grows by an assistant + user (TOOL RESULTS) pair per round.
+ * @param {Array<{role:string, content:string}>} messages - full conversation to send
+ * @param {string|null} [profileId=null]
+ * @param {string} [agent='unknown']
+ * @param {AbortSignal|null} [externalSignal=null]
+ * @returns {Promise<string>} the LLM response text ('' on failure — callers degrade)
+ */
+export async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown', externalSignal = null) {
     // Up to 2 attempts. Retry on:
     // - Empty response (providers like Deepseek intermittently return empty)
     // - Network errors (mobile users hit ERR_NETWORK_CHANGED on WiFi↔cellular switch)
     // CACHE-ELIGIBILITY (honest): observe prefix stability, NEVER a cache hit. Computed once
     // per call (before the retry loop) so a retry doesn't double-log or falsely flip the flag.
+    // The stability hash is computed over the leading SYSTEM message (the cacheable prefix);
+    // a messages array without one simply skips the check.
+    const systemPrompt = (Array.isArray(messages) && messages[0]?.role === 'system')
+        ? String(messages[0].content || '')
+        : '';
     try {
         const sysHash = cheapHash(systemPrompt);
         const sysTokens = Math.round((String(systemPrompt || '').length) / 4); // ~4 chars/token estimate
@@ -310,7 +336,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
                 break;
             }
             try {
-                const result = await callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent, callCtrl.signal);
+                const result = await callAgentLLMOnce(messages, profileId, agent, callCtrl.signal);
                 if (result && result.trim()) return result;
                 if (attempt === 1) {
                     addDebugLog('info', 'LLM returned empty response, retrying once...');
@@ -347,7 +373,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
     return '';
 }
 
-async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'unknown', signal) {
+async function callAgentLLMOnce(messages, profileId, agent = 'unknown', signal) {
     // ── Prompt-caching note (Claude / OpenRouter / Electron Hub etc.) ─────────────
     // We CANNOT attach `cache_control: {type:'ephemeral'}` markers from an extension.
     // SillyTavern's chat-completions backend rebuilds every message into a fresh
@@ -367,11 +393,9 @@ async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'un
     // it. Do NOT interleave variable data into the system message or the static prefix
     // stops matching and `enableSystemPromptCache` can no longer reuse it. Agent 3
     // (note-taker) sends the full uncapped DB summary in the user message; the cacheable
-    // part is its system rulebook, which this ordering preserves.
-    const messages = [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-    ];
+    // part is its system rulebook, which this ordering preserves. (redesign-v2 S2: this
+    // function now receives the FULL messages array — callAgentLLMMessages/callAgentLLM own
+    // its construction; the tool loop appends assistant/user rounds AFTER the stable prefix.)
 
     // Each leg below stops short the instant the call-level signal aborts (wall-clock budget
     // spent OR user cancel), and a deterministic 4xx from the proxy is RE-THROWN so the outer
@@ -464,4 +488,225 @@ async function callSTProxy(messages, signal) {
     }
 
     return content;
+}
+
+// =============================================================================
+// MEMORY AGENT TOOL LOOP (redesign-v2 S2) — text-protocol tool calling that works on ANY
+// backend (no provider function-call API). The agent replies with lines of strict JSON
+// tool calls and/or a final `#SHEET` (or `#DONE` in extractOnly mode) block; we execute
+// the calls against the memory store, append the results as ONE user message, and re-call.
+// Grammar + parsing live in memory-tools.js (parseAgentReply); execution is injected by
+// the caller (`executeTool`, normally memory-tools.executeMemoryTool bound to a run ctx)
+// so this loop stays pure transport and memory-tools never has to import llm-call.
+// =============================================================================
+
+/** ~4 chars/token estimate over a messages array (internal accounting only). */
+function approxMessagesTokens(messages) {
+    let chars = 0;
+    for (const m of (Array.isArray(messages) ? messages : [])) {
+        chars += String(m?.content || '').length;
+    }
+    return Math.ceil(chars / 4);
+}
+
+/**
+ * Run the Memory Agent's bounded tool-loop session (G1 protocol).
+ *
+ * Per round: call the LLM with the running conversation, parse the reply via
+ * parseAgentReply, then:
+ *   - final block (`#SHEET`/`#DONE`) with NO tool lines → accept and stop;
+ *   - final block WITH tool lines → execute only the write_fact calls (read results could
+ *     never be observed), accept the sheet, stop;
+ *   - tool lines only → execute them sequentially, append ONE user message
+ *     `TOOL RESULTS:\n<echoed JSON line>\n<result>...`, re-call;
+ *   - malformed JSON / unknown tool / pure chatter → ONE grace: send back
+ *     `ERROR: <detail>. Re-emit valid protocol lines or the #SHEET block.` and re-call;
+ *     a SECOND offense fails the loop.
+ * Failure modes (error set, caller commits nothing new, keeps the prior sheet, does NOT
+ * watermark — F-SCRIBE-1 generalized): empty LLM reply, second malformed reply, round cap
+ * without a final block, tool-call cap overrun, abort.
+ *
+ * @param {Object} opts
+ * @param {string} opts.systemPrompt - static agent rulebook (cache-stable prefix — keep
+ *   per-turn variable data in userPrompt, per the caching contract in callAgentLLMOnce)
+ * @param {string} opts.userPrompt - per-run data block (messages, DB overview, prior sheet)
+ * @param {string|null} [opts.profileId=null] - connection profile (CMRS) for the agent
+ * @param {string} [opts.agent='memory-agent'] - agent tag for logs/cache tracking
+ * @param {number} [opts.maxRounds=6] - max LLM calls in this session
+ * @param {number} [opts.maxToolCalls=20] - max tool executions across all rounds
+ * @param {(call: {tool:string, args:Object, line:string}) => Promise<string>} opts.executeTool
+ *   - executor for ONE parsed call (normally executeMemoryTool bound to a run ctx)
+ * @param {boolean} [opts.extractOnly=false] - final block is `#DONE` (no sheet expected)
+ * @param {AbortSignal|null} [opts.signal=null] - caller-owned abort (cancel/stop)
+ * @returns {Promise<{sheet: string|null, done: boolean, rounds: number, toolCallCount: number,
+ *   error: string|null, tokensInApprox: number, tokensOutApprox: number,
+ *   transcript: Array<{round:number, reply:string, toolCalls:string[], malformed:number, note:string}>}>}
+ */
+export async function callAgentLLMWithTools({
+    systemPrompt,
+    userPrompt,
+    profileId = null,
+    agent = 'memory-agent',
+    maxRounds = 6,
+    maxToolCalls = 20,
+    executeTool,
+    extractOnly = false,
+    signal = null,
+} = {}) {
+    const out = {
+        sheet: null,
+        done: false,
+        rounds: 0,
+        toolCallCount: 0,
+        error: null,
+        tokensInApprox: 0,
+        tokensOutApprox: 0,
+        transcript: [],
+    };
+    if (typeof executeTool !== 'function') {
+        out.error = 'callAgentLLMWithTools requires an executeTool function';
+        return out;
+    }
+    const finalToken = extractOnly ? '#DONE' : '#SHEET';
+    const messages = [
+        { role: 'system', content: String(systemPrompt || '') },
+        { role: 'user', content: String(userPrompt || '') },
+    ];
+    let graceUsed = false; // exactly ONE malformed-reply grace per session
+
+    for (let round = 1; round <= maxRounds; round++) {
+        if (signal?.aborted) {
+            out.error = 'aborted before round ' + round;
+            break;
+        }
+        out.rounds = round;
+        out.tokensInApprox += approxMessagesTokens(messages);
+        const reply = await callAgentLLMMessages(messages, profileId, agent, signal);
+        out.tokensOutApprox += Math.ceil(String(reply || '').length / 4);
+
+        if (!reply || !reply.trim()) {
+            // callAgentLLMMessages already retried transient failures internally — an empty
+            // reply here is terminal for the session (no grace: there is nothing to correct).
+            out.error = `empty LLM reply on round ${round}`;
+            out.transcript.push({ round, reply: '', toolCalls: [], malformed: 0, note: 'empty reply' });
+            break;
+        }
+
+        const parsed = parseAgentReply(reply);
+        const entry = {
+            round,
+            reply,
+            toolCalls: parsed.calls.map(c => c.tool),
+            malformed: parsed.malformed.length,
+            note: '',
+        };
+        out.transcript.push(entry);
+
+        // ── Malformed protocol (or pure chatter): one grace, then fail ────────────
+        const isChatter = parsed.calls.length === 0 && !parsed.done && parsed.malformed.length === 0;
+        if (parsed.malformed.length > 0 || isChatter) {
+            const detail = parsed.malformed.length > 0
+                ? parsed.malformed[0].error
+                : 'no tool-call lines and no final block found in the reply';
+            if (graceUsed) {
+                out.error = `malformed protocol reply (second offense): ${detail}`;
+                entry.note = 'malformed — second offense';
+                break;
+            }
+            graceUsed = true;
+            entry.note = 'malformed — grace round issued';
+            addDebugLog('info', `Memory Agent protocol error (grace issued): ${detail}`, {
+                subsystem: 'agent3', event: 'toolloop.malformed', reason: 'PROTOCOL_ERROR',
+                data: { agent, round, detail: String(detail).slice(0, 200) },
+            });
+            messages.push({ role: 'assistant', content: reply });
+            messages.push({ role: 'user', content: `ERROR: ${detail}. Re-emit valid protocol lines or the ${finalToken} block.` });
+            continue;
+        }
+
+        // ── Tool-call cap (across ALL rounds) ─────────────────────────────────────
+        if (parsed.calls.length > 0 && out.toolCallCount + parsed.calls.length > maxToolCalls) {
+            out.error = `tool-call cap exceeded (${out.toolCallCount} + ${parsed.calls.length} > ${maxToolCalls})`;
+            entry.note = 'tool-call cap overrun';
+            break;
+        }
+
+        // ── Final block present ────────────────────────────────────────────────────
+        if (parsed.done) {
+            // Mixed reply: execute ONLY write_fact calls (their results can never be
+            // observed — read tools are ignored), then accept the final block and stop.
+            if (parsed.calls.length > 0) {
+                const writes = parsed.calls.filter(c => c.tool === 'write_fact');
+                for (const call of writes) {
+                    if (signal?.aborted) break;
+                    out.toolCallCount++;
+                    try { await executeTool(call); }
+                    catch (e) { addDebugLog('fail', `write_fact alongside final block threw: ${e?.message || e}`, { subsystem: 'agent3', event: 'toolloop.write_error', data: { agent, round } }); }
+                }
+                if (writes.length < parsed.calls.length) {
+                    entry.note = `${parsed.calls.length - writes.length} read tool call(s) ignored (final block present)`;
+                }
+            }
+            out.done = true;
+            out.sheet = parsed.sheet; // null on #DONE — extractOnly's expected shape
+            if (!extractOnly && (out.sheet === null || out.sheet === '')) {
+                // A bare #DONE (or empty #SHEET) where a sheet was required: the caller
+                // treats a missing sheet as failure (F-SCRIBE-1) — surface it as an error
+                // here so no watermark/commit can ride a sheetless "success".
+                out.error = `final block on round ${round} carried no sheet content`;
+                out.sheet = null;
+            }
+            break;
+        }
+
+        // ── Tool rounds: execute sequentially, feed results back, re-call ────────
+        const resultParts = [];
+        for (const call of parsed.calls) {
+            if (signal?.aborted) break;
+            out.toolCallCount++;
+            let result;
+            try {
+                result = await executeTool(call);
+            } catch (e) {
+                result = `ERROR: ${call.tool} failed internally (${e?.message || e})`;
+            }
+            resultParts.push(`${call.line}\n${result}`);
+        }
+        if (signal?.aborted) {
+            out.error = `aborted during tool execution on round ${round}`;
+            break;
+        }
+        addDebugLog('debug', `Memory Agent round ${round}: executed ${parsed.calls.length} tool call(s) (${out.toolCallCount}/${maxToolCalls} total)`, {
+            subsystem: 'agent3', event: 'toolloop.round',
+            data: { agent, round, calls: parsed.calls.map(c => c.tool), toolCallCount: out.toolCallCount },
+        });
+
+        if (round === maxRounds) {
+            // No budget left for another call — the reply needed one more round to emit
+            // the final block, which the cap forbids (missing-final-on-last-round rule).
+            out.error = `max rounds (${maxRounds}) reached without a ${finalToken} block`;
+            entry.note = 'round cap without final block';
+            break;
+        }
+        messages.push({ role: 'assistant', content: reply });
+        messages.push({ role: 'user', content: `TOOL RESULTS:\n${resultParts.join('\n\n')}` });
+    }
+
+    if (!out.error && !out.done) {
+        // Defensive: loop exited without a final block and without a recorded error
+        // (e.g. maxRounds=0). Never report a silent non-success.
+        out.error = out.rounds === 0 ? 'no rounds executed' : `no ${finalToken} block produced`;
+    }
+    if (out.error) {
+        addDebugLog('fail', `Memory Agent tool loop failed: ${out.error}`, {
+            subsystem: 'agent3', event: 'toolloop.failed', reason: 'LOOP_ERROR',
+            data: { agent, rounds: out.rounds, toolCallCount: out.toolCallCount, error: out.error },
+        });
+    } else {
+        addDebugLog('pass', `Memory Agent tool loop done: ${out.rounds} round(s), ${out.toolCallCount} tool call(s)${out.sheet ? `, sheet ${out.sheet.length} chars` : ''}`, {
+            subsystem: 'agent3', event: 'toolloop.done',
+            data: { agent, rounds: out.rounds, toolCallCount: out.toolCallCount, sheetChars: out.sheet ? out.sheet.length : 0 },
+        });
+    }
+    return out;
 }

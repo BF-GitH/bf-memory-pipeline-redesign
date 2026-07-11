@@ -1,19 +1,13 @@
 // BF Memory Pipeline - Settings Module
 // Handles UI wiring, settings persistence, and the DB-profile (Layer C) machinery.
 // F-UX-8 split: the debug-log engine (debug-log.js), per-chat turn state (turn-state.js),
-// Database-tab UI (db-panel.js), usability presets (presets.js), and shared UI helpers
-// (ui-util.js) were extracted MECHANICALLY from this module. settings.js remains the public
-// facade: every symbol it exported before the split is still exported here (see the
-// re-export block below), so no importer had to change.
+// Database-tab UI (db-panel.js), and shared UI helpers (ui-util.js) were extracted
+// MECHANICALLY from this module. settings.js remains the public facade: every symbol it
+// exported before the split is still exported here (see the re-export block below).
 
-import { getConnectionProfiles, getCurrentProfileId } from './profiler.js';
-import { DEFAULT_DRAFT_PROMPT } from './agent-draft.js';
-import { DEFAULT_MEMORY_PROMPT } from './agent-memory.js';
-import { DEFAULT_WRITER_FORMAT } from './agent-writer.js';
-import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 import {
     getEntities, setEntityStatus, reloadEntitiesFromChat,
-    scanForNamedCandidates, showEntityPopup, promoteEntity, runEntityResolution,
+    scanForNamedCandidates, showEntityPopup, promoteEntity,
 } from './agent-entities.js';
 import { explainFactRetrieval } from './fact-retrieval.js';
 // F-UX-8 split modules (see the header note above).
@@ -23,7 +17,7 @@ import {
 } from './ui-util.js';
 import {
     addDebugLog, reloadDebugLogFromChat, flushDebugLogNow, flushOutgoingChatLog,
-    renderDebugLog, renderToolActivity, clearDebugLog, getDebugLogEntries,
+    renderDebugLog, clearDebugLog, getDebugLogEntries,
     exportLogs, exportLogsJSON, copyDiagnostics,
 } from './debug-log.js';
 import {
@@ -32,8 +26,8 @@ import {
     reloadSceneFromChat, renderScene,
     reloadReflectionFromChat, renderReflection,
     reloadPyramidFromChat,
+    reloadSheetFromChat,
 } from './turn-state.js';
-import { PRESET_IDS, detectPreset, applyPreset, isApplyingPreset } from './presets.js';
 import {
     refreshDatabaseView, showAllDatabases, showSpiderwebPopup, runDatabaseSearch,
     addUserLeaf, addUserCategory, onSuggestLabelsClick, renderGraphView, renderEntityPanel,
@@ -53,6 +47,7 @@ export {
     getScene, setScene, getSceneReentries, reloadSceneFromChat,
     getReflection, setReflection, reloadReflectionFromChat,
     getSummaryPyramid, setSummaryPyramid, reloadPyramidFromChat,
+    SHEET_SEED_TEXT, getMemorySheet, setMemorySheet, reloadSheetFromChat, renderMemorySheet,
 } from './turn-state.js';
 
 const EXTENSION_NAME = (() => {
@@ -67,383 +62,67 @@ const EXTENSION_NAME = (() => {
 
 let extensionSettings = null;
 
+// redesign-v2 (S1): profiler.js was deleted - the connection-profile readers are inlined
+// here (module-local; the Scribe profile dropdown is their only remaining consumer).
+function getConnectionProfiles() {
+    try {
+        const profiles = getContext().extensionSettings?.connectionManager?.profiles;
+        return Array.isArray(profiles) ? profiles : [];
+    } catch {
+        return [];
+    }
+}
+
+function getCurrentProfileId() {
+    try {
+        return getContext().extensionSettings?.connectionManager?.selectedProfile || null;
+    } catch {
+        return null;
+    }
+}
+
+// redesign-v2 (S5): the FINAL settings surface. Every other historical key was either
+// REMOVED with its feature (S1) or its behavior is now HARDCODED ON (G4 — MMR, confidence
+// ranking, temporal grounding, cross-key supersede, recency labels, truth hierarchy,
+// auto-linking, reflection/contradiction cadence, character registry, open threads); those
+// modules carry local consts instead of settings reads. migrateLegacySettings() deletes any
+// stored key not listed here.
 const DEFAULT_SETTINGS = {
     enabled: false,
-    // C1 — USABILITY PRESET. A single dropdown (Cheap · Balanced · Max Recall · Custom) that maps
-    // one choice onto the many underlying token/retrieval knobs (see PRESETS in presets.js). 'custom' means
-    // "the knobs don't match any preset" (the honest default for existing installs: detectPreset()
-    // recomputes it on init from the live values, so a config that happens to match a preset shows
-    // that preset). Applying a preset is the ONLY thing that bulk-writes those knobs; editing any
-    // governed control by hand flips this back to 'custom' so the dropdown never lies.
-    // C4: fresh installs default to the "Balanced" preset (the governed-key defaults below match
-    // the 'balanced' signature, so detectPreset() resolves to 'balanced' on a clean install).
-    // EXISTING users are unaffected — merge-missing-defaults only fills ABSENT keys, so anyone who
-    // already has these keys keeps their values and detectPreset() shows whatever they match.
-    uiPreset: 'balanced',
     // First-run onboarding wizard (src/onboarding.js): true once the user has FINISHED or
-    // SKIPPED it — either way it never auto-shows again. The "Re-run setup guide" button in
-    // the General tab reopens it on demand.
+    // SKIPPED it - either way it never auto-shows again.
     onboardingDone: false,
-    useMemoryProfile: true,
-    // Per-agent connection profiles (replacing single memoryProfile).
-    // Old `memoryProfile` is kept on the stored object for rollback safety
-    // and migrated forward in migrateLegacySettings().
-    agent1Profile: '',
+    // The background Memory Agent's connection profile (blank = current connection).
     agent3Profile: '',
-    // Per-agent context message counts (replacing single contextMessages).
-    // Agent 3 default raised from 2 -> 5 (FIX #2a): a 2-message window truncated
-    // long single-message backstory disclosures and the surrounding exchange that
-    // gave them context, so rich reveals were missed. The full target message is
-    // always sent untruncated regardless of this window (see buildMemoryPrompt /
-    // pipeline.js — only the debug-log preview is substring'd, never the prompt).
-    agent1ContextMessages: 5,
-    agent3ContextMessages: 5,
-    // Empty-scope pre-LLM skip (atomic #13): skip the Agent 3 (Scribe) LLM call when EVERY
-    // message in the extraction window is trivially empty (pure asterisk actions, OOC, or very
-    // short) per isTriviallyEmptyForExtraction. Saves a wasted call + tokens on no-content turns.
-    agent3EmptyScopeSkip: true,
-    // B3 (safe slice): trim ALREADY-EXTRACTED prior-context messages out of the Scribe's input.
-    // When ON, prior messages already marked bf_mem_processed are not re-sent to the Scribe (their
-    // facts are already stored) — a pure input-token saving with NO fact loss (new/unprocessed
-    // content and the current exchange are always kept). Default OFF = unchanged behavior. The
-    // larger "fire the Scribe only every N turns" batch is intentionally NOT implemented here: it
-    // would require reworking the extraction commit/target state machine and risks silently dropping
-    // or mis-attributing facts, so it is deferred to a test-driven change.
-    scribeTrimProcessedPriors: false,
-    // Temporal grounding at extraction (atomic, from mem0 'Observation Date'): pass the message's
-    // real-world observation timestamp into the Scribe and instruct it to convert relative time
-    // words ("yesterday","last week") into ABSOLUTE dates anchored to that timestamp, so stored
-    // facts don't rot. Default ON. The date goes in the USER prompt block (system prefix stays
-    // cache-stable); the resolution rule is appended to the system prompt only while this is on.
-    temporalGrounding: true,
-    // REFLECTION COMPRESSION GUARD (prompt-upgrades): when a reflection #SHELVES "summary"
-    // comes back NOT SHORTER than the raw sample facts it summarizes (compression failure —
-    // the model added detail instead of abstracting), re-run the reflection call ONCE with an
-    // identical system prompt (the repair paragraph rides the USER prompt only, preserving
-    // prefix-stability/prompt caching for agent 'reflection') and take the retry's shelves for
-    // the failing buckets only; a still-too-long retry keeps the prior stored summary. Default
-    // ON — costs nothing until tripped; the single-retry cap bounds the worst case at one
-    // extra reflection call per pass. Never loops.
-    reflectionCompressionGuard: true,
-    // BI-TEMPORAL FACT VALIDITY (Graphiti/Zep valid_at/invalid_at). Default OFF. When ON, the
-    // Scribe may tag a fact with story-world validity markers `| from:<when>` / `| until:<when>`
-    // (free-form in-story time), parsed in agent-memory.js into the DISTINCT `validFrom`/`validUntil`
-    // fields (NOT the existing `validAt` ordering integer). On supersession the OUTGOING fact's
-    // `validUntil` is stamped, and the recall/push formatter annotates facts that carry a window —
-    // so flashbacks/time-skips stay consistent. Purely additive + back-compat: when OFF the markers
-    // are ignored, no fields are written, and output is byte-for-byte unchanged. Absent (older
-    // settings) → default false.
-    biTemporal: false,
-    // CROSS-KEY SUPERSEDE RULES (community adoption Tier 1; NarrativeEngine timeline prior art,
-    // report §1.6). Default ON — deterministic table-driven code, no LLM call. When a genuinely
-    // NEW death/departure/loss fact is written (Scribe commit, Writer remember_fact, review-popup
-    // edit — never migration/rebuild/merge replays), same-subject changeable-STATE facts under the
-    // rule's target aspects (current_location, ownership, …) are retired to `__was` history across
-    // categories — the SAME snapshot-not-delete provenance as per-key supersession, capped at 8
-    // invalidations per trigger. Disable to restore per-key-only supersession behavior.
-    crossKeySupersede: true,
-    // TYPED-EDGE GRAPH MEMORY (Graphiti typed edges; audit F-ARCH-7). Default OFF. When ON, the
-    // Scribe may tag a fact with up to 3 typed relationship edges `| rel:<predicate>@<Category/key>`
-    // (e.g. `rel:employs@People/bob_name`), parsed in agent-memory.js into `fact.edges = [{p, t}]`
-    // — a (subject, predicate, object) triple where the fact's SUBJECT is the head, `p` the
-    // lowercase verb-ish predicate, and `t` a `Category/key` ref to an existing fact about the
-    // object. Edges merge additively in upsert (database.js), expand through the anti-hub
-    // admitter (fact-retrieval.js collectLinkCandidates), and render + answer simple
-    // relation-intent queries ("who employs X") in search_memory. Distinguishes "who employs X"
-    // from "who loves X" — the untyped `relationships` overlay cannot. Purely additive +
-    // back-compat: when OFF the marker falls through to the legacy `rel:` keyword-hint branch,
-    // no fields are written, and behavior is byte-identical. Absent (older settings) → false.
-    typedEdges: false,
-    // INJECTED-MEMORY RECENCY LABELS (community adoption Tier 1; formatter-only, no LLM).
-    // Default ON. Each fact line in the per-turn injected block gains a compact "how long ago"
-    // tail — ` (~3 turns ago, scene 2)` derived from `validAt`/`sceneNo`, or an in-story phrase
-    // (` (~2 in-story months ago)`) when bi-temporal validity is ON and the fact's `validFrom`
-    // parses as a date. Fail-soft: a legacy fact without `validAt` gets NO tail (never a wrong
-    // one). Injected block only — search_memory tool output and the appendEdgeTails exact-line
-    // contract are untouched. OFF restores the old per-line format byte-for-byte. NOTE: the
-    // labels change as turns pass, so with `injectionFreezeTurns` > 0 a frozen (cached)
-    // injection reuses labels up to N turns stale — same staleness contract as the frozen
-    // facts themselves — and the injected block is no longer byte-stable across turns for
-    // server-side prompt-prefix caching.
-    injectRecencyLabels: true,
-    // INJECTED-MEMORY TRUTH HIERARCHY (community adoption Tier 1; formatter-only, no LLM).
-    // Default ON. The injected fact block is split under a one-line precedence preamble into a
-    // CURRENT STATE section (absolute present truth, wins conflicts) and a CHRONOLOGY section
-    // (kind:event/moment only, oldest first, context-only) — so the Writer stops replaying old
-    // events as happening now. Conservative: ONLY explicit kind:event/moment facts move to
-    // CHRONOLOGY; kind-less legacy facts stay in CURRENT STATE. Empty sections are omitted.
-    // OFF restores the flat line list byte-for-byte.
-    injectTruthHierarchy: true,
-    // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
-    // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
-    // before sending — the main model sees only those + our injected facts. Lets you
-    // shrink the prompt and rely on facts to replace older history. Reversible: just
-    // change the slider back to 0.
-    // C4/A1 default flip: fresh installs trim the main-model history to the last 10 user/AI
-    // messages so stored facts REPLACE old turns instead of stacking on top (the core token win).
-    // Existing users keep their stored value (often 0). 0 still means "no trim / full history".
+    // Extra instructions APPENDED to the Memory Agent's user prompt ('' = none).
+    memoryPrompt: '',
+    // Writer history limit: 0 = off; N = trim the main model's visible chat to the last N
+    // user/AI messages (the memory sheet replaces older history).
     agent2ContextMessages: 10,
-    // A2/B5 — FROZEN INJECTION. 0 = off (default; every turn runs the Drafter fresh). When
-    // > 0, a genuine new turn REUSES the previous run's cached fact/scene injection (skipping that
-    // LLM call) for up to this many turns before a full refresh. Saves tokens/latency AND keeps
-    // the injected block byte-stable so a server-side prompt cache can reuse the prefix. Memory is
-    // unaffected — the post-reply Scribe still extracts every turn; only the INJECTED facts may be up
-    // to N turns stale. Clamp 0..20.
-    injectionFreezeTurns: 0,
-    // Writer recall tool (pull-detail / "infinite reach"). When ON, registers an optional
-    // `search_memory` function-tool the MAIN model can call mid-generation to fetch a stored
-    // fact that WASN'T pushed into its context. Default OFF so existing users and non-tool-
-    // calling models are completely unaffected. Requires a tool-calling-capable main model;
-    // only active on the main generation path (ST's tool loop never runs on the quiet/agent
-    // paths). READ-ONLY: the tool never writes or deletes.
-    // C4/A7 default flip: pull-on-demand recall is ON for fresh installs (Balanced/Cheap both use
-    // it) so the Writer can fetch a fact that wasn't pushed, instead of pushing everything. Safe:
-    // it only activates with a tool-calling main model; no-ops otherwise. Existing users keep theirs.
-    enableWriterRecallTool: true,
-    // Optional WRITE tool (`remember_fact`, Letta core_memory_append analogue): lets the MAIN model
-    // PIN one fact directly into the active store mid-reply via an ST function-tool, complementing
-    // the read-only search_memory pull tool above. ADD-ONLY (never deletes); routes through the same
-    // upsertFact/saveDatabase path as extraction. Tool-first default flip: ON for fresh installs so
-    // the main model (e.g. Claude) can PIN durable facts on demand, complementing the read-only
-    // recall tool and the background Scribe extraction. Requires a tool-calling main model (ST's tool
-    // loop never runs on the quiet/agent paths); no-ops otherwise. Existing users keep their saved
-    // value. Synced alongside the recall tool wherever syncWriterRecallTool is synced (index.js + toggle).
-    enableWriterWriteTool: true,
-    // Tool-first redesign — MEMORY MODE: how stored memory reaches the main (reply) model.
-    //   'hybrid'    (DEFAULT) each turn injects a cheap, no-LLM anchor (speculative facts +
-    //               present-character anchors + scene block); the main model pulls everything
-    //               deeper on demand via the search_memory tool. The blocking Agent 1 (Draft) LLM
-    //               call is SKIPPED — this is the primary latency win.
-    //   'tool-only' minimal anchor; recall is driven almost entirely by the model's tool calls.
-    //   'push'      classic behavior — Agent 1 drafts the reply + picks fact branches every turn
-    //               (an extra blocking LLM call). Choose this if your main model can't call tools.
-    // Default 'hybrid' is tuned for tool-calling models (e.g. Claude via the Claude Code CLI
-    // connection profile). Existing users keep whatever value is saved in their settings.
-    memoryMode: 'hybrid',
-    // Summary pyramid — optional "Big Picture" injection (hierarchical zoom-out). When ON, the
-    // Writer gets a compact block = the rolling reflection story summary + the SHORT shelf
-    // (category/aspect-bucket) summaries relevant to the current scene focus, hard token-capped.
-    // Default OFF so behavior is byte-identical to today (respects the earlier decision to NOT
-    // bloat every turn). Shelf summaries themselves are GENERATED regardless during the existing
-    // reflection pass (cost-bounded: only changed buckets, capped per pass) and stored in
-    // chat_metadata — this toggle only gates whether they're INJECTED. Absent (older settings)
-    // → default false (back-compatible).
-    // C4/A7 default flip: the compact "Big Picture" overview is ON for fresh installs (paired with
-    // the recall tool: a tiny zoom-out the Writer anchors on, then drills via search_memory).
-    // Hard token-capped (summaryPyramidMaxTokens). Existing users keep their stored value.
-    enableSummaryPyramid: true,
-    // Moment echo (Resonance Part B) — narrow, default-OFF proactive recall. When ON, each turn
-    // MAY surface ONE tiny `[Echo: …]` line: a single resonant PAST moment for the PAIR of
-    // characters present, cued either by a reflection-authored callback link that pays off in the
-    // present context, or by the most-recent charged moment for that pair (never by shared place).
-    // Capped at one echo, token-clamped, and emits NOTHING on most turns. Default OFF so the
-    // injection is byte-identical to today until opted in (the agents warned auto-injection is the
-    // bloat/attention-dilution risk; this keeps it high-precision + off by default). Build 1's full
-    // relationship thread stays PULL-ONLY (search_memory) — this is just the one-line echo.
-    enableMomentEcho: false,
-    // Hard cap on the injected moment-echo line, in approx tokens (reuses the buildSceneBlock
-    // char-budget truncation style). Deliberately tiny — ONE short beat, never a recap.
-    momentEchoMaxTokens: 40,
-    // Relationship re-entry pack (community adoption) — default OFF. When a character RETURNS to
-    // the scene after >= reentryAbsenceScenes scene-boundaries away, their per-pair relationship
-    // status record plus the last few shared kind:moment beats with those present are GUARANTEED
-    // into the injection (budget-charged against retrievalTokenBudget, de-duped against retrieval
-    // + anchors). Detection rides the push-mode #SCENE parse — hybrid/tool-only have no fresh
-    // present list, so re-entry never fires there (documented in the settings hint + debug log).
-    enableRelationshipReentry: false,
-    // How many scene-boundaries a character must have been away before their return counts.
-    reentryAbsenceScenes: 2,
-    // How many shared past moments (kind:moment) to include per re-entering pair.
-    reentryMomentCount: 3,
-    // Automatic associative linking (A-MEM style, lexical, DETERMINISTIC, zero-API). When ON, a
-    // freshly-written fact is auto-connected to related EXISTING facts (same subject / shared
-    // location / shared participants / lexical token overlap) by recording links into its
-    // `relationships` — so asking about any one surfaces the others. Free + deterministic (no LLM),
-    // so it DEFAULTS ON; the toggle lets a user disable it. Absent (older settings) => true.
-    enableAutoLinking: true,
-    // Hard cap on the injected Big Picture block, in approx tokens (reuses the buildSceneBlock
-    // char-budget truncation style). Bounds prompt growth even with a huge store.
-    summaryPyramidMaxTokens: 250,
-    // Open plot threads (open-threads feature) — default ON (deterministic, no extra LLM call,
-    // tiny token cost). When ON (and the Big Picture block is enabled), the newest unresolved
-    // `thread:open` hooks (promises, debts, mysteries, unfired Chekhov guns) are appended as ONE
-    // clamped "Open threads:" line inside the Big Picture block. The Scribe opens threads
-    // (`thread:open` marker on kind:event facts); the reflection pass closes them (#THREADS
-    // verdicts, riding the existing call — no new LLM call anywhere). Absent (older settings)
-    // => true.
-    enableOpenThreads: true,
-    // Hard cap on the "Open threads:" line alone, in approx tokens — its OWN sub-clamp applied
-    // BEFORE the whole-block summaryPyramidMaxTokens cap, so a long thread list can't silently
-    // eat the shelf summaries.
-    openThreadsMaxTokens: 60,
-    reviewInterval: 10,
-    // Contradiction scan (atomic #7): every N reflection passes, flag facts that appear to
-    // contradict (same/near key, different value) into the review popup. Heuristic, no LLM call.
-    contradictionScanEnabled: true,
-    contradictionInterval: 3,
-    // Retrieval token budget (atomic #10): approx-token budget for injected secondary+tertiary
-    // facts. Primary picks always kept + charged first; then secondary/tertiary admitted by
-    // salience until the budget OR the MAX_SECONDARY/MAX_TERTIARY count caps are hit (smaller
-    // wins). Replaces relying on count caps alone. Clamp 50..8000.
+    // SETTLED BUFFER hold-back (§7): the newest N messages are never fact-extracted (they may
+    // still be swiped/edited) — they reach the Memory Agent only as TENTATIVE planning context.
+    bufferHoldBack: 4,
+    // Approx-token budget for the facts section of the injected memory sheet.
     retrievalTokenBudget: 800,
-    // Recency cutoff (atomic #14): 0 = off. When > 0, secondary/tertiary facts created more
-    // than N days ago are dropped from retrieval. Primary picks + legacy un-stamped facts are
-    // never cut. Clamp 0..3650.
-    recencyCutoffDays: 0,
-    // MMR DIVERSITY RERANK (Graphiti/Zep maximal_marginal_relevance). Default ON. When admitting
-    // secondary+tertiary overflow under the count/token caps, pure-salience ordering can let
-    // several NEAR-DUPLICATE facts all get injected, wasting scarce slots. MMR reorders the
-    // overflow candidates so each pick balances salience against being DIFFERENT from the
-    // already-chosen set: score = lambda*normSalience - (1-lambda)*maxTrigramSim(c, chosen).
-    // Uses the existing deterministic trigramSimilarity (no embeddings, no PRNG → swipe/regen
-    // stable). Primary facts are untouched/always kept. mmrLambda: 1.0 = pure salience (no
-    // diversity), 0.0 = pure diversity; 0.7 leans on salience while breaking up duplicates.
-    mmrEnabled: true,
-    mmrLambda: 0.7,
-    // CONFIDENCE-GATED RETRIEVAL (Zep minRating + mem0 confidence). Facts may carry a
-    // `confidence` field ('high'|'med'|'low' or a 0..1 number; parsed in agent-memory.js from the
-    // `conf:` marker). When ON, that confidence folds into the OVERFLOW ranking (retrievalSalience)
-    // as a bounded multiplier so low-confidence guesses lose scarce secondary/tertiary slots to
-    // solid facts. Primary/exact/keyword matches are NEVER gated — they're always kept. Default ON.
-    confidenceRanking: true,
-    // How strongly confidence bends the overflow score. The multiplier is blended toward 1.0 by
-    // (1 - confidenceWeight), so a small weight nudges ordering without ever zeroing a fact out:
-    // effectiveMult = 1 - confidenceWeight * (1 - confidenceFactor). Clamp 0..1; small default.
-    confidenceWeight: 0.3,
-    // SEMANTIC SHELF SELECTION (selection-summary, community adoption) — DEFAULT OFF (opt-in:
-    // it re-adds ONE small blocking LLM call to the reply-critical path, even in hybrid mode,
-    // capped by the Selector's own ~10s abort). When ON, a cheap "Selector" pass reads the
-    // Reflection shelf summaries as a menu and picks which shelves matter for the current
-    // scene; picks expand into budget-charged SECONDARY facts merged into the deterministic
-    // retrieval (never unbudgeted primary). Any failure — no shelves yet, timeout, bad JSON —
-    // falls back silently to the plain deterministic cascade, byte-identical to OFF.
-    selectionSummaryEnabled: false,
-    // Max Selector picks kept per turn (shelves + exact facts combined; the model is asked for
-    // up to 2x candidates so the confidence gate has slack to cut). Clamp 1..20.
-    selectionSummaryMaxPicks: 6,
-    // Full-chat rebuild concurrency (atomic #17): max parallel Scribe calls during a
-    // "Run on current chat" backfill (shared DB object → no lost writes). Clamp 1..6.
-    rebuildConcurrency: 3,
-    // Catch-up import (community adoption §2.1): messages per Scribe call when chunk-importing
-    // an existing chat's backlog (src/catchup-import.js). Bigger = fewer/cheaper calls but
-    // coarser per-message fact attribution. Clamp 2..30.
+    // Review popup cadence (messages). 0 = never show the review popup (F-UX-6).
+    reviewInterval: 10,
+    // WHO-KNOWS-WHAT (POV) ENFORCEMENT: when ON (default), facts carrying a knownBy list are
+    // hidden from characters not on that list at every retrieval surface.
+    enforceKnownBy: true,
+    // Bonus graph-connected facts appended to the memory sheet ("Connected memories").
+    graphExtrasCount: 3,
+    // Catch-up import: messages per Memory Agent call (src/catchup-import.js). Clamp 2..30.
     catchupBatchSize: 8,
-    // RETIRED (v0.50.x): the vector/embedding stack was removed; kept inert for stored-settings
-    // back-compat only — nothing reads it anymore.
-    semanticRetrieval: false,
-    // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
-    // no random dice). These keys are kept for settings persistence/back-compat and the
-    // existing sliders, but no longer gate which facts get injected. Safe to remove the
-    // UI later; the values are inert.
-    secondaryChance: 50,
-    tertiaryChance: 15,
-    // Feature #4 / audit F-RETR-5 — sequence-track "History reach". ONE integer (0-4): how many
-    // OLDER steps of a relevant track are always shown alongside the current step (contiguous,
-    // no gaps). Replaces the four depthDice percent sliders: deterministicTrackReach had reduced
-    // those to a binary >=50% include-threshold, so 1-49% were all identical and 50-100% were all
-    // identical — the percent UI was a lie. Default 2 = exactly what the legacy defaults
-    // (70/50/25/10) derived through that threshold, so behavior is unchanged out of the box.
-    trackReachSteps: 2,
-    // DEPRECATED (F-RETR-5): legacy depth-dice weights, kept INERT for stored-settings
-    // back-compat only. No UI binds them anymore; fact-retrieval.js reads trackReachSteps and
-    // only falls back to deriving a reach from these for stored settings that predate the key.
-    depthDice1: 0.70,
-    depthDice2: 0.50,
-    depthDice3: 0.25,
-    depthDice4: 0.10,
     showToast: true,
     debugMode: false,
-    // Verbose logging tier (opt-in firehose). When false, level:'verbose' entries are
-    // DROPPED at ingestion (never enter the ring buffer or storage). RAM-only even when on.
+    // Verbose logging tier (opt-in firehose). RAM-only even when on.
     debugVerbose: false,
-    // Scene card (always-on core working-memory block). When enabled, Agent 1 emits an
-    // optional #SCENE block each turn (location / present / goals / last beat); we inject
-    // a compact one-line [Scene] block ABOVE the fact list every turn a scene exists.
-    // Absent (older settings) → default true; back-compatible (no scene = no injection).
-    sceneCardEnabled: true,
-    // Hard cap on the injected scene block, in approx tokens. Truncated defensively.
-    sceneCardMaxTokens: 150,
-    // Reflection / consolidation pass (memory-research Phase 3). Periodically (every
-    // reflectionInterval successful pipeline runs) makes ONE extra LLM call — reusing
-    // Agent 3's connection profile — to compress accumulated detail into (a) a rolling
-    // "story so far" summary and (b) higher-order observation facts. INFREQUENT + cost-
-    // aware by design (the owner has been burned by expensive full-chat passes). Default
-    // ON but with a conservative interval. Absent (older settings) → defaults apply.
-    reflectionEnabled: true,
-    reflectionInterval: 12,
-    // IDLE-TIME CONSOLIDATION (Letta sleeptime-agent pattern). In ADDITION to the every-N-turns
-    // cadence above, arm an idle timer that runs the SAME maybeRunReflection() pass once the user
-    // has been quiet for idleConsolidationMs. Lets heavy maintenance happen during dead time
-    // instead of always on the turn boundary. OFF by default (opt-in); shares every reflection
-    // guard (enabled, in-flight, group, character-changed) and never fires during generation.
-    idleConsolidation: false,
-    idleConsolidationMs: 120000,
-    // DEPRECATED (refinement #1): the reflection "story so far" summary is NO LONGER
-    // injected into the writer prompt under any circumstance. This key is retained inert
-    // for back-compat (default now FALSE) so old saved settings don't error. Reflection
-    // still runs as a silent dedupe-janitor / observation writer (refinement #4).
-    reflectionInject: false,
-    reflectionMaxTokens: 200,
-    reflectionPrompt: '',
-    // Character registry + NPC-promotion flow. Periodically (every characterCheckInterval
-    // successful pipeline runs) scans the fact store for NEWLY-SEEN NAMED entities (proper
-    // names in facts' involved/subject and the NPC drawer's `about`) that aren't yet
-    // classified, and offers ONE batched popup to mark each Recurring / NPC / Later.
-    // Deterministic scan (NO LLM call). Runs OFF the critical path on MESSAGE_RECEIVED, like
-    // reflection. Absent (older settings) → defaults apply (back-compatible).
-    characterRegistryEnabled: true,
-    characterCheckInterval: 10,
-    // SEMANTIC ENTITY RESOLUTION / MERGE (Graphiti node-dedup + mem0 entity-linking). When ON,
-    // a CONSERVATIVE pass (run from the same OFF-critical-path entity-check cadence) merges
-    // facts recorded under variant names for the SAME entity ("Bobby"/"Robert"/"Rob") into one
-    // canonical subject, re-keying the loser's facts (reusing the promoteEntity re-key/collision
-    // machinery) and recording an alias. Merge requires a STRONG signal only — exact alias/aka
-    // match OR trigram name-similarity >= entityResolutionThreshold (default 0.85) AND the two
-    // are NOT both already classified as distinct 'named' entities. Never merges {{user}}/{{char}}
-    // /the active character. False merges are the main risk, so this is DEFAULT OFF and logs every
-    // merge loudly. Deterministic (NO LLM call). Absent (older settings) → defaults apply.
-    entityResolution: false,
-    entityResolutionThreshold: 0.85,
-    // GUARANTEED ANCHORS: how many key anchor facts (identity / current-state / active relationship)
-    // per present character to always inject alongside the retrieved facts, so the in-focus
-    // character's anchors surface even if retrieval misses them. 0 disables.
-    finderAnchorsPerCharacter: 3,
-    // WHO-KNOWS-WHAT (POV) ENFORCEMENT: when ON (default), facts carrying a knownBy list are
-    // hidden from characters not on that list at every retrieval surface (push cascade,
-    // search_memory, scene/relationship rows, anchors). Facts with an EMPTY knownBy stay visible
-    // to all. OFF = every character sees every fact (secrets leak; escape hatch for users
-    // sharing one DB across characters). Enforcement itself pre-dates this toggle — the gate
-    // lives in isFactVisible() (fact-retrieval.js) so all call sites follow it automatically.
-    enforceKnownBy: true,
-    // USER-LEVEL SHARED MEMORY (Zep/mem0 user-scoping). Default OFF. When ON, facts whose SUBJECT
-    // resolves to the user persona ({{user}}) are ALSO routed into a single shared, durable
-    // "global user" store (a fixed pseudo-avatar record reusing the same IDB+attachment layer), and
-    // on read that shared store is MERGED into the active character's fact map (dedupe by
-    // category:key, the active character's own fact WINS on conflict). So the player's facts are
-    // remembered by EVERY character instead of being re-learned per character. Purely additive +
-    // back-compat: when OFF, storage AND retrieval are byte-identical to today (no shared store is
-    // ever read or written). Absent (older settings) => default false.
-    userLevelMemory: false,
-    draftPrompt: '',
-    memoryPrompt: '',
-    writerFormat: '',
+    // --- data, not knobs ---
     dbProfiles: {},
     activeDbProfile: '',
-    // Chats the user EXPLICITLY unlinked from every profile. autoSaveDbProfile must NOT
-    // auto-create/re-link a profile for a chat in this set, so an unlink actually STICKS
-    // across CHAT_CHANGED + reload (without it, re-entering the chat silently re-links and
-    // the unlink "does nothing"). Re-linking a chat (Link Current Chat / link to a profile)
-    // removes it from this set. Array of chat IDs; default empty => no detached chats.
+    // Chats the user EXPLICITLY unlinked from every profile (see markChatUnlinked).
     unlinkedChats: [],
-    // USER TAXONOMY OVERLAY (persisted, GLOBAL across chats). Extra Layer-1 categories and
-    // Layer-2 leaves the user added from the Database tab, merged ON TOP of the built-in
-    // TAXONOMY by database.js (flatVocab/effectiveCategories/groupedTaxonomyMenu). DATA-ONLY +
-    // ADDITIVE — never removes/shadows a built-in. Default empty => behaves byte-identically to
-    // the built-in-only taxonomy. Shape:
-    //   categories: string[]                         — extra L1 names
-    //   aspects:    { [category]: string[] }         — extra leaves per category (snake_case)
-    //   subAreas:   { [category]: { [subArea]: string[] } } — OPTIONAL grouping for the menu
-    // The AI-expansion flow (a later task) writes to this SAME overlay.
+    // USER TAXONOMY OVERLAY (persisted, GLOBAL across chats). DATA-ONLY + ADDITIVE.
     taxonomyOverlay: { categories: [], aspects: {}, subAreas: {} },
     // schemaVersion intentionally NOT in defaults: the merge-missing-defaults loop
     // would otherwise pre-fill it for existing users and short-circuit the migration.
@@ -491,151 +170,39 @@ function clamp(value, lo, hi, fallback) {
     return Math.min(hi, Math.max(lo, n));
 }
 
-// Exported for presets.js (applyPreset() validates through the exact same path a manual edit uses).
+// Exported for db-panel.js and the (S5) migration path — validates through the same path a manual edit uses.
 export function validateSettings(s) {
-    s.contextMessages = Math.floor(clamp(s.contextMessages, 1, 50, 5));
-    s.agent1ContextMessages = Math.floor(clamp(s.agent1ContextMessages, 1, 50, 5));
-    s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 5));
-    s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 10)); // garbage-fallback matches DEFAULT_SETTINGS (10), like its neighbors
-    // A2/B5 frozen injection: 0 = off; clamp to a sane window so it can't freeze forever.
-    s.injectionFreezeTurns = Math.floor(clamp(s.injectionFreezeTurns, 0, 20, 0));
+    s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 10));
+    s.bufferHoldBack = Math.floor(clamp(s.bufferHoldBack, 0, 10, 4));
+    s.graphExtrasCount = Math.floor(clamp(s.graphExtrasCount, 0, 8, 3));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  0, 100, 10)); // 0 = never show the review popup (F-UX-6)
-    s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 50, 3));
     s.retrievalTokenBudget = Math.floor(clamp(s.retrievalTokenBudget, 50, 8000, 800));
-    s.recencyCutoffDays = Math.floor(clamp(s.recencyCutoffDays, 0, 3650, 0));
-    // MMR diversity rerank (default ON): boolean toggle + 0..1 lambda (salience vs diversity tradeoff).
-    if (typeof s.mmrEnabled !== 'boolean') s.mmrEnabled = true;
-    s.mmrLambda = clamp(s.mmrLambda, 0, 1, 0.7);
-    // Confidence-gated retrieval (default ON): boolean toggle + small 0..1 blend weight.
-    if (typeof s.confidenceRanking !== 'boolean') s.confidenceRanking = true;
-    s.confidenceWeight = clamp(s.confidenceWeight, 0, 1, 0.3);
-    // Semantic shelf selection (default OFF — adds an LLM call per turn): toggle + picks cap.
-    if (typeof s.selectionSummaryEnabled !== 'boolean') s.selectionSummaryEnabled = false;
-    s.selectionSummaryMaxPicks = Math.floor(clamp(s.selectionSummaryMaxPicks, 1, 20, 6));
-    s.rebuildConcurrency = Math.floor(clamp(s.rebuildConcurrency, 1, 6, 3));
-    // Catch-up import chunk size: whole messages per Scribe call (src/catchup-import.js).
     s.catchupBatchSize = Math.floor(clamp(s.catchupBatchSize, 2, 30, 8));
-    // RETIRED vector stack (v0.50.x): coerced inert for stored-settings back-compat; nothing reads it.
-    if (typeof s.semanticRetrieval !== 'boolean') s.semanticRetrieval = false;
-    s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
-    s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
-    // F-RETR-5 history reach: whole steps 0..4. Default 2 = the reach the legacy depth-dice
-    // defaults (70/50/25/10) derived through the >=50% include-threshold.
-    s.trackReachSteps = Math.floor(clamp(s.trackReachSteps, 0, 4, 2));
-    // DEPRECATED depth-dice probabilities (0..1 floats): coerced for stored-settings back-compat
-    // only — no UI binds them and retrieval only reads them as a pre-trackReachSteps fallback.
-    s.depthDice1 = clamp(s.depthDice1, 0, 1, 0.70);
-    s.depthDice2 = clamp(s.depthDice2, 0, 1, 0.50);
-    s.depthDice3 = clamp(s.depthDice3, 0, 1, 0.25);
-    s.depthDice4 = clamp(s.depthDice4, 0, 1, 0.10);
     if (typeof s.enabled !== 'boolean') {
         // FIX #10: log when a coercion silently flips a previously-true enable off.
         if (s.enabled === true || (s.enabled && s.enabled !== false)) {
-            addDebugLog('fail', `enabled coerced to false (was non-boolean: ${JSON.stringify(s.enabled)})`);
+            addDebugLog('fail', 'enabled coerced to false (was non-boolean: ' + JSON.stringify(s.enabled) + ')');
         }
         s.enabled = false;
     }
-    s.sceneCardMaxTokens = Math.floor(clamp(s.sceneCardMaxTokens, 30, 400, 150));
-    // Reflection: interval clamped to a sane range (min 4 so it can't fire every turn);
-    // token cap for the injected summary clamped small (it's continuity glue, not a dump).
-    s.reflectionInterval = Math.floor(clamp(s.reflectionInterval, 4, 100, 12));
-    s.reflectionMaxTokens = Math.floor(clamp(s.reflectionMaxTokens, 50, 500, 200));
-    if (typeof s.reflectionEnabled !== 'boolean') s.reflectionEnabled = true;
-    // Idle-time consolidation: opt-in toggle + idle delay. Delay clamped to a sane floor (30s,
-    // so it can't thrash) and ceiling (30min) with the 2-minute default as fallback.
-    if (typeof s.idleConsolidation !== 'boolean') s.idleConsolidation = false;
-    s.idleConsolidationMs = Math.floor(clamp(s.idleConsolidationMs, 30000, 1800000, 120000));
-    if (typeof s.reflectionInject !== 'boolean')  s.reflectionInject = false; // inert (refinement #1)
-    if (typeof s.reflectionPrompt !== 'string')   s.reflectionPrompt = '';
-    // Character registry: enable toggle + check interval (clamped 2..50 so it can't fire every
-    // turn nor be set absurdly high). Defaults: enabled true, interval 10.
-    if (typeof s.characterRegistryEnabled !== 'boolean') s.characterRegistryEnabled = true;
-    s.characterCheckInterval = Math.floor(clamp(s.characterCheckInterval, 2, 50, 10));
-    // Semantic entity resolution/merge: DEFAULT OFF (false-merge risk). Threshold clamped to a
-    // high, conservative band [0.80..0.99] so it can't be loosened into noise; default 0.85.
-    if (typeof s.entityResolution !== 'boolean') s.entityResolution = false;
-    s.entityResolutionThreshold = clamp(s.entityResolutionThreshold, 0.80, 0.99, 0.85);
-    // User-level shared memory: DEFAULT OFF (largest behavior change; opt-in only). When false,
-    // the shared store is never touched, so storage+retrieval are byte-identical to today.
-    if (typeof s.userLevelMemory !== 'boolean') s.userLevelMemory = false;
-    if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
     if (typeof s.debugVerbose !== 'boolean')     s.debugVerbose = false;
-    if (typeof s.sceneCardEnabled !== 'boolean') s.sceneCardEnabled = true;
-    if (typeof s.memoryProfile !== 'string')     s.memoryProfile = '';
-    if (typeof s.agent1Profile !== 'string')     s.agent1Profile = '';
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
-    // Guaranteed present-character anchors (live; the retired Finder's other knobs are gone).
-    s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
-    // knownBy (POV) enforcement: absent key (older saves) resolves to ON, matching the
-    // previously-UNCONDITIONAL filtering — zero behavior change on upgrade.
     if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
-    if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = true;
-    // Coercion matches the tool-first DEFAULT (true): an absent key (older saved settings) resolves
-    // to ON, consistent with DEFAULT_SETTINGS, instead of contradicting it. Users who explicitly
-    // saved `false` keep it (an explicit boolean passes this guard untouched).
-    if (typeof s.enableWriterWriteTool !== 'boolean') s.enableWriterWriteTool = true;
-    // Tool-first redesign — memory mode (how memory reaches the main model):
-    //   'hybrid'    (default) light no-LLM anchor each turn + the model pulls deeper via search_memory
-    //   'tool-only' minimal anchor; the model drives ALL recall through the tool
-    //   'push'      classic behavior — Agent 1 (Draft) runs to plan + pick branches each turn
-    // Anything absent/garbage coerces to 'hybrid'. 'hybrid'/'tool-only' DROP the blocking Agent 1
-    // LLM call from the reply-critical path (the latency win); 'push' restores it.
-    if (s.memoryMode !== 'push' && s.memoryMode !== 'tool-only' && s.memoryMode !== 'hybrid') s.memoryMode = 'hybrid';
-    if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = true; // matches DEFAULT_SETTINGS (tool-first flip)
-    // Temporal grounding defaults ON (free, deterministic): absent/invalid => true (back-compat).
-    if (typeof s.temporalGrounding !== 'boolean') s.temporalGrounding = true;
-    // Reflection compression guard — default ON; absent/invalid => true (back-compat).
-    if (typeof s.reflectionCompressionGuard !== 'boolean') s.reflectionCompressionGuard = true;
-    // B3 safe slice — default OFF (absent/garbage => false = unchanged behavior).
-    if (typeof s.scribeTrimProcessedPriors !== 'boolean') s.scribeTrimProcessedPriors = false;
-    // Bi-temporal fact validity (opt-in) — default OFF; absent (older settings) => false (back-compat).
-    if (typeof s.biTemporal !== 'boolean') s.biTemporal = false;
-    // Cross-key supersede rules — default ON (free + deterministic); absent (older settings) => true.
-    if (typeof s.crossKeySupersede !== 'boolean') s.crossKeySupersede = true;
-    // Injected-memory recency labels (formatter-only) — default ON; absent (older settings) => true.
-    if (typeof s.injectRecencyLabels !== 'boolean') s.injectRecencyLabels = true;
-    // Injected-memory truth hierarchy (formatter-only) — default ON; absent (older settings) => true.
-    if (typeof s.injectTruthHierarchy !== 'boolean') s.injectTruthHierarchy = true;
-    // Typed-edge graph memory (opt-in, F-ARCH-7) — default OFF; absent (older settings) => false (back-compat).
-    if (typeof s.typedEdges !== 'boolean') s.typedEdges = false;
-    // Moment echo (Resonance Part B) — default OFF; absent (older settings) => false (back-compat).
-    if (typeof s.enableMomentEcho !== 'boolean') s.enableMomentEcho = false;
-    s.momentEchoMaxTokens = Math.floor(clamp(s.momentEchoMaxTokens, 12, 120, 40));
-    // Relationship re-entry pack — default OFF; absent (older settings) => false (back-compat).
-    if (typeof s.enableRelationshipReentry !== 'boolean') s.enableRelationshipReentry = false;
-    s.reentryAbsenceScenes = Math.floor(clamp(s.reentryAbsenceScenes, 1, 20, 2));
-    s.reentryMomentCount = Math.floor(clamp(s.reentryMomentCount, 1, 5, 3));
-    // Auto-linking defaults ON (free + deterministic): absent/invalid => true (back-compat).
-    if (typeof s.enableAutoLinking !== 'boolean') s.enableAutoLinking = true;
-    // Open plot threads — default ON (free + deterministic); absent (older settings) => true.
-    if (typeof s.enableOpenThreads !== 'boolean') s.enableOpenThreads = true;
-    s.openThreadsMaxTokens = Math.floor(clamp(s.openThreadsMaxTokens, 20, 200, 60));
-    s.summaryPyramidMaxTokens = Math.floor(clamp(s.summaryPyramidMaxTokens, 50, 1000, 250));
-    // C1 — usability preset id. One of the known ids or 'custom'; anything else (absent / garbage /
-    // a renamed preset) coerces to 'custom' so the dropdown falls back safely. The actual knob
-    // values are NOT touched here — detectPreset()/applyPreset() own that; this only guards the id.
-    if (!PRESET_IDS.has(s.uiPreset)) s.uiPreset = 'custom';
-    // First-run onboarding: absent/garbage => false, so existing installs see the wizard exactly
-    // once (finish or skip flips it true; it never auto-shows again).
     if (typeof s.onboardingDone !== 'boolean') s.onboardingDone = false;
-    if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
-    if (typeof s.writerFormat !== 'string')      s.writerFormat = '';
     if (typeof s.activeDbProfile !== 'string')   s.activeDbProfile = '';
     if (!s.dbProfiles || typeof s.dbProfiles !== 'object' || Array.isArray(s.dbProfiles)) {
         s.dbProfiles = {};
     }
-    // Explicitly-unlinked chats (detach set): coerce to a string array so the unlink-stick logic
-    // can read it without defensive branching. Absent/malformed => empty (auto-link unchanged).
+    // Explicitly-unlinked chats (detach set): coerce to a string array.
     if (!Array.isArray(s.unlinkedChats)) {
         s.unlinkedChats = [];
     } else {
         s.unlinkedChats = s.unlinkedChats.filter(id => typeof id === 'string' && id);
     }
-    // User taxonomy overlay: coerce to the well-formed { categories[], aspects{}, subAreas{} }
-    // shape so database.js can read it without defensive branching. Absent/malformed => empty.
+    // User taxonomy overlay: coerce to the well-formed shape.
     if (!s.taxonomyOverlay || typeof s.taxonomyOverlay !== 'object' || Array.isArray(s.taxonomyOverlay)) {
         s.taxonomyOverlay = { categories: [], aspects: {}, subAreas: {} };
     } else {
@@ -648,43 +215,48 @@ export function validateSettings(s) {
 }
 
 function migrateLegacySettings(s) {
-    // Skip if already migrated
-    if ((s.schemaVersion ?? 0) >= 2) return;
+    // Skip if already migrated to the redesign-v2 schema.
+    if ((s.schemaVersion ?? 0) >= 3) return;
 
+    // Pre-v2 (bf_memory) legacy: copy renamed fields ONLY if current is empty (don't
+    // clobber user's newer values).
     const context = getContext();
     const legacy = context.extensionSettings?.bf_memory;
     if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
-        // Copy renamed fields ONLY if current is empty (don't clobber user's newer values)
-        if (legacy.recentMessageCount !== undefined && (s.contextMessages === undefined || s.contextMessages === 5)) {
-            const n = Number(legacy.recentMessageCount);
-            if (Number.isFinite(n)) s.contextMessages = n;
-        }
         if (typeof legacy.customExtractorPrompt === 'string' && !s.memoryPrompt) {
             s.memoryPrompt = legacy.customExtractorPrompt;
         }
-        if (typeof legacy.customWriterRule === 'string' && !s.writerFormat) {
-            s.writerFormat = legacy.customWriterRule;
-        }
-        if (typeof legacy.extractorProfileId === 'string' && !s.memoryProfile) {
-            s.memoryProfile = legacy.extractorProfileId;
-        }
-        if (typeof legacy.useExtractorProfile === 'boolean' && s.useMemoryProfile === undefined) {
-            s.useMemoryProfile = legacy.useExtractorProfile;
+        if (typeof legacy.extractorProfileId === 'string' && legacy.extractorProfileId && !s.agent3Profile && !s.memoryProfile) {
+            s.agent3Profile = legacy.extractorProfileId;
         }
         console.log('[BFMemory] Migrated legacy bf_memory settings (old key preserved for rollback)');
     }
 
-    // v0.7: split single memoryProfile/contextMessages into per-agent settings.
-    // Old fields are intentionally KEPT on the stored object for rollback safety.
-    if (typeof s.memoryProfile === 'string' && s.memoryProfile && !s.agent1Profile && !s.agent3Profile) {
-        s.agent1Profile = s.memoryProfile;
+    // v0.7 legacy: a single memoryProfile predates the per-agent profiles. Migrate it
+    // forward onto the (sole surviving) background-agent profile when that is unset.
+    if (typeof s.memoryProfile === 'string' && s.memoryProfile && !s.agent3Profile) {
         s.agent3Profile = s.memoryProfile;
     }
-    if (typeof s.contextMessages === 'number' && s.contextMessages !== 5 && !s.agent1ContextMessages) {
-        s.agent1ContextMessages = s.contextMessages;
+
+    // redesign-v2 SWEEP: every key that survives carries the same name as before, so the
+    // carried-over knobs (agent2ContextMessages, retrievalTokenBudget, reviewInterval,
+    // enforceKnownBy, catchupBatchSize, memoryPrompt, agent3Profile, dbProfiles /
+    // activeDbProfile / unlinkedChats / taxonomyOverlay, ...) are simply KEPT — and every
+    // stored key NOT in the final DEFAULT_SETTINGS list is DELETED (removed features and
+    // G4 hardcoded-ON knobs alike). schemaVersion is the only extra key allowed through.
+    let dropped = 0;
+    for (const key of Object.keys(s)) {
+        if (key === 'schemaVersion') continue;
+        if (!Object.hasOwn(DEFAULT_SETTINGS, key)) {
+            delete s[key];
+            dropped++;
+        }
+    }
+    if (dropped > 0) {
+        console.log(`[BFMemory] Settings migration dropped ${dropped} obsolete key(s) (schema v3)`);
     }
 
-    s.schemaVersion = 2;
+    s.schemaVersion = 3;
 }
 
 // --- Status ---
@@ -781,32 +353,25 @@ export function reloadEntitiesUI() {
 // --- Profile Dropdown ---
 
 function reloadProfiles() {
-    const agent1Select = document.getElementById('bf_mem_agent1_profile');
     const agent3Select = document.getElementById('bf_mem_agent3_profile');
-    if (!agent1Select && !agent3Select) return;
+    if (!agent3Select) return;
 
     const profiles = getConnectionProfiles();
     const activeProfile = getCurrentProfileId();
 
-    const populate = (select, savedValue) => {
-        if (!select) return;
-        const currentValue = select.value;
-        select.innerHTML = '<option value="">-- Use default profile --</option>';
-        profiles.forEach(profile => {
-            const option = document.createElement('option');
-            option.value = profile.id;
-            option.textContent = profile.name + (profile.id === activeProfile ? ' (current)' : '');
-            select.appendChild(option);
-        });
-        if (currentValue && profiles.find(p => p.id === currentValue)) {
-            select.value = currentValue;
-        } else if (savedValue) {
-            select.value = savedValue;
-        }
-    };
-
-    populate(agent1Select, extensionSettings?.agent1Profile);
-    populate(agent3Select, extensionSettings?.agent3Profile);
+    const currentValue = agent3Select.value;
+    agent3Select.innerHTML = '<option value="">-- Use default profile --</option>';
+    profiles.forEach(profile => {
+        const option = document.createElement('option');
+        option.value = profile.id;
+        option.textContent = profile.name + (profile.id === activeProfile ? ' (current)' : '');
+        agent3Select.appendChild(option);
+    });
+    if (currentValue && profiles.find(p => p.id === currentValue)) {
+        agent3Select.value = currentValue;
+    } else if (extensionSettings?.agent3Profile) {
+        agent3Select.value = extensionSettings.agent3Profile;
+    }
 }
 
 // --- Tabs ---
@@ -975,7 +540,6 @@ async function importDatabasesFromJson(text) {
 async function exportWorldInfoFlow() {
     const wi = await import('./worldinfo-interop.js');
     const { getAllDatabases } = await import('./database.js');
-    const { getAgent3ProfileId } = await import('./profiler.js');
 
     const databases = await getAllDatabases();
     const factUnits = wi.collectWorldInfoUnits(databases, { mode: 'fact' });
@@ -1019,7 +583,7 @@ async function exportWorldInfoFlow() {
         : 'Keywords will be generated offline (no LLM calls, lower quality).';
     if (!confirm(`Export ${units.length} World Info entr${units.length === 1 ? 'y' : 'ies'} (one per ${mode})?\n\n${costLine}\n\nProceed?`)) return;
 
-    const profileId = getAgent3ProfileId(extensionSettings);
+    const profileId = extensionSettings?.agent3Profile || null;
     const banned = wi.buildBannedNames(databases);
     const { llmCalls: madeCalls, aiUnits, fallbackUnits } = await wi.generateKeywords({ units, profileId, useAI, banned });
     const book = wi.buildWorldInfoBook(units);
@@ -1776,138 +1340,37 @@ export function estimateFullChatCalls({ skipAlreadyProcessed = true } = {}) {
 }
 
 /**
- * Process every message in the current chat through Agent 3 sequentially.
- * Used by the "Run on current chat" button — for users who installed the
- * extension after their chat was already going.
+ * Process the current chat's unprocessed backlog through the Memory Agent.
+ *
+ * redesign-v2 (S3): the old per-message Scribe fan-out was DELETED with runMemoryUpdater —
+ * this is now a thin delegate over the chunked catch-up importer (src/catchup-import.js),
+ * which runs one extract-only Memory Agent session per chunk, keeps the per-chunk resume
+ * watermark, and rebuilds the memory sheet at the end. Kept as an export so the existing
+ * "Run on full chat" button keeps working until S5 unifies the UI.
  *
  * @param {object} options
- * @param {boolean} options.skipAlreadyProcessed - if true, skip messages whose
- *   extra.bf_mem_processed is already true (default true)
+ * @param {boolean} options.skipAlreadyProcessed - accepted for signature compatibility; the
+ *   importer ALWAYS skips already-processed messages (strict bf_mem_processed === true test).
  * @param {(progress: {current: number, total: number, factsAdded: number}) => void} options.onProgress
- * @param {() => boolean} options.shouldCancel - return true to abort
+ * @param {() => boolean} options.shouldCancel - return true to abort at the next chunk boundary
  */
 export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgress, shouldCancel } = {}) {
-    const ctx = getContext();
-    const chat = ctx.chat || [];
-    if (chat.length === 0) {
-        toastr.warning('No messages in current chat', 'BF Memory');
-        return { processed: 0, skipped: 0, factsAdded: 0 };
-    }
-
-    const { runMemoryUpdater } = await import('./agent-memory.js');
-    const { getAgent3ProfileId } = await import('./profiler.js');
-    const { getAllDatabases } = await import('./database.js');
-    const { createSemaphore } = await import('./llm-call.js');
-
-    const profileId = getAgent3ProfileId(extensionSettings);
-    const charInfo = (function() {
-        const char = ctx.characters?.[ctx.characterId];
-        if (!char) return '';
-        const parts = [];
-        if (char.name) parts.push(`Name: ${char.name}`);
-        if (char.description) parts.push(`Description: ${char.description.substring(0, 2000)}`);
-        if (char.personality) parts.push(`Personality: ${char.personality.substring(0, 1000)}`);
-        if (char.scenario) parts.push(`Scenario: ${char.scenario.substring(0, 1000)}`);
-        return parts.join('\n');
-    })();
-    const userPersona = ctx.persona?.description || ctx.name1 || '';
-
-    // PERF (fix): load the databases ONCE before the loop instead of re-fetching every
-    // iteration. applyUpdates() mutates this map IN PLACE (via upsertFact) and persists
-    // each touched category through saveDatabase(), so the same reference stays current
-    // across iterations — passing it forward is both correct and avoids a fresh round of
-    // fetch()+JSON.parse per message (which on a long chat was a huge serial cost and,
-    // combined with the per-message LLM call below, could hang the UI). saveDatabase()
-    // also invalidates the per-turn getAllDatabases() cache, so any later reader (the
-    // Database tab, the next turn's pipeline) still re-reads fresh from disk.
-    const databases = await getAllDatabases();
-
-    let processed = 0, skipped = 0, factsAdded = 0;
-    const total = chat.length;
-    const backfillStart = Date.now();
-    addDebugLog('info', `Full-chat backfill start (${total} messages)`, {
-        subsystem: 'import', event: 'backfill.start', actor: 'USER',
-        data: { total, profileId: profileId || null, skipAlreadyProcessed },
+    void skipAlreadyProcessed; // the importer's strict watermark test supersedes this flag
+    const { runCatchupImport } = await import('./catchup-import.js');
+    const result = await runCatchupImport({
+        onProgress: ({ msgsDone, msgsTotal, factsAdded }) => {
+            onProgress?.({ current: msgsDone, total: msgsTotal, factsAdded });
+        },
+        shouldCancel,
     });
-    // FIX #7: accumulate proposed + committed facts so the Last Generated /
-    // Last Inserted tabs reflect what THIS backfill produced (mirrors pipeline.js).
-    const allUpdates = [];
-    const allApplied = [];
-
-    // Build the work list up front (apply skip rules) so trivial/processed messages never
-    // spend an LLM call and the progress total is accurate.
-    const workItems = [];
-    for (let i = 0; i < chat.length; i++) {
-        const msg = chat[i];
-        const skip = (reason) => addDebugLog('debug', `Full-chat: msg ${i + 1} skipped (${reason})`, {
-            subsystem: 'import', event: 'backfill.skipped', reason, data: { msgIndex: i },
-        });
-        if (!msg || !msg.mes) { skipped++; skip('EMPTY'); continue; }
-        if (msg.is_system) { skipped++; skip('SYSTEM'); continue; }
-        if (msg.extra?.type) { skipped++; skip('EXTRA_TYPE'); continue; }
-        if (skipAlreadyProcessed && msg.extra?.bf_mem_processed) { skipped++; skip('ALREADY_PROCESSED'); continue; }
-        if (isTriviallyEmptyForExtraction(msg.mes)) {
-            skipped++;
-            skip('TRIVIALLY_EMPTY');
-            msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
-            continue;
-        }
-        workItems.push({ msg, idx: i });
-    }
-
-    // CONCURRENT FAN-OUT (atomic #17). The `databases` map is loaded ONCE above and shared by
-    // all workers; upsertFact is synchronous between awaits, so concurrent workers can't lose
-    // each other's writes. A semaphore caps parallel Scribe calls at rebuildConcurrency.
-    const concurrency = Math.max(1, Math.min(6, extensionSettings.rebuildConcurrency || 3));
-    const sem = createSemaphore(concurrency);
-    const workTotal = workItems.length;
-    const counter = { done: 0 };
-    await Promise.all(workItems.map(async ({ msg, idx }) => {
-        if (shouldCancel?.()) return;
-        const release = await sem.acquire();
-        if (shouldCancel?.()) { release(); return; }
-        try {
-            const result = await runMemoryUpdater(
-                msg.mes, idx, charInfo, databases, profileId,
-                !!msg.is_user, userPersona,
-                [],   // no prior context — process each message in isolation for retro extraction
-                null,
-                String(msg.name || '').trim(), // source speaker (HUB FIX per-character namespacing)
-            );
-            const n = result?.updates?.length || 0;
-            factsAdded += n;
-            if (Array.isArray(result?.updates)) allUpdates.push(...result.updates);
-            if (Array.isArray(result?.applied)) allApplied.push(...result.applied);
-            msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
-            processed++;
-            addDebugLog('info', `Full-chat: msg ${idx + 1} → +${n} facts`, {
-                subsystem: 'import', event: 'backfill.perMsg', data: { msgIndex: idx, total: workTotal, factsAdded: n },
-            });
-        } catch (err) {
-            addDebugLog('fail', `Full-chat: msg ${idx + 1} failed: ${err.message || err}`, {
-                subsystem: 'import', event: 'backfill.msgFailed', reason: 'ERROR', data: { msgIndex: idx, error: err.message || String(err) },
-            });
-        } finally {
-            counter.done++;
-            onProgress?.({ current: counter.done, total: workTotal, factsAdded });
-            release();
-        }
-    }));
-
-    // FIX #7: surface this backfill's results in the Generated / Inserted panels.
-    // Replace (not append) so the tabs show what this backfill produced.
-    setLastGenerated(allUpdates);
-    setLastInserted(allApplied);
-
-    // Persist chat (the extra.bf_mem_processed flags) + active DB profile
-    ctx.saveChatDebounced?.();
-    await saveCurrentToActiveProfile();
-
-    addDebugLog('pass', `Full-chat backfill complete: ${processed} processed, ${skipped} skipped, +${factsAdded} facts`, {
-        subsystem: 'import', event: 'backfill.complete', actor: 'USER',
-        data: { processed, skipped, factsAdded, durationMs: Date.now() - backfillStart },
-    });
-    return { processed, skipped, factsAdded };
+    return {
+        processed: result.msgsDone || 0,
+        skipped: 0,
+        factsAdded: result.factsAdded || 0,
+        refused: result.refused,
+        cancelled: result.cancelled,
+        aborted: result.aborted,
+    };
 }
 
 async function autoSaveDbProfile() {
@@ -2315,13 +1778,13 @@ export async function initSettings() {
     if (freshInstall && typeof toastr !== 'undefined') {
         try {
             toastr.info(
-                'Ready on the "Balanced" preset. Tick Enable, then pick a memory model in the Drafter/Scribe tabs (a cheap one is fine). Switch to "Cheap" mode to save tokens.',
+                'Tick Enable, then pick a memory model for the background Memory Agent (a cheap one is fine).',
                 'BF Memory — quick start',
                 { timeOut: 12000, extendedTimeOut: 6000 },
             );
         } catch { /* nudge is best-effort */ }
-        addDebugLog('info', 'First-run install detected — shipped with Balanced preset (disabled until user enables)', {
-            subsystem: 'settings', event: 'settings.first_run', actor: 'SYSTEM', data: { preset: extensionSettings.uiPreset },
+        addDebugLog('info', 'First-run install detected (disabled until user enables)', {
+            subsystem: 'settings', event: 'settings.first_run', actor: 'SYSTEM',
         });
     }
 
@@ -2345,50 +1808,9 @@ export async function initSettings() {
         }
     });
 
-    // --- C1: Usability preset dropdown (Cheap · Balanced · Max Recall · Custom) ---
-    // Reconcile the stored id against the LIVE values first: if the user (or a future default flip)
-    // left the knobs matching a preset, show that preset; otherwise 'custom'. This keeps the
-    // dropdown honest without ever rewriting the user's knobs on load.
-    {
-        const detected = detectPreset();
-        if (detected !== extensionSettings.uiPreset) {
-            extensionSettings.uiPreset = detected;
-            saveSettings();
-        }
-        $('#bf_mem_preset').val(extensionSettings.uiPreset);
-        $('#bf_mem_preset').on('change', function () {
-            applyPreset($(this).val());
-        });
-        // Manual edit of ANY governed control flips the dropdown back to "Custom" so it never lies.
-        // Delegated so it covers every governed input regardless of bind order; skipped while
-        // applyPreset() is doing its own programmatic writes (isApplyingPreset() guard).
-        // Only the governed settings that HAVE an on-screen control are listed
-        // (finderAnchorsPerCharacter has no slider, so it can't be manually edited anyway).
-        const governedSelector = [
-            '#bf_mem_pyramid_enabled',
-            '#bf_mem_recall_tool_enabled', '#bf_mem_agent2_context', '#bf_mem_reflection_interval',
-            '#bf_mem_retrieval_budget', '#bf_mem_reentry_moments',
-        ].join(',');
-        $('#bf_memory_settings').on('change input', governedSelector, function () {
-            if (isApplyingPreset()) return;
-            if (extensionSettings.uiPreset !== 'custom') {
-                extensionSettings.uiPreset = 'custom';
-                $('#bf_mem_preset').val('custom');
-                saveSettings();
-            }
-        });
-    }
-
-    // "Use separate profiles" toggle REMOVED (v0.21.x menu cleanup): per-agent profiles are
-    // now ALWAYS active. The useMemoryProfile key is kept (default true) for back-compat;
-    // profiler.js no longer gates on it (getAgent1/3/4ProfileId always honor configured profiles).
+    // redesign-v2 (S1): the usability-preset dropdown (uiPreset) was removed.
 
     reloadProfiles();
-    $('#bf_mem_agent1_profile').val(extensionSettings.agent1Profile || '').on('change', function () {
-        extensionSettings.agent1Profile = $(this).val() || '';
-        addDebugLog('info', `Agent 1 profile changed`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent1Profile', value: extensionSettings.agent1Profile } });
-        saveSettings();
-    });
     $('#bf_mem_agent3_profile').val(extensionSettings.agent3Profile || '').on('change', function () {
         extensionSettings.agent3Profile = $(this).val() || '';
         addDebugLog('info', `Agent 3 profile changed`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent3Profile', value: extensionSettings.agent3Profile } });
@@ -2400,47 +1822,14 @@ export async function initSettings() {
         toastr.info('Profiles refreshed', 'BF Memory');
     });
 
-    // Agent 1 context slider
-    $('#bf_mem_agent1_context').val(extensionSettings.agent1ContextMessages);
-    $('#bf_mem_agent1_context_val').text(extensionSettings.agent1ContextMessages);
-    $('#bf_mem_agent1_context').on('input', function () {
-        const val = parseInt($(this).val());
-        const before = extensionSettings.agent1ContextMessages;
-        extensionSettings.agent1ContextMessages = val;
-        $('#bf_mem_agent1_context_val').text(val);
-        if (before !== val) addDebugLog('debug', `Agent 1 context messages: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent1ContextMessages' }, before, after: val });
-        saveSettings();
-    });
+    // Writer history limit slider (agent2ContextMessages): trims the main model's visible chat.
 
-    // Agent 3 context slider
-    $('#bf_mem_agent3_context').val(extensionSettings.agent3ContextMessages);
-    $('#bf_mem_agent3_context_val').text(extensionSettings.agent3ContextMessages);
-    $('#bf_mem_agent3_context').on('input', function () {
-        const val = parseInt($(this).val());
-        const before = extensionSettings.agent3ContextMessages;
-        extensionSettings.agent3ContextMessages = val;
-        $('#bf_mem_agent3_context_val').text(val);
-        if (before !== val) addDebugLog('debug', `Agent 3 context messages: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent3ContextMessages' }, before, after: val });
-        saveSettings();
-    });
-
-    // Agent 2 context slider (force-attention duplication)
     $('#bf_mem_agent2_context').val(extensionSettings.agent2ContextMessages);
     $('#bf_mem_agent2_context_val').text(extensionSettings.agent2ContextMessages);
     $('#bf_mem_agent2_context').on('input', function () {
         const val = parseInt($(this).val());
         extensionSettings.agent2ContextMessages = val;
         $('#bf_mem_agent2_context_val').text(val);
-        saveSettings();
-    });
-
-    // A2/B5 frozen injection slider (0 = off; reuse cached facts for N turns before a fresh pull).
-    $('#bf_mem_freeze_turns').val(extensionSettings.injectionFreezeTurns || 0);
-    $('#bf_mem_freeze_turns_val').text(extensionSettings.injectionFreezeTurns || 0);
-    $('#bf_mem_freeze_turns').on('input', function () {
-        const val = parseInt($(this).val(), 10) || 0;
-        extensionSettings.injectionFreezeTurns = val;
-        $('#bf_mem_freeze_turns_val').text(val);
         saveSettings();
     });
 
@@ -2459,29 +1848,31 @@ export async function initSettings() {
         saveSettings();
     });
 
-    // Writer recall tool toggle (pull-detail / "infinite reach"). Default OFF. Toggling it
-    // register/unregisters the optional search_memory function-tool via syncWriterRecallTool().
-    $('#bf_mem_recall_tool_enabled').prop('checked', extensionSettings.enableWriterRecallTool === true).on('change', function () {
-        const before = extensionSettings.enableWriterRecallTool === true;
-        const next = $(this).prop('checked');
-        extensionSettings.enableWriterRecallTool = next;
-        addDebugLog('info', `Writer recall tool ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableWriterRecallTool' }, before, after: !!next });
+    // Settled buffer hold-back slider (§7): the newest N messages are never mined for facts.
+    $('#bf_mem_buffer_holdback').val(extensionSettings.bufferHoldBack);
+    $('#bf_mem_buffer_holdback_val').text(extensionSettings.bufferHoldBack);
+    $('#bf_mem_buffer_holdback').on('input', function () {
+        const val = parseInt($(this).val(), 10);
+        const before = extensionSettings.bufferHoldBack;
+        extensionSettings.bufferHoldBack = val;
+        $('#bf_mem_buffer_holdback_val').text(val);
+        if (before !== val) addDebugLog('debug', `Buffer hold-back: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'bufferHoldBack' }, before, after: val });
         saveSettings();
-        // Re-sync registration to the new state (cycle-safe lazy import).
-        import('./agent-writer.js').then(m => m.syncWriterRecallTool?.()).catch(() => {});
     });
 
-    // Writer WRITE tool toggle (remember_fact / model-writable pin). Default OFF. Toggling it
-    // register/unregisters the optional remember_fact function-tool via syncWriterWriteTool().
-    $('#bf_mem_write_tool_enabled').prop('checked', extensionSettings.enableWriterWriteTool === true).on('change', function () {
-        const before = extensionSettings.enableWriterWriteTool === true;
-        const next = $(this).prop('checked');
-        extensionSettings.enableWriterWriteTool = next;
-        addDebugLog('info', `Writer write tool ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableWriterWriteTool' }, before, after: !!next });
+    // Bonus connected facts slider (graphExtrasCount): "Connected memories" on the sheet.
+    $('#bf_mem_graph_extras').val(extensionSettings.graphExtrasCount);
+    $('#bf_mem_graph_extras_val').text(extensionSettings.graphExtrasCount);
+    $('#bf_mem_graph_extras').on('input', function () {
+        const val = parseInt($(this).val(), 10);
+        const before = extensionSettings.graphExtrasCount;
+        extensionSettings.graphExtrasCount = val;
+        $('#bf_mem_graph_extras_val').text(val);
+        if (before !== val) addDebugLog('debug', `Graph extras count: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'graphExtrasCount' }, before, after: val });
         saveSettings();
-        // Re-sync registration to the new state (cycle-safe lazy import).
-        import('./agent-writer.js').then(m => m.syncWriterWriteTool?.()).catch(() => {});
     });
+
+    // redesign-v2 (S1): the writer-side search_memory / remember_fact tool toggles were removed.
 
     // knownBy (POV) enforcement toggle. Default ON. Read lazily per call inside
     // isFactVisible() (fact-retrieval.js), so no re-wiring is needed on change.
@@ -2493,281 +1884,13 @@ export async function initSettings() {
         saveSettings();
     });
 
-    // Tool-first redesign — RECALL STRATEGY (memoryMode). Chooses how stored memory reaches the
-    // main model: 'hybrid' (default) and 'tool-only' skip the blocking Drafter LLM call and let the
-    // model pull facts via search_memory; 'push' restores the classic always-plan Drafter. Pure
-    // setting (no registration side-effect) — the pipeline reads it per turn.
-    $('#bf_mem_memory_mode').val(extensionSettings.memoryMode || 'hybrid').on('change', function () {
-        const before = extensionSettings.memoryMode || 'hybrid';
-        const next = $(this).val();
-        extensionSettings.memoryMode = next;
-        addDebugLog('info', `Recall strategy (memory mode) → ${next}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryMode' }, before, after: next });
-        saveSettings();
-    });
+    // redesign-v2 (S1): the summary-pyramid / open-threads-line / moment-echo / re-entry
+    // injection toggles were removed (the memory sheet replaces the old injection stack).
 
-    // Summary pyramid "Big Picture" injection toggle. Default OFF. Gates ONLY whether the
-    // story+shelf summaries are injected into the Writer's context — shelf summaries are
-    // still generated on the reflection cadence regardless. No registration side-effect.
-    $('#bf_mem_pyramid_enabled').prop('checked', extensionSettings.enableSummaryPyramid === true).on('change', function () {
-        const before = extensionSettings.enableSummaryPyramid === true;
-        const next = $(this).prop('checked');
-        extensionSettings.enableSummaryPyramid = next;
-        addDebugLog('info', `Summary pyramid Big Picture injection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableSummaryPyramid' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Open plot threads toggle (open-threads feature). Default ON. Gates ONLY whether the
-    // "Open threads:" line is appended to the Big Picture block — the Scribe still records
-    // `thread:open` markers and the reflection pass still resolves them regardless (the DB
-    // stays complete either way). No registration side-effect.
-    $('#bf_mem_open_threads_enabled').prop('checked', extensionSettings.enableOpenThreads === true).on('change', function () {
-        const before = extensionSettings.enableOpenThreads === true;
-        const next = $(this).prop('checked');
-        extensionSettings.enableOpenThreads = next;
-        addDebugLog('info', `Open plot threads line ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableOpenThreads' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Moment echo (Resonance Part B) injection toggle. Default OFF. Gates ONLY whether a single
-    // narrow `[Echo: …]` line (one resonant past moment for the present pair) is injected; emits
-    // nothing on most turns even when on. No registration side-effect.
-    $('#bf_mem_moment_echo_enabled').prop('checked', extensionSettings.enableMomentEcho === true).on('change', function () {
-        const before = extensionSettings.enableMomentEcho === true;
-        const next = $(this).prop('checked');
-        extensionSettings.enableMomentEcho = next;
-        addDebugLog('info', `Moment echo injection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableMomentEcho' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Relationship re-entry pack (community adoption). Default OFF. Gates ONLY whether a returning
-    // character's pair-status record + shared moments are guaranteed into the injection. Detection
-    // rides the push-mode #SCENE parse (see turn-state.js setScene) — pure settings, read per turn.
-    $('#bf_mem_reentry_enabled').prop('checked', extensionSettings.enableRelationshipReentry === true).on('change', function () {
-        const before = extensionSettings.enableRelationshipReentry === true;
-        const next = $(this).prop('checked');
-        extensionSettings.enableRelationshipReentry = next;
-        addDebugLog('info', `Relationship re-entry pack ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableRelationshipReentry' }, before, after: !!next });
-        saveSettings();
-    });
-    $('#bf_mem_reentry_absence').val(extensionSettings.reentryAbsenceScenes);
-    $('#bf_mem_reentry_absence_val').text(extensionSettings.reentryAbsenceScenes);
-    $('#bf_mem_reentry_absence').on('input', function () {
-        const val = parseInt($(this).val(), 10) || 2;
-        const before = extensionSettings.reentryAbsenceScenes;
-        extensionSettings.reentryAbsenceScenes = val;
-        $('#bf_mem_reentry_absence_val').text(val);
-        if (before !== val) addDebugLog('debug', `Re-entry absence threshold: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reentryAbsenceScenes' }, before, after: val });
-        saveSettings();
-    });
-    $('#bf_mem_reentry_moments').val(extensionSettings.reentryMomentCount);
-    $('#bf_mem_reentry_moments_val').text(extensionSettings.reentryMomentCount);
-    $('#bf_mem_reentry_moments').on('input', function () {
-        const val = parseInt($(this).val(), 10) || 3;
-        const before = extensionSettings.reentryMomentCount;
-        extensionSettings.reentryMomentCount = val;
-        $('#bf_mem_reentry_moments_val').text(val);
-        if (before !== val) addDebugLog('debug', `Re-entry shared-moment count: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reentryMomentCount' }, before, after: val });
-        saveSettings();
-    });
-
-    // Auto-linking toggle (A-MEM style associative linking). DEFAULT ON (free + deterministic),
-    // so the checkbox reflects `!== false`. Gates whether applyUpdates auto-connects a fresh fact
-    // to related existing facts via `relationships`. No registration side-effect.
-    $('#bf_mem_autolink_enabled').prop('checked', extensionSettings.enableAutoLinking !== false).on('change', function () {
-        const before = extensionSettings.enableAutoLinking !== false;
-        const next = $(this).prop('checked');
-        extensionSettings.enableAutoLinking = next;
-        addDebugLog('info', `Automatic associative linking ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableAutoLinking' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // B3 safe slice: trim already-extracted prior context out of the Scribe's input. Default OFF.
-    $('#bf_mem_scribe_trim_priors').prop('checked', extensionSettings.scribeTrimProcessedPriors === true).on('change', function () {
-        const before = extensionSettings.scribeTrimProcessedPriors === true;
-        const next = $(this).prop('checked');
-        extensionSettings.scribeTrimProcessedPriors = next;
-        addDebugLog('info', `Scribe trim already-extracted priors ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'scribeTrimProcessedPriors' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Bi-temporal fact validity toggle (Graphiti/Zep valid_at/invalid_at). DEFAULT OFF, so the
-    // checkbox reflects `=== true`. Gates story-world `from:`/`until:` marker parsing (agent-memory),
-    // the supersession `validUntil` stamp (database), and the formatter annotation (fact-retrieval).
-    $('#bf_mem_bitemporal_enabled').prop('checked', extensionSettings.biTemporal === true).on('change', function () {
-        const before = extensionSettings.biTemporal === true;
-        const next = $(this).prop('checked');
-        extensionSettings.biTemporal = next;
-        addDebugLog('info', `Bi-temporal fact validity ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'biTemporal' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Cross-key supersede rules toggle (NarrativeEngine timeline; report §1.6). DEFAULT ON
-    // (validateSettings coerces absent → true), so the checkbox reflects `!== false`. Gates the
-    // deterministic death/departure/loss rule table (database.js applyCrossKeySupersedeRules)
-    // applied at the genuine-new-write callers; OFF restores per-key-only supersession.
-    $('#bf_mem_cross_key_supersede').prop('checked', extensionSettings.crossKeySupersede !== false).on('change', function () {
-        const before = extensionSettings.crossKeySupersede !== false;
-        const next = $(this).prop('checked');
-        extensionSettings.crossKeySupersede = next;
-        addDebugLog('info', `Cross-key supersede rules ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'crossKeySupersede' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Injected-memory recency labels toggle (formatter-only). DEFAULT ON (validateSettings
-    // coerces absent → true), so the checkbox reflects `=== true`. Gates ONLY the per-turn
-    // injected block's per-fact "(~N turns ago)" tails (pipeline.js formatChosenFacts + the
-    // matching estimator charge) — never the search_memory tool output.
-    $('#bf_mem_recency_labels').prop('checked', extensionSettings.injectRecencyLabels === true).on('change', function () {
-        const before = extensionSettings.injectRecencyLabels === true;
-        const next = $(this).prop('checked');
-        extensionSettings.injectRecencyLabels = next;
-        addDebugLog('info', `Injected-memory recency labels ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'injectRecencyLabels' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Injected-memory truth hierarchy toggle (formatter-only). DEFAULT ON (validateSettings
-    // coerces absent → true). Gates ONLY the CURRENT STATE / CHRONOLOGY restructuring of the
-    // injected fact block; OFF restores the flat line list byte-for-byte.
-    $('#bf_mem_truth_hierarchy').prop('checked', extensionSettings.injectTruthHierarchy === true).on('change', function () {
-        const before = extensionSettings.injectTruthHierarchy === true;
-        const next = $(this).prop('checked');
-        extensionSettings.injectTruthHierarchy = next;
-        addDebugLog('info', `Injected-memory truth hierarchy ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'injectTruthHierarchy' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Typed-edge graph memory toggle (Graphiti typed edges; audit F-ARCH-7). DEFAULT OFF, so the
-    // checkbox reflects `=== true`. Gates the Scribe's `rel:<predicate>@<Category/key>` marker
-    // grammar + parsing (agent-memory), edge-target graph expansion (fact-retrieval
-    // collectLinkCandidates), and the search_memory edge rendering / relation-intent path.
-    $('#bf_mem_typed_edges').prop('checked', extensionSettings.typedEdges === true).on('change', function () {
-        const before = extensionSettings.typedEdges === true;
-        const next = $(this).prop('checked');
-        extensionSettings.typedEdges = next;
-        addDebugLog('info', `Typed-edge graph memory ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'typedEdges' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // User-level shared memory (opt-in, default OFF). Gates routing user-subject facts into the
-    // shared global store on write (database.saveDatabase) and merging that store into every
-    // character's map on read (database.getAllDatabases). When off, storage+retrieval are unchanged.
-    $('#bf_mem_user_level_memory').prop('checked', extensionSettings.userLevelMemory === true).on('change', function () {
-        const before = extensionSettings.userLevelMemory === true;
-        const next = $(this).prop('checked');
-        extensionSettings.userLevelMemory = next;
-        addDebugLog('info', `User-level shared memory ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'userLevelMemory' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // RETRIEVAL/EXTRACTION ENHANCEMENTS (all DEFAULT ON — checkbox reflects `!== false` so a
-    // legacy settings blob without the key still shows enabled, matching the registered default).
-
-    // MMR diversity rerank (fact-retrieval). Off = pure salience order for overflow facts.
-    $('#bf_mem_mmr_enabled').prop('checked', extensionSettings.mmrEnabled !== false).on('change', function () {
-        const before = extensionSettings.mmrEnabled !== false;
-        const next = $(this).prop('checked');
-        extensionSettings.mmrEnabled = next;
-        addDebugLog('info', `MMR diversity rerank ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'mmrEnabled' }, before, after: !!next });
-        saveSettings();
-    });
-    // MMR lambda slider (stored 0..1; UI shows 0..100). Higher favors relevance; lower favors diversity.
-    {
-        const lam = (typeof extensionSettings.mmrLambda === 'number') ? extensionSettings.mmrLambda : 0.7;
-        $('#bf_mem_mmr_lambda').val(Math.round(lam * 100));
-        $('#bf_mem_mmr_lambda_val').text(lam.toFixed(2));
-        $('#bf_mem_mmr_lambda').on('input', function () {
-            const v = Math.min(1, Math.max(0, parseInt($(this).val(), 10) / 100));
-            extensionSettings.mmrLambda = v;
-            $('#bf_mem_mmr_lambda_val').text(v.toFixed(2));
-            saveSettings();
-        });
-    }
-
-    // Confidence-gated ranking (fact-retrieval). Off = ignore stored confidence in overflow ranking.
-    $('#bf_mem_confidence_ranking').prop('checked', extensionSettings.confidenceRanking !== false).on('change', function () {
-        const before = extensionSettings.confidenceRanking !== false;
-        const next = $(this).prop('checked');
-        extensionSettings.confidenceRanking = next;
-        addDebugLog('info', `Confidence ranking ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'confidenceRanking' }, before, after: !!next });
-        saveSettings();
-    });
-    // Confidence weight slider (stored 0..1; UI shows 0..100). How hard low-confidence facts are nudged down.
-    {
-        const cw = (typeof extensionSettings.confidenceWeight === 'number') ? extensionSettings.confidenceWeight : 0.3;
-        $('#bf_mem_confidence_weight').val(Math.round(cw * 100));
-        $('#bf_mem_confidence_weight_val').text(cw.toFixed(2));
-        $('#bf_mem_confidence_weight').on('input', function () {
-            const v = Math.min(1, Math.max(0, parseInt($(this).val(), 10) / 100));
-            extensionSettings.confidenceWeight = v;
-            $('#bf_mem_confidence_weight_val').text(v.toFixed(2));
-            saveSettings();
-        });
-    }
-
-    // Semantic shelf selection (agent-selector). OPT-IN (default OFF — unlike its neighbors):
-    // checkbox reflects `=== true` so a legacy blob without the key shows disabled, matching
-    // the registered default. Adds one small LLM call to the reply-critical path when on.
-    $('#bf_mem_selection_enabled').prop('checked', extensionSettings.selectionSummaryEnabled === true).on('change', function () {
-        const before = extensionSettings.selectionSummaryEnabled === true;
-        const next = $(this).prop('checked');
-        extensionSettings.selectionSummaryEnabled = next;
-        addDebugLog('info', `Semantic shelf selection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'selectionSummaryEnabled' }, before, after: !!next });
-        saveSettings();
-    });
-    // Selector max-picks slider (integer 1..20; shelves + exact facts combined per turn).
-    {
-        const mp = Math.min(20, Math.max(1, Math.floor(Number(extensionSettings.selectionSummaryMaxPicks) || 6)));
-        $('#bf_mem_selection_max_picks').val(mp);
-        $('#bf_mem_selection_max_picks_val').text(mp);
-        $('#bf_mem_selection_max_picks').on('input', function () {
-            const v = Math.min(20, Math.max(1, parseInt($(this).val(), 10) || 6));
-            extensionSettings.selectionSummaryMaxPicks = v;
-            $('#bf_mem_selection_max_picks_val').text(v);
-            addDebugLog('info', `Selector max picks set to ${v}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'selectionSummaryMaxPicks' }, after: v });
-            saveSettings();
-        });
-    }
-
-    // Temporal grounding at extraction (agent-memory + pipeline). Off = store relative dates verbatim.
-    $('#bf_mem_temporal_grounding').prop('checked', extensionSettings.temporalGrounding !== false).on('change', function () {
-        const before = extensionSettings.temporalGrounding !== false;
-        const next = $(this).prop('checked');
-        extensionSettings.temporalGrounding = next;
-        addDebugLog('info', `Temporal grounding ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'temporalGrounding' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Reflection compression guard (agent-reflect). Off = accept a shelf summary that didn't
-    // actually compress its source facts, instead of re-running the consolidation once.
-    $('#bf_mem_reflection_compression_guard').prop('checked', extensionSettings.reflectionCompressionGuard !== false).on('change', function () {
-        const before = extensionSettings.reflectionCompressionGuard !== false;
-        const next = $(this).prop('checked');
-        extensionSettings.reflectionCompressionGuard = next;
-        addDebugLog('info', `Reflection compression guard ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionCompressionGuard' }, before, after: !!next });
-        saveSettings();
-    });
-
-    // Clear shared user memory (user-level shared memory). DESTRUCTIVE: wipes ONLY the shared
-    // pseudo-avatar store (IDB working copy + backup files); each character's own memory is
-    // untouched. Confirm first (mirrors the deleteDatabase confirm pattern), then call the
-    // database-layer clearSharedUserMemory() via the same dynamic import used elsewhere here.
-    $('#bf_mem_clear_shared_user').on('click', async function () {
-        if (!confirm('Clear the shared "facts about you" memory used across ALL characters? Each character\'s own memory is left untouched. This cannot be undone.')) return;
-        const $btn = $(this);
-        $btn.prop('disabled', true);
-        try {
-            const { clearSharedUserMemory } = await import('./database.js');
-            const { categories, files } = await clearSharedUserMemory();
-            if (typeof toastr !== 'undefined') {
-                toastr.success(`Cleared shared user memory (${categories} categor${categories === 1 ? 'y' : 'ies'}, ${files} file${files === 1 ? '' : 's'}).`, 'BF Memory');
-            }
-        } catch (e) {
-            addDebugLog('fail', `Clear shared user memory failed: ${e?.message || e}`);
-            if (typeof toastr !== 'undefined') toastr.error('Failed to clear shared user memory — see Debug log.', 'BF Memory');
-        } finally {
-            $btn.prop('disabled', false);
-        }
-    });
+    // redesign-v2 (S5): the auto-linking, scribe-trim, cross-key-supersede, recency-labels,
+    // truth-hierarchy, MMR, confidence-ranking, temporal-grounding and reflection-compression
+    // toggles/sliders were removed — every one of those behaviors is now HARDCODED ON (G4) and
+    // its setting key deleted from DEFAULT_SETTINGS. The modules that used them read a local const.
 
     // Review interval slider
     $('#bf_mem_review_interval').val(extensionSettings.reviewInterval);
@@ -2781,126 +1904,22 @@ export async function initSettings() {
         saveSettings();
     });
 
-    // Secondary/Tertiary fact-chance sliders REMOVED (v0.21.x menu cleanup): retrieval became
-    // deterministic, so these gated nothing. The settings keys (secondaryChance/tertiaryChance)
-    // are retained inert in DEFAULT_SETTINGS/validateSettings for back-compat only.
-
-    // History reach stepper (F-RETR-5) — replaces the four depth-dice percent sliders, which
-    // deterministicTrackReach had reduced to a binary >=50% threshold (1-49% identical,
-    // 50-100% identical). One honest 0-4 integer control; the legacy depthDice keys stay
-    // stored-inert for back-compat and nothing binds them anymore.
-    $('#bf_mem_track_reach').val(extensionSettings.trackReachSteps);
-    $('#bf_mem_track_reach_val').text(extensionSettings.trackReachSteps);
-    $('#bf_mem_track_reach').on('input', function () {
-        const val = parseInt($(this).val(), 10) || 0;
-        const before = extensionSettings.trackReachSteps;
-        extensionSettings.trackReachSteps = val;
-        $('#bf_mem_track_reach_val').text(val);
-        if (before !== val) addDebugLog('debug', `History reach: ${before} → ${val} step(s)`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'trackReachSteps' }, before, after: val });
-        saveSettings();
-    });
-
     // Toast
     $('#bf_mem_toast').prop('checked', extensionSettings.showToast).on('change', function () {
         extensionSettings.showToast = $(this).prop('checked');
         saveSettings();
     });
 
-    // Scene card enable toggle (Agent 1 tab)
-    $('#bf_mem_scene_enabled').prop('checked', extensionSettings.sceneCardEnabled).on('change', function () {
-        extensionSettings.sceneCardEnabled = $(this).prop('checked');
-        saveSettings();
-    });
-    // Render the current live scene card (read-only)
+    // Render the current live scene card (read-only; no-op when the panel is absent)
     renderScene();
 
-    // Reflection / consolidation (Agent 3 tab)
-    $('#bf_mem_reflection_enabled').prop('checked', extensionSettings.reflectionEnabled).on('change', function () {
-        extensionSettings.reflectionEnabled = $(this).prop('checked');
-        saveSettings();
-    });
-    // "Inject story so far" checkbox REMOVED (v0.21.x menu cleanup): the summary is no longer
-    // injected into the writer under any setting. reflectionInject key is kept (default false)
-    // in DEFAULT_SETTINGS/validateSettings for back-compat only.
-    $('#bf_mem_reflection_interval').val(extensionSettings.reflectionInterval);
-    $('#bf_mem_reflection_interval_val').text(extensionSettings.reflectionInterval);
-    $('#bf_mem_reflection_interval').on('input', function () {
-        const val = parseInt($(this).val());
-        const before = extensionSettings.reflectionInterval;
-        extensionSettings.reflectionInterval = val;
-        $('#bf_mem_reflection_interval_val').text(val);
-        if (before !== val) addDebugLog('debug', `Reflection interval changed: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionInterval' }, before, after: val });
-        saveSettings();
-    });
-    // Idle-time consolidation: opt-in toggle + idle delay (shown in seconds, stored as ms).
-    $('#bf_mem_idle_consolidation').prop('checked', extensionSettings.idleConsolidation).on('change', function () {
-        extensionSettings.idleConsolidation = $(this).prop('checked');
-        saveSettings();
-    });
-    $('#bf_mem_idle_consolidation_ms').val(Math.round((extensionSettings.idleConsolidationMs || 120000) / 1000));
-    $('#bf_mem_idle_consolidation_ms_val').text(Math.round((extensionSettings.idleConsolidationMs || 120000) / 1000));
-    $('#bf_mem_idle_consolidation_ms').on('input', function () {
-        const secs = parseInt($(this).val());
-        extensionSettings.idleConsolidationMs = secs * 1000;
-        $('#bf_mem_idle_consolidation_ms_val').text(secs);
-        saveSettings();
-    });
-    $('#bf_mem_reflection_prompt').val(extensionSettings.reflectionPrompt || DEFAULT_REFLECT_PROMPT).off('input').on('input', function () {
-        const val = $(this).val();
-        extensionSettings.reflectionPrompt = (val === DEFAULT_REFLECT_PROMPT) ? '' : val;
-        saveSettings();
-    });
-    $('#bf_mem_reset_reflection_prompt').on('click', () => {
-        extensionSettings.reflectionPrompt = '';
-        $('#bf_mem_reflection_prompt').val(DEFAULT_REFLECT_PROMPT);
-        addDebugLog('info', 'Reflection prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionPrompt', isDefault: true } });
-        saveSettings();
-        toastr.info('Reflection prompt reset', 'BF Memory');
-    });
+    // redesign-v2 (S5): reflection is HARDCODED ON (G4 — interval 12, maxTokens 200); its
+    // enable/interval/prompt controls were removed. agent-reflect.js falls back to
+    // DEFAULT_REFLECT_PROMPT when no override is stored. The live summary panel remains.
     // Render the current live reflection summary (read-only)
     renderReflection();
 
-    // --- Character Registry (Agent 3 tab) ---
-    $('#bf_mem_charreg_enabled').prop('checked', extensionSettings.characterRegistryEnabled !== false).on('change', function () {
-        extensionSettings.characterRegistryEnabled = $(this).prop('checked');
-        saveSettings();
-    });
-    $('#bf_mem_charcheck_interval').val(extensionSettings.characterCheckInterval);
-    $('#bf_mem_charcheck_interval_val').text(extensionSettings.characterCheckInterval);
-    $('#bf_mem_charcheck_interval').on('input', function () {
-        const val = parseInt($(this).val());
-        const before = extensionSettings.characterCheckInterval;
-        extensionSettings.characterCheckInterval = val;
-        $('#bf_mem_charcheck_interval_val').text(val);
-        if (before !== val) addDebugLog('debug', `Character-check interval changed: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'characterCheckInterval' }, before, after: val });
-        saveSettings();
-    });
-    // Semantic entity resolution / merge toggle (default OFF). Conservative, off-critical-path.
-    $('#bf_mem_entity_resolution').prop('checked', extensionSettings.entityResolution === true).on('change', function () {
-        extensionSettings.entityResolution = $(this).prop('checked');
-        addDebugLog('debug', `Entity resolution ${extensionSettings.entityResolution ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'entityResolution' }, after: extensionSettings.entityResolution });
-        saveSettings();
-    });
-    // Manual "merge now": run the conservative entity-merge pass immediately (off the interval
-    // gate). Self-guarded; reports the result via toast. Requires the toggle above to be ON.
-    $('#bf_mem_entity_merge_now').on('click', async () => {
-        try {
-            if (extensionSettings.entityResolution !== true) {
-                toastr.info('Enable "Merge entity name variants" first.', 'BF Memory');
-                return;
-            }
-            const res = await runEntityResolution();
-            if (res && res.merges > 0) {
-                toastr.success(`Merged ${res.merges} variant(s), re-keyed ${res.factsMoved} fact(s).`, 'BF Memory');
-            } else {
-                toastr.info('No strong-signal name variants to merge.', 'BF Memory');
-            }
-            renderEntities();
-        } catch (err) {
-            addDebugLog('fail', `Manual entity merge failed: ${err.message || err}`);
-            toastr.error('Entity merge failed (see debug log).', 'BF Memory');
-        }
-    });
+    // --- Character Registry (hardcoded ON, interval 10 — G4; only the manual scan remains) ---
     // Manual "scan now": run the deterministic scan and, if there are unclassified named
     // candidates, open the batched popup immediately (off the normal interval gate).
     $('#bf_mem_charreg_scan').on('click', async () => {
@@ -2922,46 +1941,21 @@ export async function initSettings() {
     // Render the current live registry list.
     renderEntities();
 
-    // --- Prompts Tab ---
-    $('#bf_mem_draft_prompt').val(extensionSettings.draftPrompt || DEFAULT_DRAFT_PROMPT).off('input').on('input', function () {
-        const val = $(this).val();
-        extensionSettings.draftPrompt = (val === DEFAULT_DRAFT_PROMPT) ? '' : val;
+    // --- Prompts ---
+    // redesign-v2 (S3): memoryPrompt is now an OVERRIDE — extra instructions APPENDED to the
+    // Memory Agent's user prompt (agent-memory.js buildAgentUserPrompt), never a replacement
+    // of the static rulebook (which must stay byte-stable for prompt caching). Blank = none.
+    $('#bf_mem_memory_prompt').val(extensionSettings.memoryPrompt || '').off('input').on('input', function () {
+        extensionSettings.memoryPrompt = String($(this).val() || '').trim() ? String($(this).val()) : '';
         saveSettings();
-    });
-
-    $('#bf_mem_memory_prompt').val(extensionSettings.memoryPrompt || DEFAULT_MEMORY_PROMPT).off('input').on('input', function () {
-        const val = $(this).val();
-        extensionSettings.memoryPrompt = (val === DEFAULT_MEMORY_PROMPT) ? '' : val;
-        saveSettings();
-    });
-
-    $('#bf_mem_writer_format').val(extensionSettings.writerFormat || DEFAULT_WRITER_FORMAT).off('input').on('input', function () {
-        const val = $(this).val();
-        extensionSettings.writerFormat = (val === DEFAULT_WRITER_FORMAT) ? '' : val;
-        saveSettings();
-    });
-
-    $('#bf_mem_reset_draft_prompt').on('click', () => {
-        extensionSettings.draftPrompt = '';
-        $('#bf_mem_draft_prompt').val(DEFAULT_DRAFT_PROMPT);
-        addDebugLog('info', 'Agent 1 (draft) prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'draftPrompt', isDefault: true } });
-        saveSettings();
-        toastr.info('Draft prompt reset', 'BF Memory');
     });
 
     $('#bf_mem_reset_memory_prompt').on('click', () => {
         extensionSettings.memoryPrompt = '';
-        $('#bf_mem_memory_prompt').val(DEFAULT_MEMORY_PROMPT);
-        addDebugLog('info', 'Agent 3 (memory) prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryPrompt', isDefault: true } });
+        $('#bf_mem_memory_prompt').val('');
+        addDebugLog('info', 'Memory Agent extra instructions cleared', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryPrompt', isDefault: true } });
         saveSettings();
-        toastr.info('Memory prompt reset', 'BF Memory');
-    });
-
-    $('#bf_mem_reset_writer_format').on('click', () => {
-        extensionSettings.writerFormat = '';
-        $('#bf_mem_writer_format').val(DEFAULT_WRITER_FORMAT);
-        saveSettings();
-        toastr.info('Writer format reset', 'BF Memory');
+        toastr.info('Memory Agent extra instructions cleared', 'BF Memory');
     });
 
     // --- Database Tab: Profiles ---
@@ -3151,53 +2145,8 @@ export async function initSettings() {
         refreshDatabaseView();
     });
 
-    // --- Run Agent 3 on full chat (retroactive extraction) ---
-    let fullChatCancel = false;
-    let fullChatRunning = false; // cross-guard: catch-up import refuses/disables while this runs (and vice versa)
-    $('#bf_mem_run_full_chat').on('click', async () => {
-        const skipDone = $('#bf_mem_skip_processed').is(':checked');
-        // FIX #9: estimate LLM calls (post-skip, post-prefilter) so the user sees cost.
-        const { calls, total } = estimateFullChatCalls({ skipAlreadyProcessed: skipDone });
-        if (calls === 0) {
-            toastr.info(`Nothing to process: all ${total} message(s) are already done or trivially empty.`, 'BF Memory');
-            return;
-        }
-        if (!confirm(`Run the Scribe on this chat?\n\nThis will make ~${calls} LLM call(s) (one per eligible message, out of ${total} total). Each call costs tokens. Already-processed and trivially-empty messages are skipped.\n\nProceed?`)) return;
-        const btn = $('#bf_mem_run_full_chat');
-        const progress = $('#bf_mem_full_chat_progress');
-        const cancelBtn = $('#bf_mem_run_full_chat_cancel');
-
-        fullChatCancel = false;
-        fullChatRunning = true;
-        btn.prop('disabled', true).text('Running...');
-        cancelBtn.show();
-        progress.show().text('Starting…');
-
-        try {
-            const result = await runAgent3OnFullChat({
-                skipAlreadyProcessed: skipDone,
-                onProgress: ({ current, total, factsAdded }) => {
-                    progress.text(`Message ${current}/${total} · ${factsAdded} facts added`);
-                },
-                shouldCancel: () => fullChatCancel,
-            });
-            const verb = fullChatCancel ? 'cancelled' : 'finished';
-            toastr.success(`Full-chat ${verb}: ${result.processed} processed, ${result.skipped} skipped, ${result.factsAdded} facts added`, 'BF Memory');
-            progress.text(`${verb}: ${result.processed} processed, ${result.skipped} skipped, ${result.factsAdded} facts`);
-        } catch (err) {
-            toastr.error(`Full-chat failed: ${err.message}`, 'BF Memory');
-            progress.text(`Failed: ${err.message}`);
-        } finally {
-            fullChatRunning = false;
-            btn.prop('disabled', false).text('Run the Scribe on full chat');
-            cancelBtn.hide();
-        }
-    });
-
-    $('#bf_mem_run_full_chat_cancel').on('click', () => {
-        fullChatCancel = true;
-        $('#bf_mem_run_full_chat_cancel').prop('disabled', true).text('Cancelling…');
-    });
+    // redesign-v2 (S5): the per-message "Run the Scribe on full chat" button was removed — the
+    // chunked catch-up importer below is the single retroactive-extraction path now.
 
     // --- Catch-up import (chunked backlog onboarding, src/catchup-import.js) ---
     // One Scribe call per CHUNK of messages instead of per message — the cheap way to onboard a
@@ -3226,12 +2175,6 @@ export async function initSettings() {
                 toastr.warning('A catch-up import is already running.', 'BF Memory');
                 return;
             }
-            if (fullChatRunning) {
-                // Both share the DB map safely, but running them at once interleaves the
-                // Last Generated/Inserted views confusingly — one bulk run at a time.
-                toastr.warning('"Run the Scribe on full chat" is still running — wait for it to finish.', 'BF Memory');
-                return;
-            }
             // Cost estimate up front (FIX #9 pattern): calls = chunks. planCatchupChunks reads the
             // live chat without spending anything.
             const chat = getContext().chat || [];
@@ -3243,7 +2186,6 @@ export async function initSettings() {
             if (!confirm(`Catch-up import this chat in chunks?\n\nThis will make ~${chunks.length} LLM call(s) (one per chunk of ≤${extensionSettings.catchupBatchSize} messages; ${eligibleCount} unprocessed message(s) out of ${totalMsgs} total). Per-chunk prompts are bigger than per-message ones.\n\nDon't chat in this conversation while it runs. Proceed?`)) return;
 
             btn.prop('disabled', true).text('Importing...');
-            $('#bf_mem_run_full_chat').prop('disabled', true); // no full-chat Scribe run while importing
             cancelBtn.show().prop('disabled', false);
             progress.show();
             progressText.text('Starting…');
@@ -3269,9 +2211,6 @@ export async function initSettings() {
             progressText.text(`Failed: ${err.message || err}`);
         } finally {
             btn.prop('disabled', false).html('<i class="fa-solid fa-forward-fast"></i> Catch-up import');
-            // Safe unconditionally: the fullChatRunning guard above means a full-chat run can
-            // never be the one holding this button disabled while we're in this handler.
-            $('#bf_mem_run_full_chat').prop('disabled', false);
             cancelBtn.hide().prop('disabled', false).html('<i class="fa-solid fa-stop"></i> Cancel');
         }
     });
@@ -3319,11 +2258,6 @@ export async function initSettings() {
     $(document).on('change', '.bf-mem-log-level', () => renderDebugLog());
     $('#bf_mem_log_subsystem').on('change', () => renderDebugLog());
     $('#bf_mem_log_search').on('input', () => renderDebugLog());
-
-    // "What Claude did" tool-activity panel (tool-first redesign): manual refresh + initial paint.
-    // It also auto-refreshes from addDebugLog on each tool-call event.
-    $('#bf_mem_tool_activity_refresh').on('click', () => renderToolActivity());
-    renderToolActivity();
 
     // Graph view (Database tab): show a fact's linked neighbors; Enter or button triggers it.
     $('#bf_mem_graph_btn').on('click', () => renderGraphView($('#bf_mem_graph_key').val()));
@@ -3498,6 +2432,7 @@ export async function initSettings() {
         reloadSceneFromChat();
         reloadReflectionFromChat();
         reloadPyramidFromChat();
+        reloadSheetFromChat();
         reloadEntitiesUI();
 
         // Remember which chat we're now on so the NEXT switch can report an accurate
@@ -3516,6 +2451,7 @@ export async function initSettings() {
     reloadSceneFromChat();
     reloadReflectionFromChat();
     reloadPyramidFromChat();
+    reloadSheetFromChat();
     reloadEntitiesUI();
 
     // Save to active profile on page close/refresh

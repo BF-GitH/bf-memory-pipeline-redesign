@@ -10,9 +10,9 @@
 // module evaluation), which ESM resolves safely via hoisted function declarations.
 
 import { getSettings } from './settings.js';
-import { getContext, escapeHtml, safeStringify, fmt } from './ui-util.js';
+import { getContext, escapeHtml, safeStringify } from './ui-util.js';
 import {
-    addToolLoopTokens, getLastRunTokens, getSessionTokens,
+    getLastRunTokens, getSessionTokens,
     getLastGenerated, getLastInserted, getLastInjection, getScene,
 } from './turn-state.js';
 
@@ -399,14 +399,6 @@ export function addDebugLog(type, message, opts = {}) {
     logFileDirty = true;
     void flushDebugLogFile(false); // throttled; async fire-and-forget (errors swallowed)
     renderDebugLog();
-    // Tool-first redesign: refresh the "What Claude did" panel on tool-call events so memory
-    // recalls/writes appear live. Cheap (scans the small ring buffer); guarded inside.
-    // Each such event is ONE tool invocation → also fold its estimated re-billed prompt
-    // round-trip into the run/session token records (addToolLoopTokens).
-    if (entry.event === 'tool.search_memory' || entry.event === 'tool.remember_fact') {
-        addToolLoopTokens();
-        renderToolActivity();
-    }
 
     if (getSettings()?.debugMode) {
         const tag = level.toUpperCase();
@@ -416,66 +408,8 @@ export function addDebugLog(type, message, opts = {}) {
     }
 }
 
-// Per-turn tool-call count beyond which a turn is flagged as a possible runaway tool loop (Phase 2
-// observability). Soft — purely visual; nothing is blocked.
-const TOOL_ACTIVITY_SOFTCAP = 8;
-
-/**
- * "What Claude did" panel (tool-first redesign). Scans the in-memory debug ring buffer for the
- * main model's memory tool calls (`search_memory` recall + `remember_fact` pin), groups them by
- * runId (one turn), and renders the most recent turns so the user can SEE the tool-driven memory
- * working. A high per-turn call count is flagged. Pure read of `debugLog`; safe to call anytime.
- */
-export function renderToolActivity() {
-    const el = document.getElementById('bf_mem_tool_activity');
-    if (!el) return; // panel not in DOM (older template / tab not built) — no-op
-    const summaryEl = document.getElementById('bf_mem_tool_activity_summary');
-    const calls = debugLog.filter(e => e.event === 'tool.search_memory' || e.event === 'tool.remember_fact');
-    if (calls.length === 0) {
-        el.innerHTML = '<div class="bf-mem-hint" style="opacity:.7;">No memory tool calls recorded yet. When the main model calls <code>search_memory</code> / <code>remember_fact</code>, they appear here.</div>';
-        if (summaryEl) summaryEl.textContent = '';
-        return;
-    }
-    const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    // Group by runId (a turn), preserving the newest-first order of the buffer.
-    const groups = new Map(); // runId -> { rid, search: [], write: [] }
-    for (const e of calls) {
-        const rid = e.runId || '(no turn id)';
-        if (!groups.has(rid)) groups.set(rid, { rid, search: [], write: [] });
-        const g = groups.get(rid);
-        (e.event === 'tool.search_memory' ? g.search : g.write).push(e);
-    }
-    const turns = [...groups.values()].slice(0, 12); // most recent 12 turns
-    // Per-call token ESTIMATE: each tool call re-bills the whole prompt as an extra round-trip,
-    // priced at the LAST measured main-model prompt input (see addToolLoopTokens). One current
-    // figure is applied to every listed turn — older turns had a different prompt size, so their
-    // line is an approximation (0 → estimate hidden when no run has measured input yet).
-    const perCall = Number(getLastRunTokens()?.actualInput) || Number(getLastRunTokens()?.baselineInput) || 0;
-    let totalSearch = 0, totalWrite = 0;
-    const html = turns.map(g => {
-        const n = g.search.length + g.write.length;
-        totalSearch += g.search.length; totalWrite += g.write.length;
-        const hot = n > TOOL_ACTIVITY_SOFTCAP;
-        const rows = [];
-        for (const e of g.search) {
-            const d = e.data || {};
-            const cnt = d.resultCount != null ? d.resultCount : '?';
-            rows.push(`<div class="bf-mem-tool-row"><span class="bf-mem-tool-badge bf-mem-tool-search">recall</span> <code>${esc(d.query || '')}</code>${d.category ? ` <span class="bf-mem-dim">[${esc(d.category)}]</span>` : ''}${d.with ? ` <span class="bf-mem-dim">with ${esc(d.with)}</span>` : ''} → <b>${esc(cnt)}</b> fact(s)</div>`);
-        }
-        for (const e of g.write) {
-            const d = e.data || {};
-            rows.push(`<div class="bf-mem-tool-row"><span class="bf-mem-tool-badge bf-mem-tool-write">pin</span> <code>${esc(d.category)}/${esc(d.key)}</code> = ${esc(String(d.value || '').slice(0, 80))}</div>`);
-        }
-        return `<details class="bf-mem-tool-turn" open>`
-            + `<summary>Turn <code>${esc(g.rid)}</code> — ${g.search.length} recall, ${g.write.length} pin`
-            + (perCall ? ` <span class="bf-mem-dim" title="Estimated re-billed prompt tokens: ${n} call(s) × last measured prompt input (${fmt(perCall)}). Each tool call re-sends the whole prompt as an extra round-trip.">· ~${fmt(n * perCall)} tok</span>` : '')
-            + (hot ? ` <span class="bf-mem-tool-warn" title="High tool-call count this turn — possible runaway loop">⚠ ${n} calls</span>` : '')
-            + `</summary>${rows.join('')}</details>`;
-    }).join('');
-    el.innerHTML = html;
-    if (summaryEl) summaryEl.textContent = `${turns.length} turn(s) · ${totalSearch} recall, ${totalWrite} pin`
-        + (perCall ? ` · ~${fmt((totalSearch + totalWrite) * perCall)} tok est.` : '');
-}
+// redesign-v2 (S1): the "What Claude did" tool-activity panel (renderToolActivity) was removed
+// with the writer-side function tools — the main model no longer makes memory tool calls.
 
 /**
  * "Copy Diagnostics" (Debug tab). Bundles EVERYTHING needed to debug the extension into one JSON

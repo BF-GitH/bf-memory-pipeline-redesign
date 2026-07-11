@@ -10,7 +10,7 @@
 //
 // Subcommands:
 //   /bfmem on|off|toggle   — enable/disable the pipeline
-//   /bfmem status          — toast a one-line status (enabled? preset? fact count)
+//   /bfmem status          — toast a one-line status (enabled? fact count)
 //   /bfmem recall <query>  — search long-term memory, return the formatted facts (pipeable)
 //   /bfmem facts [N]       — list up to N (default 20) stored facts (pipeable)
 //   /bfmem catchup [N|cancel] — chunked catch-up import of this chat's unprocessed backlog
@@ -56,7 +56,7 @@ async function actionStatus() {
         const dbs = await getAllDatabases();
         factCount = Object.values(dbs).reduce((n, db) => n + ((db.facts || []).length), 0);
     } catch { /* count is best-effort */ }
-    const msg = `BF Memory: ${s.enabled ? 'ON' : 'OFF'} · preset "${s.uiPreset || 'custom'}" · ${factCount} fact(s) stored`;
+    const msg = `BF Memory: ${s.enabled ? 'ON' : 'OFF'} · ${factCount} fact(s) stored`;
     toast('info', msg);
     return msg;
 }

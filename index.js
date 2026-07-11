@@ -1,5 +1,5 @@
 // BF's Memory Pipeline - Main Entry Point
-// 3-agent memory system: Draft -> Retrieve -> Write -> Update
+// redesign-v2: pure-code memory-sheet injection + background Memory Agent
 
 export const extension_name = 'bf-memory-pipeline';
 
@@ -19,12 +19,9 @@ jQuery(async () => {
         const { initCommands } = await import('./src/commands.js');
         initCommands();
 
-        // Register the Writer recall tool (search_memory) when its setting is on.
-        // Default-ON since the tool-first flip; idempotent; no-ops if ST's function-tool
-        // API is unavailable. Also sync the Writer WRITE tool (remember_fact) the same way.
-        const { syncWriterRecallTool, syncWriterWriteTool } = await import('./src/agent-writer.js');
-        syncWriterRecallTool();
-        syncWriterWriteTool();
+        // redesign-v2 (S1): the writer-side function tools (search_memory / remember_fact)
+        // were REMOVED — the main writer model never uses tools anymore. Memory reaches it
+        // exclusively through the pure-code memory-sheet injection (pipeline.js).
 
         console.log('[BFMemory] Extension loaded successfully');
     } catch (error) {

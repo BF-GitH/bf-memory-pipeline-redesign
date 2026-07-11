@@ -295,28 +295,5 @@ export function toast(level, message, title, options) {
     } catch { /* notifications must never break the pipeline */ }
 }
 
-/**
- * Feature-detect SillyTavern's function-tool registration API. The register/unregister
- * pair lives either directly on the context or under `context.ToolManager` (ST has
- * exposed both shapes across versions). Returns the resolved { register, unregister }
- * (both bound to their owner to preserve `this`), or null when neither exists.
- * @returns {{register: Function, unregister: Function|null}|null}
- */
-export function getToolApi() {
-    const ctx = rawCtx();
-    if (!ctx) return null;
-    if (typeof ctx.registerFunctionTool === 'function') {
-        return {
-            register: ctx.registerFunctionTool.bind(ctx),
-            unregister: typeof ctx.unregisterFunctionTool === 'function' ? ctx.unregisterFunctionTool.bind(ctx) : null,
-        };
-    }
-    const tm = ctx.ToolManager;
-    if (tm && typeof tm.registerFunctionTool === 'function') {
-        return {
-            register: tm.registerFunctionTool.bind(tm),
-            unregister: typeof tm.unregisterFunctionTool === 'function' ? tm.unregisterFunctionTool.bind(tm) : null,
-        };
-    }
-    return null;
-}
+// redesign-v2 (S1): getToolApi() removed — the writer-side function tools are gone
+// and no module registers ST function tools anymore.

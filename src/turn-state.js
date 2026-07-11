@@ -8,7 +8,6 @@
 // (debug-log.js imports token accessors from this module). Every cross-module use happens
 // inside a function body at CALL time, which ESM resolves safely via hoisted declarations.
 
-import { estimateToolSchemaTokens } from './agent-writer.js';
 import { addDebugLog, getCurrentRunId } from './debug-log.js';
 // Intentional ESM cycle (same class as the debug-log one above): settings.js re-exports this
 // module's scene API. getSettings is a hoisted function declaration and is only ever called
@@ -321,31 +320,8 @@ export function addReflectionTokens({ reflectionInput = 0, reflectionOutput = 0 
     renderTokens();
 }
 
-// Called from addDebugLog whenever the main model actually invokes a memory tool
-// (search_memory recall / remember_fact pin) during generation.
-//
-// ESTIMATE ONLY — SillyTavern's tool-calling loop does not expose per-round token usage, but
-// each tool call makes ST re-send the ENTIRE prompt (plus the growing tool transcript) as one
-// extra billed round-trip. We price each call at this turn's measured main-model prompt input
-// (actualInput, falling back to baselineInput), which slightly UNDER-estimates: later rounds
-// also carry the earlier tool calls/results.
-//
-// ORDERING/ATTRIBUTION: the run's token record is created at prompt-ready (setRunTokens),
-// BEFORE the main generation starts; tool calls fire DURING that generation — so every tool
-// event lands on the CURRENT lastRunTokens. This is the same post-hoc stamping pattern
-// addAgent3Tokens / setMainOutputTokens use for their after-the-fact figures.
-export function addToolLoopTokens() {
-    const perCall = Number(lastRunTokens?.actualInput) || Number(lastRunTokens?.baselineInput) || 0;
-    if (lastRunTokens) {
-        lastRunTokens.toolCalls = (Number(lastRunTokens.toolCalls) || 0) + 1;
-        lastRunTokens.toolLoopIn = (Number(lastRunTokens.toolLoopIn) || 0) + perCall;
-    }
-    // Guarded += so a session record persisted before this field existed can't go NaN.
-    sessionTokens.toolCalls = (Number(sessionTokens.toolCalls) || 0) + 1;
-    sessionTokens.toolLoopIn = (Number(sessionTokens.toolLoopIn) || 0) + perCall;
-    saveTokensToMeta();
-    renderTokens();
-}
+// redesign-v2 (S1): addToolLoopTokens was removed with the writer-side function tools —
+// the main model never makes tool round-trips anymore, so there is nothing to estimate.
 
 // Called by pipeline.js MESSAGE_RECEIVED handler when the main reply lands.
 export function setMainOutputTokens(n) {
@@ -361,6 +337,142 @@ export function reloadTokensFromChat() {
     sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, toolCalls: 0, toolLoopIn: 0, runs: 0 };
     loadTokensFromMeta();
     renderTokens();
+}
+
+// --- Memory Sheet (persistent — stored in chat_metadata.bf_mem_sheet) --------------------------
+// redesign-v2 (S3, G2): the ONE block of memory the writer ever sees. Rebuilt in the background
+// by the Memory Agent after each settled reply (agent-memory.js runMemoryAgent → composeSheet);
+// injected by PURE CODE on the prompt-ready events (pipeline.js, S4). The sheet is NEVER empty:
+// a chat without one yet reads the seed text, so injection is unconditional and cache-friendly.
+
+const SHEET_META_KEY = 'bf_mem_sheet';
+
+/** Seed text a brand-new chat's sheet carries until the first Memory Agent run replaces it. */
+export const SHEET_SEED_TEXT = 'Story just beginning — no memories yet.';
+
+// Cached per-chat sheet record (reloaded on CHAT_CHANGED via reloadSheetFromChat; lazily
+// loaded on first read). Shape per G2:
+// { text: string, updatedAt: ISOstring, runId: string, sourceMessageIndex: number, seeded: boolean }
+let memorySheet = null;
+let memorySheetLoaded = false; // distinguishes "not loaded yet" from "loaded, chat has none"
+
+/** Build a fresh seed-sheet record. */
+function seedSheet() {
+    return {
+        text: SHEET_SEED_TEXT,
+        updatedAt: new Date().toISOString(),
+        runId: '',
+        sourceMessageIndex: -1,
+        seeded: true,
+    };
+}
+
+/** Coerce a stored value into the sheet shape, or null if unusable/blank. */
+function normalizeSheet(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const text = typeof raw.text === 'string' ? raw.text.trim() : '';
+    if (!text) return null; // a blank sheet is treated as absent — getMemorySheet re-seeds
+    const srcIdx = Math.floor(Number(raw.sourceMessageIndex));
+    return {
+        text,
+        updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString(),
+        runId: typeof raw.runId === 'string' ? raw.runId : '',
+        sourceMessageIndex: Number.isInteger(srcIdx) ? srcIdx : -1,
+        seeded: raw.seeded === true,
+    };
+}
+
+function loadSheetFromMeta() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return null;
+        return normalizeSheet(md[SHEET_META_KEY]);
+    } catch { return null; }
+}
+
+function saveSheetToMeta() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[SHEET_META_KEY] = memorySheet;
+        ctx.saveMetadata?.();
+    } catch { /* best-effort */ }
+}
+
+/**
+ * The current chat's memory-sheet record. NEVER returns an empty/absent sheet: when the chat
+ * has none (or a blank one), a seed record is minted, lazily persisted, and returned — so the
+ * injection path can splice unconditionally and the "empty-seeded → skip trimming" signal is
+ * just `rec.seeded`.
+ * @returns {{text:string, updatedAt:string, runId:string, sourceMessageIndex:number, seeded:boolean}}
+ */
+export function getMemorySheet() {
+    if (!memorySheetLoaded) {
+        memorySheet = loadSheetFromMeta();
+        memorySheetLoaded = true;
+    }
+    if (!memorySheet || !String(memorySheet.text || '').trim()) {
+        memorySheet = seedSheet();
+        saveSheetToMeta(); // lazily persist the seed so the metadata always carries a sheet
+    }
+    return memorySheet;
+}
+
+/**
+ * Store a freshly-composed memory sheet (replaces the prior one — it's rolling state, not a
+ * log). An empty/blank `text` is REFUSED (never leave the sheet empty — F-SCRIBE-1's
+ * generalized "keep the previous sheet" contract lives here).
+ * @param {string} text - the full rendered sheet (composeSheet output)
+ * @param {{runId?: string, sourceMessageIndex?: number}} [opts]
+ */
+export function setMemorySheet(text, { runId = '', sourceMessageIndex = -1 } = {}) {
+    const t = String(text ?? '').trim();
+    if (!t) {
+        addDebugLog('fail', 'setMemorySheet refused an empty sheet — keeping the previous one', {
+            subsystem: 'pipeline', event: 'sheet.refused', reason: 'EMPTY_SHEET',
+        });
+        return;
+    }
+    const srcIdx = Math.floor(Number(sourceMessageIndex));
+    memorySheet = {
+        text: t,
+        updatedAt: new Date().toISOString(),
+        runId: typeof runId === 'string' ? runId : '',
+        sourceMessageIndex: Number.isInteger(srcIdx) ? srcIdx : -1,
+        seeded: false,
+    };
+    memorySheetLoaded = true;
+    saveSheetToMeta();
+    renderMemorySheet();
+    addDebugLog('info', `Memory sheet updated (${t.length} chars, source msg ${memorySheet.sourceMessageIndex})`, {
+        subsystem: 'pipeline', event: 'sheet.updated',
+        data: { chars: t.length, sourceMessageIndex: memorySheet.sourceMessageIndex, runId: memorySheet.runId },
+    });
+}
+
+/** Re-load the sheet from the current chat's metadata. Called on CHAT_CHANGED. */
+export function reloadSheetFromChat() {
+    memorySheet = loadSheetFromMeta();
+    memorySheetLoaded = true;
+    renderMemorySheet();
+}
+
+/**
+ * Render the read-only sheet preview panel (S5 wires a `bf_mem_sheet_view` element into the
+ * Memory tab; until then this is a harmless no-op). Best-effort, never throws.
+ */
+export function renderMemorySheet() {
+    try {
+        const el = document.getElementById('bf_mem_sheet_view');
+        if (!el) return;
+        const rec = memorySheet;
+        if (!rec || !String(rec.text || '').trim()) {
+            el.innerHTML = '<div class="bf-mem-summary-empty">No memory sheet yet. It is rebuilt in the background after each reply.</div>';
+            return;
+        }
+        el.innerHTML = `<pre style="white-space:pre-wrap;margin:0;">${escapeHtml(rec.text)}</pre>`;
+    } catch { /* preview is best-effort */ }
 }
 
 // --- Scene Card (persistent — stored in chat_metadata.bf_mem_scene) ---
@@ -588,8 +700,7 @@ export function setScene(patch, runId = '') {
     // the new sceneNo so the map rides the scene card (normalizeScene coerces + caps it).
     const prevSeen = (prev.lastSeen && typeof prev.lastSeen === 'object' && !Array.isArray(prev.lastSeen)) ? prev.lastSeen : {};
     const prevPresentSet = new Set((prev.present || []).map(p => String(p ?? '').trim().toLowerCase()).filter(Boolean));
-    let absenceScenes = 2;
-    try { absenceScenes = Math.max(1, Math.floor(Number(getSettings()?.reentryAbsenceScenes)) || 2); } catch { /* settings not ready — default holds */ }
+    const absenceScenes = 2; // redesign-v2 (S1): fixed (the reentryAbsenceScenes setting was removed)
     const reentries = [];
     const stampNow = Date.now();
     const lastSeen = { ...prevSeen };
@@ -841,15 +952,13 @@ function renderTokens() {
     }
 
     const L = lastRunTokens;
-    // Extension total now includes ALL four pipeline agents that make LLM calls:
-    // Drafter (agent1), Scribe (agent3), Librarian/finder (Agent 4) and the Reflection pass —
-    // PLUS the estimated Writer tool-loop round-trips (each search_memory / remember_fact call
-    // re-bills the whole prompt; see addToolLoopTokens), so the NET row reflects them.
+    // Extension total = the background agent LLM calls (Memory Agent + Reflection) on top of
+    // the main model's own input/output. Legacy fields (agent1/finder/selector) render as 0
+    // on records that pre-date the redesign-v2 purge.
     const fIn = L.finderInput || 0, fOut = L.finderOutput || 0;
     const selIn = L.selectorInput || 0, selOut = L.selectorOutput || 0;
     const rIn = L.reflectionInput || 0, rOut = L.reflectionOutput || 0;
-    const tIn = L.toolLoopIn || 0, tCalls = L.toolCalls || 0;
-    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0) + fIn + selIn + rIn + tIn;
+    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0) + fIn + selIn + rIn;
     const extOut = (L.mainOutput || 0) + (L.agent1Output || 0) + (L.agent3Output || 0) + fOut + selOut + rOut;
     const netIn = extIn - (L.baselineInput || 0);   // negative = saved
     const netOut = extOut - (L.mainOutput || 0);     // agent output overhead (always >= 0)
@@ -866,11 +975,6 @@ function renderTokens() {
     const netInClass = netIn < 0 ? 'bf-mem-tok-save' : 'bf-mem-tok-bad';
     const netInStr = (netIn < 0 ? '' : '+') + fmt(netIn);
 
-    // Fixed per-request cost of the ENABLED Writer tool schemas (rough JSON-length/4 estimate;
-    // 0 when both tools are off). Shown as a one-liner so the always-on overhead is visible.
-    let schemaTok = 0;
-    try { schemaTok = estimateToolSchemaTokens(); } catch { /* estimator unavailable — hide the line */ }
-
     lastEl.innerHTML = `
         <table class="bf-mem-db-table">
             <thead><tr><th></th><th>Input</th><th>Output</th></tr></thead>
@@ -882,20 +986,15 @@ function renderTokens() {
                 ${(selIn || selOut) ? `<tr><td>— Selector (semantic pass)</td><td>${fmt(selIn)}</td><td>${fmt(selOut)}</td></tr>` : ''}
                 <tr><td>— Scribe</td><td>${fmt(L.agent3Input)}</td><td>${fmt(L.agent3Output)}</td></tr>
                 <tr><td>— Reflection</td><td>${fmt(rIn)}</td><td>${fmt(rOut)}</td></tr>
-                ${(tCalls || tIn) ? `<tr><td title="Each search_memory / remember_fact call makes SillyTavern re-send the whole prompt as an extra billed round-trip. Estimated as calls × this turn's measured prompt input (ST doesn't expose per-round usage).">— Tool round-trips (est., ${tCalls} call${tCalls === 1 ? '' : 's'})</td><td>~${fmt(tIn)}</td><td>—</td></tr>` : ''}
                 <tr><td><b>Extension total</b></td><td><b>${fmt(extIn)}</b></td><td><b>${fmt(extOut)}</b></td></tr>
                 <tr><td><b>NET vs baseline</b></td><td class="${netInClass}">${netInStr}</td><td class="bf-mem-tok-cost">+${fmt(netOut)}</td></tr>
             </tbody>
         </table>
-        ${schemaTok ? `<small class="bf-mem-hint" title="Fixed overhead billed on EVERY main-model request while the tools are enabled: each request carries the tool descriptions + parameter schemas. Approximated as JSON length ÷ 4.">Tool schemas (per request): ~${fmt(schemaTok)} tokens</small><br>` : ''}
         <small class="bf-mem-hint">Approx. token counts (local tokenizer). Negative input = saved; output overhead is the agent calls.</small>`;
 
     if (sessEl) {
         const s = sessionTokens;
-        // Session NET includes the estimated tool-loop round-trips too (same reasoning as the
-        // last-run table above).
-        const sToolIn = s.toolLoopIn || 0, sToolCalls = s.toolCalls || 0;
-        const sExtIn = (s.actualInput || 0) + (s.agentInput || 0) + sToolIn;
+        const sExtIn = (s.actualInput || 0) + (s.agentInput || 0);
         const sExtOut = (s.mainOutput || 0) + (s.agentOutput || 0);
         const sNetIn = sExtIn - (s.baselineInput || 0);
         const sNetClass = sNetIn < 0 ? 'bf-mem-tok-save' : 'bf-mem-tok-bad';
@@ -904,7 +1003,6 @@ function renderTokens() {
                 <thead><tr><th>${s.runs} run(s)</th><th>Input</th><th>Output</th></tr></thead>
                 <tbody>
                     <tr><td>Baseline total</td><td>${fmt(s.baselineInput)}</td><td>${fmt(s.mainOutput)}</td></tr>
-                    ${(sToolCalls || sToolIn) ? `<tr><td title="Each search_memory / remember_fact call re-bills the whole prompt as an extra round-trip (estimated).">Tool round-trips (est., ${sToolCalls} call${sToolCalls === 1 ? '' : 's'})</td><td>~${fmt(sToolIn)}</td><td>—</td></tr>` : ''}
                     <tr><td>Extension total</td><td>${fmt(sExtIn)}</td><td>${fmt(sExtOut)}</td></tr>
                     <tr><td><b>NET</b></td><td class="${sNetClass}">${(sNetIn < 0 ? '' : '+') + fmt(sNetIn)}</td><td class="bf-mem-tok-cost">+${fmt(sExtOut - (s.mainOutput || 0))}</td></tr>
                 </tbody>

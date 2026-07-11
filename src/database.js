@@ -1095,254 +1095,8 @@ const IDB_STORE = 'character_dbs';
 // can recognize an old on-disk shape. Bump only on a breaking record-shape change.
 const SNAPSHOT_SCHEMA_VERSION = 1;
 
-// =============================================================================
-// USER-LEVEL SHARED MEMORY (opt-in; setting `userLevelMemory`, default OFF).
-// A single GLOBAL store holding facts about the player ({{user}}) so EVERY character remembers
-// them instead of re-learning per character. It is just ANOTHER avatar record in the SAME IDB
-// store + the SAME `bf_memory_db_<category>.json` attachment layer, keyed by this fixed
-// PSEUDO-AVATAR string (never a real character avatar, so it can't collide). All the existing
-// load / save / snapshot / rehydrate machinery is reused unchanged — zero new persistence code,
-// fully durable + device-independent + back-compat. When the setting is OFF this key is NEVER
-// read or written, so storage+retrieval are byte-identical to today.
-//
-// NOTE: attachments are stored under `character_attachments[avatar]`. The shared store's
-// attachment files therefore live under this pseudo-avatar key; SillyTavern treats it as an
-// (orphan) attachment bucket, which is harmless — it is never a selectable character.
-const SHARED_USER_AVATAR = 'bf_shared_user_memory';
-
-/** Is the opt-in user-level shared memory feature ON? Defaults OFF; never throws. */
-function sharedUserMemoryEnabled() {
-    try {
-        return host.getExtensionSettings()?.userLevelMemory === true;
-    } catch {
-        return false;
-    }
-}
-
-/**
- * Does this fact's SUBJECT resolve to the user persona ({{user}})? Used to decide which facts to
- * MIRROR into the shared user store. Resolution reuses deriveSubject (explicit `subject` → key
- * prefix, reserved-token resolution) so a fact filed under the live persona NAME or the generic
- * `user`/`{{user}}` token both match. Best-effort; returns false on any error or when the persona
- * name is unknown. Sequence/track facts are excluded — they're chat-local narrative scaffolding,
- * not portable identity facts about the player.
- * @param {FactSchema} fact
- * @returns {boolean}
- */
-function isUserSubjectFact(fact) {
-    try {
-        if (!fact || isSequenceFact(fact)) return false;
-        const subject = deriveSubject(fact); // lowercased, reserved-token-resolved
-        if (!subject) return false;
-        // Match the resolved live persona name, or the un-resolvable generic placeholders (covers
-        // the unnamed-persona fallback where resolveGenericSubjectToken returns the literal token).
-        if (_RESERVED_USER_SUBJECT.has(subject)) return true;
-        const persona = String(host.getUserPersonaName() || '').trim().toLowerCase();
-        return !!persona && subject === persona;
-    } catch {
-        return false;
-    }
-}
-
-/**
- * Read the shared user store's full { category: DatabaseSchema } map. Reuses loadAllDatabases
- * (IDB-first with attachment rehydrate/fallback) against the pseudo-avatar. Never throws.
- * @returns {Promise<Object<string, DatabaseSchema>>}
- */
-async function loadSharedUserDatabases() {
-    try {
-        return await loadAllDatabases(SHARED_USER_AVATAR);
-    } catch (e) {
-        console.error('[BFMemory] shared user store load failed', e);
-        return {};
-    }
-}
-
-/**
- * Mirror the user-subject facts of ONE just-saved category into the shared user store (read-merge-
- * write against the pseudo-avatar via the SAME upsert + persistence machinery). Best-effort and
- * fully isolated: any failure is swallowed so the primary per-character write is never affected.
- *
- * IMPORTANT: this routes a COPY into the shared store; the fact ALSO remains in the character store
- * (the character store stays the source of truth and WINS on read-merge conflicts). We upsert into
- * a freshly-loaded shared-store category so merges/supersession behave exactly as in a normal save.
- * @param {DatabaseSchema} charDb - the category db just written for the active character
- */
-async function mirrorUserFactsToSharedStore(charDb) {
-    if (!charDb || !Array.isArray(charDb.facts) || charDb.facts.length === 0) return;
-    const userFacts = charDb.facts.filter(isUserSubjectFact);
-    if (userFacts.length === 0) return;
-    try {
-        const sharedMap = await loadSharedUserDatabases();
-        const category = charDb.category;
-        const sharedDb = sharedMap[category] && Array.isArray(sharedMap[category].facts)
-            ? sharedMap[category]
-            : { category, facts: [] };
-        let changed = 0;
-        for (const f of userFacts) {
-            // Deep-clone so the shared copy and the character copy never alias the same object
-            // (an in-place merge in one store must not silently mutate the other). Drop the
-            // transient `__sharedOrigin` read-merge tag so it is never persisted into the store.
-            const clone = JSON.parse(JSON.stringify(f));
-            delete clone.__sharedOrigin;
-            upsertFact(sharedDb, clone);
-            changed++;
-        }
-        if (changed === 0) return;
-        await saveSharedUserDatabase(sharedDb);
-        addDebugLog('debug', 'Mirrored user facts into shared user store', {
-            subsystem: 'db', event: 'db.sharedUser.mirror',
-            data: { category, mirrored: changed },
-        });
-    } catch (e) {
-        // Never break the per-character write because the optional shared mirror failed.
-        console.error('[BFMemory] mirrorUserFactsToSharedStore failed', e);
-    }
-}
-
-/**
- * Persist ONE category db into the shared user store (pseudo-avatar). Mirrors saveDatabase's
- * hybrid IDB-first / attachment-fallback body but PINNED to SHARED_USER_AVATAR (saveDatabase
- * itself is hard-wired to getCharacterAvatar()). Applies cold-tiering like the normal path.
- * Never invalidates the per-character cache (that key is unrelated). Best-effort; throws only to
- * its caller (mirrorUserFactsToSharedStore), which swallows.
- * @param {DatabaseSchema} db
- */
-async function saveSharedUserDatabase(db) {
-    coldTierOverflow(db);
-    if (idbAvailable()) {
-        try {
-            // ATOMIC read-modify-write (F-STOR-2): ONE readwrite transaction via idbUpdateRecord,
-            // so a mirror racing another mirror (or the shared-store clear) can't interleave a
-            // stale read and silently drop a category. Same tombstone lifecycle as saveDatabase:
-            // writing a category clears its delete-tombstone; others carry through.
-            await idbUpdateRecord(SHARED_USER_AVATAR, (rec) => {
-                const databases = (rec && rec.databases) ? rec.databases : {};
-                databases[db.category] = db;
-                const tombs = { ...((rec && rec.deletedCategories) || {}) };
-                delete tombs[db.category];
-                return { databases, updatedAt: Date.now(), deletedCategories: tombs };
-            });
-            scheduleSnapshot(SHARED_USER_AVATAR);
-            return;
-        } catch (e) {
-            console.error('[BFMemory] shared user IDB save failed; falling back to attachment', e);
-            disableIdb('shared user IDB save failed mid-session');
-        }
-    }
-    await saveDatabaseToAttachment(SHARED_USER_AVATAR, db);
-}
-
-/**
- * CLEAR the entire shared user store (user-level shared memory). Wipes both the IDB working
- * record and every durable attachment file pinned to SHARED_USER_AVATAR, so the cross-character
- * "facts about you" pool is emptied. Cancels any throttled snapshot for that avatar first so it
- * can't re-upload after the wipe, and invalidates the per-turn cache so the next read reflects the
- * cleared state. Best-effort + isolated: an IDB failure still removes the attachment files, and a
- * single failed file delete never aborts the rest. Does NOT touch any character's own store — only
- * the shared pseudo-avatar. Returns a small summary for the caller to surface.
- * @returns {Promise<{categories:number, files:number}>}
- */
-export async function clearSharedUserMemory() {
-    // A wipe is a write to the shared store; drop the memoized map so the next getAllDatabases()
-    // (which merges the shared store in) re-reads the now-empty pool.
-    invalidateDatabaseCache();
-    // Cancel any armed snapshot for the shared avatar so its timer can't fire post-wipe and
-    // resurrect category files from a stale dirty IDB record.
-    try { cancelPendingSnapshot(SHARED_USER_AVATAR); } catch { /* best-effort */ }
-
-    let categories = 0;
-    // 1) Empty the IDB working record (best-effort — on failure we still clear attachments below).
-    // ATOMIC (F-STOR-2): count + wipe inside ONE readwrite transaction so a concurrent mirror
-    // write can't land between our read and our put and be silently erased without a trace.
-    // TOMBSTONES (F-STOR-4): every wiped category gets a delete-tombstone — this is a deliberate
-    // USER-destructive clear, so if any shared category is later re-created and snapshotted, the
-    // tombstones ride along and stop another device from resurrecting the wiped ones.
-    if (idbAvailable()) {
-        try {
-            await idbUpdateRecord(SHARED_USER_AVATAR, (rec) => {
-                const live = (rec && rec.databases) ? Object.keys(rec.databases) : [];
-                categories = live.length;
-                const now = Date.now();
-                const tombs = { ...((rec && rec.deletedCategories) || {}) };
-                for (const cat of live) tombs[cat] = now;
-                return { databases: {}, updatedAt: now, deletedCategories: tombs };
-            });
-        } catch (e) {
-            console.error('[BFMemory] clearSharedUserMemory: IDB wipe failed; clearing attachments only', e);
-            disableIdb('shared user IDB wipe failed');
-        }
-    }
-
-    // 2) Remove every durable bf_memory_db_*.json attachment under the shared pseudo-avatar bucket.
-    let files = 0;
-    const context = getContext();
-    const attachments = context?.extensionSettings?.character_attachments?.[SHARED_USER_AVATAR];
-    if (Array.isArray(attachments) && attachments.length) {
-        // Iterate a copy; splice the live array as we go.
-        for (const a of [...attachments]) {
-            if (!a || typeof a.name !== 'string' || !a.name.startsWith(DB_PREFIX)) continue;
-            try { await deleteAttachmentFile(a.url); } catch { /* one failed delete must not abort the rest */ }
-            const idx = attachments.indexOf(a);
-            if (idx >= 0) attachments.splice(idx, 1);
-            files++;
-        }
-        if (!categories) categories = files; // fall back to file count when IDB was unavailable
-        context.saveSettingsDebounced?.();
-    }
-
-    addDebugLog('info', `Cleared shared user memory: ${categories} category(ies), ${files} file(s) removed`, {
-        subsystem: 'db', event: 'shared_user.cleared', actor: 'USER',
-        data: { categories, files },
-    });
-    return { categories, files };
-}
-
-/**
- * Merge the shared user store into a per-character database map IN A NEW MAP (the input map is
- * never mutated). Dedupe is by `category:key`: the CHARACTER store ALWAYS WINS on conflict, so a
- * character that has its own version of a user fact is unaffected; only user facts the character
- * has NOT seen are added from the shared store. Returns the merged map. Never throws (returns the
- * original character map on any error).
- * @param {Object<string, DatabaseSchema>} charMap - the active character's loaded map
- * @param {Object<string, DatabaseSchema>} sharedMap - the shared user store map
- * @returns {Object<string, DatabaseSchema>}
- */
-function mergeSharedUserIntoCharacter(charMap, sharedMap) {
-    try {
-        if (!sharedMap || typeof sharedMap !== 'object') return charMap || {};
-        const out = {};
-        // Start from a shallow-but-array-copied clone of the character map so we never mutate the
-        // cached/shared object reference the rest of the code may still hold.
-        for (const [cat, sdb] of Object.entries(charMap || {})) {
-            out[cat] = sdb ? { ...sdb, facts: Array.isArray(sdb.facts) ? sdb.facts.slice() : [] } : { category: cat, facts: [] };
-        }
-        for (const [cat, sharedDb] of Object.entries(sharedMap)) {
-            const sharedFacts = (sharedDb && Array.isArray(sharedDb.facts)) ? sharedDb.facts : [];
-            if (sharedFacts.length === 0) continue;
-            if (!out[cat]) out[cat] = { category: cat, facts: [] };
-            const have = new Set(out[cat].facts.map(f => String(f && f.key || '')));
-            for (const sf of sharedFacts) {
-                const key = String(sf && sf.key || '');
-                if (!key || have.has(key)) continue; // character store WINS — skip duplicates
-                // Clone so the merged-in shared fact never aliases the shared store's object, and
-                // TAG it with a transient `__sharedOrigin` marker. This fact is shown to retrieval/
-                // the finder/menu like any other, but saveDatabase() STRIPS `__sharedOrigin` facts
-                // before persisting to the CHARACTER store — so the shared store stays the single
-                // source of truth for user facts and they don't get copied into every character's
-                // own store on the next write (which would defeat the dedup + risk divergence).
-                const clone = JSON.parse(JSON.stringify(sf));
-                clone.__sharedOrigin = true;
-                out[cat].facts.push(clone);
-                have.add(key);
-            }
-        }
-        return out;
-    } catch (e) {
-        console.error('[BFMemory] mergeSharedUserIntoCharacter failed', e);
-        return charMap || {};
-    }
-}
+// redesign-v2 (S1): the opt-in USER-LEVEL SHARED MEMORY store (pseudo-avatar
+// bf_shared_user_memory, mirror/merge/clearSharedUserMemory) was removed.
 
 // Capability probe result is memoized: 'unknown' until first checked, then true/false.
 let _idbCapable = 'unknown';
@@ -1771,19 +1525,6 @@ export async function flushSnapshotNow({ avatar: pinnedAvatar, reconcileDeletes 
         if (_snapshotTimers.has(avatar)) { clearTimeout(_snapshotTimers.get(avatar)); _snapshotTimers.delete(avatar); }
         _snapshotDirty.add(avatar); // ensure snapshotAvatar runs even if no timer was armed
         await snapshotAvatar(avatar, { reconcileDeletes });
-        // USER-LEVEL SHARED MEMORY (opt-in): the shared user store is a SEPARATE pseudo-avatar
-        // record with its own throttled snapshot timer; the per-character flush above never covers
-        // it. So on every meaningful flush boundary (CHAT_CHANGED / beforeunload / destructive op)
-        // ALSO flush the shared store IFF it has un-snapshotted writes. We pass reconcileDeletes:false
-        // (the conservative stance) so a transiently-empty shared store can't prune durable backups.
-        // No-op when the feature is OFF or nothing was mirrored (dirty set empty). Self-guarded.
-        if (sharedUserMemoryEnabled() && _snapshotDirty.has(SHARED_USER_AVATAR)) {
-            if (_snapshotTimers.has(SHARED_USER_AVATAR)) {
-                clearTimeout(_snapshotTimers.get(SHARED_USER_AVATAR));
-                _snapshotTimers.delete(SHARED_USER_AVATAR);
-            }
-            await snapshotAvatar(SHARED_USER_AVATAR, { reconcileDeletes: false });
-        }
     } catch (e) {
         console.error('[BFMemory] flushSnapshotNow failed', e);
     }
@@ -1854,21 +1595,7 @@ export async function getAllDatabases() {
     _dbCacheChatId = chatId;
     _dbCachePromise = (async () => {
         try {
-            let result = await loadAllDatabases(avatar);
-            // USER-LEVEL SHARED MEMORY (opt-in): merge the global shared user store ON TOP of this
-            // character's map so the player's facts surface for EVERY character. Dedupe is by
-            // category:key with the CHARACTER store winning (a character's own version is untouched).
-            // Self-guarded: any failure falls back to the un-merged character map (today's behavior).
-            // The merged result is what gets cached/served, and the cache invalidates on every write,
-            // so a freshly-mirrored user fact is visible on the next read.
-            if (sharedUserMemoryEnabled()) {
-                try {
-                    const sharedMap = await loadSharedUserDatabases();
-                    result = mergeSharedUserIntoCharacter(result, sharedMap);
-                } catch (e) {
-                    console.error('[BFMemory] shared user merge failed; serving character map only', e);
-                }
-            }
+            const result = await loadAllDatabases(avatar);
             // Only commit to the cache if neither the avatar NOR the chatId changed under us mid-load
             // and the cache wasn't invalidated (a write/switch during the fetch nulls the keys). This
             // stops a load started under chat A from committing under chat B (same character).
@@ -2753,19 +2480,8 @@ export async function saveDatabase(db) {
     // concurrent read mid-upload can't latch onto a now-stale snapshot.
     invalidateDatabaseCache();
 
-    // USER-LEVEL SHARED MEMORY (opt-in): when ON, getAllDatabases() merges shared-store user facts
-    // into the character map TAGGED with a transient `__sharedOrigin`. Those copies must NOT be
-    // persisted into the CHARACTER store (the shared store is the single source of truth for user
-    // facts; copying them per-character would defeat the dedup + risk divergence). So before writing
-    // we STRIP them, persisting only the character's OWN facts. The mirror below still routes the
-    // character's user-subject facts back into the shared store. `mirrorSource` keeps the FULL
-    // (pre-strip) fact list so an updated shared-origin user fact still reaches the shared store.
-    // When the feature is OFF nothing is ever tagged, so this is a no-op and behavior is unchanged.
-    let mirrorSource = db;
-    if (sharedUserMemoryEnabled() && Array.isArray(db.facts) && db.facts.some(f => f && f.__sharedOrigin)) {
-        mirrorSource = db; // mirror considers the full set (incl. updated shared-origin user facts)
-        db = { ...db, facts: db.facts.filter(f => !(f && f.__sharedOrigin)) };
-    }
+    // redesign-v2 (S1): the user-level shared-memory strip/mirror was removed. Old facts that
+    // still carry a stale `__sharedOrigin` tag are persisted as ordinary character facts.
 
     // INFINITE FACTS — RANK, NEVER EVICT. We do NOT delete facts when a category grows. Instead,
     // when the ACTIVE hot working set overflows HOT_SET_SIZE, the lowest-salience overflow is
@@ -2799,12 +2515,6 @@ export async function saveDatabase(db) {
             });
             // Mark dirty + arm the throttled durable snapshot to attachments.
             scheduleSnapshot(avatar);
-            // USER-LEVEL SHARED MEMORY (opt-in): ALSO mirror this category's user-subject facts into
-            // the global shared store so every character remembers them. Awaited but self-guarded —
-            // a failed mirror never affects the primary per-character write above (already done).
-            // Mirror from `mirrorSource` (the pre-strip full set) so an updated shared-origin user
-            // fact still reaches the shared store even though it was stripped from the char write.
-            if (sharedUserMemoryEnabled()) await mirrorUserFactsToSharedStore(mirrorSource);
             return;
         } catch (e) {
             // IDB write failed mid-session → disable IDB and fall back to attachment-only for the
@@ -2816,9 +2526,6 @@ export async function saveDatabase(db) {
 
     // FALLBACK / attachment-only path (also the original behavior): upload synchronously.
     await saveDatabaseToAttachment(avatar, db);
-    // Mirror into the shared user store on the fallback path too (opt-in, self-guarded). Uses the
-    // pre-strip full set (mirrorSource) so updated shared-origin user facts still reach the store.
-    if (sharedUserMemoryEnabled()) await mirrorUserFactsToSharedStore(mirrorSource);
 }
 
 /**
@@ -3047,11 +2754,9 @@ export function upsertFact(db, fact) {
             const mergedContext = mergeContext(existing.context, seqFact.context);
             const mergedAliases = mergeAliases(existing.aliases, seqFact.aliases);
             const mergedInvolved = mergeInvolved(existing.involved, seqFact.involved);
-            // Typed edges (F-ARCH-7): union additively like the other accumulating fields.
-            const mergedEdges = mergeEdges(existing.edges, seqFact.edges);
             const sal = mergeSalience(existing, seqFact);
             const oldSeqVal = existing.value;
-            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...mergeProvenance(existing, seqFact, Date.now()), createdAt: existing.createdAt || new Date().toISOString(), lastUpdated: Date.now() };
+            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, seqFact, Date.now()), createdAt: existing.createdAt || new Date().toISOString(), lastUpdated: Date.now() };
             if (!factValuesEqual(oldSeqVal, seqFact.value)) {
                 addDebugLog('debug', `Sequence step updated: [${db.category}] ${existing.key} (track ${seqFact.track}, ord ${ord})`, {
                     subsystem: 'db', event: 'fact.updated', reason: 'VALUE_CHANGED',
@@ -3162,11 +2867,6 @@ export function upsertFact(db, fact) {
         const mergedAliases = mergeAliases(existing.aliases, fact.aliases);
         // Involved feature: union participants so a bare re-mention can't wipe a prior list.
         const mergedInvolved = mergeInvolved(existing.involved, fact.involved);
-        // Typed edges (F-ARCH-7): union additively (dedupe by p+t, incoming wins ties, cap
-        // MAX_FACT_EDGES) so a re-mention accumulates relationship triples rather than wiping
-        // them. Only ever non-undefined when the opt-in typedEdges feature wrote edges, so the
-        // default path stays byte-identical (an undefined `edges` never survives JSON).
-        const mergedEdges = mergeEdges(existing.edges, fact.edges);
         // Merge salience: keep the HIGHER importance (a fact only grows more foundational
         // as it's re-mentioned, never wiped by a bare re-mention); prefer the incoming
         // kind if the writer provided one, else keep existing.
@@ -3192,19 +2892,8 @@ export function upsertFact(db, fact) {
                 supersededAt: now,
                 supersededBy: existing.key, // in-place: canonical key is unchanged
             };
-            // BI-TEMPORAL (feature, opt-in): when story-world validity is being tracked, close the
-            // OUTGOING (now-inactive) fact's story-world window — stamp its `validUntil` with the
-            // INCOMING fact's `validFrom` (the moment the new truth begins), falling back to the
-            // current wall-clock time if the writer gave no `from:`. Only do this when the feature
-            // is enabled AND the snapshot doesn't already carry a `validUntil` (don't overwrite an
-            // explicit end the writer set). `supersededAt` already records the RECORD-time end; this
-            // adds the distinct STORY-WORLD end so flashbacks/time-skips stay consistent. Wrapped in
-            // try/catch + a default-off settings read so the hot supersession path never breaks.
-            try {
-                if (host.getExtensionSettings()?.biTemporal === true && !snapshot.validUntil) {
-                    snapshot.validUntil = fact.validFrom || new Date(now).toISOString();
-                }
-            } catch { /* settings unavailable — leave the snapshot's story-world window open */ }
+            // redesign-v2 (S1): the opt-in bi-temporal validUntil stamping was removed
+            // (existing validFrom/validUntil fields on old facts are carried through untouched).
             // Drop any prior superseded snapshot of this same logical key (keep just one).
             const normCanon = normalizeFactKey(existing.key);
             db.facts = db.facts.filter(f =>
@@ -3228,7 +2917,7 @@ export function upsertFact(db, fact) {
             if (typeof fact?.sourceMsg === 'string' && fact.sourceMsg) liveSceneOverride.sourceMsg = fact.sourceMsg;
             db.facts[canonIdx] = {
                 ...existing, ...fact, key: existing.key, relationships: mergedRels,
-                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...liveSceneOverride, active: true,
+                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...liveSceneOverride, active: true,
                 ...mergeProvenance(existing, fact, now),
                 createdAt: existing.createdAt || new Date(now).toISOString(),
                 supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
@@ -3247,7 +2936,7 @@ export function upsertFact(db, fact) {
         // (renaming would orphan any relationship refs pointing at the old key).
         const oldValue = existing.value;
         const updNow = Date.now();
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, edges: mergedEdges, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
         if (factValuesEqual(oldValue, fact.value)) {
             addDebugLog('debug', `Fact unchanged: [${db.category}] ${existing.key}`, {
                 subsystem: 'db', event: 'fact.unchanged',
@@ -3460,13 +3149,7 @@ function invalidateFactCrossKey(db, target, triggerRef, ruleId, now) {
     target.active = false;
     target.supersededAt = now;
     target.supersededBy = triggerRef; // Category/key cross-ref form (no readers depend on bare keys)
-    // BI-TEMPORAL (opt-in): close the story-world window when the feature is on and the fact
-    // doesn't already carry an explicit end (same policy as upsertFact's supersession branch).
-    try {
-        if (host.getExtensionSettings()?.biTemporal === true && !target.validUntil) {
-            target.validUntil = new Date(now).toISOString();
-        }
-    } catch { /* settings unavailable — leave the story-world window open */ }
+    // redesign-v2 (S1): bi-temporal validUntil stamping removed (old fields tolerated on load).
     // Drop any prior superseded snapshot of this same logical key (keep just one).
     const normCanon = normalizeFactKey(canonicalKey);
     db.facts = db.facts.filter(f =>
@@ -3999,42 +3682,8 @@ function mergeInvolved(existing, incoming) {
     return out.length ? out : undefined;
 }
 
-// Hard cap on stored typed edges per fact (F-ARCH-7). The Scribe is capped at 3 per WRITE;
-// the STORED union across re-mentions may accumulate up to this many before the oldest
-// (existing) entries are dropped in favor of incoming ones.
-const MAX_FACT_EDGES = 6;
-
-/**
- * Union TYPED EDGES across a re-mention (typed-edge graph memory, F-ARCH-7 / opt-in
- * `typedEdges`). Each edge is `{p, t}` — predicate + `Category/key` target ref. Dedupes by
- * p+t case-insensitively with the INCOMING side winning ties (a fresh write is the newer
- * observation of the same edge), preserves order (incoming first, then surviving existing),
- * drops malformed entries, and hard-caps the union at MAX_FACT_EDGES. Returns undefined when
- * empty so a fact without edges stays lean (back-compat / byte-identical when the feature is
- * off — the field is simply never present). Mirrors mergeAliases/mergeInvolved.
- * @param {Array<{p:string, t:string}>|undefined} existing
- * @param {Array<{p:string, t:string}>|undefined} incoming
- * @returns {Array<{p:string, t:string}>|undefined}
- */
-function mergeEdges(existing, incoming) {
-    const seen = new Set();
-    const out = [];
-    // INCOMING first so it wins ties AND keeps priority under the cap.
-    for (const list of [incoming, existing]) {
-        if (!Array.isArray(list)) continue;
-        for (const e of list) {
-            if (!e || typeof e !== 'object') continue;
-            const p = String(e.p ?? '').trim().toLowerCase();
-            const t = String(e.t ?? '').trim();
-            if (!p || !t) continue;
-            const id = `${p}|${t.toLowerCase()}`;
-            if (seen.has(id)) continue;
-            seen.add(id);
-            if (out.length < MAX_FACT_EDGES) out.push({ p, t });
-        }
-    }
-    return out.length ? out : undefined;
-}
+// redesign-v2 (S1): mergeEdges/MAX_FACT_EDGES removed with the typedEdges feature (stale
+// `edges` fields on old facts are carried through the merge spreads untouched).
 
 /** Prefer an incoming context note; fall back to the existing one. Empty → undefined. */
 function mergeContext(existing, incoming) {

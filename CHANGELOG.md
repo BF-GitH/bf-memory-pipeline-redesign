@@ -1,5 +1,89 @@
 # Changelog
 
+## [0.70.0] - 2026-07-11 — redesign-v2
+
+> A large architectural rewrite that collapses the extension to **one** memory architecture: the
+> main model never uses tools, no LLM call blocks reply generation, and a persistent memory sheet —
+> rebuilt in the background — carries the memory. `node --check` passes on every module; **not yet
+> runtime-tested inside SillyTavern**.
+
+### Architecture
+
+- **No tools on the Writer.** `search_memory` and `remember_fact` — their schemas, registration,
+  runaway softcap, and the "What Claude did" tool-activity panel — are removed. Your main model just
+  receives context and writes.
+- **Nothing blocks the reply.** On `CHAT_COMPLETION_PROMPT_READY` (and the text-completion twin) only
+  pure code runs: trim chat history to the last N user/AI messages (`agent2ContextMessages`,
+  preserving system / World Info / author's-note messages), then splice **one** system message — the
+  memory sheet — immediately before the last user message.
+- **Persistent memory sheet** (`bf_mem_sheet` in `chat_metadata`, per chat, always populated — new
+  chats seed with a placeholder). Holds a rolling story summary, the facts the scene needs (recency
+  labels + CURRENT STATE / CHRONOLOGY split), a one-line scene card, and a few graph-connected bonus
+  facts. Injection is pure code reading stored text.
+- **Memory Agent** (merged Drafter + Scribe into one background tool-loop per settled reply, on the
+  Scribe connection profile). Behind the existing ~1.8 s swipe-aware settle debounce it anticipates
+  the next scene, extracts new lasting facts, and emits the updated sheet.
+- **Text tool protocol** (works on any backend, no function-call API): the agent emits one-line JSON
+  tool calls — `list_categories` → `list_keys` → `read_facts` → `write_fact` / `search` — the
+  extension executes them against `database.js` + `fact-retrieval.js` and feeds results back, then
+  the agent finishes with a `#SHEET` block. Hard caps: max 6 rounds, max 20 tool calls; malformed
+  JSON gets one grace, then degrades to **keeping the previous sheet and committing nothing** (no
+  silent memory loss, no watermark on a failed run). New `src/memory-tools.js`;
+  `callAgentLLMWithTools` / `callAgentLLMMessages` in `src/llm-call.js`.
+- **Settled buffer** (`bufferHoldBack`, default 4, clamp 0–10): facts are only extracted from
+  messages at index ≤ `chat.length − 1 − holdback`; the newest few are shown to the agent as
+  **TENTATIVE — do not store** context for sheet planning only. Per-message `bf_mem_processed`
+  watermark + swipe/edit invalidation kept.
+
+### Fixed
+
+- **F-SCRIBE-1:** a run missing its final `#SHEET` block sets `result.error` and never watermarks —
+  the prior sheet is kept and the exchange retries.
+- **F-ORCH-2 / F-ORCH-3:** extraction-in-flight now **reschedules** instead of dropping the exchange;
+  the shared `isInternalCall` boolean is replaced everywhere by the `internalCallDepth` refcount.
+- **`initCommands()` is now called** from `index.js` (it was a dead, never-wired module).
+
+### Removed
+
+- **Files:** `agent-draft.js`, `agent-selector.js`, `presets.js`, `profiler.js` (inlined into
+  `settings.js`).
+- **Modes & presets:** `memoryMode` (hybrid / tool-only / push), `uiPreset` + all preset machinery.
+- **Opt-in experiments:** bi-temporal validity (`biTemporal`), entity merge (`entityResolution*` +
+  "Merge variants now"), user-level shared memory (`userLevelMemory` + clear button), typed edges
+  (`typedEdges` — plain relationship link tiers and `autoLinkFact` stay), idle consolidation
+  (`idleConsolidation*`), moment echo (`enableMomentEcho`, `momentEchoMaxTokens`), relationship
+  re-entry (`enableRelationshipReentry`, `reentry*`), summary-pyramid **injection** (storage stays,
+  feeding the sheet).
+- **Dead settings:** `injectionFreezeTurns`, `selectionSummary*`, `useMemoryProfile`, `agent1*`,
+  `draftPrompt`, `sceneCardEnabled` (scene card is now always-on in the sheet), `semanticRetrieval`,
+  `secondaryChance`, `tertiaryChance`, `depthDice1-4`, `reflectionInject`, `useFinderAgent` (+ Finder
+  remnants), `writerFormat`, `enableWriterRecallTool`, `enableWriterWriteTool`, `summaryPyramid*`,
+  `#NextHint`, and the `agent3ContextMessages` window (replaced by the settled buffer).
+
+### Hardcoded ON (settings deleted, behavior always active)
+
+Temporal grounding, recency labels, truth hierarchy, MMR diversity rerank, confidence ranking,
+cross-key supersede, auto-linking + 1-hop graph expansion, periodic reflection (its `#STORY` summary
+feeds the sheet), reflection compression guard, character registry, open-threads tracking. See
+[UPGRADES.md](UPGRADES.md).
+
+### Settings
+
+Final surface: `enabled`, `onboardingDone`, `agent3Profile`, `memoryPrompt`, `agent2ContextMessages`
+(0–50), `bufferHoldBack` (0–10), `retrievalTokenBudget` (50–8000), `reviewInterval` (0–100),
+`enforceKnownBy`, `graphExtrasCount` (0–8), `catchupBatchSize` (2–30), `showToast`, `debugMode`,
+`debugVerbose`, plus data keys (`dbProfiles`, `activeDbProfile`, `unlinkedChats`, `taxonomyOverlay`).
+Settings UI shrinks to four tabs — **Memory / Database / Tokens / Debug**. `migrateLegacySettings`
+maps `memoryProfile → agent3Profile`, drops removed keys, bumps `schemaVersion` to 3. Onboarding
+simplified to 3 steps (welcome → Scribe profile → where to look).
+
+### Kept
+
+Swipe-aware settle debounce; per-character IndexedDB + attachment persistence, DB profiles,
+tombstones; knownBy / POV enforcement; auto-link + graph expansion + anti-hub caps; catch-up import
+(adapted to the Memory Agent); World Info interop; the DB panel (browser / search / graph /
+spiderweb); message brain icons; review popup (`reviewInterval`); `/bfmem` commands.
+
 ## [0.61.0] - 2026-07-09
 
 ### Added — community-features batch (adoption plan: `docs/COMMUNITY-RESEARCH-2026-07-09.md`)

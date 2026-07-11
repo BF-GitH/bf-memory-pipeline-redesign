@@ -263,9 +263,8 @@ export async function onSuggestLabelsClick() {
     if (btn && btn.dataset.busy === '1') return; // guard against double-click while the call is in flight
     if (btn) { btn.dataset.busy = '1'; btn.disabled = true; }
     try {
-        const { getAgent3ProfileId } = await import('./profiler.js');
         const { runLabelSuggestion } = await import('./taxonomy-suggest.js');
-        const profileId = getAgent3ProfileId(getSettings());
+        const profileId = getSettings()?.agent3Profile || null;
 
         toastr.info('Scanning facts and asking the model for label ideas…', 'BF Memory');
         const result = await runLabelSuggestion({ profileId });

@@ -216,17 +216,18 @@ function subjectGroupLabel(fact) {
  */
 export function estimateInjectionTokens(r, seenSubjects = null) {
     const f = r.fact;
-    // Read the bi-temporal flag the same way the formatter does (best-effort; default off).
-    let biTemporalOn = false;
-    try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
+    // redesign-v2 (S1): the biTemporal setting was removed — no bi-temporal tails are charged.
+    const biTemporalOn = false;
     // RECENCY LABELS: when the injected block will carry per-fact recency tails, charge them
     // here too (F-RETR-3 invariant — the budget must price the exact bytes the injected
     // formatter emits). getTurnNowContext() is the SAME per-turn memoized object pipeline.js
     // passes to formatChosenFacts, so estimator and formatter measure identical tails. (With
     // bi-temporal ON the formatter may later fill storyNowMs and swap a turn phrase for a
     // similarly-sized in-story phrase — an accepted ~few-chars estimate skew.)
+    // redesign-v2 (G4): recency labels are HARDCODED ON (injectRecencyLabels setting deleted), so
+    // the estimator always prices the per-fact recency tails the formatter now always emits.
     let nowCtx = null;
-    try { if (getSettings()?.injectRecencyLabels === true) nowCtx = getTurnNowContext(); } catch { /* default off */ }
+    try { nowCtx = getTurnNowContext(); } catch { /* best-effort */ }
     let chars = buildFactLine(f, r.category, biTemporalOn, nowCtx).length;
     if (seenSubjects && !seenSubjects.has(subjectGroupKey(f))) {
         // One `[Subject]` header line (brackets + label) plus its newline.
@@ -786,167 +787,26 @@ export function retrievalSalience(fact, now) {
     const halfLife = RETRIEVAL_HALF_LIFE_DAYS[kind] || RETRIEVAL_HALF_LIFE_DAYS.trait;
     const recency = Math.pow(0.5, ageDays / halfLife);
     let base = RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
-    // CONFIDENCE GATE (overflow ranking only). Gated behind settings.confidenceRanking (default ON)
-    // and degrades to the ungated score on any error. Applied as a BOUNDED multiplier blended
-    // toward 1.0 by (1 - confidenceWeight): effectiveMult = 1 - w*(1 - factor). A small weight
-    // nudges low-confidence facts down without ever zeroing them — they still surface on a direct
-    // match (which doesn't use this) and merely lose ties for scarce overflow slots to solid facts.
+    // CONFIDENCE GATE (overflow ranking only). Degrades to the ungated score on any error. Applied
+    // as a BOUNDED multiplier blended toward 1.0 by (1 - w): effectiveMult = 1 - w*(1 - factor). The
+    // small weight nudges low-confidence facts down without ever zeroing them — they still surface on
+    // a direct match (which doesn't use this) and merely lose ties for scarce overflow slots.
+    // redesign-v2 (G4): confidence ranking is HARDCODED ON (confidenceRanking/confidenceWeight
+    // settings deleted) with the former default weight 0.3.
     try {
-        const cfg = getSettings();
-        if (cfg?.confidenceRanking) {
-            const w = Math.min(1, Math.max(0, Number(cfg.confidenceWeight ?? 0.3)));
-            const mult = 1 - w * (1 - confidenceFactor(fact));
-            base *= mult;
-        }
+        const w = 0.3;
+        const mult = 1 - w * (1 - confidenceFactor(fact));
+        base *= mult;
     } catch { /* degrade to ungated base score */ }
     return isColdFact(fact) ? base - RETRIEVAL_COLD_PENALTY : base;
 }
 
-/**
- * SEMANTIC SELECTION EXPANSION (selection-summary feature). Pure + deterministic given the
- * picks: no I/O, no PRNG — the same Selector result always expands to the same rows (the
- * nondeterminism lives entirely in the LLM pick upstream; since the merged rows land BEFORE
- * the injection snapshot is cached, swipe reuse stays byte-identical — pipeline.js ~26-27).
- *
- * Shelf picks (`Category/aspect`): validated against index.byCatAspect (key
- * `${category.toLowerCase()}||${aspect.toLowerCase()}` — exactly the map buildMemoryIndex
- * builds; aspects are already normalized lowercase snake_case). A HALLUCINATED shelf simply
- * misses the map and is silently dropped (anti-drift, mirroring the reflection pass's shelf
- * snap). Each valid shelf contributes its top `maxPerShelf` active facts ranked by the same
- * retrievalSalience the overflow tiers use.
- *
- * Fact picks (`Category/key`): resolved through resolveExactKeys — case-insensitive,
- * isActiveFact-guarded, validated against the REAL store, so a hallucinated key matches
- * nothing. Deliberately admitted as tier 'secondary' (NEVER the unbudgeted primary the exact
- * path normally grants): selection rows must always compete under the caller's token budget
- * (audit F-ARCH-2 failure class).
- *
- * Rows are ordered by pick confidence desc, then salience desc — the caller's budget loop
- * admits the strongest picks first. The caller still dedups against already-chosen facts,
- * filters isFactVisible, and charges estimateInjectionTokens against retrievalTokenBudget.
- *
- * @param {{shelfPicks?:Array<{shelf:string,confidence:number}>, factPicks?:Array<{fact:string,confidence:number}>}|null} selection - runSelectionPass result (null → [])
- * @param {{byCatAspect: Map}} index - per-turn fact index
- * @param {Object<string, DatabaseSchema>} databases
- * @param {number} [maxPerShelf=4] - top-salience facts taken per valid shelf pick
- * @returns {Array<{fact: Object, category: string, tier: string, via: string, confidence: number}>}
- */
-export function expandSelectionPicks(selection, index, databases, maxPerShelf = 4) {
-    if (!selection || typeof selection !== 'object') return [];
-    const perShelf = Math.max(1, Math.floor(Number(maxPerShelf) || 4));
-    const clampConf = (c) => {
-        const n = Number(c);
-        return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0.5;
-    };
-    const now = Date.now();
-    const rows = [];
-    const seen = new Set(); // `category:key` — matches the caller's dedup id scheme
+// redesign-v2 (S1): expandSelectionPicks removed with the selection-summary (Selector) feature.
 
-    for (const pick of (Array.isArray(selection.shelfPicks) ? selection.shelfPicks : [])) {
-        const raw = String(pick?.shelf || '').trim();
-        const slash = raw.indexOf('/');
-        if (slash <= 0) continue; // not Category/aspect shaped — drop
-        const cat = raw.slice(0, slash).trim().toLowerCase();
-        const aspect = raw.slice(slash + 1).trim().toLowerCase();
-        if (!cat || !aspect) continue;
-        const entries = index?.byCatAspect?.get(`${cat}||${aspect}`);
-        if (!Array.isArray(entries) || entries.length === 0) continue; // hallucinated shelf → silent drop
-        const confidence = clampConf(pick.confidence);
-        const ranked = entries
-            .filter(({ fact }) => isActiveFact(fact)) // index is active-only; cheap defense anyway
-            .sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now))
-            .slice(0, perShelf);
-        for (const { fact, category } of ranked) {
-            const id = `${category}:${fact.key}`;
-            if (seen.has(id)) continue;
-            seen.add(id);
-            rows.push({ fact, category, tier: 'secondary', via: 'selector', confidence });
-        }
-    }
-
-    for (const pick of (Array.isArray(selection.factPicks) ? selection.factPicks : [])) {
-        const raw = String(pick?.fact || '').trim();
-        if (raw.indexOf('/') < 0) continue; // not Category/key shaped — drop
-        const confidence = clampConf(pick.confidence);
-        for (const r of resolveExactKeys(databases, [raw])) {
-            const id = `${r.category}:${r.fact.key}`;
-            if (seen.has(id)) continue;
-            seen.add(id);
-            rows.push({ fact: r.fact, category: r.category, tier: 'secondary', via: 'selector', confidence });
-        }
-    }
-
-    rows.sort((a, b) =>
-        (b.confidence - a.confidence) ||
-        (retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now)));
-    return rows;
-}
-
-/**
- * LEGACY depth-dice "reach weights" (Feature #4) — back-compat fallback ONLY (audit F-RETR-5).
- * The reach is now configured directly as `settings.trackReachSteps` (integer 0-4, one honest
- * "History reach" control). These weights + the threshold below are consulted only for stored
- * settings that PREDATE trackReachSteps, deriving the same reach the old UI actually produced.
- * Historically these were rolled against Math.random per turn; the reach is DETERMINISTIC
- * (see deterministicTrackReach) so a swipe/regen — which re-injects from the cached snapshot and
- * MUST yield the same fact set (pipeline.js ~26-27) — can never silently pull a different slice
- * of history.
- */
-const DEFAULT_DEPTH_PROBS = [0.70, 0.50, 0.25, 0.10]; // depth 1,2,3,4
-
-/**
- * DETERMINISTIC-INCLUDE threshold for the LEGACY depth-dice weights (fallback path only). A depth
- * tier is INCLUDED when its configured weight is at/above this threshold (≥ 0.5 = "more likely
- * than not"), and the reach is the FURTHEST CONTIGUOUS depth that clears it (a gap stops the
- * reach so continuity holds). With the defaults [0.70, 0.50, 0.25, 0.10] this yields reach 2 —
- * which is exactly the trackReachSteps default. This threshold is WHY the percent sliders were
- * retired (F-RETR-5): it made 1-49% identical and 50-100% identical, so the four dials were a lie.
- */
-const DEPTH_INCLUDE_THRESHOLD = 0.5;
-
-/** Read LEGACY depth probabilities (clamped 0..1), falling back to defaults. Fallback path only. */
-function getDepthProbs() {
-    const s = (() => { try { return getSettings(); } catch { return null; } })() || {};
-    const pick = (v, d) => {
-        const n = Number(v);
-        return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d;
-    };
-    return [
-        pick(s.depthDice1, DEFAULT_DEPTH_PROBS[0]),
-        pick(s.depthDice2, DEFAULT_DEPTH_PROBS[1]),
-        pick(s.depthDice3, DEFAULT_DEPTH_PROBS[2]),
-        pick(s.depthDice4, DEFAULT_DEPTH_PROBS[3]),
-    ];
-}
-
-/**
- * DETERMINISTIC track reach (audit F-RETR-5). Source of truth is `settings.trackReachSteps`
- * (integer 0-4: how many older steps beyond the current one to always include) — the single
- * honest control that replaced the four depth-dice percent sliders. When the setting is absent
- * (stored settings predating it, or a settings read failure) we fall back to the LEGACY
- * derivation: the furthest CONTIGUOUS depth whose configured depthDice weight clears
- * DEPTH_INCLUDE_THRESHOLD (a gap stops the reach so continuity is preserved) — byte-identical
- * behavior for old installs until the user touches the new control. Same inputs (settings) →
- * same reach, every time, so swipes/regens that re-derive retrieval get an identical history
- * slice (no silent drift; pipeline.js ~26-27 invariant). No Math.random anywhere in the path.
- * @param {number[]} probs - LEGACY depth weights for depths 1..N (fallback path only)
- * @returns {number} reach in [0, probs.length] (0 = current step only)
- */
-function deterministicTrackReach(probs) {
-    // NEW setting wins when present: a finite number is clamped to a whole 0..N step count.
-    const s = (() => { try { return getSettings(); } catch { return null; } })() || {};
-    const steps = Number(s.trackReachSteps);
-    if (Number.isFinite(steps)) {
-        return Math.max(0, Math.min(probs.length, Math.floor(steps)));
-    }
-    // LEGACY fallback: derive the reach from the stored depth-dice weights via the threshold.
-    let reach = 0;
-    for (let depth = 1; depth <= probs.length; depth++) {
-        if (probs[depth - 1] >= DEPTH_INCLUDE_THRESHOLD) reach = depth;
-        else break; // contiguity: a below-threshold tier stops the reach (no gaps)
-    }
-    return reach;
-}
+// G4 hardcoded-on (redesign-v2): sequence-track history reach. Was settings.trackReachSteps
+// (with a legacy depth-dice fallback); now a fixed constant — always the current step plus
+// this many contiguous older steps.
+const TRACK_REACH_STEPS = 2;
 
 /**
  * Depth-dice sequence expansion with mandatory continuity (Feature #4) — DETERMINISTIC.
@@ -969,15 +829,14 @@ function expandSequenceTracks(databases, seeds, alreadyFound) {
     }
     if (tracks.size === 0) return [];
 
-    const probs = getDepthProbs();
     const candidates = [];
 
     for (const track of tracks) {
         const steps = getTrackSteps(databases, track); // ascending by ord
         if (steps.length === 0) continue;
 
-        // DETERMINISTIC reach (was a Math.random dice roll) — stable across swipes.
-        const reach = deterministicTrackReach(probs);
+        // DETERMINISTIC reach — hardcoded (G4), stable across swipes.
+        const reach = TRACK_REACH_STEPS;
         // Number of steps to include from the tail: current + `reach` older = reach+1,
         // bounded by how many steps actually exist.
         const includeCount = Math.min(reach + 1, steps.length);
@@ -1176,59 +1035,11 @@ function collectLinkCandidates(databases, seeds, alreadyFound) {
         }
     }
 
-    // DIRECTION 5 — TYPED EDGES (opt-in `typedEdges`, default OFF; audit F-ARCH-7). A seed fact
-    // carrying typed `edges` ([{p, t}] triples) pulls each edge's TARGET fact (`t` is a
-    // `Category/key` ref) as an expansion candidate. Every candidate is attributed to the SEED
-    // fact's own seedId (`edge:<cat>:<key>`), so the unified admitter's ANTI-HUB per-seed cap
-    // applies — a heavily-edged hub fact can't flood the tier. CANDIDACY-NOT-RANKING invariant
-    // honored: edges only decide ELIGIBILITY here; the admitter still orders by retrievalSalience
-    // with NO connectedness/degree term. Same emit() gate as every other direction (active +
-    // visible + deduped, tier 'secondary'). When the flag is OFF (or edges are absent — the
-    // default, since only the opt-in feature writes them) this block contributes nothing and the
-    // collector is byte-identical to today. Wrapped so a malformed edge can never break expansion.
-    try {
-        if (getSettings()?.typedEdges === true) {
-            for (const r of seeds) {
-                const fact = r.fact;
-                const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
-                if (factEdges.length === 0) continue;
-                const seedId = `edge:${r.category}:${fact.key}`;
-                for (const e of factEdges) {
-                    const target = resolveEdgeTarget(databases, e && e.t);
-                    if (target) emit(target.category, target.fact, seedId);
-                }
-            }
-        }
-    } catch { /* typed-edge expansion must never break the base collector (degrade to no edges) */ }
+    // redesign-v2 (S1): DIRECTION 5 (typed-edge expansion) removed with the typedEdges feature.
 
     return candidates;
 }
 
-/**
- * Resolve a typed edge's `Category/key` target ref to the stored fact it names (typed-edge
- * graph memory, F-ARCH-7). Case-insensitive on BOTH the category and the key so a Scribe
- * casing drift ("people/Bob_name") still resolves; exact key identity otherwise (an edge is
- * an IDENTITY reference to a real stored fact, mirroring the autoLinkRef contract). Returns
- * `{category, fact}` or null (a hallucinated/stale ref simply resolves to nothing).
- * @param {Object<string, DatabaseSchema>} databases
- * @param {string} ref - `Category/key` target ref string (an edge's `t`)
- * @returns {{category: string, fact: Object}|null}
- */
-function resolveEdgeTarget(databases, ref) {
-    const s = String(ref || '').trim();
-    const slash = s.indexOf('/');
-    if (slash <= 0) return null;
-    const wantCat = s.slice(0, slash).trim().toLowerCase();
-    const wantKey = s.slice(slash + 1).trim().toLowerCase();
-    if (!wantCat || !wantKey) return null;
-    for (const [category, db] of Object.entries(databases)) {
-        if (category.toLowerCase() !== wantCat) continue;
-        for (const fact of (db.facts || [])) {
-            if (String(fact.key).toLowerCase() === wantKey) return { category, fact };
-        }
-    }
-    return null;
-}
 
 /**
  * RELATIONSHIP-REF candidate collector. For each PRIMARY seed result, follow its
@@ -1445,13 +1256,9 @@ export function formatFactsForWriter(results) {
     // one-word `[Subject]` header per group. Subjects appear in FIRST-APPEARANCE order (so a primary
     // hit's subject still leads); facts with no/unknown subject collapse into a trailing "Misc"
     // group, so it degrades cleanly when subject is missing or mixed.
-    // BI-TEMPORAL (feature, opt-in): when story-world validity is enabled, annotate a fact carrying
-    // `validFrom`/`validUntil` with a compact `{from→until}` tail so the Writer sees WHEN the fact is
-    // true in-story (keeps flashbacks/time-skips consistent). Read the flag ONCE per call (not per
-    // line). When the feature is OFF — the default — these fields never get written, so output is
-    // byte-for-byte unchanged. Best-effort: a settings read failure simply omits the annotation.
-    let biTemporalOn = false;
-    try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
+    // redesign-v2 (S1): the biTemporal setting was removed — no `{from→until}` tails are emitted
+    // (stale validFrom/validUntil fields on old facts are simply ignored by the formatter).
+    const biTemporalOn = false;
 
     // Per-fact lines come from the SHARED buildFactLine (audit F-RETR-3): the estimator charges
     // the exact same bytes this formatter emits, so budget math can never drift from the output.
@@ -1725,146 +1532,8 @@ function detectRelationshipQuery(query) {
     return null;
 }
 
-// ── TYPED-EDGE recall helpers (opt-in `typedEdges`, default OFF; audit F-ARCH-7) ────────────
-// Deterministic, bounded, zero-LLM helpers for (a) rendering a matched fact's typed edges
-// compactly on its search_memory output line and (b) answering simple relation-intent queries
-// ("who employs X") by matching a predicate token against stored edge predicates. Everything
-// here is only reachable when the typedEdges setting is ON (callers gate + try/catch), so the
-// default tool output is byte-identical.
-
-/**
- * Compact edge tail for one fact's search_memory line: ` [rel: employs->People/bob_name, …]`.
- * Renders at most 3 edges (the per-write cap) so a line can never balloon. Returns '' when the
- * fact has no well-formed edges (the common case — output unchanged).
- * @param {Object} fact
- * @returns {string}
- */
-function formatEdgeTail(fact) {
-    const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
-    const parts = [];
-    for (const e of factEdges) {
-        const p = String(e?.p ?? '').trim();
-        const t = String(e?.t ?? '').trim();
-        if (p && t) parts.push(`${p}->${t}`);
-        if (parts.length >= 3) break;
-    }
-    return parts.length ? ` [rel: ${parts.join(', ')}]` : '';
-}
-
-/**
- * Append edge tails to the formatted search_memory text WITHOUT touching the shared
- * formatFactsForWriter/buildFactLine contract (the push path + token estimator must stay
- * byte-identical, so we post-process the TOOL output only). For each row whose fact carries
- * edges, its exact line (rebuilt via the same buildFactLine the formatter used) is located in
- * the text and the compact tail appended; a line that can't be located (defensive) is skipped.
- * Deterministic; each output line is claimed at most once so duplicate lines stay stable.
- * @param {string} text - formatFactsForWriter output
- * @param {Array<{fact: Object, category: string}>} rows - the rows that produced `text`
- * @returns {string}
- */
-function appendEdgeTails(text, rows) {
-    let biTemporalOn = false;
-    try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
-    const lines = String(text ?? '').split('\n');
-    const claimed = new Set();
-    for (const { fact, category } of rows) {
-        const tail = formatEdgeTail(fact);
-        if (!tail) continue;
-        const line = buildFactLine(fact, category, biTemporalOn);
-        for (let i = 0; i < lines.length; i++) {
-            if (claimed.has(i) || lines[i] !== line) continue;
-            lines[i] = line + tail;
-            claimed.add(i);
-            break;
-        }
-    }
-    return lines.join('\n');
-}
-
-// Tokens that must never be mistaken for a relation predicate in "who <pred> <name>" frames
-// (auxiliaries/fillers a natural question contains). Small on purpose — the real gate is that
-// the predicate must ALSO match a stored edge predicate before the path activates.
-const EDGE_INTENT_STOP = new Set([
-    'is', 'are', 'was', 'were', 'does', 'did', 'has', 'had', 'have', 'the', 'and',
-    'will', 'would', 'can', 'could', 'should', 'not', 'about', 'with', 'that', 'this',
-]);
-
-/**
- * Detect a simple RELATION-INTENT query (typed-edge feature): "who employs bob?" /
- * "who loves the baker" / "who does bob employ" / "whom does mira fear". Returns
- * `{p, name}` (predicate token + single-token name, both lowercased) or null for anything
- * else — conservative, so ordinary keyword recall is unaffected. Deterministic, no LLM.
- * @param {string} query
- * @returns {{p: string, name: string}|null}
- */
-function detectEdgeIntentQuery(query) {
-    const lower = String(query || '').trim().toLowerCase();
-    if (!lower) return null;
-    // "who <pred> <name>?" — e.g. "who employs bob".
-    let m = lower.match(/^\s*who\s+([a-z][a-z_'-]{2,})\s+(?:the\s+)?([a-z0-9][a-z0-9_'-]{1,})\s*\??\s*$/);
-    if (m && !EDGE_INTENT_STOP.has(m[1]) && !EDGE_INTENT_STOP.has(m[2])) return { p: m[1], name: m[2] };
-    // "who/whom does <name> <pred>?" — e.g. "who does bob employ".
-    m = lower.match(/^\s*whom?\s+does\s+(?:the\s+)?([a-z0-9][a-z0-9_'-]{1,})\s+([a-z][a-z_'-]{2,})\s*\??\s*$/);
-    if (m && !EDGE_INTENT_STOP.has(m[2]) && !EDGE_INTENT_STOP.has(m[1])) return { p: m[2], name: m[1] };
-    return null;
-}
-
-/** Predicate normalization for intent matching: lowercase + strip ONE trailing 's' so the
- * query's "employ"/"employs" both match a stored `employs` (and vice versa). */
-function normalizeEdgePredicate(p) {
-    const s = String(p || '').trim().toLowerCase();
-    return s.endsWith('s') ? s.slice(0, -1) : s;
-}
-
-/** Does `name` (single lowercase token) name this subject/ref? Exact subject match, subject
- * key-prefix match, or token membership in a `Category/key` ref's key part. Conservative. */
-function edgeNameMatches(name, subjectOrRef) {
-    const s = String(subjectOrRef || '').trim().toLowerCase();
-    if (!s || !name) return false;
-    if (s === name) return true;
-    // `Category/key` ref: match tokens of the key part; bare subject: match its underscore tokens.
-    const keyPart = s.includes('/') ? s.slice(s.indexOf('/') + 1) : s;
-    return keyPart === name || wordTokens(keyPart, { min: 1 }).includes(name); // keys are short; no length gate (legacy)
-}
-
-/**
- * Collect facts answering a relation-intent query `{p, name}` (typed-edge feature). BOTH
- * directions are matched deterministically over stored edges:
- *   - HEAD answers ("who employs bob"): facts whose edge predicate matches `p` AND whose edge
- *     TARGET ref names <name> — the matching fact's SUBJECT is the answer.
- *   - TAIL answers ("who does bob employ"): facts whose SUBJECT is <name> with a `p`-matching
- *     edge — the edge's target (rendered in the ` [rel: …]` tail) is the answer.
- * Active facts only; visibility is filtered by the caller (same as the other recall paths).
- * Bounded: one linear scan, results capped by the caller. Returns [{fact, category}].
- * @param {Object<string, DatabaseSchema>} databases
- * @param {{p: string, name: string}} intent
- * @returns {Array<{fact: Object, category: string}>}
- */
-function collectEdgeIntentMatches(databases, intent) {
-    const wantP = normalizeEdgePredicate(intent.p);
-    const name = String(intent.name || '').trim().toLowerCase();
-    const out = [];
-    if (!wantP || !name) return out;
-    for (const [category, db] of Object.entries(databases)) {
-        for (const fact of (db.facts || [])) {
-            if (!isActiveFact(fact)) continue;
-            const factEdges = Array.isArray(fact?.edges) ? fact.edges : [];
-            if (factEdges.length === 0) continue;
-            const subjIsName = edgeNameMatches(name, deriveSubject(fact));
-            for (const e of factEdges) {
-                if (normalizeEdgePredicate(e?.p) !== wantP) continue;
-                // HEAD direction: edge target names the queried person → this fact's subject
-                // answers "who <pred> <name>". TAIL direction: the queried person IS the
-                // subject → the edge target answers "who does <name> <pred>".
-                if (edgeNameMatches(name, e?.t) || subjIsName) {
-                    out.push({ fact, category });
-                    break; // one admission per fact
-                }
-            }
-        }
-    }
-    return out;
-}
+// redesign-v2 (S1): the typed-edge recall helpers (formatEdgeTail/appendEdgeTails,
+// relation-intent query path) were removed with the typedEdges feature.
 
 /**
  * PULL-DETAIL recall for the Writer's `search_memory` tool (Feature: infinite reach).
@@ -1943,38 +1612,7 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
         return { text: 'No stored memory yet — nothing to search.', count: 0 };
     }
 
-    // RELATION-INTENT PATH (typed-edge graph memory, opt-in `typedEdges`; audit F-ARCH-7).
-    // A simple "who employs X" / "who does X employ" query is answered by matching the query's
-    // predicate token against the stored edge predicates of the resolved subject's facts —
-    // deterministic and bounded (one linear scan), no LLM. Only fires when the flag is ON, no
-    // scene/pair intent claimed the query first, AND at least one stored edge actually matches;
-    // otherwise it falls through to the normal keyword cascade below (zero regression risk).
-    // Wrapped so a failure here degrades to plain keyword recall.
-    try {
-        if (q && sceneTarget === null && relPair === null && getSettings()?.typedEdges === true) {
-            const edgeIntent = detectEdgeIntentQuery(q);
-            if (edgeIntent) {
-                let edgeRows = collectEdgeIntentMatches(databases, edgeIntent);
-                if (catFilter) edgeRows = edgeRows.filter(r => String(r.category).toLowerCase() === catFilter);
-                const ctxE = host.getCtx();
-                const namesE = ctxE ? { charName: ctxE.characters?.[ctxE.characterId]?.name || '', userName: ctxE.name1 || '' } : null;
-                edgeRows = edgeRows.filter(r => isFactVisible(r.fact, namesE));
-                if (edgeRows.length > 0) {
-                    const cappedEdge = edgeRows.slice(0, cap);
-                    addDebugLog('debug', `Relation-intent recall: "${edgeIntent.p}" ⇒ ${edgeIntent.name} → ${cappedEdge.length}/${edgeRows.length} edge-matched fact(s)`, {
-                        subsystem: 'retrieval', event: 'recall.edge_intent',
-                        data: { predicate: edgeIntent.p, name: edgeIntent.name, returned: cappedEdge.length, total: edgeRows.length },
-                    });
-                    const edgeText = appendEdgeTails(
-                        formatFactsForWriter(cappedEdge.map(r => ({ fact: r.fact, category: r.category, tier: 'primary' }))),
-                        cappedEdge,
-                    );
-                    return { text: edgeText, count: cappedEdge.length };
-                }
-                // No stored edge matched — fall through to the ordinary keyword cascade.
-            }
-        }
-    } catch { /* typed-edge intent must never break recall — degrade to keyword search */ }
+    // redesign-v2 (S1): the relation-intent (typed-edge) recall path was removed.
 
     // RELATIONSHIP-THREAD PATH (Phase 0): return the couple's chronological moment-thread (cold +
     // superseded included), formatted like the push gist. Honors the optional category filter +
@@ -2110,14 +1748,7 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     if (capped.length) {
         // Reuse the push formatter so the recalled lines look identical to the injected gist.
         let text = formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })));
-        // TYPED EDGES (opt-in, F-ARCH-7): render each matched fact's edges compactly on its tool
-        // output line (` [rel: employs->People/bob_name]`) so the model sees the relation TYPE,
-        // not just that facts are related. Post-processes the TOOL output only — the shared
-        // buildFactLine/estimator contract (and the push injection) are untouched, and when the
-        // flag is OFF (or no fact carries edges) the text is byte-identical. Best-effort.
-        try {
-            if (getSettings()?.typedEdges === true) text = appendEdgeTails(text, capped);
-        } catch { /* never let edge rendering break recall output */ }
+        // redesign-v2 (S1): typed-edge tail rendering removed.
         return { text, count: capped.length };
     }
 

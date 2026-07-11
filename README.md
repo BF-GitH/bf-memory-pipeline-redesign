@@ -1,87 +1,173 @@
 # BF's Memory Pipeline
 
-A memory system for SillyTavern. A background note-taker extracts lasting facts from your roleplay and stores them per character; each turn, the relevant ones reach your AI two ways — a small, budgeted block is **pushed** into the prompt for free (no extra AI call), and the AI can **pull** anything deeper itself, mid-reply, through memory tools. So your character actually remembers things across long sessions without the context window ballooning.
+A memory system for SillyTavern. A background note-taker reads your roleplay, extracts the lasting
+facts, and keeps a compact **memory sheet** up to date per chat. Every turn that sheet is spliced
+into the prompt by **pure code — no extra AI call blocks your reply**. So your character remembers
+things across long sessions without the context window ballooning, and generation never waits on a
+second model.
 
-Works best with a **tool-calling-capable main model** (e.g. Claude) — the pull tools need one. If your model can't call tools, switch to Push mode (below) and everything still works the classic way.
+Works with **any backend**. The background agent talks to its tools over a plain text protocol, so
+it does not need a function-calling API — a cheap local or hosted model works fine.
+
+> **Status:** redesign-v2 (v0.70.0). This is a large architectural rewrite. `node --check` passes on
+> every module, but it is **not yet runtime-tested inside SillyTavern** — the host globals
+> (`SillyTavern`, IndexedDB, connection profiles) can only be exercised in the app. Smoke-test on
+> this branch before relying on it.
 
 ## Install
 
-Drop into `SillyTavern/public/scripts/extensions/third-party/bf-memory-pipeline-redesign/` (or clone there). Enable in the Extensions panel. The drawer header shows the installed version, read live from `manifest.json` (e.g. `v0.61.0`) — handy for confirming you're testing the latest after a `git pull`.
+Drop into `SillyTavern/public/scripts/extensions/third-party/bf-memory-pipeline-redesign/` (or clone
+there). Enable in the Extensions panel. The drawer header shows the installed version, read live from
+`manifest.json` (e.g. `v0.70.0`) — handy for confirming you're testing the latest after a `git pull`.
 
 ---
 
-## The mental model — 3 agents + 2 tools
+## The mental model
+
+There is **one** architecture now — no modes, no presets, no tools on your main model.
 
 | Piece | Role | LLM call? | When it runs |
 |---|---|---|---|
-| **Drafter** (Agent 1) | Plans the reply + picks which fact branches to inject | YES | **Push mode only** |
-| **Writer** (Agent 2) | Your main model writing the actual reply | YES (your main model) | Every turn |
-| **Scribe** (Agent 3) | The note-taker — reads the exchange, stores new facts | YES (a cheap model works great) | **After** each reply lands |
-| `search_memory` | Tool the Writer can call mid-reply to look up stored facts — like checking a notebook. Read-only. | — | On demand (default **ON**) |
-| `remember_fact` | Tool the Writer can call mid-reply to pin an important new fact. Add-only, never deletes. | — | On demand (default **ON**) |
+| **Writer** | Your main model, writing the reply | YES (your model) | Every turn |
+| **Memory Sheet** | A persistent per-chat note, always present, injected as one system message | NO — pure code | Every turn, spliced before your last message |
+| **Memory Agent** | The background note-taker: reads the settled exchange, updates the store, rebuilds the sheet | YES (a cheap model works great) | **After** each reply settles, off the reply path |
 
-## Memory modes
+Your Writer **never sees a tool**. It just receives the memory sheet as context and writes. Nothing
+plans your reply; nothing blocks it.
 
-The dropdown at the top of the settings panel picks **how** memory reaches your main model:
+### The memory sheet
 
-- **Hybrid (default)** — no Drafter call at all. Each turn a cheap, **deterministic, no-LLM anchor** is injected: a one-line scene block, a few guaranteed anchor facts per present character, and speculative keyword-matched facts — all under a token budget. The main model pulls everything deeper on demand via `search_memory` and pins new facts via `remember_fact`. Skipping the Drafter removes a full blocking LLM round-trip from every reply — the main latency win.
-- **Tool-only** — *intended* as "barely any anchor, the model drives all recall itself." Honest note: as of v0.50.x the pipeline treats it **identically to Hybrid** — same anchor injection, the only thing the mode switch actually changes is whether the Drafter runs. Treat it as a forward-looking option.
-- **Push (classic)** — the Drafter plans the reply and picks fact branches every turn (an extra blocking LLM call before your reply starts). Choose this if your main model can't call tools.
+Stored in `chat_metadata` (`bf_mem_sheet`), one per chat, and it **always** has content — new chats
+seed with `Story just beginning — no memories yet.` It contains:
 
-In **every** mode the Scribe extracts facts *after* the reply arrives (on `MESSAGE_RECEIVED`), on a short settle debounce (~1.8 s) that is **swipe-aware**: spinning four swipes doesn't bill four extractions — only the swipe you settle on gets extracted, and re-extraction resets if you edit a message.
+- a rolling **story summary**,
+- the **facts the current scene needs**, rendered with recency labels and split into
+  **CURRENT STATE** (established truth, wins conflicts) vs **CHRONOLOGY** (older context),
+- a one-line **scene card** (location; who's present; current goal/tension),
+- a few **graph-connected bonus facts** pulled through the deterministic 1-hop link expansion.
 
-## What happens on a turn (Hybrid, the default)
+Injecting the sheet is pure code reading stored text — deterministic, cache-friendly, stable across
+swipes and regens. The sheet is *rebuilt in the background* by the Memory Agent after each settled
+reply.
 
-1. You hit Send. Nothing plans your reply — no waiting on a draft call.
-2. **Injection (pure code, no LLM):** scene line + up to 3 anchor facts per present character + keyword-matched facts, deduped, diversity-reranked so five near-identical facts don't hog the space, confidence-weighted so shaky facts lose to solid ones, and hard-capped by the retrieval token budget. Deterministic: same chat state → same injection, **stable across swipes and regens** (no dice).
-3. **The Writer writes.** Mid-reply it can call `search_memory` (exact `Category/key` handle → keyword → fuzzy/typo match → a bounded two-hop graph walk; on a miss it gets a hint listing the categories that actually exist, so it re-queries instead of giving up) and `remember_fact` (pins a fact, which is auto-linked into the fact graph so recall can find it later).
-4. **The reply lands.** The Scribe reads the last few messages (default 5), stores new facts, and converts "yesterday"/"last week" into real dates so facts don't rot. Every so often a reflection pass merges duplicate notes and writes bigger-picture observations.
+### The Memory Agent (background, one tool-loop per settled reply)
+
+On `MESSAGE_RECEIVED`, behind a ~1.8 s **swipe-aware settle debounce** (spinning four swipes doesn't
+bill four runs — only the swipe you settle on is processed; editing a message re-arms extraction),
+the agent runs **one tool-loop session** on the Scribe connection profile. In that one session it:
+
+1. anticipates where the scene is going and which memories the next reply will need,
+2. extracts new lasting facts from the settled messages,
+3. emits the updated memory sheet.
+
+**Text tool protocol (works on any backend).** The agent replies with lines of strict JSON, one tool
+call per line, and the extension executes them and feeds results back:
+
+```
+{"tool":"list_categories"}
+{"tool":"list_keys","args":{"category":"People"}}
+{"tool":"read_facts","args":{"category":"People","keys":["monika_name","monika_mood"]}}
+{"tool":"write_fact","args":{"category":"People","key":"monika_mood","value":"…","note":"…","known_by":["Monika"],"aspect":"mood","importance":3}}
+{"tool":"search","args":{"query":"who owns the bakery"}}
+```
+
+This layered navigation — **list categories → list keys → read facts → write / search** — is the
+point of the redesign: the agent explores the store on demand instead of being handed a giant dump.
+It finishes with a `#SHEET` block (the new memory sheet), optionally preceded by `write_fact` lines.
+
+Hard caps keep it bounded: **max 6 tool rounds, max 20 tool calls** total. Malformed JSON gets one
+error message back to re-emit; a second failure degrades safely — it **commits nothing new but keeps
+the previous sheet**, and does **not** mark messages processed, so there is no silent memory loss.
+
+### The settled buffer
+
+Facts are only extracted from messages that have **settled** — index ≤ `chat.length − 1 − holdback`
+(hold-back **4** by default, `bufferHoldBack`). The most recent few messages are shown to the agent
+only as clearly-labeled **TENTATIVE — do not store facts from these** context for planning the sheet;
+they can shape the scene card and what the next reply needs, but nothing is committed from them until
+they settle. A per-message `bf_mem_processed` watermark (invalidated on swipe/edit) makes sure each
+settled message is extracted at most once.
+
+## What happens on a turn
+
+1. You hit Send. **Injection (pure code, no LLM):** trim chat history to the last N user/AI messages
+   (`agent2ContextMessages`, default 10; system / World Info / author's-note messages preserved),
+   then splice **one** system message — the memory sheet — immediately before your last message.
+   Same position every time, cache-friendly. (Trimming only kicks in once the sheet is past its
+   seed.)
+2. **The Writer writes.** It sees the sheet as established truth for the scene and nothing else new —
+   no tools, no waiting.
+3. **The reply settles** (~1.8 s debounce, swipe-aware). The Memory Agent runs in the background:
+   navigates the store with the text protocol, writes new settled facts, and emits a fresh sheet
+   that's stored for next turn. Temporal phrases ("yesterday", "last week") are grounded to real
+   dates at write time. Periodic reflection compresses duplicate notes and updates the story summary
+   that feeds the sheet.
 
 ## Token economics, honestly
 
-- **The push side is budgeted.** Injected facts can't exceed `retrievalTokenBudget` (default ~800 tokens), plus small capped extras (scene block ≤ 150, "Big Picture" overview ≤ 250).
-- **The pull side is conditional spend, not free.** Each tool call costs an extra prompt round-trip (your context gets re-sent). Cheap on turns where the model doesn't need it; real money on turns where it digs. The **Tokens** tab shows exactly what was injected, what it roughly cost, and how that compares to just sending the whole chat.
+- **The sheet is budgeted.** Its facts section can't exceed `retrievalTokenBudget` (default ~800
+  tokens); the bonus connected facts are capped by `graphExtrasCount` (default 3).
+- **The win is trimming.** Because a compact sheet carries the memory, `agent2ContextMessages` can
+  trim old turns out of the Writer's context — stored facts replace raw history. The **Tokens** tab
+  shows what was injected, roughly what it cost, and how that compares to sending the whole chat.
+- **The agent's cost is off the reply path.** One background tool-loop per settled reply, on a cheap
+  profile. It never delays your generation.
 
 ## Settings reference
 
-| Setting | Default | What it does |
-|---|---|---|
-| **Memory mode** (`memoryMode`) | `hybrid` | How memory reaches the main model — see above. |
-| **Cost preset** (`uiPreset`) | `balanced` | One dropdown that sets the spend knobs together: **Cheap** (300-token budget, sparser anchors), **Balanced** (800), **Max Recall** (1600, full history, more anchors). Hand-editing any governed knob honestly flips it to **Custom**. |
-| **Retrieval token budget** (`retrievalTokenBudget`) | 800 | Hard cap (50–8000) on the injected fact block. |
-| **Writer context limit** (`agent2ContextMessages`) | 10 | How many recent messages the main model sees. **0 = full history.** Trimming lets stored facts replace old turns — the core token win. |
-| **Scribe context** (`agent3ContextMessages`) | 5 | How many recent messages the note-taker reads per extraction. |
-| **Review interval** (`reviewInterval`) | 10 | Fact-review popup every N messages (0 = never show it). Higher = fewer interruptions. |
-| **Memory lookups** (`enableWriterRecallTool`) | ON | Registers the `search_memory` pull tool. Read-only; no-ops on non-tool models. |
-| **Memory notes** (`enableWriterWriteTool`) | ON | Registers the `remember_fact` pin tool. Add-only; no-ops on non-tool models. |
-| **POV scoping** (`enforceKnownBy`) | ON | Facts tagged with a who-knows list are hidden from characters not on it (empty list = visible to all). Applies to injection, `search_memory`, and `/recall`. OFF = every character sees every fact. |
+The settings panel has four tabs: **Memory** (the knobs), **Database**, **Tokens**, **Debug**.
 
-**Opt-in extras** (details in [UPGRADES.md](UPGRADES.md)) — each behind its own toggle, OFF unless noted:
+| Setting | Default | Range | What it does |
+|---|---|---|---|
+| **Enabled** (`enabled`) | off | — | Master switch. |
+| **Memory Agent profile** (`agent3Profile`) | — | connection profile | Which connection profile the background agent uses (pick a cheap model). |
+| **Extra instructions** (`memoryPrompt`) | — | text | Optional text appended to the agent's prompt. Blank = stock behavior. |
+| **Writer history limit** (`agent2ContextMessages`) | 10 | 0–50 | How many recent messages the main model sees. **0 = full history** (no trim). |
+| **Buffer hold-back** (`bufferHoldBack`) | 4 | 0–10 | How many newest messages are held back as TENTATIVE (not yet extracted). |
+| **Retrieval token budget** (`retrievalTokenBudget`) | 800 | 50–8000 | Hard cap on the facts section of the sheet. |
+| **Graph extras** (`graphExtrasCount`) | 3 | 0–8 | Bonus graph-connected facts added to the sheet. |
+| **Review interval** (`reviewInterval`) | 10 | 0–100 | Fact-review popup every N messages (0 = never). |
+| **POV scoping** (`enforceKnownBy`) | on | — | Facts tagged with a who-knows list are hidden from characters not on it (empty list = visible to all). Off = every character sees every fact. |
+| **Catch-up batch size** (`catchupBatchSize`) | 8 | 2–30 | Messages per chunk when back-filling an existing chat. |
+| **Show toasts** (`showToast`) | on | — | Status toasts. |
+| **Debug** (`debugMode`, `debugVerbose`) | off | — | Debug logging in the Debug tab. |
 
-| Feature | Default | One line |
-|---|---|---|
-| Temporal grounding | ON | "yesterday" is saved as an actual date. |
-| Recency labels | ON | Injected facts say how long ago they happened — `(~3 turns ago, scene 2)`. |
-| Truth hierarchy | ON | Injected memory splits into CURRENT STATE (wins conflicts) vs CHRONOLOGY (context only), so old events aren't replayed as now. |
-| MMR diversity rerank | ON | Injected facts cover more ground instead of repeating. |
-| Confidence ranking | ON | Shaky facts lose scarce slots to solid ones. |
-| Bi-temporal validity | OFF | Track *when in the story* a fact was true (flashbacks/time-skips). |
-| Entity merge | OFF | "Bobby"/"Robert"/"Rob" become one character (conservative, logged). |
-| Shared user memory | OFF | Facts about *you* are known to every character. |
-| Idle consolidation | OFF | The tidy-up pass also runs while you're away. |
+*(Plus data, not knobs: `dbProfiles`, `activeDbProfile`, `unlinkedChats`, `taxonomyOverlay`,
+`onboardingDone`.)*
+
+**Hardcoded on** (no longer settings — they're always active): temporal grounding, recency labels,
+truth hierarchy (CURRENT STATE / CHRONOLOGY split), MMR diversity rerank, confidence ranking,
+cross-key supersede, auto-linking + 1-hop graph expansion, periodic reflection, the character
+registry, and the reflection compression guard. See [UPGRADES.md](UPGRADES.md).
 
 ## Catching up an existing chat
 
-Installed mid-story? **Database tab → Process Existing Chat → Catch-up import** reads your backlog in chunks of N messages (default 8, `catchupBatchSize`) with **one** Scribe call per chunk — far cheaper than the per-message "Run the Scribe on full chat" button on a long thread. It shows a call estimate before starting, a progress bar while running, and the fact-review popup at the end. Cancel anytime: processed chunks are watermarked, so re-running resumes where it stopped (a failed chunk is retried automatically on the next run). Also available as `/bfmem catchup [N|cancel]`. Two honest caveats: don't keep chatting while it runs, and imported facts get pinned to each chunk's *last* message, so the per-message brain icon is approximate for imported history.
+Installed mid-story? **Database tab → Process Existing Chat → Catch-up import** reads your backlog in
+chunks of N messages (default 8, `catchupBatchSize`) with **one** Memory Agent session per chunk. It
+shows a call estimate before starting, a progress bar while running, and rebuilds the sheet from the
+tail once the backlog is done. Cancel anytime: processed chunks are watermarked, so re-running
+resumes where it stopped (a failed chunk is retried automatically on the next run). Also available as
+`/bfmem catchup [N|cancel]`. Two honest caveats: don't keep chatting while it runs, and imported
+facts get pinned to each chunk's *last* message, so the per-message brain icon is approximate for
+imported history.
 
-## Removed features
+## Removed in redesign-v2
 
-The Finder/Librarian agent (Agent 4) and the embeddings/semantic-retrieval stack were **removed** in v0.50.x — retrieval is now the deterministic keyword + graph path, and `search_memory` is the semantic layer. The old random Secondary/Tertiary "fact chance" dice are gone too: retrieval rolls no dice, which is a feature — the same situation injects the same facts, stable across swipes.
+The whole tool-on-the-writer path (`search_memory` / `remember_fact`), the memory **modes**
+(hybrid / tool-only / push), the **Drafter** and **Selector** agents, and the **cost presets** are
+gone. So are a batch of opt-in experiments that never earned their keep: moment echo, relationship
+re-entry, typed edges, entity merge, shared user memory, bi-temporal validity, idle consolidation,
+and the selection-summary pass. One architecture, no switches. See the [CHANGELOG](CHANGELOG.md) for
+the full list.
 
 ## Troubleshooting
 
-- **Debug tab** — live event log, plus the **"What Claude did"** panel showing each turn's `search_memory` queries and `remember_fact` pins. The **Copy Diagnostics** button bundles settings, the full log, the entire fact database (including the link graph), and token usage into one JSON file/clipboard copy for support sharing — no API keys included.
-- **Brain icon** on each message: **click** = free viewer of what the Scribe stored from that line (delete anything wrong); **Shift+click** = (re-)run extraction on it (makes an AI call).
+- **Debug tab** — live event log. The **Copy Diagnostics** button bundles settings, the full log,
+  the entire fact database (including the link graph), and token usage into one JSON file/clipboard
+  copy for support sharing — no API keys included.
+- **Brain icon** on each message: **click** = free viewer of what the agent stored from that line
+  (delete anything wrong); **Shift+click** = (re-)run extraction on it (makes an AI call).
 - **Tokens tab** — what was actually injected last turn and roughly what it cost.
 
-See [CHANGELOG.md](CHANGELOG.md) for version history.
+See [CHANGELOG.md](CHANGELOG.md) for version history and [UPGRADES.md](UPGRADES.md) for what's
+hardcoded on vs removed.

@@ -8,8 +8,13 @@
 // STMB's /stmb-catchup) — one call per CHUNK instead of the per-message "Run the Scribe on full
 // chat" button, so a 300-message backlog costs ~40 calls instead of ~300.
 //
-// DELIBERATE DIFFERENCES from runAgent3OnFullChat (settings.js — which stays untouched):
-//   - SEQUENTIAL chunk loop, NOT the semaphore fan-out: later chunks' scoped-dedup context must
+// redesign-v2 (S3): each chunk is now ONE extract-only Memory Agent tool-loop session
+// (runMemoryAgent, text tool protocol) instead of a #MEM Scribe call; after the final chunk a
+// single full session rebuilds the persistent memory sheet. settings.js's old per-message
+// "Run the Scribe on full chat" button now delegates to THIS runner.
+//
+// DESIGN NOTES:
+//   - SEQUENTIAL chunk loop, NOT a semaphore fan-out: later chunks' store overview must
 //     see earlier chunks' committed facts, or a fact revealed in chunk 1 gets re-proposed in
 //     chunk 9.
 //   - Eligibility tests bf_mem_processed !== true (STRICT), not truthy: a message stranded
@@ -33,8 +38,9 @@
 import {
     getSettings, addDebugLog, setLastGenerated, setLastInserted, appendLastInserted,
     saveCurrentToActiveProfile, isTriviallyEmptyForExtraction, getPendingRun,
+    getMemorySheet, setMemorySheet, getScene, getReflection,
 } from './settings.js';
-import { trackUpdate, showReviewPopup, getPendingItems } from './review-popup.js';
+import { showReviewPopup, getPendingItems } from './review-popup.js';
 
 /** Resolve the live ST context, null-safe (same helper shape as commands.js). */
 function ctx() {
@@ -164,12 +170,10 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
     const startMs = Date.now();
 
     try {
-        // Heavy modules loaded lazily inside the runner (runAgent3OnFullChat's pattern — no cycles).
-        const { runMemoryUpdater } = await import('./agent-memory.js');
-        const { getAgent3ProfileId } = await import('./profiler.js');
-        const { getAllDatabases } = await import('./database.js');
+        // Heavy modules loaded lazily inside the runner (no static cycles).
+        const { runMemoryAgent } = await import('./agent-memory.js');
 
-        const profileId = getAgent3ProfileId(settings);
+        const profileId = settings.agent3Profile || null;
         // Short character brief (B4 pattern): the Scribe extracts from message text, not the card.
         const charInfo = (function () {
             const char = context.characters?.[context.characterId];
@@ -180,12 +184,6 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
             return parts.join('\n');
         })();
         const userPersona = context.persona?.description || context.name1 || '';
-
-        // Load the databases ONCE before the loop (settings.js precedent): applyUpdates mutates
-        // this map in place and persists each touched category, so the same reference stays
-        // current across chunks — and each later chunk's scoped-dedup context sees the earlier
-        // chunks' committed facts.
-        const databases = await getAllDatabases();
 
         addDebugLog('info', `Catch-up import start: ${plan.chunks.length} chunk(s) × ≤${size} msgs (${plan.eligibleCount} eligible of ${plan.totalMsgs})`, {
             subsystem: 'import', event: 'catchup.start', actor: 'USER',
@@ -222,18 +220,16 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
             const target = chat[targetIdx];
             if (!target || !target.mes) { failedChunks++; continue; } // defensive: chat mutated under us
 
-            // Prior context = every chunk message but the target (pipeline.js prior-message shape).
-            const priorMessages = [];
-            for (let k = 0; k < idxs.length - 1; k++) {
-                const m = chat[idxs[k]];
-                if (m && m.mes) priorMessages.push({ role: m.is_user ? 'USER' : 'CHAR', text: m.mes });
+            // The whole chunk is SETTLED history (this is a backlog import) — every message is
+            // an extraction source, indexed so write_fact attribution stays per-message-ish
+            // (the agent's writes carry the newest chunk index as their source).
+            const settledMessages = [];
+            for (const i of idxs) {
+                const m = chat[i];
+                if (!m || !m.mes) continue;
+                settledMessages.push({ index: i, role: m.is_user ? 'USER' : 'CHAR', name: String(m.name || '').trim(), text: m.mes });
             }
-            // Latest USER message in the chunk (absolute chat index) for @src:user attribution.
-            let lastUserIdx = null;
-            for (let k = idxs.length - 1; k >= 0; k--) {
-                const m = chat[idxs[k]];
-                if (m && m.is_user) { lastUserIdx = idxs[k]; break; }
-            }
+            if (settledMessages.length === 0) { failedChunks++; continue; }
 
             const stampChunk = () => {
                 for (const i of idxs) {
@@ -245,7 +241,7 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
             // EMPTY-SCOPE PRE-LLM SKIP (mirrors pipeline.js agent3EmptyScopeSkip): if EVERY
             // message in the chunk is trivially empty, stamp + move on without spending a call.
             if (settings.agent3EmptyScopeSkip !== false) {
-                const windowTexts = [target.mes, ...priorMessages.map(m => m.text)];
+                const windowTexts = settledMessages.map(m => m.text);
                 if (windowTexts.every(t => isTriviallyEmptyForExtraction(t))) {
                     addDebugLog('info', `Catch-up: chunk ${c + 1}/${plan.chunks.length} trivially empty — skipping LLM call`, {
                         subsystem: 'import', event: 'catchup.chunkSkipped', reason: 'EMPTY_SCOPE', data: { chunk: c + 1, msgs: idxs.length },
@@ -270,20 +266,37 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
             }
 
             try {
-                const result = await runMemoryUpdater(
-                    target.mes, targetIdx, charInfo, databases, profileId,
-                    !!target.is_user, userPersona, priorMessages, lastUserIdx,
-                    String(target.name || '').trim(), // source speaker (per-character namespacing)
+                // EXTRACT-ONLY Memory Agent run (redesign-v2 S3): the agent navigates the store
+                // with the layered tools and commits facts via write_fact (which also queues the
+                // review items), ending with #DONE. A missing #DONE / protocol failure returns
+                // result.error and the chunk stays UNSTAMPED (retryable) — F-SCRIBE-1 semantics.
+                const result = await runMemoryAgent({
+                    settledMessages,
+                    tentativeMessages: [],
+                    characterInfo: charInfo,
+                    userPersona,
+                    profileId,
                     observationDate,
-                );
+                    runId: `C${Date.now().toString(36).slice(-5)}`,
+                    extractOnly: true,
+                });
                 if (result?.error) throw new Error(result.error);
-                const n = result?.updates?.length || 0;
+                const applied = Array.isArray(result?.applied) ? result.applied : [];
+                const updatesLike = applied.map(({ category, key, fact, status }) => ({
+                    category,
+                    key,
+                    value: String(fact?.value ?? ''),
+                    tags: Array.isArray(fact?.tags) ? fact.tags : [],
+                    knownBy: Array.isArray(fact?.knownBy) ? fact.knownBy : [],
+                    context: (typeof fact?.context === 'string' && fact.context) ? fact.context : undefined,
+                    source: fact?.source,
+                    status: status || 'NEW',
+                    changed: true,
+                }));
+                const n = updatesLike.length;
                 factsAdded += n;
-                if (Array.isArray(result?.updates)) {
-                    allUpdates.push(...result.updates);
-                    for (const update of result.updates) trackUpdate(update); // queue for the final review popup
-                }
-                if (Array.isArray(result?.applied)) allApplied.push(...result.applied);
+                allUpdates.push(...updatesLike);
+                allApplied.push(...updatesLike);
                 stampChunk(); // success: stamp EVERY message in the chunk (resume watermark)
                 processedChunks++;
                 msgsDone += idxs.length;
@@ -300,6 +313,50 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
                 });
             }
             onProgress?.({ chunk: c + 1, chunks: plan.chunks.length, msgsDone, msgsTotal: plan.eligibleCount, factsAdded });
+        }
+
+        // SHEET REBUILD (redesign-v2 S3): after the final chunk succeeds, run ONE full
+        // (non-extractOnly) Memory Agent session — no settled messages, the last 4 chat
+        // messages as TENTATIVE planning context — so the freshly-imported store immediately
+        // yields a usable memory sheet. Skipped on cancel/abort (the sheet keeps its prior
+        // value — never blanked). Best-effort: a sheet failure never fails the import.
+        if (!catchupCancelled && !aborted && processedChunks > 0) {
+            try {
+                const tentative = [];
+                for (let i = Math.max(0, chat.length - 4); i < chat.length; i++) {
+                    const m = chat[i];
+                    if (!m || !m.mes || m.is_system || m.extra?.type) continue;
+                    tentative.push({ index: i, role: m.is_user ? 'USER' : 'CHAR', name: String(m.name || '').trim(), text: m.mes });
+                }
+                const sheetRunId = `C${Date.now().toString(36).slice(-5)}`;
+                const sheetRun = await runMemoryAgent({
+                    settledMessages: [],
+                    tentativeMessages: tentative,
+                    characterInfo: charInfo,
+                    userPersona,
+                    profileId,
+                    priorSheetText: getMemorySheet()?.text || '',
+                    reflection: getReflection(),
+                    scene: getScene(),
+                    observationDate: new Date().toISOString(),
+                    runId: sheetRunId,
+                    extractOnly: false,
+                });
+                if (!sheetRun?.error && sheetRun?.sheetText) {
+                    setMemorySheet(sheetRun.sheetText, { runId: sheetRunId, sourceMessageIndex: chat.length - 1 });
+                    addDebugLog('pass', 'Catch-up: memory sheet rebuilt from the imported store', {
+                        subsystem: 'import', event: 'catchup.sheetRebuilt', data: { chars: sheetRun.sheetText.length },
+                    });
+                } else {
+                    addDebugLog('info', `Catch-up: sheet rebuild skipped/failed (${sheetRun?.error || 'no sheet'}) — prior sheet kept`, {
+                        subsystem: 'import', event: 'catchup.sheetFailed', reason: 'SHEET_ERROR',
+                    });
+                }
+            } catch (err) {
+                addDebugLog('fail', `Catch-up: sheet rebuild threw (non-fatal): ${err.message || err}`, {
+                    subsystem: 'import', event: 'catchup.sheetFailed', reason: 'ERROR',
+                });
+            }
         }
     } finally {
         // COMPLETION (success OR cancel OR abort): surface what this import produced in the

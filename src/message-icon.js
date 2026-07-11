@@ -97,38 +97,34 @@ async function onIconClick(e, mesId) {
     iconEl.classList.add(ICON_LOADING_CLASS);
 
     try {
-        const { runMemoryUpdater } = await import('./agent-memory.js');
-        const { getAgent3ProfileId } = await import('./profiler.js');
-        const { getAllDatabases } = await import('./database.js');
+        const { runMemoryAgent } = await import('./agent-memory.js');
         const { getSettings, saveCurrentToActiveProfile } = await import('./settings.js');
 
         const settings = getSettings();
-        const profileId = getAgent3ProfileId(settings);
+        const profileId = settings?.agent3Profile || null;
 
         const char = ctx.characters?.[ctx.characterId];
         const charInfo = char ? [
             char.name && `Name: ${char.name}`,
-            char.description && `Description: ${char.description.substring(0, 2000)}`,
-            char.personality && `Personality: ${char.personality.substring(0, 1000)}`,
-            char.scenario && `Scenario: ${char.scenario.substring(0, 1000)}`,
+            char.description && `Description: ${char.description.substring(0, 400)}`,
         ].filter(Boolean).join('\n') : '';
         const userPersona = ctx.persona?.description || ctx.name1 || '';
 
-        const databases = await getAllDatabases();
-        addDebugLog('info', `Per-msg icon: forcing Agent 3 on msg ${mesId}`);
-        const result = await runMemoryUpdater(
-            msg.mes,
-            mesId,
-            charInfo,
-            databases,
-            profileId,
-            !!msg.is_user,
+        addDebugLog('info', `Per-msg icon: forcing the Memory Agent on msg ${mesId}`);
+        // EXTRACT-ONLY Memory Agent session over just this message (redesign-v2 S3). A
+        // protocol failure returns result.error and we THROW below, so the watermark is only
+        // ever stamped on a successful run (F-SCRIBE-1).
+        const result = await runMemoryAgent({
+            settledMessages: [{ index: mesId, role: msg.is_user ? 'USER' : 'CHAR', name: String(msg.name || '').trim(), text: msg.mes }],
+            tentativeMessages: [],
+            characterInfo: charInfo,
             userPersona,
-            [],
-            null,
-            String(msg.name || '').trim(), // source speaker (HUB FIX per-character namespacing)
-        );
-        const n = result?.updates?.length || 0;
+            profileId,
+            runId: `I${Date.now().toString(36).slice(-5)}`,
+            extractOnly: true,
+        });
+        if (result?.error) throw new Error(result.error);
+        const n = result?.applied?.length || 0;
 
         // Mark processed + persist
         msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
@@ -137,7 +133,7 @@ async function onIconClick(e, mesId) {
 
         updateIconState(iconEl, msg);
         if (typeof toastr !== 'undefined') {
-            toastr.success(`Scribe: ${n} facts extracted from msg ${mesId}`, 'BF Memory', { timeOut: 3000 });
+            toastr.success(`Memory Agent: ${n} facts stored from msg ${mesId}`, 'BF Memory', { timeOut: 3000 });
         }
     } catch (err) {
         addDebugLog('fail', `Per-msg icon failed for msg ${mesId}: ${err.message || err}`);
