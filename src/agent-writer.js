@@ -91,11 +91,19 @@ function injectIntoMessages(messages, injection) {
     if (lastUserIdx === -1) {
 
         messages.push({ role: 'system', content: injection });
+        console.log('[BFMemory] Memory context injected as system-message fallback (no user message found)');
     } else {
 
-        messages.splice(lastUserIdx, 0, { role: 'system', content: injection });
+        const target = messages[lastUserIdx];
+        if (typeof target.content === 'string') {
+            target.content = injection + '\n\n' + target.content;
+        } else if (Array.isArray(target.content)) {
+            target.content.unshift({ type: 'text', text: injection + '\n\n' });
+        } else {
+            target.content = injection + '\n\n' + String(target.content ?? '');
+        }
+        console.log('[BFMemory] Memory context concatenated onto last user message');
     }
 
-    console.log('[BFMemory] Memory context injected into prompt');
     return true;
 }
