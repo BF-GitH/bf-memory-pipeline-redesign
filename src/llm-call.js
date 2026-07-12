@@ -372,6 +372,12 @@ export async function callAgentLLMWithTools({
             const detail = parsed.malformed.length > 0
                 ? parsed.malformed[0].error
                 : 'no tool-call lines and no final block found in the reply';
+            // Capture the RAW model reply so a protocol failure can be diagnosed
+            // from the exported debug log (what did the model actually return?).
+            addDebugLog('fail', `[${agent}] Protocol parse failed (round ${round}, ${isChatter ? 'chatter' : 'malformed'}): raw reply is ${String(reply).length} chars. First 2000: ${String(reply).slice(0, 2000)}`, {
+                subsystem: 'agent3', event: 'toolloop.rawreply', reason: 'PROTOCOL_DEBUG',
+                data: { agent, round, replyChars: String(reply).length, isChatter, graceUsed, rawReply: String(reply).slice(0, 4000) },
+            });
             if (graceUsed) {
                 out.error = `malformed protocol reply (second offense): ${detail}`;
                 entry.note = 'malformed — second offense';
