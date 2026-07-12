@@ -20,7 +20,7 @@ import { addDebugLog } from './settings.js';
 import { wordTokens, keyToken } from './tokenize.js';
 import * as host from './host.js';
 
-export const KNOWN_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'write_fact', 'search'];
+const KNOWN_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'write_fact', 'search'];
 
 const LIST_KEYS_CAP = 80;
 

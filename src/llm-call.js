@@ -143,7 +143,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
     ], profileId, agent, externalSignal);
 }
 
-export async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown', externalSignal = null) {
+async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown', externalSignal = null) {
 
     const systemPrompt = (Array.isArray(messages) && messages[0]?.role === 'system')
         ? String(messages[0].content || '')

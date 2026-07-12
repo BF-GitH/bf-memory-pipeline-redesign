@@ -1,7 +1,5 @@
 import { addDebugLog } from './debug-log.js';
 
-import { getSettings } from './settings.js';
-import { wordTokens } from './tokenize.js';
 import { getContext, escapeHtml, fmt, getCurrentChatId, isBranchChat } from './ui-util.js';
 
 let lastGenerated = { runId: null, timestamp: null, updates: [] };

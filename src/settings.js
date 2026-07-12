@@ -113,7 +113,7 @@ export function setPipelineEnabled(next) {
     return next;
 }
 
-export function saveSettings() {
+function saveSettings() {
     const context = getContext();
     context.extensionSettings[EXTENSION_NAME] = extensionSettings;
     context.saveSettingsDebounced();
@@ -125,7 +125,7 @@ function clamp(value, lo, hi, fallback) {
     return Math.min(hi, Math.max(lo, n));
 }
 
-export function validateSettings(s) {
+function validateSettings(s) {
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 10));
     s.bufferHoldBack = Math.floor(clamp(s.bufferHoldBack, 0, 10, 4));
 
@@ -625,7 +625,7 @@ export async function saveCurrentToActiveProfile(profileKey = null, { allowEmpty
     }
 }
 
-export function pruneActiveProfile(category = null) {
+function pruneActiveProfile(category = null) {
     const profiles = extensionSettings?.dbProfiles;
     if (!profiles || typeof profiles !== 'object') return { profilesPruned: [], factsPruned: 0 };
 

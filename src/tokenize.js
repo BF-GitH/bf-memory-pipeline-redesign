@@ -1,5 +1,5 @@
 let _segmenter = null;
-export let hasSegmenter = false;
+let hasSegmenter = false;
 try {
     _segmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
     hasSegmenter = true;

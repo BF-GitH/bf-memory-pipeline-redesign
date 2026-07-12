@@ -1,6 +1,6 @@
 import { getScene } from './turn-state.js';
 
-export function computeNowContext() {
+function computeNowContext() {
     let msgIndex = null;
     try {
         const chat = SillyTavern.getContext()?.chat;

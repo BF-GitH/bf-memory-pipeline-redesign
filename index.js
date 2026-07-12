@@ -1,4 +1,3 @@
-export const extension_name = 'bf-memory-pipeline';
 
 jQuery(async () => {
     try {

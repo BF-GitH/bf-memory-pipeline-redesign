@@ -37,7 +37,7 @@ export function getUserPersonaName() {
     return rawCtx()?.name1 || '';
 }
 
-export const EXTENSION_SETTINGS_KEY = (() => {
+const EXTENSION_SETTINGS_KEY = (() => {
     try {
         const parts = new URL(import.meta.url).pathname.split('/');
         const srcIdx = parts.lastIndexOf('src');

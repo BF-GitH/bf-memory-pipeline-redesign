@@ -26,12 +26,12 @@ function getSettingsSafe() {
 const KEY_INVENTORY_CAP = 200;   
 const NEED_REFS_CAP = Infinity;  
 
-export const TEMPORAL_GROUNDING_RULE = `
+const TEMPORAL_GROUNDING_RULE = `
 
 # OBSERVATION DATE (TIME GROUNDING)
 The user data block gives a \`## Observation date\` (the real-world time the newest message was observed). Resolve RELATIVE time expressions to ABSOLUTE dates relative to it — e.g. "yesterday" → the day before that date, "last week" → "the week of <date>", "two years ago" → the year. Store the absolute form (in the value or note), not the relative word, so the fact doesn't rot. If no observation date is given, leave time expressions as-is.`;
 
-export const DEFAULT_MEMORY_AGENT_PROMPT = `You are the MEMORY AGENT for an ongoing roleplay between {{user}} (the human player) and {{char}} (the AI character). You run in the BACKGROUND after each reply — the storyteller model never sees you, only the MEMORY SHEET you produce. You do TWO jobs in one session:
+const DEFAULT_MEMORY_AGENT_PROMPT = `You are the MEMORY AGENT for an ongoing roleplay between {{user}} (the human player) and {{char}} (the AI character). You run in the BACKGROUND after each reply — the storyteller model never sees you, only the MEMORY SHEET you produce. You do TWO jobs in one session:
 
 1. EXTRACT — store new LASTING facts from the SETTLED messages into the memory database (write_fact).
 2. ANTICIPATE — work out where the scene is going and which stored memories the NEXT reply will need, then emit the updated MEMORY SHEET.
@@ -292,7 +292,7 @@ function buildAgentUserPrompt({
     }
 }
 
-export function parseSheetBlock(text) {
+function parseSheetBlock(text) {
     const out = { summary: '', sceneLine: '', timeline: '', need: [], notes: '', error: null };
     const raw = String(text ?? '').trim();
     if (!raw) {
@@ -340,7 +340,7 @@ function clampNum(v, min, max, dflt) {
     return Math.min(max, Math.max(min, n));
 }
 
-export function composeSheet({ summary = '', sceneLine = '', timeline = '', notes = '', need = [], settings = {}, databases = {} } = {}) {
+function composeSheet({ summary = '', sceneLine = '', timeline = '', notes = '', need = [], settings = {}, databases = {} } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
 

@@ -86,7 +86,7 @@ function subjectGroupLabel(fact) {
     return subjRaw || 'Misc';
 }
 
-export function estimateInjectionTokens(r, seenSubjects = null) {
+function estimateInjectionTokens(r, seenSubjects = null) {
     const f = r.fact;
 
     let nowCtx = null;
@@ -287,7 +287,7 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
 
 const FUZZY_THRESHOLD = 0.4;
 
-export function trigramSimilarity(a, b) {
+function trigramSimilarity(a, b) {
     const grams = (s) => {
         const t = `  ${String(s || '').toLowerCase().trim()}  `;
         const set = new Set();
@@ -450,7 +450,7 @@ function confidenceFactor(fact) {
     const f = CONFIDENCE_FACTOR[String(c).toLowerCase()];
     return f === undefined ? 1.0 : f;
 }
-export function retrievalSalience(fact, now) {
+function retrievalSalience(fact, now) {
     const importance = clampImportance(fact?.importance);
     const kind = normalizeKind(fact?.kind);
 

@@ -8,8 +8,8 @@ const HOT_SET_SIZE = 50;
 
 const COLD_TIER_PROTECT_IMPORTANCE = 5;
 
-export const DEFAULT_IMPORTANCE = 3;
-export const DEFAULT_KIND = 'trait';
+const DEFAULT_IMPORTANCE = 3;
+const DEFAULT_KIND = 'trait';
 
 const VALID_KINDS = new Set(['trait', 'state', 'event', 'moment']);
 
@@ -50,14 +50,14 @@ export function normalizeKind(v) {
 
 const TONE_MAX_LEN = 40;
 
-export function normalizeTone(v) {
+function normalizeTone(v) {
     const t = String(v ?? '').replace(/\s+/g, ' ').trim();
     return t ? t.slice(0, TONE_MAX_LEN) : '';
 }
 
 export const L1_CATEGORIES = ['People', 'Places', 'Things', 'Relationships', 'Events', 'World', 'Unsorted'];
 
-export const TAXONOMY = {
+const TAXONOMY = {
     People: {
 
         'Identity': [
@@ -385,7 +385,7 @@ let _overlayVocabMemo = null;
 
 let _overlayCatsMemo = null;
 
-export function getTaxonomyOverlay() {
+function getTaxonomyOverlay() {
     const ov = host.getExtensionSettings()?.taxonomyOverlay;
     return {
         categories: Array.isArray(ov?.categories) ? ov.categories : [],
@@ -415,7 +415,7 @@ export function effectiveCategories() {
     return [...L1_CATEGORIES, ...overlayCategories()];
 }
 
-export function flatVocab(category) {
+function flatVocab(category) {
     const canon = mapLegacyCategory(category);
     if (!_overlayVocabMemo) _overlayVocabMemo = new Map();
     const cached = _overlayVocabMemo.get(canon);
@@ -439,11 +439,11 @@ export function flatVocab(category) {
     return merged;
 }
 
-export function aspectVocabFor(category) {
+function aspectVocabFor(category) {
     return flatVocab(category);
 }
 
-export function defaultAspectFor(category) {
+function defaultAspectFor(category) {
     const canon = mapLegacyCategory(category);
     return DEFAULT_ASPECT[canon] || flatVocab(canon)[0] || 'misc';
 }
@@ -496,7 +496,7 @@ export function withSkeleton(databases) {
 
 const VALID_SCOPES = new Set(['character', 'place', 'event']);
 
-export function normalizeScope(v) {
+function normalizeScope(v) {
     const s = String(v || '').trim().toLowerCase();
     return VALID_SCOPES.has(s) ? s : '';
 }
@@ -518,7 +518,7 @@ export function isActiveFact(fact) {
     return !(fact && fact.active === false);
 }
 
-export function isHotFact(fact) {
+function isHotFact(fact) {
     return !(fact && fact.cold === true);
 }
 
@@ -526,7 +526,7 @@ export function isColdFact(fact) {
     return !!(fact && fact.cold === true);
 }
 
-export function uncoldFact(fact, category, reason = 'COLD_REACTIVATED', detail = '') {
+function uncoldFact(fact, category, reason = 'COLD_REACTIVATED', detail = '') {
     if (!fact || fact.cold !== true) return false;
     delete fact.cold;
     addDebugLog('info', `Fact resurfaced (un-cold): [${category}] ${fact.key}${detail ? ` — ${detail}` : ''}`, {
@@ -917,7 +917,7 @@ export async function getAllDatabases() {
 let _idxCache = null;        
 let _idxCacheAvatar = null;  
 
-export function invalidateMemoryIndex() {
+function invalidateMemoryIndex() {
     _idxCache = null;
     _idxCacheAvatar = null;
 }
