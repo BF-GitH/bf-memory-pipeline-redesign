@@ -3,8 +3,8 @@ import { addDebugLog } from './settings.js';
 import { parseAgentReply } from './memory-tools.js';
 import * as host from './host.js';
 
-const LLM_TIMEOUT_MS = 28000;          
-const LLM_WALLCLOCK_BUDGET_MS = 45000; 
+const LLM_TIMEOUT_MS = 120000;          // per-attempt cap. Generous on purpose: a self-hosted bridge (e.g. Claude Code CLI on Termux) chewing a ~20k-char prompt can take a minute+. The memory agent runs in the BACKGROUND (post-reply, detached), so a long wait never blocks the chat.
+const LLM_WALLCLOCK_BUDGET_MS = 150000; // total budget across the (up to 2) attempts of a single round.
 
 const lastSystemHashByAgent = new Map();   
 let lastPersonaName = undefined;            
