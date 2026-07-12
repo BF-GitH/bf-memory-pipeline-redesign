@@ -814,6 +814,9 @@ async function snapshotAvatar(avatar, { reconcileDeletes = true } = {}) {
         console.error('[BFMemory] snapshotAvatar failed', e);
     } finally {
         _snapshotInFlight = false;
+        // Re-arm any avatars deferred (or re-dirtied on failure) while this ran,
+        // so a dirty avatar is never stranded until the next write / forced flush.
+        for (const pending of _snapshotDirty) scheduleSnapshot(pending);
     }
 }
 
@@ -870,8 +873,13 @@ export async function flushSnapshotNow({ avatar: pinnedAvatar, reconcileDeletes 
     }
 }
 
-let _dbCache = null;          
-let _dbCacheAvatar = null;    
+// Storage tiers (all called "database" elsewhere — this is the map):
+//   IndexedDB           = source of truth (per avatar, write-through every action).
+//   Attachment bf_memory_db_*.json = durable MIRROR of IDB (debounced 15s, force-flushed on chat-switch/unload).
+//   _dbCache            = in-memory read cache (per avatar+chat), invalidated on every save/delete.
+//   dbProfiles (settings.js) = per-chat named checkpoints that swap the working store on autoload.
+let _dbCache = null;
+let _dbCacheAvatar = null;
 let _dbCacheChatId = null;    
 let _dbCachePromise = null;   
 
@@ -1538,10 +1546,6 @@ function mergeProvenance(existing, incoming, now) {
         ...(genesisValidFrom !== undefined ? { validFrom: genesisValidFrom } : {}),
         ...(history.length ? { sourceHistory: history } : {}),
     };
-}
-
-export function sinceIso(days) {
-    return new Date(Date.now() - Math.max(0, days) * 86400000).toISOString();
 }
 
 export function upsertFact(db, fact) {

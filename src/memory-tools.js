@@ -26,52 +26,84 @@ const LIST_KEYS_CAP = 80;
 
 const SEARCH_RESULT_CAP = 15;
 
+// Pull every balanced {...} object out of a line, honoring quoted strings/escapes.
+function extractJsonObjects(line) {
+    const found = [];
+    for (let i = 0; i < line.length; i++) {
+        if (line[i] !== '{') continue;
+        let depth = 0, inStr = false, esc = false;
+        for (let j = i; j < line.length; j++) {
+            const ch = line[j];
+            if (esc) { esc = false; continue; }
+            if (ch === '\\') { esc = true; continue; }
+            if (ch === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (depth === 0) { found.push(line.slice(i, j + 1)); i = j; break; } }
+        }
+    }
+    return found;
+}
+
 export function parseAgentReply(text) {
     const out = { calls: [], sheet: null, done: false, malformed: [] };
     const raw = String(text ?? '');
     if (!raw.trim()) return out;
 
     const lines = raw.split('\n');
+
+    const tryTool = (jsonStr, strict) => {
+        let obj;
+        try { obj = JSON.parse(jsonStr); }
+        catch (e) { if (strict) out.malformed.push({ line: jsonStr, error: `invalid JSON (${e.message || e}) — a tool call must be ONE line of strict JSON` }); return; }
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+        const tool = String(obj.tool || '').trim();
+        if (!KNOWN_TOOLS.includes(tool)) { if (strict) out.malformed.push({ line: jsonStr, error: `unknown tool "${tool || '(missing)'}" — valid tools: ${KNOWN_TOOLS.join(', ')}` }); return; }
+        if (obj.args !== undefined && (typeof obj.args !== 'object' || obj.args === null || Array.isArray(obj.args))) { if (strict) out.malformed.push({ line: jsonStr, error: `"args" must be a JSON object` }); return; }
+        out.calls.push({ tool, args: obj.args || {}, line: jsonStr });
+    };
+
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i].trim();
         if (!line) continue;
-        if (/^```/.test(line)) continue; 
+        if (/^```/.test(line)) continue;
 
-        const finalMatch = /^#(SHEET|DONE)\s*$/i.exec(line);
+        // Tolerant final-token: optional leading fence/quote/bullet/bold/hash decoration,
+        // "# SHEET", trailing ":" or trailing content all accepted.
+        const finalMatch = /^[>*_`~\s#-]*#\s*(SHEET|DONE)\b\s*:?\s*(.*)$/i.exec(line);
         if (finalMatch) {
             out.done = true;
             if (finalMatch[1].toUpperCase() === 'SHEET') {
-
-                out.sheet = lines.slice(i + 1)
-                    .filter(l => !/^\s*```/.test(l))
-                    .join('\n')
-                    .trim();
+                const inline = finalMatch[2].replace(/[*_`~]+$/, '').trim();
+                const body = lines.slice(i + 1).filter(l => !/^\s*```/.test(l));
+                out.sheet = (inline ? inline + '\n' : '') + body.join('\n');
+                out.sheet = out.sheet.trim();
             }
-            break; 
+            break;
         }
 
-        if (line.startsWith('{')) {
-            let obj;
-            try {
-                obj = JSON.parse(line);
-            } catch (e) {
-                out.malformed.push({ line, error: `invalid JSON (${e.message || e}) — a tool call must be ONE line of strict JSON` });
-                continue;
-            }
-            const tool = String(obj?.tool || '').trim();
-            if (!KNOWN_TOOLS.includes(tool)) {
-                out.malformed.push({ line, error: `unknown tool "${tool || '(missing)'}" — valid tools: ${KNOWN_TOOLS.join(', ')}` });
-                continue;
-            }
-            if (obj.args !== undefined && (typeof obj.args !== 'object' || obj.args === null || Array.isArray(obj.args))) {
-                out.malformed.push({ line, error: `"args" must be a JSON object` });
-                continue;
-            }
-            out.calls.push({ tool, args: obj.args || {}, line });
-            continue;
-        }
+        // Fast path: whole line is a JSON tool call (unchanged behavior, incl. malformed reporting).
+        if (line.startsWith('{')) { tryTool(line, true); continue; }
 
+        // Tolerant path: a tool-call object wrapped in prose / after a prefix.
+        if (line.includes('{') && /["']tool["']\s*:/.test(line)) {
+            for (const cand of extractJsonObjects(line)) tryTool(cand, false);
+        }
     }
+
+    // Last-ditch: model wrote the sheet with no #SHEET token at all. Only when the
+    // reply is otherwise pure chatter, so well-formed replies are never affected.
+    if (!out.done && out.calls.length === 0 && out.malformed.length === 0) {
+        let start = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (/^\s*(SUMMARY|SCENE|TIMELINE|NEED|NOTES)\s*:/i.test(lines[i])) { start = i; break; }
+        }
+        if (start >= 0) {
+            const body = lines.slice(start).filter(l => !/^\s*```/.test(l)).join('\n').trim();
+            if (/^\s*SUMMARY\s*:/im.test(body) || /\bSUMMARY\s*:/i.test(body)) { out.done = true; out.sheet = body; }
+        }
+    }
+
     return out;
 }
 
@@ -300,6 +332,9 @@ function execWriteFact(args, ctx) {
     const status = !matched ? 'NEW' : (changed ? 'UPDATED' : 'SKIPPED');
 
     upsertFact(db, fact);
+    // Always mark the category dirty when upsertFact ran, so a note-only in-place
+    // edit (status SKIPPED) is still persisted to IDB. Set.add is idempotent.
+    ctx.touchedCategories.add(category);
 
     if (changed) {
 

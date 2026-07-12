@@ -23,8 +23,7 @@ function getSettingsSafe() {
     try { return host.getExtensionSettings(); } catch { return null; }
 }
 
-const KEY_INVENTORY_CAP = 200;   
-const NEED_REFS_CAP = Infinity;  
+const KEY_INVENTORY_CAP = 200;
 
 const TEMPORAL_GROUNDING_RULE = `
 
@@ -129,8 +128,6 @@ export async function runMemoryAgent({
         return result;
     }
 
-    const usageBumpCats = [];
-
     let sourceIndex = null;
     let sourceUid = '';
     for (const m of (Array.isArray(settledMessages) ? settledMessages : [])) {
@@ -182,6 +179,13 @@ export async function runMemoryAgent({
 
     if (loop.error) {
         result.error = loop.error;
+        // Write-salvage: persist writes that already executed into ctx.databases
+        // even though the loop errored, so extracted facts aren't discarded.
+        for (const cat of ctx.touchedCategories) {
+            if (!databases[cat]) continue;
+            try { await saveDatabase(databases[cat]); }
+            catch (e) { addDebugLog('fail', `[${runId}] Failed to save "${cat}" after loop error: ${e?.message || e}`); }
+        }
         return result;
     }
     if (!extractOnly && (!loop.sheet || !String(loop.sheet).trim())) {
@@ -199,7 +203,6 @@ export async function runMemoryAgent({
     }
 
     const toSave = new Set(ctx.touchedCategories);
-    for (const cat of usageBumpCats) toSave.add(cat);
     for (const cat of toSave) {
         if (!databases[cat]) continue;
         try {
@@ -341,10 +344,13 @@ function parseSheetBlock(text) {
         const key = r.slice(slash + 1).trim();
         if (!category || !key) continue;
         out.need.push({ category, key });
-        if (out.need.length >= NEED_REFS_CAP) break;
     }
 
-    if (!out.summary) out.error = 'missing SUMMARY line';
+    // Only hard-fail when the sheet is effectively empty (no SUMMARY and no other
+    // usable section); a missing SUMMARY alongside SCENE/TIMELINE/NEED still composes.
+    if (!out.summary && !out.sceneLine && !out.timeline && out.need.length === 0) {
+        out.error = 'missing SUMMARY line';
+    }
     return out;
 }
 
@@ -360,7 +366,7 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', notes = '',
 
     const rows = [];
     const seen = new Set();
-    for (const ref of (Array.isArray(need) ? need : []).slice(0, NEED_REFS_CAP)) {
+    for (const ref of (Array.isArray(need) ? need : [])) {
         try {
             const category = mapLegacyCategory(String(ref?.category || '').trim() || 'Unsorted');
             const key = String(ref?.key || '').trim();

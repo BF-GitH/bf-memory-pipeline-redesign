@@ -21,6 +21,28 @@ let memoryExtractionInFlight = false;
 let extractionRetryAfterBusy = false;
 let cancelledRetryArmed = false;
 
+// --- User-visible error stream (separate from the debug log) ---------------
+// A memory-pipeline run failing must NOT interrupt chat (the run is post-reply
+// and every branch is already caught) — it should only raise a toast. Throttled
+// so a per-turn recurring failure can't spam: an identical message is suppressed
+// within the window; a *different* error always surfaces immediately.
+let lastErrToastMsg = '';
+let lastErrToastAt = 0;
+const ERROR_TOAST_THROTTLE_MS = 60000;
+
+function toastPipelineError(msg) {
+    try {
+        const settings = getSettings();
+        if (!settings || settings.showToast === false) return;
+        if (typeof toastr === 'undefined') return;
+        const now = Date.now();
+        if (msg === lastErrToastMsg && (now - lastErrToastAt) < ERROR_TOAST_THROTTLE_MS) return;
+        lastErrToastMsg = msg;
+        lastErrToastAt = now;
+        toastr.error(String(msg), 'BF Memory', { timeOut: 6000, preventDuplicates: true });
+    } catch {  }
+}
+
 function firstInjectableArray(data) {
     if (!data || typeof data !== 'object') return null;
     const candidates = [data.chat, data.messages, data.prompt, data.chatCompletion, data.messageArray];
@@ -319,6 +341,7 @@ async function runMemoryExtraction() {
                 subsystem: 'agent3', event: 'agent3.run', reason: 'ERROR',
                 data: { agent: 'memory-agent', profileId: agent3ProfileId, success: false, error: memoryResult.error, durationMs: Date.now() - startTime },
             });
+            if (memoryResult?.error) toastPipelineError(`Memory update failed: ${memoryResult.error}`);
 
             setWatermark(false);
             return;
@@ -394,6 +417,7 @@ async function runMemoryExtraction() {
     } catch (err) {
 
         addDebugLog('fail', `[${runId}] Memory agent (post-reply) failed (non-fatal): ${err.message || err}`);
+        toastPipelineError(`Memory update failed: ${err.message || err}`);
 
         if (!reachedCommit) {
             try {
@@ -574,35 +598,43 @@ export function initPipeline() {
         }
     });
 
-    eventSource.on(eventTypes.MESSAGE_RECEIVED, async () => {
+    eventSource.on(eventTypes.MESSAGE_RECEIVED, () => {
+        // Runs inside ST's awaited emit chain: keep this handler SYNCHRONOUS so
+        // the reply finalizes and the send button re-activates immediately.
         clearInjectedGuard();
 
         pipelineCancelled = false;
         updateStatus('idle');
 
-        try {
-            if (runRecordedInput) {
-                const ctx = SillyTavern.getContext();
-                const lastMsg = ctx.chat?.[ctx.chat.length - 1];
-                if (lastMsg && !lastMsg.is_user && lastMsg.mes) {
-                    const n = await (ctx.getTokenCountAsync?.(lastMsg.mes) ?? 0);
-                    setMainOutputTokens(n);
-                }
-            }
-        } catch {  }
-
+        const shouldRecordOutput = runRecordedInput;
         runRecordedInput = false;
 
-        try {
-            await runMemoryExtraction();
+        // Detached memory stream — the chat is never blocked while memory runs.
+        // Re-entrancy is guarded by memoryExtractionInFlight in runMemoryExtraction();
+        // a run that is still in flight when the next reply arrives is coalesced
+        // into a single chained catch-up retry, so runs never stack.
+        (async () => {
+            try {
+                if (shouldRecordOutput) {
+                    const ctx = SillyTavern.getContext();
+                    const lastMsg = ctx.chat?.[ctx.chat.length - 1];
+                    if (lastMsg && !lastMsg.is_user && lastMsg.mes) {
+                        const n = await (ctx.getTokenCountAsync?.(lastMsg.mes) ?? 0);
+                        setMainOutputTokens(n);
+                    }
+                }
+            } catch {  }
 
-            maybeRunReflection();
-        } catch (err) {
-            addDebugLog('fail', `Settle extraction failed (non-fatal): ${err.message || err}`);
-        } finally {
-
-            consumePendingRun();
-        }
+            try {
+                await runMemoryExtraction();
+                maybeRunReflection();
+            } catch (err) {
+                addDebugLog('fail', `Settle extraction failed (non-fatal): ${err.message || err}`);
+                toastPipelineError(`Memory update failed: ${err.message || err}`);
+            } finally {
+                consumePendingRun();
+            }
+        })();
     });
 
     eventSource.on(eventTypes.GENERATION_STOPPED, () => {
@@ -625,6 +657,8 @@ export function initPipeline() {
         extractionRetryAfterBusy = false;
         cancelledRetryArmed = false;
         groupSkipToastShown = false;
+        lastErrToastMsg = '';
+        lastErrToastAt = 0;
 
         successfulRunsSinceReflection = 0;
         reflectionPending = null;

@@ -25,15 +25,14 @@ import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 
 export {
     beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun,
-    reloadDebugLogFromChat, addDebugLog, exportLogsJSON,
+    addDebugLog,
 } from './debug-log.js';
 export {
-    setLastGenerated, setLastInserted, reloadFactsFromChat,
-    setRunTokens, addAgent3Tokens, addReflectionTokens, setMainOutputTokens, reloadTokensFromChat,
-    getScene, reloadSceneFromChat,
-    getReflection, setReflection, reloadReflectionFromChat,
-    getSummaryPyramid, setSummaryPyramid, reloadPyramidFromChat,
-    SHEET_SEED_TEXT, getMemorySheet, setMemorySheet, reloadSheetFromChat, renderMemorySheet,
+    setLastGenerated, setLastInserted,
+    setRunTokens, addAgent3Tokens, addReflectionTokens, setMainOutputTokens,
+    getReflection, setReflection,
+    getSummaryPyramid, setSummaryPyramid,
+    getMemorySheet, setMemorySheet,
 } from './turn-state.js';
 
 const EXTENSION_NAME = (() => {
@@ -1230,6 +1229,51 @@ export async function initSettings() {
         } catch (err) {
             addDebugLog('fail', `Save-as-new profile failed: ${err?.message || err}`, { subsystem: 'settings', event: 'profile.save', actor: 'USER' });
             toastr.error('Failed to save profile', 'BF Memory');
+        }
+    });
+
+    $('#bf_mem_db_profile_new').on('click', async () => {
+        const name = prompt('Name for the new (empty) memory database:');
+        if (!name || !name.trim()) return;
+        const cleanName = name.trim();
+        if (extensionSettings.dbProfiles?.[cleanName]) {
+            toastr.warning(`Profile "${cleanName}" already exists — pick another name`, 'BF Memory');
+            return;
+        }
+        if (!confirm(`Create empty database "${cleanName}" and switch this chat to it?\n\nThis clears the current live facts from the working store (use "Save" / "Save As New" first if you want to keep them).`)) return;
+        try {
+            const { buildSkeletonDatabases, getAllDatabases, deleteDatabase, flushSnapshotNow, cancelPendingSnapshot } = await import('./database.js');
+            // wipe the live working store so the new DB genuinely starts empty
+            cancelPendingSnapshot();
+            const existing = await getAllDatabases();
+            for (const category of Object.keys(existing)) await deleteDatabase(category);
+            await flushSnapshotNow();
+            // create the empty profile (same shape as the auto-create path)
+            if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
+            extensionSettings.dbProfiles[cleanName] = {
+                databases: buildSkeletonDatabases(),
+                savedAt: Date.now(),
+                linkedChats: [],
+            };
+            extensionSettings.activeDbProfile = cleanName;
+            // link the current chat so it auto-loads this DB next time
+            const currentChatId = getCurrentChatId();
+            if (currentChatId) {
+                linkChatToProfile(cleanName, currentChatId);
+                lastAutoLoadedChat = currentChatId;
+            }
+            saveSettings();
+            refreshDbProfileDropdown();
+            refreshLinkedChatsField();
+            refreshDatabaseView();
+            toastr.success(`Created empty database "${cleanName}"`, 'BF Memory');
+            addDebugLog('info', `New empty DB profile created: "${cleanName}"${currentChatId ? ` + linked to chat ${currentChatId}` : ''}`, {
+                subsystem: 'db', event: 'profile.saved', actor: 'USER', reason: 'NEW_EMPTY',
+                data: { profileName: cleanName, linkedChat: currentChatId || null },
+            });
+        } catch (err) {
+            addDebugLog('fail', `New DB profile failed: ${err?.message || err}`, { subsystem: 'settings', event: 'profile.save', actor: 'USER' });
+            toastr.error('Failed to create database', 'BF Memory');
         }
     });
 

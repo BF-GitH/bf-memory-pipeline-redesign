@@ -384,7 +384,7 @@ export async function callAgentLLMWithTools({
                 data: { agent, round, detail: String(detail).slice(0, 200) },
             });
             messages.push({ role: 'assistant', content: reply });
-            messages.push({ role: 'user', content: `ERROR: ${detail}. Re-emit valid protocol lines or the ${finalToken} block.` });
+            messages.push({ role: 'user', content: `ERROR: ${detail}. Re-emit as bare protocol: put each tool call alone on its own line as strict JSON, e.g.\n{"tool":"write_fact","args":{"category":"People","key":"x_name","value":"..."}}\nand end with a line that is exactly ${finalToken} (nothing else on that line).` });
             continue;
         }
 
