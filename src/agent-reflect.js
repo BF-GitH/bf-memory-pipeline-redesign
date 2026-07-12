@@ -1,4 +1,4 @@
-import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, markFactCold, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
+import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, dedupeDatabase, removeFact, markFactCold, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
 import { tokenSet, keyToken } from './tokenize.js';
 
 const MAX_CONFLICT_PAIRS = 30;
@@ -65,8 +65,6 @@ import * as host from './host.js';
 
 const MAX_FACT_SUMMARY_CHARS = 4000;
 
-const MAX_TRACK_STEPS = 6;
-
 const MAX_SUMMARY_CHARS = 1200;
 
 const MAX_OBSERVATIONS = 8;
@@ -88,10 +86,7 @@ const MAX_CALLBACKS_PER_PASS = 2;
 
 const MAX_CALLBACK_REASON_CHARS = 120;
 
-const MAX_OPEN_THREADS = 12;
-const MAX_THREAD_RESOLUTIONS_PER_PASS = 5;
-
-export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, and to maintain short zoom-out summaries.
+export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, and to maintain short zoom-out summaries.
 
 Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
 
@@ -102,8 +97,6 @@ Also produce a STORY summary: the whole-story "so far" in 2-4 short sentences, a
 If a "## Shelves to summarize" list is given, write ONE short summary line per listed shelf (a shelf is a Category/aspect bucket of related facts). Each summary is one or two clauses (at most 25 words) capturing the gist of that bucket so it can stand in for the raw facts — it MUST be shorter than the raw facts it stands for; abstract, never enumerate. When a shelf shows a "prev:" line (its prior stored summary), UPDATE that prior summary — integrate what the samples add or change; do not regenerate from scratch and do not restate it at greater length. Only summarize the shelves in that list. If no list is given, put a single "." under #SHELVES.
 
 If a "## Recent moments" list is given (the couple/character emotional beats — confessions, fights, betrayals, reunions — each shown with its exact id), you MAY name 0-2 CALLBACK links: a NEW recent beat that clearly ECHOES an EARLIER one (a confession that pays off an earlier hidden feeling; a betrayal that resurfaces an old wound; a reunion that answers a parting). Emit a link ONLY when the resonance is unmistakable — most passes name none. Each link points the EARLIER beat's id to the LATER beat's id with a one-clause reason. Use ONLY ids from the list (never invent one). If no clear echo exists (or no list was given), put a single "." under #CALLBACK.
-
-If an "## Open threads" list is given (unresolved plot hooks — promises, debts, mysteries, unfired Chekhov guns — each shown with its exact id), mark a thread \`resolved\` ONLY when the stored material clearly shows it concluded (the promise kept, the debt paid, the mystery answered, the gun fired). Most passes resolve none — when in doubt, leave it open. Reference each thread by its exact id shown in brackets; never invent an id.
 
 You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture:
 - PROMOTE — the evidence now supports it as a real, lasting fact: give its proper Layer-1 category (People/Places/Things/Relationships/Events/World) and the most-specific aspect. e.g. a recurring vice → People/vices; a confirmed home → People/home.
@@ -127,16 +120,13 @@ Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fac
 #CALLBACK
 + <earlier_id> <- <later_id> | <short reason this later beat echoes the earlier one>
 .
-#THREADS
-+ <id> = resolved | <short reason the thread is concluded>
-.
 #REEVAL
 + <id> = promote | <Category> | <aspect>
 + <id> = drop
 + <id> = keep
 .
 
-If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no clear echo exists (or no recent-moments list was given), put a single "." under #CALLBACK. If no open-threads list was given (or nothing is clearly concluded — the usual case), put a single "." under #THREADS. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (at most 10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material.`;
+If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no clear echo exists (or no recent-moments list was given), put a single "." under #CALLBACK. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (at most 10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material.`;
 
 function collectReevalCandidates(databases) {
     const now = Date.now();
@@ -191,28 +181,6 @@ function collectRecentMoments(databases) {
     return out.slice(0, MAX_MOMENTS_FOR_CALLBACK);
 }
 
-function collectOpenThreads(databases) {
-    const out = [];
-    for (const [category, db] of Object.entries(databases || {})) {
-        for (const fact of (db.facts || [])) {
-            if (!fact || fact.active === false || fact.track) continue; 
-            if (fact.thread !== 'open') continue;
-            out.push({ id: `${category}::${fact.key}`, category, key: fact.key, fact });
-        }
-    }
-
-    out.sort((a, b) => {
-        const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : -1;
-        const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : -1;
-        if (av !== bv) return bv - av;
-        const as = Number.isInteger(a.fact.sceneNo) ? a.fact.sceneNo : -1;
-        const bs = Number.isInteger(b.fact.sceneNo) ? b.fact.sceneNo : -1;
-        if (as !== bs) return bs - as;
-        return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
-    });
-    return out.slice(0, MAX_OPEN_THREADS);
-}
-
 function pickChangedShelves(index, priorPyramid) {
     const priorShelves = (priorPyramid && priorPyramid.shelves) || {};
     const candidates = [];
@@ -243,36 +211,12 @@ function pickChangedShelves(index, priorPyramid) {
     return candidates.slice(0, MAX_SHELVES_PER_PASS);
 }
 
-function buildReflectInput({ scene, databases, reevalCandidates = [], changedShelves = [], recentMoments = [], openThreads = [], priorStory = '' }) {
+function buildReflectInput({ databases, reevalCandidates = [], changedShelves = [], recentMoments = [], priorStory = '' }) {
     const parts = [];
 
     if (typeof priorStory === 'string' && priorStory.trim()) {
         parts.push(`## Prior story summary (update this; do not restate unchanged parts at greater length)\n${priorStory.trim()}`);
     }
-
-    if (scene && typeof scene === 'object') {
-        const sLines = [];
-        if (scene.location) sLines.push(`Location: ${scene.location}`);
-        if (Array.isArray(scene.present) && scene.present.length) sLines.push(`Present: ${scene.present.join(', ')}`);
-        if (Array.isArray(scene.goals) && scene.goals.length) sLines.push(`Goals: ${scene.goals.join('; ')}`);
-        if (Array.isArray(scene.beats) && scene.beats.length) sLines.push(`Recent beats: ${scene.beats.join('; ')}`);
-        if (sLines.length) parts.push(`## Current scene\n${sLines.join('\n')}`);
-    }
-
-    const trackNames = new Set();
-    for (const db of Object.values(databases || {})) {
-        for (const f of (db.facts || [])) {
-            if (f && typeof f.track === 'string' && f.track.trim()) trackNames.add(f.track.trim());
-        }
-    }
-    const trackLines = [];
-    for (const track of trackNames) {
-        const steps = getTrackSteps(databases, track).slice(-MAX_TRACK_STEPS);
-        if (steps.length) {
-            trackLines.push(`${track}: ${steps.map(s => s.fact.value).join(' -> ')}`);
-        }
-    }
-    if (trackLines.length) parts.push(`## Timelines\n${trackLines.join('\n')}`);
 
     const factLines = [];
     for (const [category, db] of Object.entries(databases || {})) {
@@ -308,16 +252,6 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
         parts.push(`## Recent moments (name 0-2 #CALLBACK echo-links between these by exact id; newest first)\n${mLines.join('\n')}`);
     }
 
-    if (Array.isArray(openThreads) && openThreads.length) {
-        const tLines = openThreads.map(c => {
-            const f = c.fact;
-            const val = String(f.value ?? '').trim().slice(0, 140);
-            const note = (typeof f.context === 'string' && f.context.trim()) ? ` (>${f.context.trim().slice(0, 100)})` : '';
-            return `[${c.id}] ${val}${note}`;
-        });
-        parts.push(`## Open threads (mark one #THREADS resolved ONLY when the stored material clearly shows it concluded; newest first)\n${tLines.join('\n')}`);
-    }
-
     if (Array.isArray(reevalCandidates) && reevalCandidates.length) {
         const reLines = reevalCandidates.map(c => {
             const f = c.fact;
@@ -329,12 +263,12 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
         parts.push(`## Re-evaluate (give a verdict per id)\n${reLines.join('\n')}`);
     }
 
-    parts.push('\nNow output ONLY the #STORY, #SHELVES, #OBS, #CALLBACK, #THREADS and #REEVAL sections.');
+    parts.push('\nNow output ONLY the #STORY, #SHELVES, #OBS, #CALLBACK and #REEVAL sections.');
     return parts.join('\n\n');
 }
 
 function parseReflectResult(response) {
-    const out = { summary: '', shelves: [], observations: [], callbacks: [], threads: [], reevals: [] };
+    const out = { summary: '', shelves: [], observations: [], callbacks: [], reevals: [] };
     if (!response || !response.trim()) return out;
 
     let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim()).replace(/```/g, '');
@@ -375,7 +309,7 @@ function parseReflectResult(response) {
         }
     }
 
-    const obsMatch = text.match(/#OBS\s*([\s\S]*?)(?=\n\s*#CALLBACK|\n\s*#THREADS|\n\s*#REEVAL|$)/i);
+    const obsMatch = text.match(/#OBS\s*([\s\S]*?)(?=\n\s*#CALLBACK|\n\s*#REEVAL|$)/i);
     if (obsMatch) {
         const block = obsMatch[1].trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
@@ -398,7 +332,7 @@ function parseReflectResult(response) {
         }
     }
 
-    const cbMatch = text.match(/#CALLBACK\s*([\s\S]*?)(?=\n\s*#THREADS|\n\s*#REEVAL|$)/i);
+    const cbMatch = text.match(/#CALLBACK\s*([\s\S]*?)(?=\n\s*#REEVAL|$)/i);
     if (cbMatch) {
         const block = cbMatch[1].trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
@@ -419,28 +353,6 @@ function parseReflectResult(response) {
                 if (reason.length > MAX_CALLBACK_REASON_CHARS) reason = reason.slice(0, MAX_CALLBACK_REASON_CHARS).trimEnd() + '…';
                 out.callbacks.push({ earlierId, laterId, reason });
                 if (out.callbacks.length >= MAX_CALLBACKS_PER_PASS) break;
-            }
-        }
-    }
-
-    const thMatch = text.match(/#THREADS\s*([\s\S]*?)(?=\n\s*#REEVAL|$)/i);
-    if (thMatch) {
-        const block = thMatch[1].trim();
-        if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
-            for (const rawLine of block.split('\n')) {
-                let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
-                if (!line || line === '.' || !line.startsWith('+')) continue;
-                line = line.slice(1).trim();
-                const eqIdx = line.indexOf('=');
-                if (eqIdx < 0) continue;
-
-                const id = line.slice(0, eqIdx).trim().replace(/^\[|\]$/g, '').trim();
-                const verdictPart = line.slice(eqIdx + 1).trim();
-                const segs = verdictPart.split('|').map(s => s.trim()).filter(Boolean);
-                const verdict = (segs[0] || '').toLowerCase();
-                if (!id || !verdict.startsWith('resolve')) continue; 
-                out.threads.push({ id, reason: (segs[1] || '').slice(0, MAX_CALLBACK_REASON_CHARS) });
-                if (out.threads.length >= MAX_THREAD_RESOLUTIONS_PER_PASS) break;
             }
         }
     }
@@ -481,12 +393,12 @@ function deriveSubjectFromObsKey(key) {
     return us > 0 ? k.slice(0, us) : k;
 }
 
-export async function runReflection({ runId = '', scene = null, prevReflection = null, characterInfo = '', userPersona = '', profileId = null } = {}) {
+export async function runReflection({ runId = '', prevReflection = null, characterInfo = '', userPersona = '', profileId = null } = {}) {
     try {
         const databases = await getAllDatabases();
 
         const totalFacts = Object.values(databases).reduce((n, db) => n + (db.facts?.length || 0), 0);
-        if (totalFacts === 0 && !scene) {
+        if (totalFacts === 0) {
             addDebugLog('info', `[${runId}] Reflection skipped (nothing to consolidate)`);
             return { summary: '', observations: [], merged: 0, tokensIn: 0, tokensOut: 0 };
         }
@@ -546,9 +458,6 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const recentMoments = collectRecentMoments(databases);
         const momentById = new Map(recentMoments.map(c => [c.id, c]));
 
-        const openThreads = collectOpenThreads(databases);
-        const threadById = new Map(openThreads.map(c => [c.id, c]));
-
         const priorPyramid = (() => { try { return getSummaryPyramid(); } catch { return null; } })();
         let index = null;
         try { index = buildMemoryIndex(databases); } catch { index = null; }
@@ -563,7 +472,7 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const dataParts = [];
         if (characterInfo) dataParts.push(`## Character Info ({{char}})\n${characterInfo}`);
         if (userPersona) dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
-        dataParts.push(buildReflectInput({ scene, databases, reevalCandidates, changedShelves, recentMoments, openThreads, priorStory: (priorPyramid && priorPyramid.story) || '' }));
+        dataParts.push(buildReflectInput({ databases, reevalCandidates, changedShelves, recentMoments, priorStory: (priorPyramid && priorPyramid.story) || '' }));
         const userPrompt = substitute(dataParts.join('\n\n'));
 
         addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
@@ -722,30 +631,6 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             addDebugLog('pass', `[${runId}] Reflection authored ${callbacksWritten} callback-link(s) (cap ${MAX_CALLBACKS_PER_PASS}, from ${recentMoments.length} recent moment(s))`);
         }
 
-        let threadsResolved = 0;
-        const threadModified = new Set();
-        for (const tv of (parsed.threads || [])) {
-            const cand = threadById.get(tv.id);
-            if (!cand) continue; 
-            const fact = cand.fact;
-            if (fact.thread !== 'open') continue; 
-            fact.thread = 'resolved';
-            fact.threadResolvedAt = Date.now();
-            threadModified.add(cand.category);
-            threadsResolved++;
-            addDebugLog('info', `[${runId}] Reflection resolved thread: [${cand.category}] ${cand.key} = "${String(fact.value ?? '').slice(0, 60)}"${tv.reason ? ` | ${tv.reason}` : ''}`, {
-                subsystem: 'reflection', event: 'thread.resolved',
-                data: { category: cand.category, key: cand.key, reason: tv.reason || '' },
-            });
-        }
-        for (const category of threadModified) {
-            try { await saveDatabase(databases[category]); }
-            catch (err) { addDebugLog('fail', `[${runId}] Thread resolution failed to save "${category}": ${err.message || err}`); }
-        }
-        if (threadsResolved > 0) {
-            addDebugLog('pass', `[${runId}] Reflection resolved ${threadsResolved} open thread(s) (cap ${MAX_THREAD_RESOLUTIONS_PER_PASS}, from ${openThreads.length} open)`);
-        }
-
         let promoted = 0, dropped = 0;
         const reevalModified = new Set();
         for (const v of (parsed.reevals || [])) {
@@ -806,8 +691,8 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             addDebugLog('pass', `[${runId}] Re-evaluation: promoted ${promoted}, dropped ${dropped} (from ${reevalCandidates.length} candidate(s))`);
         }
 
-        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, callbacks=${callbacksWritten}, threads=${threadsResolved}, reeval(+${promoted}/-${dropped})`);
-        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, callbacks: callbacksWritten, threadsResolved, promoted, dropped, tokensIn, tokensOut };
+        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, callbacks=${callbacksWritten}, reeval(+${promoted}/-${dropped})`);
+        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, callbacks: callbacksWritten, promoted, dropped, tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Reflection error (non-fatal): ${error.message || error}`);
         return { summary: '', observations: [], tokensIn: 0, tokensOut: 0, error: error.message || String(error) };

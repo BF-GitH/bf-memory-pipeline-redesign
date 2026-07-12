@@ -2,7 +2,7 @@ import { injectMemoryContext } from './agent-writer.js';
 import { runMemoryAgent } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { cancelInFlightLLM } from './llm-call.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getScene, getReflection, getMemorySheet, setMemorySheet, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getReflection, getMemorySheet, setMemorySheet, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
 
 let internalCallDepth = 0;
 const isInternalCall = () => internalCallDepth > 0;
@@ -427,7 +427,6 @@ async function maybeRunReflection() {
         updateStatus('running', 'Reflecting (consolidating memory)...');
         const reflResult = await runReflection({
             runId: pending.runId,
-            scene: getScene(),
             characterInfo: pending.characterInfo || '',
             userPersona: pending.userPersona || '',
             profileId: pending.profileId || null,
