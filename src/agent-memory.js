@@ -1,28 +1,7 @@
-// BF Memory Pipeline - the MEMORY AGENT (redesign-v2, S3)
-// =============================================================================
-// The merged Drafter+Scribe: ONE background LLM tool-loop session per settled reply that
-//   (a) anticipates where the scene is going and which stored memories the NEXT reply needs,
-//   (b) extracts new LASTING facts from the SETTLED messages (never from TENTATIVE ones),
-//   (c) emits the updated persistent MEMORY SHEET (#SHEET block).
-// Transport is the TEXT tool protocol (G1): the agent replies with lines of strict one-line
-// JSON tool calls (list_categories -> list_keys -> read_facts -> write_fact / search) executed
-// by memory-tools.js via llm-call.js's callAgentLLMWithTools loop — works on ANY backend, no
-// provider function-call API.
-//
-// F-SCRIBE-1 (generalized): a failed run — loop error, missing #SHEET, unparseable sheet —
-// returns { error } and the caller commits nothing new, KEEPS the previous sheet, and does NOT
-// watermark the messages, so no exchange is ever silently lost.
-//
-// PERSISTENCE CONTRACT: write_fact (memory-tools.js) mutates the live in-memory database map
-// and records changes on ctx.applied / ctx.touchedCategories; THIS module saves each touched
-// category ONCE after the loop (plus any use-it-or-lose-it bump categories). The durable
-// profile snapshot (saveCurrentToActiveProfile) stays with the caller, as today.
-
 import {
     getAllDatabases,
     getMemoryIndex,
     saveDatabase,
-    applyBufferedFactUsage,
     findFactMatch,
     mapLegacyCategory,
     isActiveFact,
@@ -40,29 +19,18 @@ import { executeMemoryTool } from './memory-tools.js';
 import { addDebugLog } from './settings.js';
 import * as host from './host.js';
 
-// Lazy settings read (avoids a static settings.js cycle at module-eval time).
 function getSettingsSafe() {
     try { return host.getExtensionSettings(); } catch { return null; }
 }
 
-// ── Prompt-size guards (per-run user prompt) ─────────────────────────────────
-const KEY_INVENTORY_CAP = 200;   // max Category/key inventory lines shown (list_keys covers the rest)
-const NEED_REFS_CAP = Infinity;  // MVP: NO cap — the sheet carries as many memories as the next scene needs (G1)
+const KEY_INVENTORY_CAP = 200;   
+const NEED_REFS_CAP = Infinity;  
 
-// TEMPORAL GROUNDING rule (G4 hardcoded-ON; kept from the old Scribe prompt). Relative time
-// words rot ("yesterday" is meaningless once stored), so the agent anchors them to the
-// "## Observation date" supplied in the user data block. Static suffix — cache-stable.
 export const TEMPORAL_GROUNDING_RULE = `
 
 # OBSERVATION DATE (TIME GROUNDING)
 The user data block gives a \`## Observation date\` (the real-world time the newest message was observed). Resolve RELATIVE time expressions to ABSOLUTE dates relative to it — e.g. "yesterday" → the day before that date, "last week" → "the week of <date>", "two years ago" → the year. Store the absolute form (in the value or note), not the relative word, so the fact doesn't rot. If no observation date is given, leave time expressions as-is.`;
 
-// ── The static system rulebook ────────────────────────────────────────────────
-// CACHE CONTRACT (llm-call.js): this string must stay BYTE-STABLE across chats/characters so
-// the host's server-side prompt cache can reuse the prefix. The {{user}}/{{char}} macros stay
-// LITERAL here; every per-run variable (character brief, persona, DB overview, taxonomy MENU —
-// which is per-store variable via the user overlay — messages, prior sheet) lives in the USER
-// prompt built by runMemoryAgent. Never interleave variable data into this block.
 export const DEFAULT_MEMORY_AGENT_PROMPT = `You are the MEMORY AGENT for an ongoing roleplay between {{user}} (the human player) and {{char}} (the AI character). You run in the BACKGROUND after each reply — the storyteller model never sees you, only the MEMORY SHEET you produce. You do TWO jobs in one session:
 
 1. EXTRACT — store new LASTING facts from the SETTLED messages into the memory database (write_fact).
@@ -124,30 +92,6 @@ DO NOT STORE: transient poses/moods, scene atmosphere, food eaten, items momenta
 
 Messages in the block marked "TENTATIVE" may still be swiped/edited. They may inform your SCENE/NEED/NOTES planning, but you MUST NOT write_fact anything from them — extract only from the SETTLED messages.` + TEMPORAL_GROUNDING_RULE;
 
-// ── runMemoryAgent ────────────────────────────────────────────────────────────
-
-/**
- * Run ONE Memory Agent session: tool loop → fact writes → (unless extractOnly) sheet.
- *
- * Message shape for settledMessages/tentativeMessages: { index:number, role:'USER'|'CHAR',
- * name:string, text:string } — index is the absolute chat index (used for source attribution
- * of writes), name the display author (group speaker / persona).
- *
- * @param {Object} opts
- * @param {Array}  [opts.settledMessages=[]]  - SAFE-to-extract messages (oldest first)
- * @param {Array}  [opts.tentativeMessages=[]] - hold-back window, planning context only
- * @param {string} [opts.characterInfo='']    - short character brief
- * @param {string} [opts.userPersona='']      - persona description
- * @param {string|null} [opts.profileId=null] - Memory Agent connection profile (CMRS)
- * @param {string} [opts.priorSheetText='']   - the sheet the writer currently sees
- * @param {Object|null} [opts.reflection=null] - turn-state getReflection() record
- * @param {string} [opts.observationDate='']  - ISO real-world timestamp of the newest message
- * @param {string} [opts.runId='']            - correlation id for logs / write attribution
- * @param {boolean} [opts.extractOnly=false]  - catchup/backfill mode: writes only, #DONE final
- * @param {AbortSignal|null} [opts.signal=null] - caller-owned abort
- * @returns {Promise<{sheetText:string|null, applied:Array, error:string|null,
- *   tokensIn:number, tokensOut:number, rounds:number, toolCallCount:number}>}
- */
 export async function runMemoryAgent({
     settledMessages = [],
     tentativeMessages = [],
@@ -176,15 +120,8 @@ export async function runMemoryAgent({
         return result;
     }
 
-    // USE-IT-OR-LOSE-IT: drain the use buffer staged by prior injections onto these freshly
-    // loaded fact objects BEFORE this run's writes; the bumped categories ride this run's
-    // per-category saves below (only persisted on a SUCCESSFUL run — same as before, where the
-    // bumps rode the extraction's saves).
-    let usageBumpCats = [];
-    try { usageBumpCats = applyBufferedFactUsage(databases, runId) || []; } catch { /* best-effort */ }
+    const usageBumpCats = [];
 
-    // Source attribution for write_fact: the NEWEST settled message index (facts come only from
-    // settled messages). No settled messages (sheet-only run) → agent_<runId> fallback in S2.
     let sourceIndex = null;
     for (const m of (Array.isArray(settledMessages) ? settledMessages : [])) {
         if (Number.isInteger(m?.index) && (sourceIndex === null || m.index > sourceIndex)) sourceIndex = m.index;
@@ -229,10 +166,6 @@ export async function runMemoryAgent({
     result.tokensOut = loop.tokensOutApprox || 0;
     result.applied = ctx.applied;
 
-    // F-SCRIBE-1 (generalized): a loop error, or a missing sheet where one was required, is a
-    // FAILED run — nothing is saved, the caller keeps the prior sheet and does NOT watermark.
-    // (Tool writes may have mutated the in-memory map; they are NOT persisted here, and the
-    // per-turn DB cache is reloaded from disk on the next invalidation.)
     if (loop.error) {
         result.error = loop.error;
         return result;
@@ -242,8 +175,6 @@ export async function runMemoryAgent({
         return result;
     }
 
-    // Parse the sheet BEFORE persisting anything, so an unparseable sheet fails the whole run
-    // atomically (no watermark, facts re-proposed next turn and deduped by the upsert reconcile).
     let parsedSheet = null;
     if (!extractOnly) {
         parsedSheet = parseSheetBlock(loop.sheet);
@@ -253,9 +184,6 @@ export async function runMemoryAgent({
         }
     }
 
-    // Persist: ONE saveDatabase per touched category (write_fact + cross-key supersede side
-    // effects), plus any use-bump-only categories. The durable profile snapshot stays with the
-    // caller (saveCurrentToActiveProfile — the flushSnapshotNow debounce rides saveDatabase).
     const toSave = new Set(ctx.touchedCategories);
     for (const cat of usageBumpCats) toSave.add(cat);
     for (const cat of toSave) {
@@ -292,9 +220,6 @@ export async function runMemoryAgent({
     return result;
 }
 
-// ── User-prompt build (all per-run variable data lives HERE, never in the system prompt) ─────
-
-/** Render one message line for the prompt: `#12 [USER: Bernd] text`. */
 function renderMessageLine(m) {
     const idx = Number.isInteger(m?.index) ? `#${m.index} ` : '';
     const role = m?.role === 'USER' ? 'USER' : 'CHAR';
@@ -302,7 +227,6 @@ function renderMessageLine(m) {
     return `${idx}[${role}${name ? `: ${name}` : ''}] ${String(m?.text || '').trim()}`;
 }
 
-/** Cap a multi-line block at `max` lines with a "+N more" footer. */
 function capLines(text, max, footer) {
     const lines = String(text || '').split('\n').filter(Boolean);
     if (lines.length <= max) return lines.join('\n');
@@ -316,7 +240,6 @@ function buildAgentUserPrompt({
 }) {
     const parts = [];
 
-    // Run mode first — the rulebook's EXTRACT-ONLY / #SHEET branch keys off this.
     parts.push('## Task\n' + (extractOnly
         ? 'EXTRACT-ONLY RUN: store new lasting facts from the settled messages via write_fact, then end with the #DONE line. Do NOT emit a #SHEET block.'
         : 'FULL RUN: store new lasting facts from the settled messages, anticipate the next scene, then end with the #SHEET block.'));
@@ -332,9 +255,6 @@ function buildAgentUserPrompt({
         parts.push(`## Prior memory sheet (what the writer currently sees — update it)\n${String(priorSheetText || '').trim() || '(none yet)'}`);
     }
 
-    // DB overview: populated aspect drawers with counts + a capped Category/key inventory.
-    // Deliberately compact — the layered tools (list_keys/read_facts/search) are the real
-    // navigation; this just orients the agent and powers DELTA-ONLY checks.
     try {
         const menu = summarizeMenuIndexed(index);
         const keys = capLines(summarizeKeys(databases), KEY_INVENTORY_CAP, 'use list_keys');
@@ -345,7 +265,7 @@ function buildAgentUserPrompt({
 
     try {
         parts.push(`## Taxonomy menu (Category ▸ SubArea: leaf aspects)\n${groupedTaxonomyMenu()}`);
-    } catch { /* menu is best-effort */ }
+    } catch {  }
 
     if (Array.isArray(settledMessages) && settledMessages.length > 0) {
         parts.push(`## SETTLED messages (safe — extract facts from these)\n${settledMessages.map(renderMessageLine).join('\n\n')}`);
@@ -357,8 +277,6 @@ function buildAgentUserPrompt({
         parts.push(`## TENTATIVE — do not store facts from these (planning context only):\n${tentativeMessages.map(renderMessageLine).join('\n\n')}`);
     }
 
-    // User's extra instructions (the memoryPrompt override — appended, never replacing the
-    // static rulebook, so the cacheable system prefix stays byte-stable).
     const extra = String(settings?.memoryPrompt || '').trim();
     if (extra) parts.push(`## Additional instructions from the user\n${extra}`);
 
@@ -366,7 +284,6 @@ function buildAgentUserPrompt({
         ? 'Work now: check the store with tools where needed, write the new lasting facts, then end with the #DONE line.'
         : 'Work now: check the store with tools where needed, write the new lasting facts, then end with the #SHEET block.');
 
-    // Resolve {{user}}/{{char}} macros in the data block via ST's canonical substituteParams.
     try {
         const substitute = host.getSubstituteParams();
         return substitute(parts.join('\n\n'));
@@ -375,15 +292,6 @@ function buildAgentUserPrompt({
     }
 }
 
-// ── parseSheetBlock ───────────────────────────────────────────────────────────
-
-/**
- * Parse the raw text after the `#SHEET` line into its fields (G1 final-block grammar).
- * Tolerant: missing NEED/NOTES (and even SCENE) are fine; continuation lines under a header
- * are folded into that field; markdown fences are skipped. Missing SUMMARY → error.
- * @param {string} text - raw sheet block (parseAgentReply's `sheet`)
- * @returns {{summary:string, sceneLine:string, need:Array<{category:string,key:string}>, notes:string, error:string|null}}
- */
 export function parseSheetBlock(text) {
     const out = { summary: '', sceneLine: '', timeline: '', need: [], notes: '', error: null };
     const raw = String(text ?? '').trim();
@@ -402,7 +310,7 @@ export function parseSheetBlock(text) {
             if (m[2].trim()) buf[current].push(m[2].trim());
             continue;
         }
-        // Continuation line of the current field (headerless preamble lines are ignored).
+
         if (current) buf[current].push(line);
     }
     out.summary = buf.SUMMARY.join(' ').trim();
@@ -410,7 +318,6 @@ export function parseSheetBlock(text) {
     out.timeline = buf.TIMELINE.join(' ').trim();
     out.notes = buf.NOTES.join(' ').trim();
 
-    // NEED: comma-separated `Category/key` refs (across all NEED lines), capped.
     for (const ref of buf.NEED.join(',').split(',')) {
         const r = ref.trim().replace(/^[-*]\s*/, '');
         if (!r || /^\(?none\)?$/i.test(r)) continue;
@@ -427,31 +334,16 @@ export function parseSheetBlock(text) {
     return out;
 }
 
-// ── composeSheet ──────────────────────────────────────────────────────────────
-
-/** Clamp helper for settings knobs (mirrors validateSettings semantics). */
 function clampNum(v, min, max, dflt) {
     const n = Number(v);
     if (!Number.isFinite(n)) return dflt;
     return Math.min(max, Math.max(min, n));
 }
 
-/**
- * Render the persistent MEMORY SHEET from the agent's parsed final block (G3). PURE CODE —
- * no LLM: NEED refs resolve via findFactMatch (missing skipped, knownBy/POV enforced), split
- * into CURRENT STATE / CHRONOLOGY (recency.js truth hierarchy) with always-on recency tails,
- * then up to graphExtrasCount bonus facts collected by a RANDOM GRAPH WALK out from the NEED
- * rows ("Connected memories" — a different connected chain each turn, see randomWalkExtras).
- * All resolved NEED facts + the walk extras are rendered (no per-line token cap).
- * @param {{summary?:string, sceneLine?:string, notes?:string,
- *          need?:Array<{category:string,key:string}>, settings?:Object, databases?:Object}} opts
- * @returns {string} the rendered sheet (never empty when summary is non-empty)
- */
 export function composeSheet({ summary = '', sceneLine = '', timeline = '', notes = '', need = [], settings = {}, databases = {} } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
 
-    // 1) Resolve the NEED refs to live, visible facts (dedup by category:key).
     const rows = [];
     const seen = new Set();
     for (const ref of (Array.isArray(need) ? need : []).slice(0, NEED_REFS_CAP)) {
@@ -462,17 +354,14 @@ export function composeSheet({ summary = '', sceneLine = '', timeline = '', note
             const db = databases[category];
             if (!db) continue;
             const fact = findFactMatch(db, key);
-            if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue; // skip missing/invisible
+            if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue; 
             const id = `${category}:${fact.key}`;
             if (seen.has(id)) continue;
             seen.add(id);
             rows.push({ fact, category, tier: 'primary' });
-        } catch { /* one bad ref must never break the sheet */ }
+        } catch {  }
     }
 
-    // 2) Graph extras: a RANDOM WALK out from the NEED rows through the memory graph, surfacing
-    //    up to graphExtrasCount connected memories — a different connected chain each turn
-    //    (restaurant -> Luigi's -> first date) instead of always the top-ranked neighbors.
     const extrasMax = Math.floor(clampNum(settings?.graphExtrasCount ?? 3, 0, 8, 3));
     let extras = [];
     if (extrasMax > 0 && rows.length > 0) {
@@ -481,8 +370,6 @@ export function composeSheet({ summary = '', sceneLine = '', timeline = '', note
         } catch { extras = []; }
     }
 
-    // 3) Truth-hierarchy split + rendering. retrievalTokenBudget was removed — every resolved
-    //    NEED fact + walk extra is rendered (still split into the same sections).
     const { state, chrono } = splitInjectionSections(rows);
 
     const lines = [];
@@ -495,7 +382,7 @@ export function composeSheet({ summary = '', sceneLine = '', timeline = '', note
     const renderSection = (header, sectionRows) => {
         const admitted = [];
         for (const r of sectionRows) {
-            admitted.push(buildFactLine(r.fact, r.category, nowCtx)); // recency labels always on
+            admitted.push(buildFactLine(r.fact, r.category, nowCtx)); 
         }
         if (admitted.length > 0) {
             lines.push(header);

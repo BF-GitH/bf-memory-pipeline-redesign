@@ -1,42 +1,15 @@
-// BF Memory Pipeline - Slash commands + macro (A8)
-// =============================================================================
-// Adds a single `/bfmem` slash command (with subcommands) and a `{{bf_facts}}` macro so users can
-// act WITHOUT opening the settings panel — mirroring how every comparable extension (Qvink's
-// /qm-*, Timeline's {{timeline}}, MemoryBooks' /creatememory) exposes quick actions.
-//
-// DEFENSIVE BY DESIGN (matches the rest of this codebase): SillyTavern's slash-command and macro
-// APIs differ across versions, so EVERY registration is feature-detected and wrapped in try/catch.
-// If an API shape is missing the feature simply no-ops — it never throws into extension init.
-//
-// Subcommands:
-//   /bfmem on|off|toggle   — enable/disable the pipeline
-//   /bfmem status          — toast a one-line status (enabled? fact count)
-//   /bfmem recall <query>  — search long-term memory, return the formatted facts (pipeable)
-//   /bfmem facts [N]       — list up to N (default 20) stored facts (pipeable)
-//   /bfmem catchup [N|cancel] — chunked catch-up import of this chat's unprocessed backlog
-//                            (optional batch-size override N; 'cancel' stops the running one)
-//
-// Macro:
-//   {{bf_facts}}           — a compact newline list of the current character's stored facts
-//                            (bounded), usable inside any prompt/preset.
-// =============================================================================
-
 import { getSettings, setPipelineEnabled, addDebugLog } from './settings.js';
 
-const MACRO_FACT_CAP = 40;        // bound the {{bf_facts}} macro so a huge store can't blow up a prompt
-const MACRO_VALUE_CHARS = 120;    // per-fact value clamp for the macro
+const MACRO_FACT_CAP = 40;        
+const MACRO_VALUE_CHARS = 120;    
 
-/** Resolve the live ST context, null-safe. */
 function ctx() {
     try { return (typeof SillyTavern !== 'undefined') ? SillyTavern.getContext() : null; } catch { return null; }
 }
 
-/** Best-effort toast. */
 function toast(level, msg, title = 'BF Memory') {
-    try { if (typeof toastr !== 'undefined' && toastr[level]) toastr[level](msg, title); } catch { /* noop */ }
+    try { if (typeof toastr !== 'undefined' && toastr[level]) toastr[level](msg, title); } catch {  }
 }
-
-// --- Action implementations (return a STRING for the slash-command pipe) ------
 
 function actionToggle(target) {
     const s = getSettings();
@@ -55,7 +28,7 @@ async function actionStatus() {
         const { getAllDatabases } = await import('./database.js');
         const dbs = await getAllDatabases();
         factCount = Object.values(dbs).reduce((n, db) => n + ((db.facts || []).length), 0);
-    } catch { /* count is best-effort */ }
+    } catch {  }
     const msg = `BF Memory: ${s.enabled ? 'ON' : 'OFF'} · ${factCount} fact(s) stored`;
     toast('info', msg);
     return msg;
@@ -75,7 +48,6 @@ async function actionRecall(query) {
     }
 }
 
-/** Build a compact, bounded list of the current character's facts. Shared by `/bfmem facts` + macro. */
 async function buildFactList(limit) {
     const cap = Math.max(1, Math.min(MACRO_FACT_CAP * 4, Number(limit) || 20));
     try {
@@ -84,7 +56,7 @@ async function buildFactList(limit) {
         const lines = [];
         for (const [category, db] of Object.entries(dbs)) {
             for (const fact of (db.facts || [])) {
-                if (!isActiveFact(fact) || isColdFact(fact)) continue; // active + hot only
+                if (!isActiveFact(fact) || isColdFact(fact)) continue; 
                 const val = String(fact.value ?? '').trim().slice(0, MACRO_VALUE_CHARS);
                 lines.push(`${category}/${fact.key}${val ? ` = ${val}` : ''}`);
                 if (lines.length >= cap) break;
@@ -103,14 +75,6 @@ async function actionFacts(n) {
     return lines.join('\n');
 }
 
-/**
- * Chunked catch-up import over the current chat (community adoption §2.1; engine in
- * src/catchup-import.js — shares its in-flight/cancel state with the Database-tab button).
- *   /bfmem catchup            — run with the configured batch size (catchupBatchSize)
- *   /bfmem catchup 15         — run with a one-off batch-size override (clamped 2-30)
- *   /bfmem catchup cancel     — stop the running import at the next chunk boundary
- * Returns a pipeable summary string.
- */
 async function actionCatchup(rest) {
     const arg = String(rest || '').trim().toLowerCase();
     try {
@@ -133,8 +97,7 @@ async function actionCatchup(rest) {
         const result = await runCatchupImport({
             batchSize: batchOverride,
             onProgress: ({ chunk, chunks, msgsDone, msgsTotal, factsAdded }) => {
-                // Toast progress sparingly (every 5 chunks + the last) so a long import
-                // doesn't bury the UI in notifications.
+
                 if (chunk === chunks || chunk % 5 === 0) {
                     toast('info', `Catch-up: chunk ${chunk}/${chunks} · ${msgsDone}/${msgsTotal} msgs · ${factsAdded} facts`);
                 }
@@ -151,36 +114,21 @@ async function actionCatchup(rest) {
     }
 }
 
-// --- Registration -------------------------------------------------------------
-
-/** Register the `{{bf_facts}}` macro (feature-detected; no-op if the macro API is absent). */
 function registerMacro(context) {
     try {
-        // Macros must resolve synchronously, but our fact store is async. We keep a small
-        // async-refreshed cache and return its last snapshot. KNOWN 1-TURN LAG: the value
-        // returned reflects the store as of the PREVIOUS read, not the live store. We seed the
-        // cache with a non-empty placeholder so the very first use never returns an empty string
-        // (which some prompt templates treat as "macro failed"); once the first refresh resolves,
-        // `seeded` flips and subsequent reads return the real (possibly empty) snapshot.
+
         const PLACEHOLDER = '(facts loading…)';
         let cache = PLACEHOLDER;
         let seeded = false;
         const refresh = () => {
             buildFactList(MACRO_FACT_CAP)
                 .then(l => { cache = l.join('\n'); seeded = true; })
-                .catch(() => { seeded = true; }); // on error, stop showing the placeholder forever
+                .catch(() => { seeded = true; }); 
         };
         refresh();
-        // Returns last snapshot (1-turn lag) and refreshes for the next read. While the first
-        // refresh is still pending we return the placeholder instead of an empty string.
+
         const getter = () => { refresh(); return seeded ? cache : PLACEHOLDER; };
-        // NEWEST API FIRST: current ST builds expose `context.macros.register(name, options)`
-        // (the pattern ST's own bundled extensions use) where options is a definition object
-        // with a `handler` — passing a bare getter is a shape error. CRITICAL: the registry
-        // does NOT throw on a bad definition, it logs and returns null — so success must be
-        // checked via the RETURN VALUE, not try/catch. Feature-detected and individually
-        // guarded so any mismatch falls through to the established fallbacks below — never
-        // throws into extension init (house rule: degrade to the next API, then to a no-op).
+
         try {
             const m = context.macros;
             const registerFn = typeof m?.register === 'function' ? m.register.bind(m)
@@ -203,9 +151,7 @@ function registerMacro(context) {
             context.registerMacro('bf_facts', getter);
             return true;
         }
-        // DEPRECATED fallback (older ST): MacrosParser.registerMacro — kept LAST so old
-        // installs keep the macro; current builds never reach it (registry above wins), so
-        // the host-side deprecation warning stops firing on up-to-date SillyTavern.
+
         if (context.MacrosParser && typeof context.MacrosParser.registerMacro === 'function') {
             context.MacrosParser.registerMacro('bf_facts', getter);
             return true;
@@ -216,7 +162,6 @@ function registerMacro(context) {
     return false;
 }
 
-/** Route a parsed `/bfmem` invocation to the right action. `sub` is the first positional arg. */
 async function dispatch(sub, rest) {
     switch (String(sub || '').trim().toLowerCase()) {
         case 'on': return actionToggle('on');
@@ -232,18 +177,12 @@ async function dispatch(sub, rest) {
     }
 }
 
-/**
- * Register the `/bfmem` slash command. Tries the modern SlashCommandParser API first (so it shows
- * in autocomplete with help), then falls back to the legacy registerSlashCommand. Idempotent-ish:
- * guarded so a double-init doesn't throw. Never throws into the caller.
- */
 export function initCommands() {
     const context = ctx();
     if (!context) return;
 
     registerMacro(context);
 
-    // MODERN API: SlashCommandParser.addCommandObject(SlashCommand.fromProps({...})).
     try {
         const SCP = context.SlashCommandParser;
         const SC = context.SlashCommand;
@@ -268,7 +207,7 @@ export function initCommands() {
                 helpString: 'BF Memory control: <code>/bfmem on|off|toggle|status|recall &lt;query&gt;|facts [N]|catchup [N|cancel]</code>.',
                 unnamedArgumentList: unnamedArgs,
                 callback: async (_namedArgs, unnamed) => {
-                    // unnamed may be a string (single arg) or an array (multiple). Normalize.
+
                     const parts = Array.isArray(unnamed) ? unnamed : [unnamed];
                     const sub = parts[0] || '';
                     const rest = parts.slice(1).join(' ').trim();
@@ -282,7 +221,6 @@ export function initCommands() {
         addDebugLog('info', `Modern slash registration failed, trying legacy: ${e?.message || e}`);
     }
 
-    // LEGACY API: context.registerSlashCommand(name, callback, aliases, help, ...).
     try {
         if (typeof context.registerSlashCommand === 'function') {
             context.registerSlashCommand('bfmem', async (_args, value) => {

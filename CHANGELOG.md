@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased] — dead-code sweep + comment strip
+
+> Removes code that was defined but never reached by the live loop, and strips all source comments.
+> No behavior change to the working paths; `node --check` passes on every module.
+
+### Removed (dead / orphaned code)
+
+- **Fact usage-tracking** — `markFactsUsed` (never called; the only writer of the usage buffer) and
+  its drain `applyBufferedFactUsage`, plus the buffer plumbing. The feature never functioned.
+- **Relationship-re-entry scene writer** — `setScene` and its RELATIONSHIP RE-ENTRY DETECTION block,
+  `getSceneReentries`, and `lastReentries` (nothing called `setScene`). `getScene` /
+  `reloadSceneFromChat` stay — the scene card still displays from persisted metadata.
+- **Phantom Tokens-tab rows** — the always-zero "Drafter", "Librarian (finder)", and "Selector
+  (semantic pass)" rows and their unwritten `agent1*` / `finder*` / `selector*` token fields.
+- **Unused exports** — `getOpenThreads`, `findExistingLeaf`, `collectBranchFactsIndexed`, singular
+  `getDatabase`, `groupedTaxonomySubAreas`, `NPC_SUBJECT`, `createSemaphore`, `estimateFullChatCalls`,
+  `appendLastInserted`, the `renderScene` no-op, `showAllDatabases`, and seven unused `host.js`
+  wrappers (`getChatId`, `getChatMetadata`, `getCharacters`, `getCharacterId`, `getCurrentCharacter`,
+  `getExtensionSettingsRoot`, `saveChatNow`).
+
+### Changed
+
+- **All source comments stripped** from every JS module. Rationale now lives in git history and the
+  README, not inline.
+
 ## [0.71.0] - 2026-07-11 — settings cleanup + random-walk memories
 
 > Trims the extension toward its core: removes several stale settings/UI and the features behind

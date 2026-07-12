@@ -159,6 +159,20 @@ re-entry, typed edges, entity merge, shared user memory, bi-temporal validity, i
 and the selection-summary pass. One architecture, no switches. See the [CHANGELOG](CHANGELOG.md) for
 the full list.
 
+### Dead-code sweep (post-v0.71.0)
+
+A final pass removed code that was defined but never reached by the live loop: the never-wired
+fact **usage-tracking** buffer (`markFactsUsed` / `applyBufferedFactUsage`), the orphaned
+**relationship-re-entry scene writer** (`setScene` and its detection block, which nothing called),
+the phantom **Drafter / Librarian / Selector** rows on the Tokens tab, and a set of unused helper
+exports (`getOpenThreads`, `findExistingLeaf`, `collectBranchFactsIndexed`, singular `getDatabase`,
+`groupedTaxonomySubAreas`, `createSemaphore`, `estimateFullChatCalls`, `showAllDatabases`, and seven
+unused `host.js` wrappers). ~630 lines of dead code, `node --check` still green on every module, and
+the live paths (sheet injection, Memory Agent, reflection, catch-up import) are untouched.
+
+**Source comments were stripped** from every module in the same pass — the rationale lives in git
+history and this doc, not inline. The code is the source of truth.
+
 ## Troubleshooting
 
 - **Debug tab** — live event log. The **Copy Diagnostics** button bundles settings, the full log,

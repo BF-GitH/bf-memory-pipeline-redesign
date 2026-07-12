@@ -1,31 +1,15 @@
-// BF Memory Pipeline - Database tab UI (F-UX-8 split from settings.js)
-// The Database-tab surface: category cards, the per-fact manager (edit/delete/bulk), the
-// cross-category search, taxonomy add-label controls + AI label suggestions, the spiderweb and
-// graph views, and the recurring-characters panel. The Layer-C dbProfiles write-through helpers
-// (pruneActiveProfile / pruneFactFromProfiles / updateFactInProfiles) stay in settings.js —
-// it owns the dbProfiles state — and are imported here so every destructive/edit op keeps the
-// same 3-layer anti-resurrection guarantee as before the split.
-//
-// NOTE on cycles: the static import from settings.js below is an intentional ESM cycle; every
-// use is inside a function body at CALL time, which ESM resolves via hoisted declarations.
-
 import { addDebugLog } from './debug-log.js';
 import { ensurePopup, Popup, POPUP_TYPE, escapeHtml } from './ui-util.js';
 import {
     pruneFactFromProfiles, updateFactInProfiles,
 } from './settings.js';
 
-// --- Database View ---
-
 export async function refreshDatabaseView() {
     const { getAllDatabases, withSkeleton, MENU_CATEGORY_ORDER } = await import('./database.js');
     const real = await getAllDatabases();
-    // 3-layer model: overlay the empty Layer-1 skeleton so the FULL taxonomy (every category,
-    // count 0 when empty) is always shown — never "No databases yet". The skeleton is purely
-    // in-memory here (no empty files are written; categories persist only when a fact lands).
-    // The skeleton already includes user-added overlay categories (effectiveCategories).
+
     const databases = withSkeleton(real);
-    // Stable Layer-1 order first, then any custom extras.
+
     const ordered = [];
     for (const c of MENU_CATEGORY_ORDER) if (databases[c]) ordered.push(c);
     for (const c of Object.keys(databases)) if (!ordered.includes(c)) ordered.push(c);
@@ -38,20 +22,8 @@ export async function refreshDatabaseView() {
     statsEl.innerHTML = `<b>${categories.length}</b> databases | <b>${totalFacts}</b> total facts`;
 }
 
-// Cap the number of fact rows rendered into the (innerHTML-built) view at once so a 10k-fact
-// category can't freeze the UI with a multi-MB DOM write. The user filters or pages past it.
 const FACT_VIEW_PAGE_SIZE = 200;
 
-/**
- * Build the HTML for the per-fact rows of the single-category viewer. Re-run on every
- * filter/page change. Each row carries a checkbox (bulk-select), a cold badge when cold,
- * and per-row Edit/Delete buttons. Only the facts in [0, limit) of the FILTERED set render.
- * @param {import('./database.js').FactSchema[]} facts - already filtered + ordered
- * @param {number} limit - max rows to render now (pagination cap)
- * @param {(f) => boolean} isColdFact
- * @param {(f) => string} deriveAspect
- * @returns {string}
- */
 function renderFactRows(facts, limit, isColdFact, deriveAspect) {
     const shown = facts.slice(0, limit);
     return shown.map((fact) => {
@@ -61,11 +33,11 @@ function renderFactRows(facts, limit, isColdFact, deriveAspect) {
         const note = fact.context || '';
         const coldBadge = cold ? ' <span class="bf-mem-custom-chip" title="Cold-tiered: kept but deprioritized by retrieval">cold</span>' : '';
         const superseded = fact.active === false ? ' <span class="bf-mem-custom-chip" title="Superseded (historical)">old</span>' : '';
-        // Open-threads feature: make plot-thread state visible/auditable (editable-memory doctrine).
+
         const threadChip = fact.thread === 'open'
             ? ' <span class="bf-mem-custom-chip" title="Open plot thread: unresolved hook — surfaced in the Big Picture and protected from cold-tiering until resolved">thread: open</span>'
             : (fact.thread === 'resolved' ? ' <span class="bf-mem-custom-chip" title="Plot thread resolved by the maintenance (reflection) pass">thread: resolved</span>' : '');
-        // Spiderweb 2: the fact's origin scene (No + name) + source-message provenance.
+
         const sceneLine = Number.isInteger(fact.sceneNo)
             ? `<div class="bf-mem-fact-source">scene: #${fact.sceneNo}${fact.sceneName ? ` · ${escapeHtml(fact.sceneName)}` : ''}${fact.sourceMsg ? ` · from ${escapeHtml(fact.sourceMsg)}` : ''}</div>`
             : (fact.sourceMsg ? `<div class="bf-mem-fact-source">from ${escapeHtml(fact.sourceMsg)}</div>` : '');
@@ -84,9 +56,7 @@ function renderFactRows(facts, limit, isColdFact, deriveAspect) {
                         ${fact.location ? `<div class="bf-mem-fact-source">location: ${escapeHtml(String(fact.location))}</div>` : ''}
                         ${fact.kind ? `<div class="bf-mem-fact-source">kind: ${escapeHtml(String(fact.kind))}</div>` : ''}
                         ${(() => {
-                            // SPIDERWEB: surface the fact's connections (primary/secondary/tertiary links to
-                            // other facts). These were stored + used for retrieval but never shown — this is
-                            // why the viewer looked like "only simple facts".
+
                             const r = fact.relationships || {};
                             const parts = [];
                             if ((r.primary || []).length) parts.push(`◆ ${escapeHtml((r.primary || []).join(', '))}`);
@@ -105,16 +75,6 @@ function renderFactRows(facts, limit, isColdFact, deriveAspect) {
     }).join('');
 }
 
-/**
- * Interactive per-category fact manager: VIEW + FILTER + per-fact EDIT/DELETE + BULK DELETE, with
- * cold-tier badges and a rendered-row cap for huge categories. Every destructive/edit op goes
- * through the 3-layer-safe path (working store via removeFact/saveDatabase, PLUS the dbProfiles
- * snapshot via pruneFactFromProfiles/updateFactInProfiles) so changes can't be resurrected by
- * autoSaveDbProfile on the next CHAT_CHANGED — the same guarantee as the category-delete in
- * commit 4e281b7.
- * @param {string} category
- * @param {Object<string, import('./database.js').DatabaseSchema>} databases - the withSkeleton map
- */
 async function viewSingleDatabase(category, databases) {
     const { isColdFact, deriveAspect } = await import('./database.js');
     const db = databases[category];
@@ -125,8 +85,6 @@ async function viewSingleDatabase(category, databases) {
         return;
     }
 
-    // Working copy of the facts we render (re-read from the live store on every mutation so the
-    // list reflects deletes/edits without reopening). filter + page are popup-local UI state.
     let allFacts = [...db.facts];
     let renderLimit = FACT_VIEW_PAGE_SIZE;
 
@@ -142,7 +100,7 @@ async function viewSingleDatabase(category, databases) {
     </div>`;
 
     const popup = new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
-    // Show without awaiting so we can wire the live DOM while the popup is open.
+
     const shownPromise = popup.show();
     const root = popup.dlg || popup.content || document;
     const listEl = root.querySelector('#bf_mem_fact_list');
@@ -151,7 +109,6 @@ async function viewSingleDatabase(category, databases) {
     const countEl = root.querySelector('#bf_mem_fact_count');
     const selAllEl = root.querySelector('#bf_mem_fact_selall');
 
-    // Current filtered set (recomputed by applyFilter), used by render + bulk select.
     let filtered = allFacts;
 
     const applyFilter = () => {
@@ -178,28 +135,25 @@ async function viewSingleDatabase(category, databases) {
         bindRowHandlers();
     };
 
-    // Re-read the live store and refresh, after a mutation. Keeps the popup authoritative.
     const reloadFromStore = async () => {
         const { getAllDatabases } = await import('./database.js');
         const fresh = await getAllDatabases();
         allFacts = [...((fresh[category] && fresh[category].facts) || [])];
-        renderLimit = Math.max(FACT_VIEW_PAGE_SIZE, renderLimit); // keep what was paged
+        renderLimit = Math.max(FACT_VIEW_PAGE_SIZE, renderLimit); 
         render();
         refreshDatabaseView();
     };
 
-    // Single-fact DELETE through ALL THREE layers (working store + every profile the chat reloads
-    // from) so it can't resurrect. Mirrors the category-delete anti-resurrection contract.
     const deleteOne = async (key) => {
         if (!confirm(`Delete fact "${key}" from "${category}"?`)) return;
         const { getAllDatabases, removeFact, saveDatabase, flushSnapshotNow } = await import('./database.js');
         const fresh = await getAllDatabases();
         const liveDb = fresh[category];
         if (!liveDb) return;
-        removeFact(liveDb, key);                       // Layer A (IDB) + arms Layer B (attachment)
+        removeFact(liveDb, key);                       
         await saveDatabase({ ...liveDb, category });
-        const { profilesPruned, factsPruned } = pruneFactFromProfiles(category, key); // Layer C
-        await flushSnapshotNow();                       // reconcile durable attachment now
+        const { profilesPruned, factsPruned } = pruneFactFromProfiles(category, key); 
+        await flushSnapshotNow();                       
         addDebugLog('pass', `Deleted single fact "${key}" from "${category}" (Layer A+B+C)`, {
             subsystem: 'db', event: 'fact.deleted', actor: 'USER', reason: 'USER_DELETE',
             data: { category, key, profilesPruned, factsPrunedFromProfile: factsPruned },
@@ -207,12 +161,8 @@ async function viewSingleDatabase(category, databases) {
         await reloadFromStore();
     };
 
-    // BULK delete the currently-checked rows (or all filtered when "select all" was used) — one
-    // saveDatabase per category, one profile prune per key, one durable flush at the end.
     const deleteSelected = async () => {
-        // When "Select all (filtered)" is on, operate on the ENTIRE filtered set — not just the
-        // rendered (paginated) rows. The DOM only contains up to `renderLimit` checkboxes, so
-        // reading checked DOM rows would silently miss the overflow on large categories.
+
         const keys = (selAllEl && selAllEl.checked)
             ? filtered.map(f => f.key)
             : [...root.querySelectorAll('.bf-mem-fact-check:checked')].map(c => c.dataset.key);
@@ -224,11 +174,11 @@ async function viewSingleDatabase(category, databases) {
         if (!liveDb) return;
         const keySet = new Set(keys);
         const before = liveDb.facts.length;
-        liveDb.facts = liveDb.facts.filter(f => !keySet.has(f.key));   // Layer A
+        liveDb.facts = liveDb.facts.filter(f => !keySet.has(f.key));   
         liveDb.updatedAt = Date.now();
-        await saveDatabase({ ...liveDb, category });                   // persist Layer A + arm B
+        await saveDatabase({ ...liveDb, category });                   
         let profilesTouched = new Set();
-        for (const key of keys) {                                      // Layer C, per key
+        for (const key of keys) {                                      
             const { profilesPruned } = pruneFactFromProfiles(category, key);
             profilesPruned.forEach(p => profilesTouched.add(p));
         }
@@ -241,7 +191,6 @@ async function viewSingleDatabase(category, databases) {
         await reloadFromStore();
     };
 
-    // Per-fact EDIT modal: value + note (always) + aspect + importance. Writes through Layer A+B+C.
     const editOne = async (key) => {
         const { getAllDatabases, saveDatabase, deriveAspect: da, flatVocab, flushSnapshotNow } = await import('./database.js');
         const fresh = await getAllDatabases();
@@ -268,7 +217,7 @@ async function viewSingleDatabase(category, databases) {
         </div>`;
         const editPopup = new Popup(editHtml, POPUP_TYPE.TEXT, '', { okButton: 'Save', cancelButton: 'Cancel', wide: true, allowVerticalScrolling: true });
         const result = await editPopup.show();
-        if (!result) return; // cancelled
+        if (!result) return; 
         const eroot = editPopup.dlg || editPopup.content || document;
         const newValue = eroot.querySelector('#bf_mem_edit_value')?.value ?? fact.value;
         const newNote = eroot.querySelector('#bf_mem_edit_note')?.value ?? fact.context;
@@ -276,7 +225,6 @@ async function viewSingleDatabase(category, databases) {
         const newImp = Number(eroot.querySelector('#bf_mem_edit_imp')?.value) || curImp;
         const before = { value: fact.value, context: fact.context || '', aspect: fact.aspect || curAspect, importance: curImp };
 
-        // Mutate the live fact in place + persist Layer A/B.
         fact.value = String(newValue);
         fact.context = String(newNote || '');
         if (newAspect) fact.aspect = newAspect;
@@ -284,7 +232,7 @@ async function viewSingleDatabase(category, databases) {
         fact.lastUpdated = Date.now();
         liveDb.updatedAt = Date.now();
         await saveDatabase({ ...liveDb, category });
-        // Layer C write-through so the edit survives a CHAT_CHANGED reload.
+
         const { profilesUpdated } = updateFactInProfiles(category, key, fact);
         await flushSnapshotNow();
         addDebugLog('pass', `Edited fact "${key}" in "${category}" (Layer A+B+C)`, {
@@ -316,60 +264,16 @@ async function viewSingleDatabase(category, databases) {
     await shownPromise;
 }
 
-export async function showAllDatabases() {
-    const { getAllDatabases } = await import('./database.js');
-    const databases = await getAllDatabases();
-    const categories = Object.keys(databases);
-
-    if (categories.length === 0) {
-        toastr.info('No databases yet.', 'BF Memory');
-        return;
-    }
-
-    let html = '<div class="bf-mem-db-browser">';
-    for (const [category, db] of Object.entries(databases)) {
-        html += `<div class="bf-mem-db-section">
-            <h4>${escapeHtml(category)} (${db.facts.length} facts)</h4>
-            <table class="bf-mem-db-table">
-                <tr><th>Key</th><th>Value</th><th>Known By</th><th>Tags</th></tr>`;
-        for (const fact of db.facts) {
-            html += `<tr>
-                <td><b>${escapeHtml(fact.key)}</b></td>
-                <td>${escapeHtml(fact.value)}</td>
-                <td>${escapeHtml((fact.knownBy || []).join(', '))}</td>
-                <td>${escapeHtml((fact.tags || []).join(', '))}</td>
-            </tr>`;
-        }
-        html += '</table></div>';
-    }
-    html += '</div>';
-
-    await ensurePopup();
-    if (Popup) {
-        const popup = new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
-        await popup.show();
-    }
-}
-
-// Stable per-category node colours for the spiderweb (the 7 built-in L1 categories + a fallback).
 const SPIDERWEB_COLORS = {
     People: '#7bb3ff', World: '#5fd38d', Events: '#f5a35c', Relationships: '#e879c9',
     Objects: '#d4c25f', Knowledge: '#9b8cff', Unsorted: '#9aa0a6',
 };
 function spiderwebColor(cat) { return SPIDERWEB_COLORS[cat] || '#c08aff'; }
 
-/**
- * SPIDERWEB VIEW (user request: "the web is visually represented via a new button").
- * Renders the fact graph — each fact is a node, each primary/secondary/tertiary link is an edge —
- * as a dependency-free force-directed SVG (no D3). Shows ONLY the connected sub-graph by default
- * (the actual web), reports how many isolated facts are hidden, and colours nodes by category.
- * Read-only; purely a visualization of `fact.relationships`, which were always stored but never drawn.
- */
 export async function showSpiderwebPopup() {
     const { getAllDatabases } = await import('./database.js');
     const databases = await getAllDatabases();
 
-    // --- Collect nodes (unique by fact key) + edges (links to OTHER existing facts) ---
     const nodes = [];
     const idByKey = new Map();
     const addNode = (key, cat, value, imp) => {
@@ -403,7 +307,7 @@ export async function showSpiderwebPopup() {
     }
 
     const totalFacts = nodes.length;
-    // Keep only connected nodes — the web — and remap to a compact index set.
+
     const connectedIdx = nodes.map((n, i) => i).filter(i => nodes[i].deg > 0);
     const isolated = totalFacts - connectedIdx.length;
 
@@ -418,7 +322,6 @@ export async function showSpiderwebPopup() {
         return;
     }
 
-    // Cap for layout cost (O(n^2) force sim). Keep the highest-degree nodes if huge.
     const CAP = 280;
     let pick = connectedIdx;
     let capped = 0;
@@ -431,9 +334,6 @@ export async function showSpiderwebPopup() {
     const liByGi = new Map(local.map(o => [o.gi, o.li]));
     const N = local.length;
 
-    // CATEGORY-CLUSTERED seed (no Math.random — reproducible). Big virtual canvas; each category
-    // gets its own region on a ring so the graph reads as separated clusters you can pan between,
-    // not one central blob. Nodes start near their category centre.
     const W = 2000, H = 1400, cx = W / 2, cy = H / 2;
     const catList = [...new Set(local.map(o => nodes[o.gi].cat))];
     const ringR = catList.length > 1 ? 540 : 0;
@@ -446,8 +346,6 @@ export async function showSpiderwebPopup() {
     const E = edges.filter(e => pickSet.has(e.s) && pickSet.has(e.t))
         .map(e => ({ s: liByGi.get(e.s), t: liByGi.get(e.t), tier: e.tier }));
 
-    // --- Force-directed layout: stronger repulsion (spread, not a blob) + edge springs +
-    //     per-node gravity toward its CATEGORY centre (keeps clusters together) + mild global pull. ---
     const ITER = 420, kRep = 26000, kSpring = 0.015, springLen = 90, catGrav = 0.03, grav = 0.004, damp = 0.85;
     for (let it = 0; it < ITER; it++) {
         for (let i = 0; i < N; i++) {
@@ -479,7 +377,7 @@ export async function showSpiderwebPopup() {
             P[i].y += Math.max(-45, Math.min(45, P[i].vy));
         }
     }
-    // Normalize into the padded viewBox. X()/Y() map a node index to its on-canvas position.
+
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const p of P) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); }
     const pad = 80, sw = (maxX - minX) || 1, sh = (maxY - minY) || 1;
@@ -487,14 +385,13 @@ export async function showSpiderwebPopup() {
     const X = i => pad + (P[i].x - minX) * layoutScale;
     const Y = i => pad + (P[i].y - minY) * layoutScale;
 
-    // --- Build SVG (edges + nodes carry data-attrs so the interactivity below can highlight) ---
     const tierStroke = { primary: 'rgba(150,180,255,0.85)', secondary: 'rgba(140,160,190,0.45)', tertiary: 'rgba(130,140,160,0.25)' };
     const tierW = { primary: 2, secondary: 1.2, tertiary: 0.7 };
     let svgEdges = '';
     E.forEach((e, ei) => {
         svgEdges += `<line class="bf-web-edge" data-ei="${ei}" data-s="${e.s}" data-t="${e.t}" data-tier="${e.tier}" x1="${X(e.s).toFixed(1)}" y1="${Y(e.s).toFixed(1)}" x2="${X(e.t).toFixed(1)}" y2="${Y(e.t).toFixed(1)}" stroke="${tierStroke[e.tier]}" stroke-width="${tierW[e.tier]}" />`;
     });
-    // Hub labels (top-degree) show always; the rest reveal on hover/focus to keep the map readable.
+
     const degOrder = [...Array(N).keys()].sort((a, b) => nodes[local[b].gi].deg - nodes[local[a].gi].deg);
     const hubSet = new Set(degOrder.slice(0, Math.min(24, N)));
     let svgNodes = '';
@@ -542,11 +439,10 @@ export async function showSpiderwebPopup() {
         if (svg && vp) {
             const nodeEls = [...root.querySelectorAll('.bf-web-node')];
             const edgeEls = [...root.querySelectorAll('.bf-web-edge')];
-            // adjacency for click-to-focus ("what is this attached to")
+
             const adj = Array.from({ length: N }, () => new Set());
             for (const e of E) { adj[e.s].add(e.t); adj[e.t].add(e.s); }
 
-            // pan + zoom via a transform on the viewport group (accurate via screen CTM)
             let sc = 1, px = 0, py = 0;
             const apply = () => vp.setAttribute('transform', `translate(${px} ${py}) scale(${sc})`);
             const toSvg = (evt) => { const pt = svg.createSVGPoint(); pt.x = evt.clientX; pt.y = evt.clientY; const m = svg.getScreenCTM(); return m ? pt.matrixTransform(m.inverse()) : { x: 0, y: 0 }; };
@@ -557,13 +453,12 @@ export async function showSpiderwebPopup() {
                 px = p.x - wx * sc; py = p.y - wy * sc; apply();
             }, { passive: false });
             let dragging = false, last = null, moved = false;
-            svg.addEventListener('pointerdown', (e) => { dragging = true; moved = false; last = toSvg(e); svg.style.cursor = 'grabbing'; try { svg.setPointerCapture(e.pointerId); } catch { /* ok */ } });
+            svg.addEventListener('pointerdown', (e) => { dragging = true; moved = false; last = toSvg(e); svg.style.cursor = 'grabbing'; try { svg.setPointerCapture(e.pointerId); } catch {  } });
             svg.addEventListener('pointermove', (e) => { if (!dragging) return; const p = toSvg(e); px += p.x - last.x; py += p.y - last.y; last = p; moved = true; apply(); });
             const endDrag = () => { dragging = false; svg.style.cursor = 'grab'; };
             svg.addEventListener('pointerup', endDrag); svg.addEventListener('pointercancel', endDrag);
             svg.style.cursor = 'grab';
 
-            // focus / clear: dim everything except a node + its direct neighbours
             const clearFocus = () => { nodeEls.forEach(el => el.classList.remove('dim', 'focus')); edgeEls.forEach(el => el.classList.remove('dim', 'focus')); };
             const focusNode = (i) => {
                 const keep = new Set([i, ...adj[i]]);
@@ -573,7 +468,6 @@ export async function showSpiderwebPopup() {
             nodeEls.forEach(el => el.addEventListener('click', (ev) => { ev.stopPropagation(); if (!moved) focusNode(+el.dataset.i); }));
             svg.addEventListener('click', (ev) => { if ((ev.target === bg || ev.target === svg) && !moved) clearFocus(); });
 
-            // faint links (secondary/tertiary) hidden by default to cut clutter
             const setFaint = (show) => edgeEls.forEach(el => { if (el.dataset.tier !== 'primary') el.style.display = show ? '' : 'none'; });
             setFaint(false);
             const faintCb = root.querySelector('#bf_web_faint');
