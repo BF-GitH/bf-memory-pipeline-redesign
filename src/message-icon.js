@@ -198,6 +198,14 @@ function injectAllIcons() {
     document.querySelectorAll('.mes[mesid]').forEach(el => injectIcon(el));
 }
 
+// Re-read every on-screen message's processed state and repaint its brain icon.
+// The pipeline calls this after a background run commits (or clears) the
+// watermark, so the green "processed" colour appears immediately instead of
+// only after the message next re-renders (scroll/edit/chat reload).
+export function refreshMessageIcons() {
+    try { injectAllIcons(); } catch {  }
+}
+
 export function initMessageIcons() {
     const ctx = SillyTavern.getContext();
     const { eventSource, eventTypes } = ctx;

@@ -296,8 +296,13 @@ async function runMemoryExtraction() {
             }
         }
         if (changed) SillyTavern.getContext().saveChatDebounced?.();
+        // Repaint the on-screen brain icons when the flag settles to true/false
+        // (skip the transient 'in-flight' marker) so green appears immediately.
+        if (val === true || val === false) {
+            import('./message-icon.js').then(m => m.refreshMessageIcons?.()).catch(() => {});
+        }
     };
-    setWatermark(BF_MEM_IN_FLIGHT); 
+    setWatermark(BF_MEM_IN_FLIGHT);
 
     memoryExtractionInFlight = true;
 
