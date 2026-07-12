@@ -263,8 +263,15 @@ async function runMemoryExtraction() {
         addDebugLog('info', `Memory agent (post-reply): ${trivialIndices.length} trivially-empty settled msg(s) stamped processed without an LLM call`);
     }
 
-    if (settledMessages.length === 0 && tentativeMessages.length === 0) {
-        addDebugLog('info', 'Memory agent (post-reply): no genuine messages — skipping');
+    // Only run once there is at least one SETTLED message to extract (index
+    // <= chat.length-1-holdBack, not yet processed). With no settled messages
+    // there is nothing new to store, and firing a sheet-refresh-only run this
+    // early (e.g. on the first message, when everything is still tentative)
+    // just makes the agent reply with prose — no tool call, no #SHEET — which
+    // trips the protocol "second offense" abort for no reason. This is the
+    // n-4 rule: nothing runs until a message is old enough to settle.
+    if (settledMessages.length === 0) {
+        addDebugLog('info', `Memory agent (post-reply): no settled messages yet (hold-back ${holdBack}) — nothing new to extract, skipping the run`);
         return;
     }
 
