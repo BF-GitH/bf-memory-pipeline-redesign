@@ -1652,47 +1652,12 @@ export function upsertFact(db, fact) {
 
         const sal = mergeSalience(existing, fact);
 
-        if (existing.active !== false && shouldSupersede(existing, fact, supersedesSignal)) {
-            const now = Date.now();
-            const oldSupersededValue = existing.value;
-            const snapshotKey = makeSupersededKey(db, existing.key);
-
-            const snapshot = {
-                ...existing,
-                key: snapshotKey,
-                active: false,
-                supersededAt: now,
-                supersededBy: existing.key, 
-            };
-
-            const normCanon = normalizeFactKey(existing.key);
-            db.facts = db.facts.filter(f =>
-                !(f.active === false && f !== existing && normalizeFactKey(stripSupersededSuffix(f.key)) === normCanon));
-
-            const canonIdx = db.facts.findIndex(f => f.key === existing.key);
-            db.facts.push(snapshot);
-
-            const liveSceneOverride = {};
-            if (Number.isInteger(fact?.sceneNo)) {
-                liveSceneOverride.sceneNo = fact.sceneNo;
-                if (fact.sceneName) liveSceneOverride.sceneName = fact.sceneName;
-            }
-            db.facts[canonIdx] = {
-                ...existing, ...fact, key: existing.key, relationships: mergedRels,
-                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...liveSceneOverride, active: true,
-                ...mergeProvenance(existing, fact, now),
-                createdAt: existing.createdAt || new Date(now).toISOString(),
-                supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
-            };
-            db.updatedAt = now;
-            addDebugLog('info', `Fact superseded: [${db.category}] ${existing.key} (old kept as ${snapshotKey})`, {
-                subsystem: 'db', event: 'fact.superseded',
-                reason: supersedesSignal ? 'EXPLICIT_SUPERSEDE_MARKER' : 'STATE_CHANGED_HEURISTIC',
-                data: { category: db.category, key: existing.key, snapshotKey, subject: deriveSubject(existing), aspect: deriveAspect(existing) },
-                before: oldSupersededValue, after: fact.value,
-            });
-            return db;
-        }
+        // History snapshots removed (v0.75): a changed fact now overwrites its live
+        // record in place instead of leaving an inactive `_superseded` copy that no
+        // read path ever surfaced. Any prior state worth keeping is carried forward
+        // inside the fact's own note/value by the memory agent (see the prompt's
+        // "UPDATING A CHANGED FACT" rule), so history stays visible to the storyteller.
+        void supersedesSignal;
 
         const oldValue = existing.value;
         const updNow = Date.now();

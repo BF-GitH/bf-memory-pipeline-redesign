@@ -74,19 +74,28 @@ NOTES: <optional 1-2 lines anticipating the next scene>
 
 # WHAT TO STORE (write_fact)
 
-Store LASTING facts only — what the STORY still tracks 50 messages from now. Many turns have ZERO new facts; a dense reveal turn (introductions, backstory, world lore, confessions) can have many. Read dialogue, not just narration — confessions, opinions, promises, and reveals live in quotes.
+Store LASTING facts — anything the STORY still tracks 50 messages from now. Be THOROUGH: most turns carry 1-5 minable lasting facts, and a dense reveal turn (introductions, backstory, world lore, confessions) can have many more. Under-storing is the common failure — if a detail would matter to a future scene, store it. Read dialogue, not just narration — confessions, opinions, preferences, promises, decisions, and reveals live in quotes.
 
 - ATOMIC values: 1-5 words per fact (a genuine backstory reveal may use up to 10). One property per fact; split multi-attribute statements into several write_fact calls. Encode the verb in the KEY (\`monika_eyes\` = \`green\`, not \`monika\` = "has green eyes").
-- key: snake_case, prefixed by the subject's name (\`monika_fear_storms\`, \`bernd_job\`). Reuse an EXISTING key (verified via tools) when updating a changeable state — the system keeps the old value as history.
+- key: snake_case, prefixed by the subject's name (\`monika_fear_storms\`, \`bernd_job\`). Reuse an EXISTING key (verified via tools) when updating a changeable state — the update OVERWRITES the stored value in place, so carry any history that still matters into the note (see UPDATING A CHANGED FACT below).
 - category: one of the Layer-1 categories from the menu in the task block (People, Places, Things, Relationships, Events, World, Unsorted). Unsorted is the catch-all for genuinely unclear facts.
 - aspect: the most specific LEAF label within the category (see the taxonomy menu in the task block), e.g. \`fears\`, \`career\`, \`tattoos\`. A near-miss is snapped to the canonical leaf; if nothing fits, use category Unsorted with aspect \`misc\`.
 - importance: 1-5 (5 = core identity like a name/species, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial).
-- kind: \`trait\` (durable identity), \`state\` (current/transient — mood, location, goal), \`event\` (something that happened), \`moment\` (a significant emotional scene beat, remembered with feeling).
+- kind: \`trait\` (durable identity), \`state\` (a durable-but-changeable condition — a job, an injury, who holds a key object, an ongoing goal), \`event\` (something that happened), \`moment\` (a significant emotional scene beat, remembered with feeling). (Do NOT use \`state\` for transient mood or the room-of-the-moment — those are excluded; see below.)
 - note: optional short prose — a meaningful verbatim quote, a disambiguation, or a one-line summary of a complex beat. Keep the atomic value TOO.
 - known_by: ONLY for secrets/restricted knowledge (list who knows). Omit for anything openly shared — it defaults to the present pair.
 - RELATIONSHIPS: file pair dynamics under Relationships with a stable pair key (\`monika_bernd_status\`, \`monika_bernd_trust\`) and an abstract aspect (trust/romance/debt/status_of_relationship). Update the pair's single status record when the dynamic MATERIALLY changes.
 
-DO NOT STORE: transient poses/moods, scene atmosphere, food eaten, items momentarily in hand, [OOC:] meta, reported/historical speech, negative facts ("no favorite revealed"). DELTA-ONLY: never re-write a fact whose stored value is unchanged (check with the tools first — an identical re-write is wasted work).
+DO NOT STORE: transient poses/moods, current emotional weather, scene atmosphere, the room they happen to be in this moment, food eaten, items momentarily in hand, [OOC:] meta, reported/historical speech, negative facts ("no favorite revealed"). Those ambient here-and-now details belong on the SCENE and TIMELINE lines of the sheet, NOT in the store.
+
+# UPDATING A CHANGED FACT
+
+When a stored fact's value changes, reuse the SAME key (never invent a variant) — the update overwrites the record in place; there is no separate history copy. Before finishing, for every character, relationship, and open thread active this scene, check whether its stored state changed and update it. Write:
+- value: the NEW current state, atomic (e.g. \`Tokyo\`) — this is what the system compares to detect the change.
+- note: a SELF-CONTAINED sentence giving the CURRENT state AND the meaningful past, because the system shows the note INSTEAD of the value to the storyteller. ALWAYS restate the current state — a note that only said "moved from Berlin" would hide that she now lives in Tokyo. Example: value \`Tokyo\`, note \`Now lives in Tokyo; previously lived in Berlin, revealed this scene\`.
+- The note is OVERWRITTEN on each update (not merged), so always write the COMPLETE note — the current state plus any earlier state that still matters. Don't hoard every prior value; keep only the history the story still cares about.
+
+DELTA-ONLY: never re-write a fact whose stored value is UNCHANGED (check with the tools first — an identical re-write is wasted work). But when the value genuinely CHANGED, you MUST write the new value — that IS the update, not waste.
 
 # TENTATIVE MESSAGES
 
