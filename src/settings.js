@@ -13,7 +13,7 @@ import {
     setLastGenerated, setLastInserted, reloadFactsFromChat,
     reloadTokensFromChat, resetSessionTokens,
     reloadSceneFromChat,
-    reloadReflectionFromChat, renderReflection,
+    reloadReflectionFromChat,
     reloadPyramidFromChat,
     reloadSheetFromChat,
 } from './turn-state.js';
@@ -1147,8 +1147,6 @@ export async function initSettings() {
         extensionSettings.showToast = $(this).prop('checked');
         saveSettings();
     });
-
-    renderReflection();
 
     $('#bf_mem_memory_prompt').val(extensionSettings.memoryPrompt || '').off('input').on('input', function () {
         extensionSettings.memoryPrompt = String($(this).val() || '').trim() ? String($(this).val()) : '';
