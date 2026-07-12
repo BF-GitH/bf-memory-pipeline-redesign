@@ -116,13 +116,145 @@ async function actionCatchup(rest) {
     }
 }
 
+// ---- Memory sheet: parse the composed sheet text into structured sections ----
+
+const SHEET_STATE_PREFIX = 'CURRENT STATE';
+const SHEET_CHRONO_PREFIX = 'CHRONOLOGY';
+
+// Escape, then apply a minimal, safe subset of markdown (bold / italic / code /
+// line breaks). Runs AFTER escapeHtml so no raw markup can slip through.
+function sheetMarkdown(s) {
+    let h = escapeHtml(String(s || ''));
+    h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    h = h.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
+    h = h.replace(/\n/g, '<br>');
+    return h;
+}
+
+function humanizeKey(key) {
+    return String(key || '').replace(/_/g, ' ').trim();
+}
+
+// One fact line: "[known] Category/key = value" | "[known] Category/key: note" | "[known] Category/key"
+function parseFactLine(line) {
+    const km = /^\[([^\]]*)\]\s*(.*)$/.exec(line);
+    const knownBy = km ? km[1].trim() : '';
+    const rest = (km ? km[2] : line).trim();
+
+    let ref = rest, detail = '';
+    const eq = rest.indexOf(' = ');
+    const colon = rest.search(/:\s/);
+    if (eq !== -1) { ref = rest.slice(0, eq).trim(); detail = rest.slice(eq + 3).trim(); }
+    else if (colon !== -1) { ref = rest.slice(0, colon).trim(); detail = rest.slice(colon + 1).trim(); }
+
+    let category = '', key = ref;
+    const slash = ref.indexOf('/');
+    if (slash !== -1) { category = ref.slice(0, slash).trim(); key = ref.slice(slash + 1).trim(); }
+    return { knownBy, category, key, ref, detail, raw: line };
+}
+
+function parseSheetText(text) {
+    const out = { summary: '', scene: '', timeline: '', notes: '', precedence: '', sections: [] };
+    let cur = null;
+    const startSection = (label) => { cur = { label, facts: [] }; out.sections.push(cur); };
+
+    for (const raw of String(text || '').split('\n')) {
+        const line = raw.replace(/\s+$/, '');
+        if (!line.trim()) continue;
+        if (line.startsWith('[MEMORY SHEET')) continue;
+        if (line.startsWith('[Memory precedence')) { out.precedence = line.replace(/^\[|\]$/g, ''); continue; }
+
+        let m;
+        if ((m = /^Story so far:\s*(.*)$/i.exec(line))) { out.summary = m[1]; cur = null; continue; }
+        if ((m = /^Scene:\s*(.*)$/i.exec(line))) { out.scene = m[1]; cur = null; continue; }
+        if ((m = /^Timeline & place:\s*(.*)$/i.exec(line))) { out.timeline = m[1]; cur = null; continue; }
+        if ((m = /^Notes:\s*(.*)$/i.exec(line))) { out.notes = m[1]; cur = null; continue; }
+        if (line.startsWith(SHEET_STATE_PREFIX)) { startSection('Current state'); continue; }
+        if (line.startsWith(SHEET_CHRONO_PREFIX)) { startSection('Chronology'); continue; }
+        if (/^Connected memories:/i.test(line)) { startSection('Connected memories'); continue; }
+
+        if (line.startsWith('[')) {
+            if (!cur) startSection('Memories');
+            cur.facts.push(parseFactLine(line));
+            continue;
+        }
+        // Unrecognised line: treat as a continuation of the summary if we are not in a section.
+        if (cur) cur.facts.push({ knownBy: '', category: '', key: '', ref: line, detail: line, raw: line });
+        else out.summary += (out.summary ? ' ' : '') + line;
+    }
+    return out;
+}
+
+function renderFact(f) {
+    const title = f.key ? humanizeKey(f.key) : (f.ref || f.raw);
+    const detail = String(f.detail || f.ref || '').trim();
+    const preview = detail.length > 70 ? detail.slice(0, 70).trim() + '…' : detail;
+
+    const tags = [];
+    if (f.category) tags.push('<span class="bf-mem-fact-tag">' + escapeHtml(f.category) + '</span>');
+    if (f.knownBy && f.knownBy.toLowerCase() !== 'everyone') {
+        tags.push('<span class="bf-mem-fact-tag bf-mem-fact-secret"><i class="fa-solid fa-lock"></i> ' + escapeHtml(f.knownBy) + '</span>');
+    }
+
+    return '<details class="bf-mem-fact">'
+        + '<summary class="bf-mem-fact-sum">'
+        +   '<span class="bf-mem-fact-key">' + escapeHtml(title) + '</span>'
+        +   (preview ? '<span class="bf-mem-fact-preview">' + escapeHtml(preview) + '</span>' : '')
+        + '</summary>'
+        + '<div class="bf-mem-fact-body">'
+        +   '<div class="bf-mem-fact-detail">' + sheetMarkdown(detail || '(no value)') + '</div>'
+        +   (tags.length ? '<div class="bf-mem-fact-tags">' + tags.join('') + '</div>' : '')
+        +   (f.ref ? '<div class="bf-mem-fact-ref">' + escapeHtml(f.ref) + '</div>' : '')
+        + '</div>'
+        + '</details>';
+}
+
+function renderSheetHtml(text) {
+    const s = parseSheetText(text);
+    const p = [];
+    p.push('<div class="bf-mem-sheet-pop">');
+    p.push('<div class="bf-mem-sheet-title"><i class="fa-solid fa-file-lines"></i> BF Memory Sheet</div>');
+
+    if (s.scene || s.timeline) {
+        p.push('<div class="bf-mem-sheet-meta">');
+        if (s.scene) p.push('<div class="bf-mem-sheet-card"><div class="bf-mem-sheet-label"><i class="fa-solid fa-location-dot"></i> Scene</div><div class="bf-mem-sheet-val">' + sheetMarkdown(s.scene) + '</div></div>');
+        if (s.timeline) p.push('<div class="bf-mem-sheet-card"><div class="bf-mem-sheet-label"><i class="fa-solid fa-clock"></i> Timeline &amp; place</div><div class="bf-mem-sheet-val">' + sheetMarkdown(s.timeline) + '</div></div>');
+        p.push('</div>');
+    }
+
+    if (s.summary) {
+        p.push('<div class="bf-mem-sheet-card bf-mem-sheet-summary">'
+            + '<div class="bf-mem-sheet-label"><i class="fa-solid fa-book"></i> Story so far</div>'
+            + '<div class="bf-mem-sheet-val">' + sheetMarkdown(s.summary) + '</div></div>');
+    }
+
+    for (const sec of s.sections) {
+        if (!sec.facts.length) continue;
+        p.push('<div class="bf-mem-sheet-section">');
+        p.push('<div class="bf-mem-sheet-section-head">' + escapeHtml(sec.label)
+            + ' <span class="bf-mem-sheet-count">' + sec.facts.length + '</span></div>');
+        for (const f of sec.facts) p.push(renderFact(f));
+        p.push('</div>');
+    }
+
+    if (s.notes) {
+        p.push('<div class="bf-mem-sheet-card bf-mem-sheet-notes">'
+            + '<div class="bf-mem-sheet-label"><i class="fa-solid fa-lightbulb"></i> Notes</div>'
+            + '<div class="bf-mem-sheet-val">' + sheetMarkdown(s.notes) + '</div></div>');
+    }
+
+    p.push('</div>');
+    return p.join('');
+}
+
 async function showMemorySheetPopup() {
     try { await ensurePopup?.(); } catch {  }
     const text = String(getMemorySheetText() || '').trim();
-    const body = text
-        ? '<pre style="white-space:pre-wrap;margin:0;">' + escapeHtml(text) + '</pre>'
-        : '<div class="bf-mem-summary-empty">No memory sheet yet. It is rebuilt in the background after each reply.</div>';
-    const html = '<div class="bf-mem-section-header"><i class="fa-solid fa-file-lines"></i> BF Memory Sheet</div>' + body;
+    const html = text
+        ? renderSheetHtml(text)
+        : '<div class="bf-mem-sheet-pop"><div class="bf-mem-sheet-title"><i class="fa-solid fa-file-lines"></i> BF Memory Sheet</div>'
+          + '<div class="bf-mem-summary-empty">No memory sheet yet. It is rebuilt in the background after each reply.</div></div>';
     await new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: 'Close' }).show();
 }
 
