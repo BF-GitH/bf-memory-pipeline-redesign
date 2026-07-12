@@ -65,7 +65,7 @@ import * as host from './host.js';
 
 const MAX_FACT_SUMMARY_CHARS = 4000;
 
-const MAX_SUMMARY_CHARS = 1200;
+const MAX_SUMMARY_CHARS = 4000;
 
 const MAX_OBSERVATIONS = 8;
 

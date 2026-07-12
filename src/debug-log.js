@@ -382,35 +382,6 @@ function entryMatchesFilter(entry) {
     return true;
 }
 
-function formatRunSummary(runId, summaryEntry) {
-    const shortId = runId || '(run)';
-    if (!summaryEntry || !summaryEntry.data) {
-        return `Run ${shortId}`;
-    }
-    const d = summaryEntry.data;
-    const parts = [`Run ${shortId}`];
-    if (Number.isFinite(d.durationMs)) parts.push(`${d.durationMs}ms`);
-    if (d.agents) {
-        const mark = (s) => s === 'ok' ? '✓' : s === 'failed' ? '✗' : s === 'skipped' ? '–' : '?';
-        const ag = [];
-        if (d.agents.agent3) ag.push(`Scribe${mark(d.agents.agent3)}`);
-        if (ag.length) parts.push(ag.join(' '));
-    }
-    if (d.facts) {
-        const f = d.facts;
-        const fstr = `facts ${f.NEW ?? 0}N/${f.UPDATED ?? 0}U/${f.SKIPPED ?? 0}S` +
-            (f.EVICTED ? `/${f.EVICTED}E` : '');
-        parts.push(fstr);
-    }
-    if (d.tokens && Number.isFinite(d.tokens.netIn)) {
-        const n = d.tokens.netIn;
-        const tok = Math.abs(n) >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
-        parts.push(`${n >= 0 ? '+' : ''}${tok} tok`);
-    }
-    if (d.cancelled) parts.push('CANCELLED');
-    return parts.join(' · ');
-}
-
 function renderEntryHtml(entry) {
     const level = entry.level || entry.type || 'info';
     const meta = [];
@@ -441,23 +412,14 @@ export function renderDebugLog() {
         groups.get(rid).push(e);
     }
 
-    const summaryByRun = new Map();
-    for (const e of debugLog) {
-        if (e.runId && e.event === 'run.summary' && !summaryByRun.has(e.runId)) {
-            summaryByRun.set(e.runId, e);
-        }
-    }
-
     const blocks = [];
     for (const rid of order) {
         const entries = groups.get(rid);
-        const summary = summaryByRun.get(rid);
-        const headerLevel = (summary && (summary.level || summary.type)) || 'info';
-        const header = escapeHtml(formatRunSummary(rid, summary));
+        const label = escapeHtml(`Run ${rid || '(run)'}`);
         const body = entries.map(renderEntryHtml).join('');
         blocks.push(
-            `<details class="bf-mem-run-group ${escapeHtml(headerLevel)}">` +
-            `<summary>${header} <span class="bf-mem-run-count">(${entries.length})</span></summary>` +
+            `<details class="bf-mem-run-group">` +
+            `<summary>${label} <span class="bf-mem-run-count">(${entries.length})</span></summary>` +
             `<div class="bf-mem-run-body">${body}</div>` +
             `</details>`,
         );

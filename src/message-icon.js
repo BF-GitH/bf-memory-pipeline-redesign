@@ -176,13 +176,27 @@ async function showMessageFacts(mesId) {
             const { getAllDatabases, removeFact, saveDatabase } = await import('./database.js');
             const dbs = await getAllDatabases();
             const db = dbs[category];
-            if (db) { removeFact(db, key); await saveDatabase(db); }
+            let deleted = false;
+            if (db) { removeFact(db, key); await saveDatabase(db); deleted = true; }
 
             const row = btn.closest('.bf-mem-fact-item');
             if (row) row.remove();
             addDebugLog('info', `Per-msg viewer: deleted ${category}/${key} (from msg ${mesId})`, {
                 subsystem: 'settings', event: 'fact.deleted', actor: 'USER', data: { category, key, mesId },
             });
+
+            // Mirror the delete into the active per-chat profile so a chat-switch
+            // autoload doesn't resurrect it from settings.json (IDB-only writes are
+            // wiped and reloaded from the profile). Same helper the pipeline runs
+            // after a committed memory run.
+            if (deleted) {
+                try {
+                    const { saveCurrentToActiveProfile } = await import('./settings.js');
+                    await saveCurrentToActiveProfile();
+                } catch (mirrorErr) {
+                    addDebugLog('fail', `Per-msg viewer: failed to mirror delete of ${category}/${key} to active profile: ${mirrorErr.message || mirrorErr}`);
+                }
+            }
             if (typeof toastr !== 'undefined') toastr.success(`Deleted ${category}/${key}`, 'BF Memory', { timeOut: 2000 });
         } catch (err) {
             btn.disabled = false;

@@ -5,6 +5,7 @@ import {
     findFactMatch,
     mapLegacyCategory,
     isActiveFact,
+    clampImportance,
     summarizeKeys,
     summarizeMenuIndexed,
     groupedTaxonomyMenu,
@@ -60,14 +61,13 @@ HARD LIMITS: at most 6 rounds (replies by you) and 20 tool calls per session. Be
 End your LAST reply with the final block. It starts with a line that is exactly \`#SHEET\` and runs to the end of the reply:
 
 #SHEET
-SUMMARY: <a COMPLETE, high-level recap of the WHOLE story so far — who the characters are to each other, the core situation and stakes, every major arc and turning point, and how it reached the present moment. CARRY THE PRIOR SHEET'S SUMMARY FORWARD AND EXTEND IT — never shrink it or drop earlier arcs. Stay high-level; the specific details live in the memories below. Write as many sentences as the story needs — do NOT compress it to fit a length.>
+SUMMARY: <a FRESH, situational high-level recap written for THIS upcoming beat — the premise plus whatever the coming scene actually leans on. Re-write it each turn for where the story now stands; do NOT retell the entire history here. The full canonical whole-story recap already lives in the periodic reflection STORY and in the memories rendered below, so stay high-level and situational rather than exhaustive.>
 SCENE: <one line: location; who is present; current goal or tension>
 TIMELINE: <the current in-story date and time; WHERE the characters physically are right now; and HOW LONG the main characters have known each other (the age of their relationship)>
 NEED: Category/key, Category/key, ...
-NOTES: <optional 1-2 lines anticipating the next scene>
 
-- SUMMARY is REQUIRED. SCENE and TIMELINE should almost always be present. NEED and NOTES may be omitted.
-- NEED lists EVERY stored fact the NEXT reply needs — there is NO limit (exact Category/key refs you VERIFIED with the tools — never invented): every person present and their current state, the pair's relationship status, all open threads/promises, and the history this scene touches. Include the load-bearing premise facts (identities, secrets, the situation that set the story in motion) EVERY turn so they never silently drop off the sheet. When in doubt, include it — a long sheet beats a missing fact. The system renders those facts onto the sheet for you.
+- SUMMARY is REQUIRED. SCENE and TIMELINE should almost always be present. NEED may be omitted.
+- NEED lists ONLY the Category/key refs THIS reply actually draws on (exact refs you VERIFIED with the tools — never invented): the people present and their current state, the active relationships, and the open threads and history THIS scene touches. Produce a UNIQUE, focused set each turn — do NOT re-list the stable premise/identity facts, because the system ALWAYS injects those for you (the premise floor). The store keeps everything forever; if a later scene needs an older fact, NEED it that turn (or find it with list_keys/search). The system renders the facts you list onto the sheet for you.
 - write_fact lines MAY appear in the same reply, BEFORE the #SHEET block (they are executed, then the sheet is accepted). Read tools in that reply are ignored.
 - EXTRACT-ONLY runs (the task block says so): do NOT emit #SHEET; end with a line that is exactly \`#DONE\` instead.
 
@@ -98,7 +98,7 @@ DELTA-ONLY: never re-write a fact whose stored value is UNCHANGED (check with th
 
 # TENTATIVE MESSAGES
 
-Messages in the block marked "TENTATIVE" may still be swiped/edited. They may inform your SCENE/NEED/NOTES planning, but you MUST NOT write_fact anything from them — extract only from the SETTLED messages.` + TEMPORAL_GROUNDING_RULE;
+Messages in the block marked "TENTATIVE" may still be swiped/edited. They may inform your SCENE/NEED planning, but you MUST NOT write_fact anything from them — extract only from the SETTLED messages.` + TEMPORAL_GROUNDING_RULE;
 
 export async function runMemoryAgent({
     settledMessages = [],
@@ -218,7 +218,6 @@ export async function runMemoryAgent({
             summary: parsedSheet.summary,
             sceneLine: parsedSheet.sceneLine,
             timeline: parsedSheet.timeline,
-            notes: parsedSheet.notes,
             need: parsedSheet.need,
             settings,
             databases,
@@ -310,18 +309,18 @@ function buildAgentUserPrompt({
 }
 
 function parseSheetBlock(text) {
-    const out = { summary: '', sceneLine: '', timeline: '', need: [], notes: '', error: null };
+    const out = { summary: '', sceneLine: '', timeline: '', need: [], error: null };
     const raw = String(text ?? '').trim();
     if (!raw) {
         out.error = 'empty sheet block';
         return out;
     }
-    const buf = { SUMMARY: [], SCENE: [], TIMELINE: [], NEED: [], NOTES: [] };
+    const buf = { SUMMARY: [], SCENE: [], TIMELINE: [], NEED: [] };
     let current = null;
     for (const rawLine of raw.split('\n')) {
         const line = rawLine.trim();
         if (!line || /^```/.test(line)) continue;
-        const m = /^(SUMMARY|SCENE|TIMELINE|NEED|NOTES)\s*:\s*(.*)$/i.exec(line);
+        const m = /^(SUMMARY|SCENE|TIMELINE|NEED)\s*:\s*(.*)$/i.exec(line);
         if (m) {
             current = m[1].toUpperCase();
             if (m[2].trim()) buf[current].push(m[2].trim());
@@ -333,7 +332,6 @@ function parseSheetBlock(text) {
     out.summary = buf.SUMMARY.join(' ').trim();
     out.sceneLine = buf.SCENE.join(' ').trim();
     out.timeline = buf.TIMELINE.join(' ').trim();
-    out.notes = buf.NOTES.join(' ').trim();
 
     for (const ref of buf.NEED.join(',').split(',')) {
         const r = ref.trim().replace(/^[-*]\s*/, '');
@@ -360,12 +358,42 @@ function clampNum(v, min, max, dflt) {
     return Math.min(max, Math.max(min, n));
 }
 
-function composeSheet({ summary = '', sceneLine = '', timeline = '', notes = '', need = [], settings = {}, databases = {} } = {}) {
+function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], settings = {}, databases = {} } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
 
     const rows = [];
     const seen = new Set();
+
+    // PREMISE FLOOR: always inject the load-bearing premise/identity facts, even if
+    // this turn's fresh NEED pick omits them. This is a FLOOR (a guaranteed minimum),
+    // not a ceiling — it never evicts or caps anything the NEED loop adds below.
+    const PREMISE_FLOOR_MAX = 15;
+    try {
+        const floorCandidates = [];
+        for (const [rawCat, db] of Object.entries(databases || {})) {
+            if (!db || !Array.isArray(db.facts)) continue;
+            const category = mapLegacyCategory(String(rawCat || '').trim() || 'Unsorted');
+            for (const fact of db.facts) {
+                if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
+                const loadBearing = clampImportance(fact.importance) >= 4 || fact.kind === 'trait';
+                if (!loadBearing) continue;
+                floorCandidates.push({ fact, category });
+            }
+        }
+        floorCandidates.sort((a, b) => {
+            const impDiff = clampImportance(b.fact.importance) - clampImportance(a.fact.importance);
+            if (impDiff !== 0) return impDiff;
+            return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
+        });
+        for (const { fact, category } of floorCandidates.slice(0, PREMISE_FLOOR_MAX)) {
+            const id = `${category}:${fact.key}`;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            rows.push({ fact, category, tier: 'primary' });
+        }
+    } catch {  }
+
     for (const ref of (Array.isArray(need) ? need : [])) {
         try {
             const category = mapLegacyCategory(String(ref?.category || '').trim() || 'Unsorted');
@@ -415,6 +443,5 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', notes = '',
     renderSection(CHRONO_SECTION_HEADER, chrono);
     renderSection('Connected memories:', extras);
 
-    if (notes) lines.push(`Notes: ${notes}`);
     return lines.join('\n');
 }

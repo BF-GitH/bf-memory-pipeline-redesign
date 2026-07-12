@@ -50,7 +50,31 @@ export function parseAgentReply(text) {
     const raw = String(text ?? '');
     if (!raw.trim()) return out;
 
-    const lines = raw.split('\n');
+    // Strip reasoning-model chain-of-thought so it never reaches the strict protocol
+    // parser below. Reasoning models emit <think>...</think> (or <thinking>...</thinking>)
+    // whose free-form prose can contain stray '{' or "#SHEET" lookalikes that would be
+    // mis-parsed as malformed tool calls or a premature final token. Kept conservative so
+    // normal replies (which have no think tags) are byte-for-byte unaffected:
+    //   1. Remove all well-formed matched pairs.
+    //   2. If an UNMATCHED leading <think> remains (model was cut off mid-thought, or the
+    //      close tag was dropped), discard from that tag up to the first protocol-looking
+    //      line — one that starts with '{' or is the tolerant #SHEET/#DONE final token — so
+    //      no real protocol tokens are lost.
+    let cleaned = raw.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
+    const dangling = /<think(?:ing)?>/i.exec(cleaned);
+    if (dangling) {
+        const after = cleaned.slice(dangling.index);
+        const afterLines = after.split('\n');
+        let cut = -1;
+        for (let i = 0; i < afterLines.length; i++) {
+            const l = afterLines[i].trim();
+            if (l.startsWith('{') || /^[>*_`~\s#-]*#\s*(SHEET|DONE)\b/i.test(l)) { cut = i; break; }
+        }
+        cleaned = cleaned.slice(0, dangling.index) +
+            (cut >= 0 ? afterLines.slice(cut).join('\n') : '');
+    }
+
+    const lines = cleaned.split('\n');
 
     const tryTool = (jsonStr, strict) => {
         let obj;
