@@ -145,10 +145,17 @@ async function callViaCMRS(profileId, messages, signal) {
 }
 
 export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, agent = 'unknown', externalSignal = null) {
-    return callAgentLLMMessages([
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-    ], profileId, agent, externalSignal);
+    // Legacy string-returning contract (used by the reflection agent): swallow the
+    // failure and return '' so callers that expect a plain string keep working.
+    try {
+        return await callAgentLLMMessages([
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+        ], profileId, agent, externalSignal);
+    } catch (err) {
+        addDebugLog('info', `callAgentLLM returning empty after failure: ${err?.message || err}`);
+        return '';
+    }
 }
 
 async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown', externalSignal = null) {
@@ -235,10 +242,10 @@ async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown
 
     if (lastError) {
         addDebugLog('fail', `LLM call failed: ${lastError.message || lastError}`);
-    } else {
-        addDebugLog('fail', 'LLM returned empty response / budget exhausted');
+        throw lastError;
     }
-    return '';
+    addDebugLog('fail', 'LLM returned empty response / budget exhausted');
+    throw new Error('LLM returned empty response');
 }
 
 async function callAgentLLMOnce(messages, profileId, agent = 'unknown', signal) {
@@ -247,30 +254,17 @@ async function callAgentLLMOnce(messages, profileId, agent = 'unknown', signal) 
     if (aborted()) throw new DOMException('Aborted before dispatch', 'AbortError');
 
     if (profileId) {
-        try {
-            const result = await withTimeout((sig) => callViaCMRS(profileId, messages, sig), LLM_TIMEOUT_MS, signal);
-            return result;
-        } catch (cmrsErr) {
-            if (isAbortError(cmrsErr)) throw cmrsErr; 
-            addDebugLog('info', `CMRS failed (${cmrsErr.message}), falling back to direct proxy`);
-        }
+        // A dedicated connection profile is configured for this agent — use ONLY
+        // that profile. NO silent fallback to the main ST proxy: a fallback would
+        // hit a different (often unconfigured) model and hide the real failure.
+        // On error the exception propagates so a toast can tell the user exactly
+        // what broke (e.g. a timeout) instead of masking it behind a wrong-model
+        // reply or a 502.
+        return await withTimeout((sig) => callViaCMRS(profileId, messages, sig), LLM_TIMEOUT_MS, signal);
     }
-    if (aborted()) throw new DOMException('Aborted after CMRS', 'AbortError');
 
-    try {
-        const result = await withTimeout((sig) => callSTProxy(messages, sig), LLM_TIMEOUT_MS, signal);
-        return result;
-    } catch (proxyErr) {
-        if (isAbortError(proxyErr)) throw proxyErr;
-
-        if (isNonRetryableError(proxyErr)) throw proxyErr;
-
-        addDebugLog('fail', `All LLM transports failed (CMRS${profileId ? '' : ' skipped — no profile'}, then ST proxy: ${proxyErr.message}) — no generateQuietPrompt fallback (F-WRITE-4); deterministic retrieval takes over for this call`, {
-            subsystem: 'pipeline', event: 'llm.transports_exhausted', reason: 'ALL_TRANSPORTS_FAILED',
-            data: { agent, profileId: profileId || null, error: String(proxyErr.message || proxyErr) },
-        });
-        throw proxyErr;
-    }
+    // No dedicated profile configured: the direct ST proxy is the only transport.
+    return await withTimeout((sig) => callSTProxy(messages, sig), LLM_TIMEOUT_MS, signal);
 }
 
 async function callSTProxy(messages, signal) {
@@ -359,7 +353,19 @@ export async function callAgentLLMWithTools({
         }
         out.rounds = round;
         out.tokensInApprox += approxMessagesTokens(messages);
-        const reply = await callAgentLLMMessages(messages, profileId, agent, signal);
+        let reply;
+        try {
+            reply = await callAgentLLMMessages(messages, profileId, agent, signal);
+        } catch (err) {
+            // No fallback — surface the real reason. Normalize timeouts/budget
+            // aborts into a plain "timed out" message so the toast is honest.
+            const raw = String(err?.message || err || '');
+            out.error = /timed out|wall-clock|budget|abort/i.test(raw)
+                ? `timed out — no response from the memory-agent connection after ${Math.round(LLM_WALLCLOCK_BUDGET_MS / 1000)}s (check the connection profile / bridge)`
+                : (raw || `LLM call failed on round ${round}`);
+            out.transcript.push({ round, reply: '', toolCalls: [], malformed: 0, note: out.error });
+            break;
+        }
         out.tokensOutApprox += Math.ceil(String(reply || '').length / 4);
 
         if (!reply || !reply.trim()) {
