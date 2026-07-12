@@ -431,14 +431,6 @@ const RETRIEVAL_HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7, moment: 30 };
 
 const RETRIEVAL_COLD_PENALTY = 1000;
 
-const CONFIDENCE_FACTOR = { high: 1.0, med: 0.8, medium: 0.8, low: 0.5 };
-function confidenceFactor(fact) {
-    const c = fact?.confidence;
-    if (c === undefined || c === null || c === '') return 1.0;
-    if (typeof c === 'number') return Number.isFinite(c) ? Math.min(1, Math.max(0, c)) : 1.0;
-    const f = CONFIDENCE_FACTOR[String(c).toLowerCase()];
-    return f === undefined ? 1.0 : f;
-}
 function retrievalSalience(fact, now) {
     const importance = clampImportance(fact?.importance);
     const kind = normalizeKind(fact?.kind);
@@ -447,13 +439,8 @@ function retrievalSalience(fact, now) {
     const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500;
     const halfLife = RETRIEVAL_HALF_LIFE_DAYS[kind] || RETRIEVAL_HALF_LIFE_DAYS.trait;
     const recency = Math.pow(0.5, ageDays / halfLife);
-    let base = RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
+    const base = RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
 
-    try {
-        const w = 0.3;
-        const mult = 1 - w * (1 - confidenceFactor(fact));
-        base *= mult;
-    } catch {  }
     return isColdFact(fact) ? base - RETRIEVAL_COLD_PENALTY : base;
 }
 

@@ -1521,14 +1521,9 @@ export function createEmptyDatabase(category) {
 
 const MAX_SOURCE_HISTORY = 10;
 
-function initProvenance(now) {
-    return { learnedAt: now };
-}
-
 function mergeProvenance(existing, incoming, now) {
     const genesisSource = existing.source || incoming.source || '';
     const genesisValidAt = (existing.validAt !== undefined) ? existing.validAt : incoming.validAt;
-    const learnedAt = existing.learnedAt || existing.lastUpdated || now;
     let history = Array.isArray(existing.sourceHistory) ? [...existing.sourceHistory] : [];
     const prevSource = existing.source;
     if (prevSource && incoming.source && prevSource !== incoming.source) {
@@ -1540,7 +1535,6 @@ function mergeProvenance(existing, incoming, now) {
     return {
         source: genesisSource,
         validAt: genesisValidAt,
-        learnedAt,
         ...(genesisValidFrom !== undefined ? { validFrom: genesisValidFrom } : {}),
         ...(history.length ? { sourceHistory: history } : {}),
     };
@@ -1584,7 +1578,7 @@ export function upsertFact(db, fact) {
                 });
             }
         } else {
-            db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), ...initProvenance(Date.now()), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
+            db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
             addDebugLog('debug', `Sequence step added: [${db.category}] ${seqFact.key} (track ${seqFact.track}, ord ${ord})`, {
                 subsystem: 'db', event: 'fact.created',
                 data: { category: db.category, key: seqFact.key, value: seqFact.value, subject: deriveSubject(seqFact), aspect: deriveAspect(seqFact), track: seqFact.track, ord, isSequence: true },
@@ -1683,7 +1677,6 @@ export function upsertFact(db, fact) {
                 liveSceneOverride.sceneNo = fact.sceneNo;
                 if (fact.sceneName) liveSceneOverride.sceneName = fact.sceneName;
             }
-            if (typeof fact?.sourceMsg === 'string' && fact.sourceMsg) liveSceneOverride.sourceMsg = fact.sourceMsg;
             db.facts[canonIdx] = {
                 ...existing, ...fact, key: existing.key, relationships: mergedRels,
                 context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...liveSceneOverride, active: true,
@@ -1717,7 +1710,7 @@ export function upsertFact(db, fact) {
             });
         }
     } else {
-        db.facts.push({ ...fact, ...normalizeSalienceFields(fact), ...initProvenance(Date.now()), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
+        db.facts.push({ ...fact, ...normalizeSalienceFields(fact), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
         addDebugLog('info', `Fact created: [${db.category}] ${fact.key}`, {
             subsystem: 'db', event: 'fact.created',
             data: { category: db.category, key: fact.key, value: fact.value, subject: deriveSubject(fact), aspect: deriveAspect(fact) },
@@ -1974,7 +1967,6 @@ function normalizeSalienceFields(fact) {
         out.sceneNo = fact.sceneNo;
         if (typeof fact?.sceneName === 'string' && fact.sceneName.trim()) out.sceneName = fact.sceneName.trim();
     }
-    if (typeof fact?.sourceMsg === 'string' && fact.sourceMsg.trim()) out.sourceMsg = fact.sourceMsg.trim();
     return out;
 }
 
@@ -2012,10 +2004,6 @@ function mergeSalience(existing, incoming) {
         out.sceneNo = incNo;
         if (incoming?.sceneName) out.sceneName = incoming.sceneName;
     }
-    const exSrc = typeof existing?.sourceMsg === 'string' && existing.sourceMsg ? existing.sourceMsg : '';
-    const incSrc = typeof incoming?.sourceMsg === 'string' && incoming.sourceMsg ? incoming.sourceMsg : '';
-    if (exSrc) out.sourceMsg = exSrc;
-    else if (incSrc) out.sourceMsg = incSrc;
     return out;
 }
 

@@ -123,8 +123,12 @@ export async function runMemoryAgent({
     const usageBumpCats = [];
 
     let sourceIndex = null;
+    let sourceUid = '';
     for (const m of (Array.isArray(settledMessages) ? settledMessages : [])) {
-        if (Number.isInteger(m?.index) && (sourceIndex === null || m.index > sourceIndex)) sourceIndex = m.index;
+        if (Number.isInteger(m?.index) && (sourceIndex === null || m.index > sourceIndex)) {
+            sourceIndex = m.index;
+            sourceUid = String(m?.uid || '');
+        }
     }
 
     const ctx = {
@@ -136,6 +140,7 @@ export async function runMemoryAgent({
         touchedCategories: new Set(),
     };
     if (sourceIndex !== null) ctx.sourceIndex = sourceIndex;
+    if (sourceUid) ctx.srcId = sourceUid;
 
     const userPrompt = buildAgentUserPrompt({
         settledMessages, tentativeMessages, characterInfo, userPersona,

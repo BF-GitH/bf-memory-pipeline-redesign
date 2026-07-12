@@ -309,11 +309,12 @@ async function editSheetFact(factEl, category, key) {
     const body = factEl.querySelector('.bf-mem-fact-body');
     if (!body || body.querySelector('.bf-mem-fact-edit-box')) return; // already editing
 
-    let current = '';
+    let curVal = '', curNote = '';
     try {
         const { fact } = await resolveStoredFact(category, key);
         if (!fact) { toast('warning', `"${key}" is no longer in the store.`); return; }
-        current = String(fact.value ?? '');
+        curVal = String(fact.value ?? '');
+        curNote = String(fact.context ?? '');   // the "note" is stored in context
     } catch (err) {
         toast('error', `Could not load fact: ${err?.message || err}`);
         return;
@@ -325,16 +326,21 @@ async function editSheetFact(factEl, category, key) {
 
     const box = document.createElement('div');
     box.className = 'bf-mem-fact-edit-box';
-    box.innerHTML = '<textarea class="bf-mem-fact-edit-input" rows="2"></textarea>'
+    box.innerHTML = '<label class="bf-mem-edit-label">Value</label>'
+        + '<textarea class="bf-mem-fact-edit-input bf-edit-value" rows="2"></textarea>'
+        + '<label class="bf-mem-edit-label">Note <span class="bf-mem-edit-hint">(optional)</span></label>'
+        + '<textarea class="bf-mem-fact-edit-input bf-edit-note" rows="2"></textarea>'
         + '<div class="bf-mem-fact-edit-actions">'
         +   '<button type="button" class="bf-mem-fact-btn bf-mem-fact-save"><i class="fa-solid fa-check"></i> Save</button>'
         +   '<button type="button" class="bf-mem-fact-btn bf-mem-fact-cancel">Cancel</button>'
         + '</div>';
-    const ta = box.querySelector('textarea');
-    ta.value = current;
+    const valTa = box.querySelector('.bf-edit-value');
+    const noteTa = box.querySelector('.bf-edit-note');
+    valTa.value = curVal;
+    noteTa.value = curNote;
     body.appendChild(box);
-    ta.focus();
-    ta.setSelectionRange(ta.value.length, ta.value.length);
+    valTa.focus();
+    valTa.setSelectionRange(valTa.value.length, valTa.value.length);
 
     const cleanup = () => { box.remove(); if (actionsEl) actionsEl.style.display = ''; };
 
@@ -343,23 +349,30 @@ async function editSheetFact(factEl, category, key) {
     });
     box.querySelector('.bf-mem-fact-save').addEventListener('click', async (ev) => {
         ev.preventDefault(); ev.stopPropagation();
-        const newVal = ta.value.trim();
+        const newVal = valTa.value.trim();
+        const newNote = noteTa.value.trim();
         if (!newVal) { toast('warning', 'Value cannot be empty — use Delete to remove the fact.'); return; }
         try {
             const { saveDatabase } = await import('./database.js');
             const { cat, db, fact } = await resolveStoredFact(category, key);
             if (!db || !fact) { toast('warning', `"${key}" is no longer in the store.`); cleanup(); return; }
-            if (newVal !== String(fact.value ?? '')) {
-                fact.value = newVal;
+            let changed = false;
+            if (newVal !== String(fact.value ?? '')) { fact.value = newVal; changed = true; }
+            if (newNote !== String(fact.context ?? '')) {
+                if (newNote) fact.context = newNote; else delete fact.context;
+                changed = true;
+            }
+            if (changed) {
                 fact.lastUpdated = Date.now();
                 await saveDatabase(db);
                 addDebugLog('info', `Sheet popup: edited fact ${cat}/${fact.key}`, {
                     subsystem: 'settings', event: 'sheet.fact.edit', actor: 'USER', data: { category: cat, key: fact.key },
                 });
             }
-            if (detailEl) detailEl.innerHTML = sheetMarkdown(newVal);
+            const shown = newVal || newNote || '(no value)';
+            if (detailEl) detailEl.innerHTML = sheetMarkdown(shown);
             const preview = factEl.querySelector('.bf-mem-fact-preview');
-            if (preview) preview.textContent = newVal.length > 70 ? newVal.slice(0, 70).trim() + '…' : newVal;
+            if (preview) preview.textContent = shown.length > 70 ? shown.slice(0, 70).trim() + '…' : shown;
             toast('success', `Updated "${fact.key}" — the sheet refreshes next turn.`);
             cleanup();
         } catch (err) {

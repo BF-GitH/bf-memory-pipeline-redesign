@@ -140,8 +140,33 @@ function isGenuineMessage(m) {
     return !!(m && m.mes && !m.is_system && !m.extra?.type);
 }
 
+// Build a stable, position-independent id for a message the first time we touch
+// it, and stash it on the message itself (extra.bf_uid) so it survives message
+// deletes, edits, and branches. Composite of chatId (separates chats/branches),
+// a to-the-second timestamp (human-readable), and a random token (uniqueness).
+function makeMsgUid(m) {
+    const ctx = SillyTavern.getContext();
+    const chatId = String(ctx.getCurrentChatId?.() || ctx.chatId || 'chat').replace(/\s+/g, '_');
+    let ts = NaN;
+    try { ts = (m?.send_date != null) ? new Date(m.send_date).getTime() : NaN; } catch { ts = NaN; }
+    const t = Number.isFinite(ts) ? ts : Date.now();
+    const stamp = new Date(t).toISOString().slice(0, 19).replace(/[-:]/g, ''); // e.g. 20260712T142233
+    let rand = '';
+    try { rand = (globalThis.crypto?.randomUUID?.() || '').replace(/-/g, '').slice(0, 12); } catch {  }
+    if (!rand) rand = (Date.now().toString(36) + Math.random().toString(36).slice(2)).slice(0, 12);
+    return `${chatId}::${stamp}::${rand}`;
+}
+
+function ensureMsgUid(m) {
+    if (!m || typeof m !== 'object') return '';
+    if (m.extra?.bf_uid) return m.extra.bf_uid;
+    const uid = makeMsgUid(m);
+    m.extra = { ...(m.extra || {}), bf_uid: uid };
+    return uid;
+}
+
 function toAgentMessage(m, index) {
-    return { index, role: m.is_user ? 'USER' : 'CHAR', name: String(m.name || '').trim(), text: m.mes };
+    return { index, uid: ensureMsgUid(m), role: m.is_user ? 'USER' : 'CHAR', name: String(m.name || '').trim(), text: m.mes };
 }
 
 async function runMemoryExtraction() {

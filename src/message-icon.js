@@ -119,13 +119,17 @@ async function onIconClick(e, mesId) {
 async function collectFactsForMessage(mesId) {
     const { getAllDatabases, isActiveFact } = await import('./database.js');
     const want = `msg_${mesId}`;
+    // Prefer the stable per-message id (survives deletes/branches); fall back to
+    // the legacy positional `source` for facts written before srcId existed.
+    let wantUid = '';
+    try { wantUid = SillyTavern.getContext()?.chat?.[mesId]?.extra?.bf_uid || ''; } catch {  }
     const dbs = await getAllDatabases();
     const out = [];
     for (const [category, db] of Object.entries(dbs)) {
         for (const fact of (db.facts || [])) {
             if (!isActiveFact(fact)) continue;
 
-            if (fact.source === want || fact.sourceMsg === want) out.push({ category, fact });
+            if ((wantUid && fact.srcId === wantUid) || fact.source === want) out.push({ category, fact });
         }
     }
     return out;

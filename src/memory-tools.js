@@ -264,16 +264,6 @@ function execWriteFact(args, ctx) {
     const involved = (Array.isArray(args?.with) ? args.with : Array.isArray(args?.involved) ? args.involved : [])
         .map(n => String(n ?? '').trim().replace(/^@/, '').trim())
         .filter(Boolean);
-    let confidence = args?.conf ?? args?.confidence ?? null;
-    if (confidence !== null && confidence !== undefined && confidence !== '') {
-        if (typeof confidence === 'number') confidence = Math.min(1, Math.max(0, confidence));
-        else {
-            const c = String(confidence).trim().toLowerCase();
-            confidence = (c === 'medium') ? 'med' : (['high', 'med', 'low'].includes(c) ? c : null);
-        }
-    } else {
-        confidence = null;
-    }
 
     const sourceIndex = Number.isInteger(ctx.sourceIndex) ? ctx.sourceIndex : null;
     const fact = {
@@ -291,9 +281,11 @@ function execWriteFact(args, ctx) {
     };
     if (note) fact.context = note;
     if (involved.length) fact.involved = involved;
-    if (confidence !== null) fact.confidence = confidence;
     if (sourceIndex !== null) fact.validAt = sourceIndex;
-    if (fact.source) fact.sourceMsg = fact.source;
+    // Stable, position-independent origin id for this fact's source message
+    // (survives deletes/branches; see pipeline.js ensureMsgUid). `source`
+    // above stays as the legacy positional pointer for provenance history.
+    if (ctx.srcId) fact.srcId = ctx.srcId;
 
     if (!ctx.databases[category]) {
         ctx.databases[category] = createEmptyDatabase(category);
