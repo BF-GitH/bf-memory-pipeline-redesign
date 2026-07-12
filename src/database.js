@@ -385,11 +385,6 @@ let _overlayVocabMemo = null;
 
 let _overlayCatsMemo = null;
 
-export function invalidateTaxonomyOverlayCache() {
-    _overlayVocabMemo = null;
-    _overlayCatsMemo = null;
-}
-
 export function getTaxonomyOverlay() {
     const ov = host.getExtensionSettings()?.taxonomyOverlay;
     return {
@@ -984,15 +979,6 @@ export async function getMemoryIndex() {
     return idx;
 }
 
-function normBranchToken(s) {
-    return String(s ?? '')
-        .trim()
-        .replace(/^[\s\-*•"'`(\[\{]+/, '')
-        .replace(/[\s.,;:"'`)\]\}]+$/, '')
-        .trim()
-        .toLowerCase();
-}
-
 export function searchFactsIndexed(index, databases, keywords) {
     const MAX_PRIMARY = 8;
     const results = [];
@@ -1153,35 +1139,6 @@ export function summarizeMenuIndexed(index) {
         data: { byIndex: true, candidateCount: aspectCount, op: 'summarizeMenu', categories: lines.length },
     });
     return lines.join('\n');
-}
-
-export function scopedScribeCandidates(index, subjects, keywords, cap = 60) {
-    const picked = new Map(); 
-    const addEntry = (e) => { if (e) picked.set(`${e.category}:${e.fact.key}`, e); };
-
-    for (const subj of (subjects || [])) {
-        const s = String(subj || '').trim().toLowerCase();
-        if (!s) continue;
-        const bucket = index.bySubject.get(s);
-        if (bucket) for (const e of bucket) addEntry(e);
-    }
-    for (const kw of (keywords || [])) {
-        for (const w of wordTokens(kw)) { 
-            const bucket = index.byToken.get(w);
-            if (bucket) for (const e of bucket) addEntry(e);
-        }
-    }
-
-    let candidates = [...picked.values()];
-
-    if (candidates.length > cap) {
-        const now = Date.now();
-        candidates = candidates
-            .slice()
-            .sort((a, b) => salienceScore(b.fact, now, true) - salienceScore(a.fact, now, true))
-            .slice(0, cap);
-    }
-    return candidates;
 }
 
 async function loadAllDatabases(avatar) {
@@ -2308,15 +2265,6 @@ export function summarizeKeys(databases) {
 }
 
 export const MENU_CATEGORY_ORDER = L1_CATEGORIES;
-
-function findDbByCategory(databases, category) {
-    const want = String(category || '').trim().toLowerCase();
-    if (!want) return null;
-    for (const [name, db] of Object.entries(databases)) {
-        if (String(name).toLowerCase() === want) return [name, db];
-    }
-    return null;
-}
 
 export function groupedTaxonomyMenu() {
     const overlay = getTaxonomyOverlay();

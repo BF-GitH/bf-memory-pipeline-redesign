@@ -327,32 +327,8 @@ export function renderMemorySheet() {
 const SCENE_META_KEY = 'bf_mem_scene';
 const SCENE_BEATS_MAX = 3; 
 
-const SCENE_SIM_THRESHOLD = 0.5; 
 const SCENE_NAME_MAX = 60;       
 const SCENE_LASTSEEN_MAX = 40;   
-
-function sceneLocTokens(loc) {
-    return new Set(
-        wordTokens(loc, { min: 3 })
-
-            .filter(t => !/^(the|and|for|with|near|into|onto)$/.test(t)),
-    );
-}
-
-function isMaterialLocationChange(prevLoc, nextLoc) {
-    const a = String(prevLoc || '').trim();
-    const b = String(nextLoc || '').trim();
-    if (!a || !b) return false;                 
-    if (a.toLowerCase() === b.toLowerCase()) return false;
-    const sa = sceneLocTokens(a);
-    const sb = sceneLocTokens(b);
-    if (sa.size === 0 || sb.size === 0) return false;
-    let inter = 0;
-    for (const t of sa) if (sb.has(t)) inter++;
-    const union = sa.size + sb.size - inter;
-    const jaccard = union > 0 ? inter / union : 0;
-    return jaccard < SCENE_SIM_THRESHOLD;       
-}
 
 function deriveSceneName(loc) {
     const s = String(loc || '').trim().replace(/\s+/g, ' ');

@@ -55,21 +55,6 @@ function recordRunTokens({ baselineInput, actualInput }) {
     }
 }
 
-function getRecentMessages(count) {
-    const context = SillyTavern.getContext();
-    const chat = context.chat;
-    if (!chat || chat.length === 0) return [];
-
-    const messages = [];
-    const startIndex = Math.max(0, chat.length - count);
-    for (let i = startIndex; i < chat.length; i++) {
-        if (chat[i] && chat[i].mes) {
-            messages.push(chat[i]);
-        }
-    }
-    return messages;
-}
-
 function getCharacterInfo() {
     const context = SillyTavern.getContext();
     const char = context.characters?.[context.characterId];

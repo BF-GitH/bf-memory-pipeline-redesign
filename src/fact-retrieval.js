@@ -503,22 +503,6 @@ function linkToken(s) {
     return String(s ?? '').trim().toLowerCase();
 }
 
-export function expandLinks(databases, results, alreadyFound) {
-
-    const candidates = collectLinkCandidates(databases, results.slice(), alreadyFound);
-    let pulled = 0;
-    for (const c of candidates) {
-        const id = `${c.category}:${c.fact.key}`;
-        if (alreadyFound.has(id)) continue;
-        results.push({ fact: c.fact, category: c.category, tier: c.tier, via: c.via });
-        alreadyFound.add(id);
-        pulled++;
-    }
-    if (pulled > 0) {
-        addDebugLog('info', `Link expansion (Phase 4b): pulled ${pulled} linked fact(s) as secondary`);
-    }
-}
-
 export function randomWalkExtras(databases, seedRows, alreadySeen, count) {
     const max = Math.max(0, Math.floor(Number(count) || 0));
     if (max <= 0) return [];

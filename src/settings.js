@@ -666,64 +666,6 @@ export function pruneActiveProfile(category = null) {
     return { profilesPruned, factsPruned };
 }
 
-function profilesLinkedToCurrentChat() {
-    const profiles = extensionSettings?.dbProfiles;
-    if (!profiles || typeof profiles !== 'object') return [];
-    const targets = new Set();
-    const active = extensionSettings?.activeDbProfile;
-    if (active && profiles[active]) targets.add(active);
-    const chatId = getCurrentChatId();
-    if (chatId) {
-        for (const [name, profile] of Object.entries(profiles)) {
-            if ((profile?.linkedChats || []).includes(chatId)) targets.add(name);
-        }
-    }
-    return [...targets];
-}
-
-export function pruneFactFromProfiles(category, key) {
-    const profiles = extensionSettings?.dbProfiles;
-    if (!profiles || !category || !key) return { profilesPruned: [], factsPruned: 0 };
-    const profilesPruned = [];
-    let factsPruned = 0;
-    for (const name of profilesLinkedToCurrentChat()) {
-        const profile = profiles[name];
-        const db = profile?.databases?.[category];
-        if (!db || !Array.isArray(db.facts)) continue;
-        const before = db.facts.length;
-        db.facts = db.facts.filter(f => f && f.key !== key);
-        const removed = before - db.facts.length;
-        if (removed > 0) {
-            factsPruned += removed;
-            db.updatedAt = Date.now();
-            profile.savedAt = Date.now();
-            profilesPruned.push(name);
-        }
-    }
-    if (profilesPruned.length > 0) saveSettings();
-    return { profilesPruned, factsPruned };
-}
-
-export function updateFactInProfiles(category, key, updatedFact) {
-    const profiles = extensionSettings?.dbProfiles;
-    if (!profiles || !category || !key || !updatedFact) return { profilesUpdated: [] };
-    const profilesUpdated = [];
-    for (const name of profilesLinkedToCurrentChat()) {
-        const profile = profiles[name];
-        const db = profile?.databases?.[category];
-        if (!db || !Array.isArray(db.facts)) continue;
-        const idx = db.facts.findIndex(f => f && f.key === key);
-        if (idx < 0) continue;
-
-        db.facts[idx] = JSON.parse(JSON.stringify(updatedFact));
-        db.updatedAt = Date.now();
-        profile.savedAt = Date.now();
-        profilesUpdated.push(name);
-    }
-    if (profilesUpdated.length > 0) saveSettings();
-    return { profilesUpdated };
-}
-
 function markChatUnlinked(chatId) {
     if (!chatId) return;
     if (!Array.isArray(extensionSettings.unlinkedChats)) extensionSettings.unlinkedChats = [];
@@ -775,25 +717,6 @@ export function isTriviallyEmptyForExtraction(mes) {
         if (allOoc) return true;
     }
     return false;
-}
-
-export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgress, shouldCancel } = {}) {
-    void skipAlreadyProcessed; 
-    const { runCatchupImport } = await import('./catchup-import.js');
-    const result = await runCatchupImport({
-        onProgress: ({ msgsDone, msgsTotal, factsAdded }) => {
-            onProgress?.({ current: msgsDone, total: msgsTotal, factsAdded });
-        },
-        shouldCancel,
-    });
-    return {
-        processed: result.msgsDone || 0,
-        skipped: 0,
-        factsAdded: result.factsAdded || 0,
-        refused: result.refused,
-        cancelled: result.cancelled,
-        aborted: result.aborted,
-    };
 }
 
 async function autoSaveDbProfile() {
