@@ -28,11 +28,6 @@ export function getCurrentCharacterName() {
     return ctx?.characters?.[ctx.characterId]?.name || '';
 }
 
-export function getCharacterAvatar() {
-    const ctx = rawCtx();
-    return ctx?.characters?.[ctx.characterId]?.avatar || null;
-}
-
 export function getUserPersonaName() {
     return rawCtx()?.name1 || '';
 }
@@ -71,38 +66,4 @@ export function getCMRS() {
 export function getRequestHeaders() {
     const ctx = rawCtx();
     return ctx?.getRequestHeaders?.() ?? null;
-}
-
-export function generateQuietPrompt(opts) {
-    const ctx = rawCtx();
-    return ctx.generateQuietPrompt(opts);
-}
-
-export function saveChatDebounced() {
-    rawCtx()?.saveChatDebounced?.();
-}
-
-export function saveMetadata() {
-    const ctx = rawCtx();
-    return ctx?.saveMetadata?.();
-}
-
-export function saveSettingsDebounced(opts = {}) {
-    const ctx = rawCtx();
-    const fn = ctx?.saveSettingsDebounced;
-    if (typeof fn !== 'function') return;
-    fn();
-    if (opts.flush !== false && typeof fn.flush === 'function') {
-        fn.flush();
-    }
-}
-
-export function toast(level, message, title, options) {
-    try {
-        const t = (typeof toastr !== 'undefined') ? toastr
-            : (typeof globalThis !== 'undefined' ? globalThis.toastr : undefined);
-        if (t && typeof t[level] === 'function') {
-            t[level](message, title, options);
-        }
-    } catch {  }
 }

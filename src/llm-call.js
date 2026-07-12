@@ -104,12 +104,8 @@ function detectCurrentConfig() {
     }
 }
 
-function getCMRS() {
-    return host.getCMRS();
-}
-
 async function callViaCMRS(profileId, messages, signal) {
-    const CMRS = getCMRS();
+    const CMRS = host.getCMRS();
     if (!CMRS) {
         throw new Error('ConnectionManagerRequestService not available');
     }

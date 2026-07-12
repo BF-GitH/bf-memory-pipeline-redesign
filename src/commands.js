@@ -197,6 +197,17 @@ function renderFact(f) {
         tags.push('<span class="bf-mem-fact-tag bf-mem-fact-secret"><i class="fa-solid fa-lock"></i> ' + escapeHtml(f.knownBy) + '</span>');
     }
 
+    // Edit/Delete are offered only for facts we can trace back to a real stored
+    // record (i.e. the sheet line carried a "Category/key" ref). Free-text
+    // continuation lines have no key, so they get no controls.
+    const editable = !!(f.category && f.key);
+    const actions = editable
+        ? '<div class="bf-mem-fact-actions" data-cat="' + escapeHtml(f.category) + '" data-key="' + escapeHtml(f.key) + '">'
+        +   '<button type="button" class="bf-mem-fact-btn bf-mem-fact-edit"><i class="fa-solid fa-pen"></i> Edit</button>'
+        +   '<button type="button" class="bf-mem-fact-btn bf-mem-fact-del"><i class="fa-solid fa-trash"></i> Delete</button>'
+        + '</div>'
+        : '';
+
     return '<details class="bf-mem-fact">'
         + '<summary class="bf-mem-fact-sum">'
         +   '<span class="bf-mem-fact-key">' + escapeHtml(title) + '</span>'
@@ -206,6 +217,7 @@ function renderFact(f) {
         +   '<div class="bf-mem-fact-detail">' + sheetMarkdown(detail || '(no value)') + '</div>'
         +   (tags.length ? '<div class="bf-mem-fact-tags">' + tags.join('') + '</div>' : '')
         +   (f.ref ? '<div class="bf-mem-fact-ref">' + escapeHtml(f.ref) + '</div>' : '')
+        +   actions
         + '</div>'
         + '</details>';
 }
@@ -248,6 +260,131 @@ function renderSheetHtml(text) {
     return p.join('');
 }
 
+// ---- Memory sheet popup: per-fact edit / delete, operating on the real store ----
+
+// Resolve the DB + the actual stored fact for a sheet row's Category/key ref.
+// findFactMatch may resolve a fuzzy/aliased key, so we always act on fact.key
+// (never the raw ref) when mutating.
+async function resolveStoredFact(category, key) {
+    const { getAllDatabases, findFactMatch, mapLegacyCategory } = await import('./database.js');
+    const cat = mapLegacyCategory(String(category || '').trim() || 'Unsorted');
+    const dbs = await getAllDatabases();
+    const db = dbs[cat] || null;
+    const fact = db ? findFactMatch(db, String(key || '').trim()) : null;
+    return { cat, db, fact };
+}
+
+async function deleteSheetFact(factEl, btn, category, key) {
+    // Two-step confirm on the button itself — no nested modal.
+    if (btn.dataset.armed !== '1') {
+        btn.dataset.armed = '1';
+        btn.classList.add('bf-mem-fact-btn-danger');
+        btn.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> Confirm';
+        clearTimeout(btn._disarm);
+        btn._disarm = setTimeout(() => {
+            btn.dataset.armed = '';
+            btn.classList.remove('bf-mem-fact-btn-danger');
+            btn.innerHTML = '<i class="fa-solid fa-trash"></i> Delete';
+        }, 3500);
+        return;
+    }
+    clearTimeout(btn._disarm);
+    try {
+        const { saveDatabase, removeFact } = await import('./database.js');
+        const { cat, db, fact } = await resolveStoredFact(category, key);
+        if (!db) { toast('warning', `Category "${category}" not in store`); return; }
+        removeFact(db, fact ? fact.key : key);
+        await saveDatabase(db);
+        factEl.remove();
+        addDebugLog('info', `Sheet popup: deleted fact ${cat}/${fact ? fact.key : key}`, {
+            subsystem: 'settings', event: 'sheet.fact.delete', actor: 'USER', data: { category: cat, key: fact ? fact.key : key },
+        });
+        toast('success', `Deleted "${key}" from the store — the sheet refreshes next turn.`);
+    } catch (err) {
+        toast('error', `Delete failed: ${err?.message || err}`);
+    }
+}
+
+async function editSheetFact(factEl, category, key) {
+    const body = factEl.querySelector('.bf-mem-fact-body');
+    if (!body || body.querySelector('.bf-mem-fact-edit-box')) return; // already editing
+
+    let current = '';
+    try {
+        const { fact } = await resolveStoredFact(category, key);
+        if (!fact) { toast('warning', `"${key}" is no longer in the store.`); return; }
+        current = String(fact.value ?? '');
+    } catch (err) {
+        toast('error', `Could not load fact: ${err?.message || err}`);
+        return;
+    }
+
+    const detailEl = body.querySelector('.bf-mem-fact-detail');
+    const actionsEl = body.querySelector('.bf-mem-fact-actions');
+    if (actionsEl) actionsEl.style.display = 'none';
+
+    const box = document.createElement('div');
+    box.className = 'bf-mem-fact-edit-box';
+    box.innerHTML = '<textarea class="bf-mem-fact-edit-input" rows="2"></textarea>'
+        + '<div class="bf-mem-fact-edit-actions">'
+        +   '<button type="button" class="bf-mem-fact-btn bf-mem-fact-save"><i class="fa-solid fa-check"></i> Save</button>'
+        +   '<button type="button" class="bf-mem-fact-btn bf-mem-fact-cancel">Cancel</button>'
+        + '</div>';
+    const ta = box.querySelector('textarea');
+    ta.value = current;
+    body.appendChild(box);
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+
+    const cleanup = () => { box.remove(); if (actionsEl) actionsEl.style.display = ''; };
+
+    box.querySelector('.bf-mem-fact-cancel').addEventListener('click', (ev) => {
+        ev.preventDefault(); ev.stopPropagation(); cleanup();
+    });
+    box.querySelector('.bf-mem-fact-save').addEventListener('click', async (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        const newVal = ta.value.trim();
+        if (!newVal) { toast('warning', 'Value cannot be empty — use Delete to remove the fact.'); return; }
+        try {
+            const { saveDatabase } = await import('./database.js');
+            const { cat, db, fact } = await resolveStoredFact(category, key);
+            if (!db || !fact) { toast('warning', `"${key}" is no longer in the store.`); cleanup(); return; }
+            if (newVal !== String(fact.value ?? '')) {
+                fact.value = newVal;
+                fact.lastUpdated = Date.now();
+                await saveDatabase(db);
+                addDebugLog('info', `Sheet popup: edited fact ${cat}/${fact.key}`, {
+                    subsystem: 'settings', event: 'sheet.fact.edit', actor: 'USER', data: { category: cat, key: fact.key },
+                });
+            }
+            if (detailEl) detailEl.innerHTML = sheetMarkdown(newVal);
+            const preview = factEl.querySelector('.bf-mem-fact-preview');
+            if (preview) preview.textContent = newVal.length > 70 ? newVal.slice(0, 70).trim() + '…' : newVal;
+            toast('success', `Updated "${fact.key}" — the sheet refreshes next turn.`);
+            cleanup();
+        } catch (err) {
+            toast('error', `Save failed: ${err?.message || err}`);
+        }
+    });
+}
+
+// One delegated handler for every Edit/Delete button inside the sheet popup.
+// Capture phase so we run before the <details> toggles.
+function onSheetPopupClick(e) {
+    const editBtn = e.target.closest?.('.bf-mem-fact-edit');
+    const delBtn = e.target.closest?.('.bf-mem-fact-del');
+    const btn = editBtn || delBtn;
+    if (!btn || !btn.closest('.bf-mem-sheet-pop')) return;
+    e.preventDefault(); e.stopPropagation();
+    const actions = btn.closest('.bf-mem-fact-actions');
+    const factEl = btn.closest('.bf-mem-fact');
+    const category = actions?.getAttribute('data-cat') || '';
+    const key = actions?.getAttribute('data-key') || '';
+    if (!factEl || !category || !key) return;
+    if (editBtn) editSheetFact(factEl, category, key);
+    else deleteSheetFact(factEl, btn, category, key);
+}
+
 async function showMemorySheetPopup() {
     try { await ensurePopup?.(); } catch {  }
     const text = String(getMemorySheetText() || '').trim();
@@ -255,7 +392,12 @@ async function showMemorySheetPopup() {
         ? renderSheetHtml(text)
         : '<div class="bf-mem-sheet-pop"><div class="bf-mem-sheet-title"><i class="fa-solid fa-file-lines"></i> BF Memory Sheet</div>'
           + '<div class="bf-mem-summary-empty">No memory sheet yet. It is rebuilt in the background after each reply.</div></div>';
-    await new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: 'Close' }).show();
+    document.addEventListener('click', onSheetPopupClick, true);
+    try {
+        await new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: 'Close' }).show();
+    } finally {
+        document.removeEventListener('click', onSheetPopupClick, true);
+    }
 }
 
 function addSheetWandMenuItem() {

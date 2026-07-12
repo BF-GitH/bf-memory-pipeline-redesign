@@ -439,10 +439,6 @@ function flatVocab(category) {
     return merged;
 }
 
-function aspectVocabFor(category) {
-    return flatVocab(category);
-}
-
 function defaultAspectFor(category) {
     const canon = mapLegacyCategory(category);
     return DEFAULT_ASPECT[canon] || flatVocab(canon)[0] || 'misc';
@@ -450,7 +446,7 @@ function defaultAspectFor(category) {
 
 export function normalizeAspect(v, category) {
     const a = String(v || '').trim().toLowerCase();
-    const vocab = aspectVocabFor(category);
+    const vocab = flatVocab(category);
     if (a && vocab.includes(a)) return a;
 
     if (a && Object.prototype.hasOwnProperty.call(LEGACY_ASPECT_MAP, a)) {
@@ -1125,7 +1121,7 @@ export function summarizeMenuIndexed(index) {
     for (const name of ordered) {
         const counts = index.aspectCounts.get(name);
         if (!counts || counts.size === 0) continue;
-        const vocab = aspectVocabFor(name);
+        const vocab = flatVocab(name);
         const parts = vocab.filter(a => (counts.get(a) || 0) > 0).map(a => `${a}(${counts.get(a)})`);
         const extras = [...counts.keys()]
             .filter(a => !vocab.includes(a) && counts.get(a) > 0)
@@ -1525,7 +1521,7 @@ export function createEmptyDatabase(category) {
 
 const MAX_SOURCE_HISTORY = 10;
 
-function initProvenance(fact, now) {
+function initProvenance(now) {
     return { learnedAt: now };
 }
 
@@ -1588,7 +1584,7 @@ export function upsertFact(db, fact) {
                 });
             }
         } else {
-            db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), ...initProvenance(seqFact, Date.now()), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
+            db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), ...initProvenance(Date.now()), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
             addDebugLog('debug', `Sequence step added: [${db.category}] ${seqFact.key} (track ${seqFact.track}, ord ${ord})`, {
                 subsystem: 'db', event: 'fact.created',
                 data: { category: db.category, key: seqFact.key, value: seqFact.value, subject: deriveSubject(seqFact), aspect: deriveAspect(seqFact), track: seqFact.track, ord, isSequence: true },
@@ -1721,7 +1717,7 @@ export function upsertFact(db, fact) {
             });
         }
     } else {
-        db.facts.push({ ...fact, ...normalizeSalienceFields(fact), ...initProvenance(fact, Date.now()), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
+        db.facts.push({ ...fact, ...normalizeSalienceFields(fact), ...initProvenance(Date.now()), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
         addDebugLog('info', `Fact created: [${db.category}] ${fact.key}`, {
             subsystem: 'db', event: 'fact.created',
             data: { category: db.category, key: fact.key, value: fact.value, subject: deriveSubject(fact), aspect: deriveAspect(fact) },

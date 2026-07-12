@@ -1,4 +1,4 @@
-import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sinceIso } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 import { recencyTail, getTurnNowContext } from './recency.js';
 import { wordTokens, tokenSet, cleanWord, isCapitalizedWord, cjkTokens } from './tokenize.js';
@@ -163,9 +163,6 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     const cfg = (() => { try { return getSettings(); } catch { return null; } })() || {};
 
     const budget = 800;
-    const cutoffDays = Number(cfg.recencyCutoffDays) || 0;
-    const cutoffIso = cutoffDays > 0 ? sinceIso(cutoffDays) : null;
-    const passesRecency = (r) => !cutoffIso || !r.fact.createdAt || r.fact.createdAt >= cutoffIso;
 
     const exactPrimaries = directResults.filter(r => r.tier === 'primary' && r.via === 'exact');
     if (exactPrimaries.length > EXACT_KEY_PRIMARY_CAP) {
@@ -190,14 +187,6 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
             data: { key: r.fact.key, category: r.category, tier: r.tier, ...extra },
         });
     };
-
-    if (cutoffIso) {
-        for (const r of [...secondary, ...tertiary]) {
-            if (!passesRecency(r)) recordExclude(r, 'RECENCY_CUTOFF', { createdAt: r.fact.createdAt || null, cutoff: cutoffIso });
-        }
-        secondary = secondary.filter(passesRecency);
-        tertiary = tertiary.filter(passesRecency);
-    }
 
     const byScore = (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now);
     secondary.sort(byScore);

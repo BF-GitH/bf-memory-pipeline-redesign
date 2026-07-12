@@ -143,7 +143,7 @@ function validateSettings(s) {
     s.catchupBatchSize = Math.floor(clamp(s.catchupBatchSize, 2, 30, 8));
     if (typeof s.enabled !== 'boolean') {
 
-        if (s.enabled === true || (s.enabled && s.enabled !== false)) {
+        if (s.enabled) {
             addDebugLog('fail', 'enabled coerced to false (was non-boolean: ' + JSON.stringify(s.enabled) + ')');
         }
         s.enabled = false;
@@ -728,7 +728,6 @@ export function isTriviallyEmptyForExtraction(mes) {
 
 async function autoSaveDbProfile() {
     try {
-        const context = getContext();
         const chatId = getCurrentChatId();
         const chatLabel = getCurrentChatLabel();
 
