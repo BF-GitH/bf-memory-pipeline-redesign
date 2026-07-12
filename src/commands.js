@@ -1,4 +1,6 @@
 import { getSettings, setPipelineEnabled, addDebugLog } from './settings.js';
+import { ensurePopup, Popup, POPUP_TYPE, escapeHtml } from './ui-util.js';
+import { getMemorySheetText } from './turn-state.js';
 
 const MACRO_FACT_CAP = 40;        
 const MACRO_VALUE_CHARS = 120;    
@@ -114,6 +116,40 @@ async function actionCatchup(rest) {
     }
 }
 
+async function showMemorySheetPopup() {
+    try { await ensurePopup?.(); } catch {  }
+    const text = String(getMemorySheetText() || '').trim();
+    const body = text
+        ? '<pre style="white-space:pre-wrap;margin:0;">' + escapeHtml(text) + '</pre>'
+        : '<div class="bf-mem-summary-empty">No memory sheet yet. It is rebuilt in the background after each reply.</div>';
+    const html = '<div class="bf-mem-section-header"><i class="fa-solid fa-file-lines"></i> BF Memory Sheet</div>' + body;
+    await new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: 'Close' }).show();
+}
+
+function addSheetWandMenuItem() {
+    const menu = document.getElementById('extensionsMenu');
+    if (!menu) return false;
+    if (document.getElementById('bf_mem_sheet_menu_item')) return true;
+    const item = document.createElement('div');
+    item.id = 'bf_mem_sheet_menu_item';
+    item.className = 'list-group-item flex-container flexGap5 interactable';
+    item.tabIndex = 0;
+    item.innerHTML = '<div class="fa-solid fa-file-lines extensionsMenuExtensionButton"></div><span>BF Memory Sheet</span>';
+    item.addEventListener('click', () => { try { document.getElementById('extensionsMenu')?.classList.remove('open'); } catch {  } showMemorySheetPopup(); });
+    menu.appendChild(item);
+    return true;
+}
+
+function initSheetWandMenuItem() {
+    let attempts = 0;
+    const tryAdd = () => {
+        attempts += 1;
+        try { if (addSheetWandMenuItem()) return; } catch {  }
+        if (attempts < 10) setTimeout(tryAdd, 500);
+    };
+    tryAdd();
+}
+
 function registerMacro(context) {
     try {
 
@@ -182,6 +218,7 @@ export function initCommands() {
     if (!context) return;
 
     registerMacro(context);
+    initSheetWandMenuItem();
 
     try {
         const SCP = context.SlashCommandParser;

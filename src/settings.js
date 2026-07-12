@@ -20,6 +20,8 @@ import {
 import {
     refreshDatabaseView, showSpiderwebPopup,
 } from './db-panel.js';
+import { DEFAULT_MEMORY_AGENT_PROMPT } from './agent-memory.js';
+import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 
 export {
     beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun,
@@ -69,6 +71,9 @@ const DEFAULT_SETTINGS = {
     agent3Profile: '',
 
     memoryPrompt: '',
+
+    memoryAgentPrompt: '',
+    reflectionPrompt: '',
 
     agent2ContextMessages: 10,
 
@@ -149,6 +154,8 @@ function validateSettings(s) {
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
     if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
+    if (typeof s.memoryAgentPrompt !== 'string') s.memoryAgentPrompt = '';
+    if (typeof s.reflectionPrompt !== 'string')  s.reflectionPrompt = '';
     if (typeof s.activeDbProfile !== 'string')   s.activeDbProfile = '';
     if (!s.dbProfiles || typeof s.dbProfiles !== 'object' || Array.isArray(s.dbProfiles)) {
         s.dbProfiles = {};
@@ -1154,6 +1161,34 @@ export async function initSettings() {
         addDebugLog('info', 'Memory Agent extra instructions cleared', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryPrompt', isDefault: true } });
         saveSettings();
         toastr.info('Memory Agent extra instructions cleared', 'BF Memory');
+    });
+
+    $('#bf_mem_memory_agent_prompt').val(extensionSettings.memoryAgentPrompt || DEFAULT_MEMORY_AGENT_PROMPT).off('input').on('input', function () {
+        const v = String($(this).val() || '');
+        extensionSettings.memoryAgentPrompt = (!v.trim() || v === DEFAULT_MEMORY_AGENT_PROMPT) ? '' : v;
+        saveSettings();
+    });
+
+    $('#bf_mem_reset_memory_agent_prompt').on('click', () => {
+        $('#bf_mem_memory_agent_prompt').val(DEFAULT_MEMORY_AGENT_PROMPT);
+        extensionSettings.memoryAgentPrompt = '';
+        addDebugLog('info', 'Memory Agent prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryAgentPrompt', isDefault: true } });
+        saveSettings();
+        toastr.info('Memory Agent prompt reset to default', 'BF Memory');
+    });
+
+    $('#bf_mem_reflect_agent_prompt').val(extensionSettings.reflectionPrompt || DEFAULT_REFLECT_PROMPT).off('input').on('input', function () {
+        const v = String($(this).val() || '');
+        extensionSettings.reflectionPrompt = (!v.trim() || v === DEFAULT_REFLECT_PROMPT) ? '' : v;
+        saveSettings();
+    });
+
+    $('#bf_mem_reset_reflect_agent_prompt').on('click', () => {
+        $('#bf_mem_reflect_agent_prompt').val(DEFAULT_REFLECT_PROMPT);
+        extensionSettings.reflectionPrompt = '';
+        addDebugLog('info', 'Reflect Agent prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionPrompt', isDefault: true } });
+        saveSettings();
+        toastr.info('Reflect Agent prompt reset to default', 'BF Memory');
     });
 
     refreshDbProfileDropdown();

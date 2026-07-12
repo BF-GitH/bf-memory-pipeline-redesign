@@ -20,7 +20,7 @@
             <!-- Tabs (redesign-v2 S5: Memory / Database / Tokens / Debug) -->
             <div class="bf-mem-tabs" role="tablist">
                 <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_memory" tabindex="0">Memory</button>
-                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_sheet" tabindex="-1">Sheet</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_prompts" tabindex="-1">System Prompts</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_tokens" tabindex="-1">Tokens</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
@@ -113,15 +113,27 @@
 
             </div>
 
-            <!-- Tab: Sheet (the live memory sheet, moved out of the Memory tab) -->
-            <div id="bf_mem_tab_sheet" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+            <!-- Tab: System Prompts (edit the full Memory + Reflect agent prompts) -->
+            <div id="bf_mem_tab_prompts" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
                 <div class="bf-mem-section">
-                    <div class="bf-mem-section-header"><i class="fa-solid fa-file-lines"></i> Memory sheet (live)</div>
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Memory Agent prompt
+                        <button id="bf_mem_reset_memory_agent_prompt" class="bf-mem-reset-btn menu_button" title="Restore the built-in Memory Agent prompt">Reset to default</button>
+                    </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">The persistent memory sheet handed to your AI before each reply — story so far, current scene, and the facts the scene needs. Rebuilt in the background after each settled reply.</small>
-                        <div id="bf_mem_sheet_view" class="bf-mem-fact-list">
-                            <div class="bf-mem-summary-empty">No memory sheet yet. It is rebuilt in the background after each reply.</div>
-                        </div>
+                        <textarea id="bf_mem_memory_agent_prompt" class="bf-mem-textarea" rows="18"></textarea>
+                        <small class="bf-mem-hint">The FULL system prompt the background Memory Agent runs on. Leave blank or Reset to use the built-in default. This is separate from the Memory tab's "extra instructions", which are still appended on top of whatever prompt is used here.</small>
+                    </div>
+                </div>
+
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Reflect Agent prompt
+                        <button id="bf_mem_reset_reflect_agent_prompt" class="bf-mem-reset-btn menu_button" title="Restore the built-in Reflect Agent prompt">Reset to default</button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_reflect_agent_prompt" class="bf-mem-textarea" rows="18"></textarea>
+                        <small class="bf-mem-hint">The FULL system prompt for the periodic Reflect maintenance pass. Leave blank or Reset to use the built-in default.</small>
                     </div>
                 </div>
             </div>

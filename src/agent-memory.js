@@ -31,7 +31,7 @@ const TEMPORAL_GROUNDING_RULE = `
 # OBSERVATION DATE (TIME GROUNDING)
 The user data block gives a \`## Observation date\` (the real-world time the newest message was observed). Resolve RELATIVE time expressions to ABSOLUTE dates relative to it — e.g. "yesterday" → the day before that date, "last week" → "the week of <date>", "two years ago" → the year. Store the absolute form (in the value or note), not the relative word, so the fact doesn't rot. If no observation date is given, leave time expressions as-is.`;
 
-const DEFAULT_MEMORY_AGENT_PROMPT = `You are the MEMORY AGENT for an ongoing roleplay between {{user}} (the human player) and {{char}} (the AI character). You run in the BACKGROUND after each reply — the storyteller model never sees you, only the MEMORY SHEET you produce. You do TWO jobs in one session:
+export const DEFAULT_MEMORY_AGENT_PROMPT = `You are the MEMORY AGENT for an ongoing roleplay between {{user}} (the human player) and {{char}} (the AI character). You run in the BACKGROUND after each reply — the storyteller model never sees you, only the MEMORY SHEET you produce. You do TWO jobs in one session:
 
 1. EXTRACT — store new LASTING facts from the SETTLED messages into the memory database (write_fact).
 2. ANTICIPATE — work out where the scene is going and which stored memories the NEXT reply will need, then emit the updated MEMORY SHEET.
@@ -149,7 +149,7 @@ export async function runMemoryAgent({
     });
 
     const loop = await callAgentLLMWithTools({
-        systemPrompt: DEFAULT_MEMORY_AGENT_PROMPT,
+        systemPrompt: (String(settings?.memoryAgentPrompt || '').trim() || DEFAULT_MEMORY_AGENT_PROMPT),
         userPrompt,
         profileId,
         agent: 'memory-agent',

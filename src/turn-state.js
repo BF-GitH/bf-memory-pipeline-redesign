@@ -309,6 +309,10 @@ export function reloadSheetFromChat() {
     renderMemorySheet();
 }
 
+export function getMemorySheetText() {
+    try { return String(memorySheet?.text || ''); } catch { return ''; }
+}
+
 export function renderMemorySheet() {
     try {
         const el = document.getElementById('bf_mem_sheet_view');
