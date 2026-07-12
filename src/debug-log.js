@@ -60,10 +60,6 @@ export function endRun() {
     currentRunId = null;
 }
 
-export function getCurrentRunId() {
-    return currentRunId;
-}
-
 export function setPendingRun(info) {
     pendingRun = info && info.runId ? { ...info } : null;
 }

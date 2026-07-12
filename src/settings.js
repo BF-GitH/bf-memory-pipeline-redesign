@@ -22,7 +22,7 @@ import {
 } from './db-panel.js';
 
 export {
-    beginRun, endRun, getCurrentRunId, setPendingRun, getPendingRun, consumePendingRun,
+    beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun,
     reloadDebugLogFromChat, addDebugLog, exportLogsJSON,
 } from './debug-log.js';
 export {
