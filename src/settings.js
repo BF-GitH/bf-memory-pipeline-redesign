@@ -1974,6 +1974,10 @@ export async function initSettings() {
         reloadReflectionFromChat();
         reloadPyramidFromChat();
         reloadSheetFromChat();
+        // Load the Database tab for the chat we just opened — autoSaveDbProfile() above already
+        // loaded the working store, but the DB panel only re-rendered on tab-click before, so
+        // opening/switching a chat with the tab already visible showed the OLD chat's facts.
+        refreshDatabaseView();
 
         // Remember which chat we're now on so the NEXT switch can report an accurate
         // "from -> to". Logging-only state; never read by storage/profile logic.
@@ -1992,6 +1996,8 @@ export async function initSettings() {
     reloadReflectionFromChat();
     reloadPyramidFromChat();
     reloadSheetFromChat();
+    // Populate the Database tab for the chat present at first load (not only after a tab-click).
+    refreshDatabaseView();
 
     // Save to active profile on page close/refresh
     window.addEventListener('beforeunload', () => {

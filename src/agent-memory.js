@@ -47,7 +47,7 @@ function getSettingsSafe() {
 
 // ── Prompt-size guards (per-run user prompt) ─────────────────────────────────
 const KEY_INVENTORY_CAP = 200;   // max Category/key inventory lines shown (list_keys covers the rest)
-const NEED_REFS_CAP = 15;        // max NEED refs honored from the #SHEET block (G1)
+const NEED_REFS_CAP = Infinity;  // MVP: NO cap — the sheet carries as many memories as the next scene needs (G1)
 
 // TEMPORAL GROUNDING rule (G4 hardcoded-ON; kept from the old Scribe prompt). Relative time
 // words rot ("yesterday" is meaningless once stored), so the agent anchors them to the
@@ -93,13 +93,14 @@ HARD LIMITS: at most 6 rounds (replies by you) and 20 tool calls per session. Be
 End your LAST reply with the final block. It starts with a line that is exactly \`#SHEET\` and runs to the end of the reply:
 
 #SHEET
-SUMMARY: <1-4 sentence rolling story summary — carry the prior sheet's summary forward, updated with what just happened>
+SUMMARY: <a COMPLETE, high-level recap of the WHOLE story so far — who the characters are to each other, the core situation and stakes, every major arc and turning point, and how it reached the present moment. CARRY THE PRIOR SHEET'S SUMMARY FORWARD AND EXTEND IT — never shrink it or drop earlier arcs. Stay high-level; the specific details live in the memories below. Write as many sentences as the story needs — do NOT compress it to fit a length.>
 SCENE: <one line: location; who is present; current goal or tension>
+TIMELINE: <the current in-story date and time; WHERE the characters physically are right now; and HOW LONG the main characters have known each other (the age of their relationship)>
 NEED: Category/key, Category/key, ...
 NOTES: <optional 1-2 lines anticipating the next scene>
 
-- SUMMARY is REQUIRED. SCENE should almost always be present. NEED and NOTES may be omitted.
-- NEED lists 0-15 stored facts (exact Category/key refs you VERIFIED with the tools — never invented) the NEXT reply needs: the people present and their current state, the pair's relationship status, open threads/promises, the history this scene is about to touch. The system renders those facts onto the sheet for you.
+- SUMMARY is REQUIRED. SCENE and TIMELINE should almost always be present. NEED and NOTES may be omitted.
+- NEED lists EVERY stored fact the NEXT reply needs — there is NO limit (exact Category/key refs you VERIFIED with the tools — never invented): every person present and their current state, the pair's relationship status, all open threads/promises, and the history this scene touches. Include the load-bearing premise facts (identities, secrets, the situation that set the story in motion) EVERY turn so they never silently drop off the sheet. When in doubt, include it — a long sheet beats a missing fact. The system renders those facts onto the sheet for you.
 - write_fact lines MAY appear in the same reply, BEFORE the #SHEET block (they are executed, then the sheet is accepted). Read tools in that reply are ignored.
 - EXTRACT-ONLY runs (the task block says so): do NOT emit #SHEET; end with a line that is exactly \`#DONE\` instead.
 
@@ -271,6 +272,7 @@ export async function runMemoryAgent({
         result.sheetText = composeSheet({
             summary: parsedSheet.summary,
             sceneLine: parsedSheet.sceneLine,
+            timeline: parsedSheet.timeline,
             notes: parsedSheet.notes,
             need: parsedSheet.need,
             settings,
@@ -383,18 +385,18 @@ function buildAgentUserPrompt({
  * @returns {{summary:string, sceneLine:string, need:Array<{category:string,key:string}>, notes:string, error:string|null}}
  */
 export function parseSheetBlock(text) {
-    const out = { summary: '', sceneLine: '', need: [], notes: '', error: null };
+    const out = { summary: '', sceneLine: '', timeline: '', need: [], notes: '', error: null };
     const raw = String(text ?? '').trim();
     if (!raw) {
         out.error = 'empty sheet block';
         return out;
     }
-    const buf = { SUMMARY: [], SCENE: [], NEED: [], NOTES: [] };
+    const buf = { SUMMARY: [], SCENE: [], TIMELINE: [], NEED: [], NOTES: [] };
     let current = null;
     for (const rawLine of raw.split('\n')) {
         const line = rawLine.trim();
         if (!line || /^```/.test(line)) continue;
-        const m = /^(SUMMARY|SCENE|NEED|NOTES)\s*:\s*(.*)$/i.exec(line);
+        const m = /^(SUMMARY|SCENE|TIMELINE|NEED|NOTES)\s*:\s*(.*)$/i.exec(line);
         if (m) {
             current = m[1].toUpperCase();
             if (m[2].trim()) buf[current].push(m[2].trim());
@@ -405,6 +407,7 @@ export function parseSheetBlock(text) {
     }
     out.summary = buf.SUMMARY.join(' ').trim();
     out.sceneLine = buf.SCENE.join(' ').trim();
+    out.timeline = buf.TIMELINE.join(' ').trim();
     out.notes = buf.NOTES.join(' ').trim();
 
     // NEED: comma-separated `Category/key` refs (across all NEED lines), capped.
@@ -444,7 +447,7 @@ function clampNum(v, min, max, dflt) {
  *          need?:Array<{category:string,key:string}>, settings?:Object, databases?:Object}} opts
  * @returns {string} the rendered sheet (never empty when summary is non-empty)
  */
-export function composeSheet({ summary = '', sceneLine = '', notes = '', need = [], settings = {}, databases = {} } = {}) {
+export function composeSheet({ summary = '', sceneLine = '', timeline = '', notes = '', need = [], settings = {}, databases = {} } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
 
@@ -486,6 +489,7 @@ export function composeSheet({ summary = '', sceneLine = '', notes = '', need = 
     lines.push('[MEMORY SHEET — persistent memory; established truth for this scene; overrides older chat history]');
     if (summary) lines.push(`Story so far: ${summary}`);
     if (sceneLine) lines.push(`Scene: ${sceneLine}`);
+    if (timeline) lines.push(`Timeline & place: ${timeline}`);
     lines.push(buildPrecedencePreamble(nowCtx));
 
     const renderSection = (header, sectionRows) => {
