@@ -129,7 +129,19 @@ async function callViaCMRS(profileId, messages, signal) {
         throw new Error(`CMRS returned no content: ${JSON.stringify(result).substring(0, 200)}`);
     }
 
-    return typeof content === 'string' ? content : String(content);
+    const text = typeof content === 'string' ? content : String(content);
+    // Some backends return an auth/API error as 200-OK *content* (nothing
+    // throws), so the error string would otherwise be mistaken for a model
+    // "reply" that fails protocol parsing (the confusing "malformed protocol
+    // reply" symptom). Detect an error-shaped reply and throw, so it surfaces
+    // as a real transport error (→ toast) AND triggers the existing fallback
+    // to the direct ST proxy (which uses the main chat's working credentials).
+    if (text.length < 600
+        && /^\s*(?:error|api error|unauthorized|forbidden)\b/i.test(text)
+        && /\b(?:401|403|429|5\d\d|authenticat\w*|invalid[^.]*credential|unauthorized|forbidden|rate.?limit|quota|api[ _-]?key)\b/i.test(text)) {
+        throw new Error(`profile "${profile.name || profileId}" returned an API error: ${text.trim().slice(0, 200)}`);
+    }
+    return text;
 }
 
 export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, agent = 'unknown', externalSignal = null) {
