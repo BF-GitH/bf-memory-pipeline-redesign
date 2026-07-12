@@ -7,9 +7,7 @@ let lastInserted = { runId: null, timestamp: null, updates: [] };
 let lastRunTokens = null; 
 let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
 
-let sceneCard = null; 
-
-let reflection = null; 
+let reflection = null;
 
 let summaryPyramid = null; 
 
@@ -273,106 +271,6 @@ export function renderMemorySheet() {
         }
         el.innerHTML = `<pre style="white-space:pre-wrap;margin:0;">${escapeHtml(rec.text)}</pre>`;
     } catch {  }
-}
-
-const SCENE_META_KEY = 'bf_mem_scene';
-const SCENE_BEATS_MAX = 3; 
-
-const SCENE_NAME_MAX = 60;       
-const SCENE_LASTSEEN_MAX = 40;   
-
-function deriveSceneName(loc) {
-    const s = String(loc || '').trim().replace(/\s+/g, ' ');
-    return s.length > SCENE_NAME_MAX ? s.slice(0, SCENE_NAME_MAX).trim() : s;
-}
-
-function normalizeScene(raw) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-    const arr = (v) => Array.isArray(v) ? v.map(x => String(x ?? '').trim()).filter(Boolean) : [];
-    const loc = typeof raw.location === 'string' ? raw.location.trim() : '';
-    const present = arr(raw.present);
-    const goals = arr(raw.goals);
-    const beats = arr(raw.beats).slice(-SCENE_BEATS_MAX);
-
-    if (!loc && present.length === 0 && goals.length === 0 && beats.length === 0) return null;
-
-    const rawNo = Math.floor(Number(raw.sceneNo));
-    const sceneNo = Number.isInteger(rawNo) && rawNo >= 1 ? rawNo : 1;
-    let sceneName = typeof raw.sceneName === 'string' ? raw.sceneName.trim() : '';
-    if (sceneName.length > SCENE_NAME_MAX) sceneName = sceneName.slice(0, SCENE_NAME_MAX).trim();
-    if (!sceneName) sceneName = deriveSceneName(loc);
-
-    const lastSeen = {};
-    if (raw.lastSeen && typeof raw.lastSeen === 'object' && !Array.isArray(raw.lastSeen)) {
-        for (const [name, v] of Object.entries(raw.lastSeen)) {
-            const key = String(name ?? '').trim().toLowerCase();
-            if (!key || !v || typeof v !== 'object' || Array.isArray(v)) continue;
-            const sn = Math.floor(Number(v.sceneNo));
-            if (!Number.isInteger(sn) || sn < 1) continue;
-            lastSeen[key] = { sceneNo: sn, updatedAt: Number(v.updatedAt) || 0 };
-        }
-        const names = Object.keys(lastSeen);
-        if (names.length > SCENE_LASTSEEN_MAX) {
-            names.sort((a, b) => lastSeen[b].updatedAt - lastSeen[a].updatedAt);
-            for (const stale of names.slice(SCENE_LASTSEEN_MAX)) delete lastSeen[stale];
-        }
-    }
-    return {
-        location: loc,
-        present,
-        goals,
-        beats,
-        sceneNo,
-        sceneName,
-        lastSeen,
-
-        ownerChatId: typeof raw.ownerChatId === 'string' ? raw.ownerChatId : '',
-        updatedAt: Number(raw.updatedAt) || Date.now(),
-        runId: typeof raw.runId === 'string' ? raw.runId : '',
-    };
-}
-
-function loadSceneFromMeta() {
-    try {
-        const md = getContext().chatMetadata || getContext().chat_metadata;
-        if (!md) return null;
-        const scene = normalizeScene(md[SCENE_META_KEY]);
-        if (!scene) return null;
-
-        const currentChatId = getCurrentChatId();
-        const owner = scene.ownerChatId || '';
-        if (currentChatId && (!owner || owner !== currentChatId)) {
-            scene.ownerChatId = currentChatId;
-            sceneCard = scene;
-            saveSceneToMeta(); 
-            if (owner) {
-                addDebugLog('info', `Scene inherited by branch chat ${currentChatId} (was owned by ${owner}); continuing at scene ${scene.sceneNo}`, {
-                    subsystem: 'settings', event: 'scene.inherited', actor: 'SYSTEM', reason: 'BRANCH_INHERITED',
-                    data: { chatId: currentChatId, ownerChatId: owner, sceneNo: scene.sceneNo, isBranch: isBranchChat(currentChatId) },
-                });
-            }
-            return scene;
-        }
-        return scene;
-    } catch { return null; }
-}
-
-function saveSceneToMeta() {
-    try {
-        const ctx = getContext();
-        const md = ctx.chatMetadata || ctx.chat_metadata;
-        if (!md) return;
-        md[SCENE_META_KEY] = sceneCard;
-        ctx.saveMetadata?.();
-    } catch {  }
-}
-
-export function getScene() {
-    return sceneCard;
-}
-
-export function reloadSceneFromChat() {
-    sceneCard = loadSceneFromMeta();
 }
 
 const REFLECTION_META_KEY = 'bf_mem_reflection';

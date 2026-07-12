@@ -2,7 +2,7 @@ import { getSettings } from './settings.js';
 import { getContext, escapeHtml, safeStringify } from './ui-util.js';
 import {
     getLastRunTokens, getSessionTokens,
-    getLastGenerated, getLastInserted, getScene,
+    getLastGenerated, getLastInserted,
 } from './turn-state.js';
 
 let debugLog = [];
@@ -276,10 +276,9 @@ export async function copyDiagnostics() {
     let payload;
     try {
         const ctx = getContext();
-        let databases = {}, scene = null, review = null, extVersion = null;
+        let databases = {}, review = null, extVersion = null;
         try { const m = await (await fetch(new URL('../manifest.json', import.meta.url))).json(); extVersion = m.version; } catch {  }
         try { const dbm = await import('./database.js'); databases = await dbm.getAllDatabases(); } catch (e) { databases = { __error: String(e?.message || e) }; }
-        try { scene = getScene(); } catch {  }
         try { review = (ctx.chatMetadata || ctx.chat_metadata || {}).bf_mem_review || null; } catch {  }
         let factCount = 0, linkCount = 0;
         for (const cdb of Object.values(databases || {})) {
@@ -309,9 +308,8 @@ export async function copyDiagnostics() {
                 lastRun: getLastRunTokens(),
                 session: getSessionTokens(),
             },
-            lastGenerated: getLastGenerated(), 
-            lastInserted: getLastInserted(),  
-            scene,
+            lastGenerated: getLastGenerated(),
+            lastInserted: getLastInserted(),
             reviewPending: review,
             databases,                     
             debugLog,                      

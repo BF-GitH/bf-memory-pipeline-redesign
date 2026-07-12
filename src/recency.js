@@ -1,17 +1,10 @@
-import { getScene } from './turn-state.js';
-
 function computeNowContext() {
     let msgIndex = null;
     try {
         const chat = SillyTavern.getContext()?.chat;
         if (Array.isArray(chat) && chat.length > 0) msgIndex = chat.length - 1;
     } catch {  }
-    let sceneNo = null;
-    try {
-        const s = getScene();
-        sceneNo = (s && s.sceneNo != null) ? s.sceneNo : null;
-    } catch { sceneNo = null; }
-    return { msgIndex, sceneNo, storyNowMs: null };
+    return { msgIndex, sceneNo: null, storyNowMs: null };
 }
 
 let _turnCtxKey = '';
@@ -46,12 +39,7 @@ export function recencyTail(fact, nowCtx) {
     }
     if (!phrase) return '';
 
-    let sceneHop = '';
-    const factScene = (fact.sceneNo != null) ? Number(fact.sceneNo) : null;
-    if (factScene != null && Number.isFinite(factScene) && nowCtx.sceneNo != null && factScene !== Number(nowCtx.sceneNo)) {
-        sceneHop = `, scene ${factScene}`;
-    }
-    return ` (${phrase}${sceneHop})`;
+    return ` (${phrase})`;
 }
 
 export function splitInjectionSections(results) {
@@ -78,7 +66,6 @@ export function buildPrecedencePreamble(nowCtx) {
     let current = '';
     if (nowCtx && Number.isInteger(nowCtx.msgIndex)) {
         current = ` — current: turn ~${Math.max(1, Math.ceil((nowCtx.msgIndex + 1) / 2))}`;
-        if (nowCtx.sceneNo != null) current += `, scene ${nowCtx.sceneNo}`;
     }
     return `[Memory precedence${current}]`;
 }

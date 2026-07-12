@@ -12,7 +12,6 @@ import {
 import {
     setLastGenerated, setLastInserted, reloadFactsFromChat,
     reloadTokensFromChat, resetSessionTokens,
-    reloadSceneFromChat,
     reloadReflectionFromChat,
     reloadPyramidFromChat,
     reloadSheetFromChat,
@@ -1558,7 +1557,6 @@ export async function initSettings() {
         reloadDebugLogFromChat();
         reloadFactsFromChat();
         reloadTokensFromChat();
-        reloadSceneFromChat();
         reloadReflectionFromChat();
         reloadPyramidFromChat();
         reloadSheetFromChat();
@@ -1573,7 +1571,6 @@ export async function initSettings() {
     reloadDebugLogFromChat();
     reloadFactsFromChat();
     reloadTokensFromChat();
-    reloadSceneFromChat();
     reloadReflectionFromChat();
     reloadPyramidFromChat();
     reloadSheetFromChat();
