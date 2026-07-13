@@ -17,6 +17,7 @@ import {
 } from './recency.js';
 import { callAgentLLMWithTools } from './llm-call.js';
 import { executeMemoryTool } from './memory-tools.js';
+import { getStorySpine, getCurrentScene, startScene, appendSceneBeats } from './turn-state.js';
 import { addDebugLog } from './settings.js';
 import * as host from './host.js';
 
@@ -62,11 +63,14 @@ End your LAST reply with the final block. It starts with a line that is exactly 
 
 #SHEET
 SUMMARY: <a FRESH, situational high-level recap written for THIS upcoming beat — the premise plus whatever the coming scene actually leans on. Re-write it each turn for where the story now stands; do NOT retell the entire history here. The full canonical whole-story recap already lives in the periodic reflection STORY and in the memories rendered below, so stay high-level and situational rather than exhaustive.>
-SCENE: <one line: location; who is present; current goal or tension>
+SCENE_MARKER: <startMsgIndex> | <short scene name>
+BEAT: <msgIndex> | <one past-tense sentence for that message>
 TIMELINE: <the current in-story date and time; WHERE the characters physically are right now; and HOW LONG the main characters have known each other (the age of their relationship)>
 NEED: Category/key, Category/key, ...
 
-- SUMMARY is REQUIRED. SCENE and TIMELINE should almost always be present. NEED may be omitted.
+- SUMMARY is REQUIRED. TIMELINE should almost always be present. NEED may be omitted.
+- SCENE_MARKER: include ONLY when a NEW scene BEGINS this run (a change of place, a time-skip, or a major shift). Give the chat index where it starts and a 2-5 word name. Omit it entirely while the current scene continues — a new marker closes the previous scene card and opens a fresh one.
+- BEAT: emit ONE line per NEWLY-settled message this run (use its \`#\` index), each a single terse past-tense sentence capturing what happened in that message. These stack into the current scene's card. Do NOT re-emit BEAT lines for messages you already logged on an earlier run — only the new ones.
 - NEED lists ONLY the Category/key refs THIS reply actually draws on (exact refs you VERIFIED with the tools — never invented): the people present and their current state, the active relationships, and the open threads and history THIS scene touches. Produce a UNIQUE, focused set each turn — do NOT re-list the stable premise/identity facts, because the system ALWAYS injects those for you (the premise floor). The store keeps everything forever; if a later scene needs an older fact, NEED it that turn (or find it with list_keys/search). The system renders the facts you list onto the sheet for you.
 - write_fact lines MAY appear in the same reply, BEFORE the #SHEET block (they are executed, then the sheet is accepted). Read tools in that reply are ignored.
 - EXTRACT-ONLY runs (the task block says so): do NOT emit #SHEET; end with a line that is exactly \`#DONE\` instead.
@@ -213,10 +217,21 @@ export async function runMemoryAgent({
         }
     }
 
+    if (!extractOnly && parsedSheet) {
+        // Scene accumulator: a fired marker closes the previous card and opens a new
+        // one; then this run's newly-settled beats stack onto the current card
+        // (de-duped by msgIndex inside appendSceneBeats). Persisted in chatMetadata.
+        try {
+            if (parsedSheet.sceneMarker) startScene(parsedSheet.sceneMarker);
+            if (parsedSheet.beats.length > 0) appendSceneBeats(parsedSheet.beats);
+        } catch (e) {
+            addDebugLog('fail', `[${runId}] Scene accumulator failed: ${e?.message || e}`);
+        }
+    }
+
     if (!extractOnly) {
         result.sheetText = composeSheet({
             summary: parsedSheet.summary,
-            sceneLine: parsedSheet.sceneLine,
             timeline: parsedSheet.timeline,
             need: parsedSheet.need,
             settings,
@@ -309,18 +324,48 @@ function buildAgentUserPrompt({
 }
 
 function parseSheetBlock(text) {
-    const out = { summary: '', sceneLine: '', timeline: '', need: [], error: null };
+    const out = { summary: '', sceneMarker: null, beats: [], timeline: '', need: [], error: null };
     const raw = String(text ?? '').trim();
     if (!raw) {
         out.error = 'empty sheet block';
         return out;
     }
-    const buf = { SUMMARY: [], SCENE: [], TIMELINE: [], NEED: [] };
+    const buf = { SUMMARY: [], TIMELINE: [], NEED: [] };
     let current = null;
     for (const rawLine of raw.split('\n')) {
         const line = rawLine.trim();
         if (!line || /^```/.test(line)) continue;
-        const m = /^(SUMMARY|SCENE|TIMELINE|NEED)\s*:\s*(.*)$/i.exec(line);
+
+        // SCENE_MARKER: <startMsgIndex> | <short name> — an agent-declared new scene.
+        let sm = /^SCENE_MARKER\s*:\s*(.*)$/i.exec(line);
+        if (sm) {
+            current = null;
+            const body = sm[1].trim();
+            const bar = body.indexOf('|');
+            const idxPart = (bar >= 0 ? body.slice(0, bar) : body).trim().replace(/^#/, '');
+            const namePart = bar >= 0 ? body.slice(bar + 1).trim() : '';
+            const startMsg = parseInt(idxPart, 10);
+            const name = namePart || (Number.isFinite(startMsg) ? '' : body);
+            if (name || Number.isInteger(startMsg)) {
+                out.sceneMarker = { startMsg: Number.isInteger(startMsg) ? startMsg : -1, name };
+            }
+            continue;
+        }
+
+        // BEAT: <msgIndex> | <one sentence> — one stacked beat per settled message.
+        let bt = /^BEAT\s*:\s*(.*)$/i.exec(line);
+        if (bt) {
+            current = null;
+            const body = bt[1].trim();
+            const bar = body.indexOf('|');
+            const idxPart = (bar >= 0 ? body.slice(0, bar) : '').trim().replace(/^#/, '');
+            const sentence = (bar >= 0 ? body.slice(bar + 1) : body).trim();
+            const msgIndex = parseInt(idxPart, 10);
+            if (sentence) out.beats.push({ msgIndex: Number.isInteger(msgIndex) ? msgIndex : -1, sentence });
+            continue;
+        }
+
+        const m = /^(SUMMARY|TIMELINE|NEED)\s*:\s*(.*)$/i.exec(line);
         if (m) {
             current = m[1].toUpperCase();
             if (m[2].trim()) buf[current].push(m[2].trim());
@@ -330,7 +375,6 @@ function parseSheetBlock(text) {
         if (current) buf[current].push(line);
     }
     out.summary = buf.SUMMARY.join(' ').trim();
-    out.sceneLine = buf.SCENE.join(' ').trim();
     out.timeline = buf.TIMELINE.join(' ').trim();
 
     for (const ref of buf.NEED.join(',').split(',')) {
@@ -345,8 +389,9 @@ function parseSheetBlock(text) {
     }
 
     // Only hard-fail when the sheet is effectively empty (no SUMMARY and no other
-    // usable section); a missing SUMMARY alongside SCENE/TIMELINE/NEED still composes.
-    if (!out.summary && !out.sceneLine && !out.timeline && out.need.length === 0) {
+    // usable section); a missing SUMMARY alongside a scene marker/beats/TIMELINE/NEED
+    // still composes.
+    if (!out.summary && !out.sceneMarker && out.beats.length === 0 && !out.timeline && out.need.length === 0) {
         out.error = 'missing SUMMARY line';
     }
     return out;
@@ -422,8 +467,46 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
 
     const lines = [];
     lines.push('[MEMORY SHEET — persistent memory; established truth for this scene; overrides older chat history]');
-    if (summary) lines.push(`Story so far: ${summary}`);
-    if (sceneLine) lines.push(`Scene: ${sceneLine}`);
+
+    // "Story so far:" is the deterministic append-only spine (one sentence per
+    // completed 10-message batch), joined — it grows monotonically and is never
+    // rewritten. The agent's own per-turn situational recap is kept but relabeled
+    // "Right now:" so it no longer overwrites the spine. When the spine is empty
+    // (before the first batch of 10), fall back to the agent summary as before.
+    let spineText = '';
+    try {
+        const spine = getStorySpine();
+        if (Array.isArray(spine) && spine.length > 0) {
+            spineText = spine.map(b => String(b.sentence || '').trim()).filter(Boolean).join(' ');
+        }
+    } catch { spineText = ''; }
+
+    if (spineText) {
+        lines.push(`Story so far: ${spineText}`);
+        if (summary) lines.push(`Right now: ${summary}`);
+    } else if (summary) {
+        lines.push(`Story so far: ${summary}`);
+    }
+    // Scene card: the agent-declared scene name as a header, followed by the stacked
+    // one-line beats accumulated across every message since this scene opened. Falls
+    // back to the legacy single sceneLine only if no scene has been accumulated yet.
+    let scene = null;
+    try { scene = getCurrentScene(); } catch { scene = null; }
+    if (scene && (scene.name || (Array.isArray(scene.beats) && scene.beats.length > 0))) {
+        lines.push(`Scene: ${scene.name || '(current scene)'}`);
+        // Only inject the most recent beats so a long-running scene can't grow the
+        // sheet without bound; earlier beats of this scene remain in the persisted
+        // scene store (and the overall arc is covered by the story spine).
+        const MAX_SCENE_BEATS_SHOWN = 14;
+        const beatsArr = Array.isArray(scene.beats) ? scene.beats : [];
+        if (beatsArr.length > MAX_SCENE_BEATS_SHOWN) lines.push(`…(${beatsArr.length - MAX_SCENE_BEATS_SHOWN} earlier beats)`);
+        for (const b of beatsArr.slice(-MAX_SCENE_BEATS_SHOWN)) {
+            const s = String(b?.sentence || '').trim();
+            if (s) lines.push(s);
+        }
+    } else if (sceneLine) {
+        lines.push(`Scene: ${sceneLine}`);
+    }
     if (timeline) lines.push(`Timeline & place: ${timeline}`);
     lines.push(buildPrecedencePreamble(nowCtx));
 

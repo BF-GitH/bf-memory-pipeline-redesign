@@ -383,6 +383,244 @@ export function reloadPyramidFromChat() {
     summaryPyramid = loadPyramidFromMeta();
 }
 
+const STORY_SPINE_META_KEY = 'bf_mem_story_spine';
+
+let storySpine = null;
+let storySpineLoaded = false;
+
+function normalizeStorySpineBatch(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const sentence = typeof raw.sentence === 'string' ? raw.sentence.trim() : '';
+    if (!sentence) return null;
+    const batchIndex = Math.floor(Number(raw.batchIndex));
+    if (!Number.isInteger(batchIndex) || batchIndex < 0) return null;
+    const startMsg = Math.floor(Number(raw.startMsg));
+    const endMsg = Math.floor(Number(raw.endMsg));
+    return {
+        batchIndex,
+        startMsg: Number.isInteger(startMsg) ? startMsg : batchIndex * 10,
+        endMsg: Number.isInteger(endMsg) ? endMsg : batchIndex * 10 + 9,
+        sentence,
+    };
+}
+
+function normalizeStorySpine(raw) {
+    if (!Array.isArray(raw)) return null;
+    const seen = new Set();
+    const out = [];
+    for (const entry of raw) {
+        const b = normalizeStorySpineBatch(entry);
+        if (!b || seen.has(b.batchIndex)) continue;
+        seen.add(b.batchIndex);
+        out.push(b);
+    }
+    out.sort((a, b) => a.batchIndex - b.batchIndex);
+    return out;
+}
+
+function loadStorySpineFromMeta() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return null;
+        return normalizeStorySpine(md[STORY_SPINE_META_KEY]);
+    } catch { return null; }
+}
+
+function saveStorySpineToMeta() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[STORY_SPINE_META_KEY] = storySpine;
+        ctx.saveMetadata?.();
+    } catch {  }
+}
+
+export function getStorySpine() {
+    if (!storySpineLoaded) {
+        storySpine = loadStorySpineFromMeta() || [];
+        storySpineLoaded = true;
+    }
+    return Array.isArray(storySpine) ? storySpine : [];
+}
+
+// Append-only: a given batchIndex is summarized ONCE. Re-appending an existing
+// batch is a no-op (idempotency guard), so the deterministic spine only grows.
+export function appendStorySpineBatch(batch) {
+    const b = normalizeStorySpineBatch(batch);
+    if (!b) return false;
+    const spine = getStorySpine();
+    if (spine.some(e => e.batchIndex === b.batchIndex)) return false;
+    spine.push(b);
+    spine.sort((a, b) => a.batchIndex - b.batchIndex);
+    storySpine = spine;
+    storySpineLoaded = true;
+    saveStorySpineToMeta();
+    return true;
+}
+
+export function setStorySpine(arr) {
+    storySpine = normalizeStorySpine(arr) || [];
+    storySpineLoaded = true;
+    saveStorySpineToMeta();
+}
+
+export function reloadStorySpineFromChat() {
+    storySpine = loadStorySpineFromMeta() || [];
+    storySpineLoaded = true;
+}
+
+// SCENE STORE: the agent-decided current scene { startMsg, name, beats:[{msgIndex,
+// sentence}] } plus the list of scenes it has already closed. Unlike the spine
+// (deterministic 10-message batches), scene boundaries are chosen by the agent via
+// a SCENE_MARKER, and each newly-settled message adds ONE beat to the current card.
+const SCENE_META_KEY = 'bf_mem_scene';
+
+let sceneStore = null;
+let sceneStoreLoaded = false;
+
+function normalizeBeat(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const sentence = typeof raw.sentence === 'string' ? raw.sentence.trim() : '';
+    if (!sentence) return null;
+    const msgIndex = Math.floor(Number(raw.msgIndex));
+    return { msgIndex: Number.isInteger(msgIndex) ? msgIndex : -1, sentence };
+}
+
+function normalizeScene(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const name = typeof raw.name === 'string' ? raw.name.trim() : '';
+    const startMsg = Math.floor(Number(raw.startMsg));
+    const beats = [];
+    const seen = new Set();
+    if (Array.isArray(raw.beats)) {
+        for (const entry of raw.beats) {
+            const b = normalizeBeat(entry);
+            if (!b) continue;
+            if (b.msgIndex >= 0) {
+                if (seen.has(b.msgIndex)) continue;
+                seen.add(b.msgIndex);
+            }
+            beats.push(b);
+        }
+    }
+    if (!name && beats.length === 0 && !Number.isInteger(startMsg)) return null;
+    return { startMsg: Number.isInteger(startMsg) ? startMsg : -1, name, beats };
+}
+
+function normalizeSceneStore(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const current = normalizeScene(raw.current);
+    const closed = [];
+    if (Array.isArray(raw.closed)) {
+        for (const s of raw.closed) {
+            const ns = normalizeScene(s);
+            if (ns) closed.push(ns);
+        }
+    }
+    if (!current && closed.length === 0) return null;
+    return { current: current || null, closed };
+}
+
+function loadSceneFromMeta() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return null;
+        return normalizeSceneStore(md[SCENE_META_KEY]);
+    } catch { return null; }
+}
+
+function saveSceneToMeta() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[SCENE_META_KEY] = sceneStore;
+        ctx.saveMetadata?.();
+    } catch {  }
+}
+
+function getSceneStore() {
+    if (!sceneStoreLoaded) {
+        sceneStore = loadSceneFromMeta() || { current: null, closed: [] };
+        sceneStoreLoaded = true;
+    }
+    return (sceneStore && typeof sceneStore === 'object') ? sceneStore : { current: null, closed: [] };
+}
+
+export function getCurrentScene() {
+    return getSceneStore().current || null;
+}
+
+export function getClosedScenes() {
+    const closed = getSceneStore().closed;
+    return Array.isArray(closed) ? closed : [];
+}
+
+// A new marker fired: close the current card (if it holds anything) and open a
+// fresh one starting at startMsg with the given name.
+export function startScene({ startMsg = -1, name = '' } = {}) {
+    const store = getSceneStore();
+    const cur = store.current;
+    if (cur && (cur.beats.length > 0 || cur.name)) store.closed.push(cur);
+    const s = Math.floor(Number(startMsg));
+    store.current = { startMsg: Number.isInteger(s) ? s : -1, name: String(name || '').trim(), beats: [] };
+    sceneStore = store;
+    sceneStoreLoaded = true;
+    saveSceneToMeta();
+    return store.current;
+}
+
+// Append newly-settled beats to the current card, de-duping by msgIndex. Auto-opens
+// an unnamed card when no scene is active yet (beats without a prior marker).
+export function appendSceneBeats(beats) {
+    const list = Array.isArray(beats) ? beats : [];
+    if (list.length === 0) return false;
+    const store = getSceneStore();
+    if (!store.current) {
+        const first = normalizeBeat(list[0]);
+        store.current = { startMsg: (first && first.msgIndex >= 0) ? first.msgIndex : -1, name: '', beats: [] };
+    }
+    const cur = store.current;
+    const seen = new Set(cur.beats.filter(b => b.msgIndex >= 0).map(b => b.msgIndex));
+    // Index-less beats (agent omitted the "| <index>") can't be de-duped by msgIndex,
+    // so track their sentence text too — otherwise a re-emitted index-less beat would
+    // stack a duplicate line every run.
+    const seenText = new Set(cur.beats.filter(b => b.msgIndex < 0).map(b => String(b.sentence || '').trim().toLowerCase()));
+    let added = 0;
+    for (const raw of list) {
+        const b = normalizeBeat(raw);
+        if (!b) continue;
+        if (b.msgIndex >= 0) {
+            if (seen.has(b.msgIndex)) continue;
+            seen.add(b.msgIndex);
+        } else {
+            const t = String(b.sentence || '').trim().toLowerCase();
+            if (!t || seenText.has(t)) continue;
+            seenText.add(t);
+        }
+        cur.beats.push(b);
+        added++;
+    }
+    if (added === 0) return false;
+    cur.beats.sort((a, b) => (a.msgIndex < 0 || b.msgIndex < 0) ? 0 : a.msgIndex - b.msgIndex);
+    sceneStore = store;
+    sceneStoreLoaded = true;
+    saveSceneToMeta();
+    return true;
+}
+
+export function setSceneStore(raw) {
+    sceneStore = normalizeSceneStore(raw) || { current: null, closed: [] };
+    sceneStoreLoaded = true;
+    saveSceneToMeta();
+}
+
+export function reloadSceneFromChat() {
+    sceneStore = loadSceneFromMeta() || { current: null, closed: [] };
+    sceneStoreLoaded = true;
+}
+
 function renderTokens() {
     const lastEl = document.getElementById('bf_mem_tokens_lastrun');
     const sessEl = document.getElementById('bf_mem_tokens_session');

@@ -15,6 +15,8 @@ import {
     reloadReflectionFromChat,
     reloadPyramidFromChat,
     reloadSheetFromChat,
+    reloadStorySpineFromChat,
+    reloadSceneFromChat,
 } from './turn-state.js';
 import {
     refreshDatabaseView, showSpiderwebPopup,
@@ -32,6 +34,8 @@ export {
     getReflection, setReflection,
     getSummaryPyramid, setSummaryPyramid,
     getMemorySheet, setMemorySheet,
+    getStorySpine, appendStorySpineBatch, setStorySpine,
+    getCurrentScene, getClosedScenes, startScene, appendSceneBeats, setSceneStore,
 } from './turn-state.js';
 
 const EXTENSION_NAME = (() => {
@@ -616,9 +620,18 @@ export async function saveCurrentToActiveProfile(profileKey = null, { allowEmpty
 
         if (totalFacts === 0 && !allowEmpty) return;
 
+        // Feature 4: the story spine + scene card travel WITH the DB profile, so a
+        // new chat later pointed at this DB shows the story-so-far and current scene
+        // instead of starting blank. Snapshot them from the current chat's metadata.
+        const { getStorySpine, getCurrentScene, getClosedScenes } = await import('./turn-state.js');
+        const storySpine = JSON.parse(JSON.stringify(getStorySpine() || []));
+        const sceneStore = JSON.parse(JSON.stringify({ current: getCurrentScene() || null, closed: getClosedScenes() || [] }));
+
         extensionSettings.dbProfiles[profileName] = {
             ...extensionSettings.dbProfiles[profileName],
             databases: JSON.parse(JSON.stringify(databases)),
+            storySpine,
+            sceneStore,
             savedAt: Date.now(),
         };
         saveSettings();
@@ -844,6 +857,33 @@ async function autoSaveDbProfile() {
                 subsystem: 'import', event: 'profile.switched', actor: 'SYSTEM', reason: 'AUTO_LOADED', data: { profileName: profileToLoad, chatId },
             });
 
+            // Feature 4: restore the profile's saved story spine + scene card onto this
+            // chat so composeSheet renders "Story so far:" / "Scene:" immediately instead
+            // of blank. Sync the in-memory caches from THIS chat's metadata first, then
+            // only restore when the chat hasn't advanced its own spine/scene yet (never
+            // clobber a chat that already has one). A branch inherits the parent profile,
+            // so this seamlessly carries the parent's spine/scene without double-applying.
+            try {
+                reloadStorySpineFromChat();
+                reloadSceneFromChat();
+                const { getStorySpine, setStorySpine, getCurrentScene, getClosedScenes, setSceneStore } = await import('./turn-state.js');
+
+                const savedSpine = Array.isArray(profile.storySpine) ? profile.storySpine : null;
+                if (savedSpine && savedSpine.length > 0 && getStorySpine().length === 0) {
+                    setStorySpine(savedSpine);
+                }
+
+                const savedScene = (profile.sceneStore && typeof profile.sceneStore === 'object') ? profile.sceneStore : null;
+                const chatHasScene = !!getCurrentScene() || getClosedScenes().length > 0;
+                if (savedScene && !chatHasScene) {
+                    setSceneStore(savedScene);
+                }
+
+                reloadSheetFromChat();
+            } catch (e) {
+                addDebugLog('fail', `Feature 4 spine/scene restore failed (non-fatal): ${e?.message || e}`);
+            }
+
             try {
                 const live = await getAllDatabases();
                 const cats = Object.keys(live || {});
@@ -871,6 +911,127 @@ async function autoSaveDbProfile() {
         lastAutoLoadedChat = chatId;
     } catch (err) {
         addDebugLog('fail', `Auto-save DB profile failed: ${err.message}`);
+    }
+}
+
+const NEW_EMPTY_DB_CHOICE = '__bf_new_empty_db__';
+
+function uniqueEmptyDbName() {
+    const base = getCurrentChatLabel() || 'New DB';
+    const profiles = extensionSettings?.dbProfiles || {};
+    if (!profiles[base]) return base;
+    let i = 2;
+    while (profiles[`${base} ${i}`]) i++;
+    return `${base} ${i}`;
+}
+
+async function createEmptyDbForNewChat(chatId) {
+    const { buildSkeletonDatabases, getAllDatabases, deleteDatabase, flushSnapshotNow, cancelPendingSnapshot } = await import('./database.js');
+    const name = uniqueEmptyDbName();
+    // wipe the live working store so the new DB genuinely starts empty (same shape as the New-empty path)
+    cancelPendingSnapshot();
+    const existing = await getAllDatabases();
+    for (const category of Object.keys(existing)) await deleteDatabase(category);
+    await flushSnapshotNow();
+    if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
+    extensionSettings.dbProfiles[name] = {
+        databases: buildSkeletonDatabases(),
+        savedAt: Date.now(),
+        linkedChats: [],
+    };
+    addDebugLog('info', `New empty DB profile created for new chat: "${name}" (chat ${chatId})`, {
+        subsystem: 'db', event: 'profile.saved', actor: 'USER', reason: 'NEW_EMPTY',
+        data: { profileName: name, linkedChat: chatId || null },
+    });
+    return name;
+}
+
+// Feature 3: on a genuinely new chat, let the user pick which DB profile it uses.
+// Returns true if a selection was applied (caller must then SKIP autoSaveDbProfile so it
+// does not auto-create/clobber), false if dismissed (caller falls back to auto behavior).
+async function promptNewChatDbChoice(toChatId) {
+    await ensurePopup();
+    if (!Popup) return false;
+
+    const profiles = extensionSettings?.dbProfiles || {};
+
+    const container = document.createElement('div');
+    container.className = 'bf-mem-newchat-db-popup';
+    const heading = document.createElement('h4');
+    heading.textContent = 'Choose a memory database for this new chat';
+    const desc = document.createElement('p');
+    desc.textContent = 'Pick an existing database to load, or start a fresh empty one. Cancel to keep the default automatic behavior.';
+    const select = document.createElement('select');
+    select.className = 'text_pole';
+    // populate exactly like refreshDbProfileDropdown, plus a New-empty option
+    for (const [name, profile] of Object.entries(profiles)) {
+        const option = document.createElement('option');
+        option.value = name;
+        const factCount = Object.values(profile.databases || {}).reduce((sum, db) => sum + (db.facts?.length || 0), 0);
+        const dbCount = Object.keys(profile.databases || {}).length;
+        const linkCount = (profile.linkedChats || []).length;
+        option.textContent = `${name} (${dbCount} dbs, ${factCount} facts${linkCount ? `, ${linkCount} chats` : ''})`;
+        select.appendChild(option);
+    }
+    const newOption = document.createElement('option');
+    newOption.value = NEW_EMPTY_DB_CHOICE;
+    newOption.textContent = '+ New empty DB';
+    select.appendChild(newOption);
+
+    container.appendChild(heading);
+    container.appendChild(desc);
+    container.appendChild(select);
+
+    const popup = new Popup(container, POPUP_TYPE.CONFIRM, '', { allowVerticalScrolling: true, okButton: 'Use selected DB' });
+    const result = await popup.show();
+    if (!result) return false;
+
+    const choice = select.value;
+    try {
+        let profileName;
+        if (choice === NEW_EMPTY_DB_CHOICE) {
+            profileName = await createEmptyDbForNewChat(toChatId);
+        } else {
+            profileName = choice;
+            await loadDbProfile(profileName);
+        }
+        if (!profileName) return false;
+
+        linkChatToProfile(profileName, toChatId);
+        extensionSettings.activeDbProfile = profileName;
+        lastAutoLoadedChat = toChatId;
+        saveSettings();
+        refreshDbProfileDropdown();
+        refreshLinkedChatsField();
+        refreshDatabaseView();
+        addDebugLog('info', `New chat ${toChatId} bound to DB profile "${profileName}" via picker`, {
+            subsystem: 'db', event: 'db.connect', actor: 'USER', reason: 'NEW_CHAT_PICKER',
+            data: { chatId: toChatId, resolvedProfile: profileName, newEmpty: choice === NEW_EMPTY_DB_CHOICE },
+        });
+
+        // Feature 4: the picker path skips autoSaveDbProfile, so restore the chosen
+        // profile's saved story spine + scene card onto this new (empty) chat here,
+        // matching autoSaveDbProfile's restore, so they render immediately not blank.
+        try {
+            reloadStorySpineFromChat();
+            reloadSceneFromChat();
+            const prof = extensionSettings.dbProfiles?.[profileName] || {};
+            const { getStorySpine, setStorySpine, getCurrentScene, getClosedScenes, setSceneStore } = await import('./turn-state.js');
+            const savedSpine = Array.isArray(prof.storySpine) ? prof.storySpine : null;
+            if (savedSpine && savedSpine.length > 0 && getStorySpine().length === 0) setStorySpine(savedSpine);
+            const savedScene = (prof.sceneStore && typeof prof.sceneStore === 'object') ? prof.sceneStore : null;
+            if (savedScene && !(getCurrentScene() || getClosedScenes().length > 0)) setSceneStore(savedScene);
+            reloadSheetFromChat();
+        } catch (e) {
+            addDebugLog('fail', `New-chat picker spine/scene restore failed (non-fatal): ${e?.message || e}`);
+        }
+
+        return true;
+    } catch (err) {
+        addDebugLog('fail', `New-chat DB picker failed: ${err?.message || err}`, {
+            subsystem: 'db', event: 'db.connect', actor: 'USER', reason: 'NEW_CHAT_PICKER',
+        });
+        return false;
     }
 }
 
@@ -1552,7 +1713,24 @@ export async function initSettings() {
             console.error('[BFMemory] coordinated chat-switch flush failed', e);
         }
 
-        await autoSaveDbProfile();
+        // Feature 3: on a genuinely NEW chat (not a branch, not already linked, not explicitly
+        // unlinked) let the user choose the DB profile BEFORE autoSaveDbProfile could
+        // auto-create/clobber. Branches keep the current auto-inherit behavior.
+        let handledByPicker = false;
+        if (
+            toChatId &&
+            fromChatId !== toChatId &&
+            toChatId !== lastAutoLoadedChat &&
+            !isBranchChat(toChatId) &&
+            !isChatUnlinked(toChatId) &&
+            findProfileForChat(toChatId) === null
+        ) {
+            handledByPicker = await promptNewChatDbChoice(toChatId);
+        }
+
+        if (!handledByPicker) {
+            await autoSaveDbProfile();
+        }
 
         reloadDebugLogFromChat();
         reloadFactsFromChat();
@@ -1560,6 +1738,8 @@ export async function initSettings() {
         reloadReflectionFromChat();
         reloadPyramidFromChat();
         reloadSheetFromChat();
+        reloadStorySpineFromChat();
+        reloadSceneFromChat();
 
         refreshDatabaseView();
 
@@ -1574,6 +1754,8 @@ export async function initSettings() {
     reloadReflectionFromChat();
     reloadPyramidFromChat();
     reloadSheetFromChat();
+    reloadStorySpineFromChat();
+    reloadSceneFromChat();
 
     refreshDatabaseView();
 
