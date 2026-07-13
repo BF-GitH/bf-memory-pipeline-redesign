@@ -1,8 +1,8 @@
 import { injectMemoryContext } from './agent-writer.js';
 import { runMemoryAgent } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { cancelInFlightLLM } from './llm-call.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getReflection, getMemorySheet, setMemorySheet, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
+import { cancelInFlightLLM, callAgentLLM } from './llm-call.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getReflection, getMemorySheet, setMemorySheet, getStorySpine, appendStorySpineBatch, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
 
 let internalCallDepth = 0;
 const isInternalCall = () => internalCallDepth > 0;
@@ -189,6 +189,72 @@ function ensureMsgUid(m) {
 
 function toAgentMessage(m, index) {
     return { index, uid: ensureMsgUid(m), role: m.is_user ? 'USER' : 'CHAR', name: String(m.name || '').trim(), text: m.mes };
+}
+
+// Deterministic "story so far" spine: for every completed block of 10 genuine
+// messages, make ONE cheap LLM call to distil those 10 into a single past-tense
+// sentence and APPEND it to the growing spine. Append-only — a batch is never
+// re-summarized (appendStorySpineBatch guards on batchIndex). Fired once per
+// successful memory run; it only does work when a NEW complete batch exists.
+async function maybeAppendStorySpine(runId, profileId) {
+    try {
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        if (!Array.isArray(chat) || chat.length === 0) return;
+
+        const genuine = [];
+        for (let i = 0; i < chat.length; i++) {
+            if (isGenuineMessage(chat[i])) genuine.push({ index: i, m: chat[i] });
+        }
+        const genuineMessageCount = genuine.length;
+        const completeBatches = Math.floor(genuineMessageCount / 10);
+        if (completeBatches <= 0) return;
+
+        const done = new Set(getStorySpine().map(b => b.batchIndex));
+
+        // Catch up incrementally: at most a couple of batches per run so a long or
+        // freshly-imported chat (many complete 10-msg blocks at once) doesn't fire a
+        // burst of serial LLM calls in a single turn. The append-only guard makes
+        // spreading the backfill across turns safe.
+        const MAX_BATCHES_PER_RUN = 2;
+        let appendedThisRun = 0;
+
+        for (let k = 0; k < completeBatches; k++) {
+            if (done.has(k)) continue;
+            if (appendedThisRun >= MAX_BATCHES_PER_RUN) break;
+            const slice = genuine.slice(k * 10, k * 10 + 10);
+            const startMsg = slice[0].index;
+            const endMsg = slice[slice.length - 1].index;
+            const transcript = slice
+                .map(({ m }) => `${m.is_user ? 'USER' : 'CHAR'}${m.name ? ` (${String(m.name).trim()})` : ''}: ${String(m.mes || '').trim()}`)
+                .join('\n\n');
+
+            let sentence = '';
+            try {
+                sentence = String(await callAgentLLM(
+                    'Summarize these 10 roleplay messages in ONE past-tense sentence capturing what happened. Reply with the sentence only.',
+                    transcript, profileId, 'story-spine',
+                ) || '').replace(/\s+/g, ' ').trim();
+            } catch (err) {
+                addDebugLog('info', `[${runId}] Story spine batch ${k} skipped (LLM error) — will retry next turn: ${err?.message || err}`);
+                break;
+            }
+            if (!sentence) {
+                addDebugLog('info', `[${runId}] Story spine batch ${k} produced no sentence — will retry next turn`);
+                break;
+            }
+
+            if (appendStorySpineBatch({ batchIndex: k, startMsg, endMsg, sentence })) {
+                appendedThisRun++;
+                addDebugLog('info', `[${runId}] Story spine: appended batch ${k} (msgs ${startMsg}–${endMsg}, ${sentence.length} chars)`, {
+                    subsystem: 'pipeline', event: 'spine.append',
+                    data: { batchIndex: k, startMsg, endMsg, chars: sentence.length },
+                });
+            }
+        }
+    } catch (err) {
+        addDebugLog('info', `Story spine update failed (non-fatal): ${err?.message || err}`);
+    }
 }
 
 async function runMemoryExtraction() {
@@ -416,8 +482,10 @@ async function runMemoryExtraction() {
             postStageMs.snapshotMs = Date.now() - snapStart; 
         }
 
+        await maybeAppendStorySpine(runId, agent3ProfileId);
+
         successfulRunsSinceReflection++;
-        const REFLECTION_INTERVAL = 12; 
+        const REFLECTION_INTERVAL = 12;
         if (successfulRunsSinceReflection >= REFLECTION_INTERVAL && !reflectionPending && !reflectionInFlight) {
             reflectionPending = {
                 runId, charAvatar: capturedCharAvatar,
