@@ -191,13 +191,35 @@ function toAgentMessage(m, index) {
     return { index, uid: ensureMsgUid(m), role: m.is_user ? 'USER' : 'CHAR', name: String(m.name || '').trim(), text: m.mes };
 }
 
-// Cut an LLM reply down to its FIRST sentence — the spine contract is one
-// sentence per batch, and prompt compliance alone doesn't guarantee it.
-function firstSentenceOnly(text) {
-    const t = String(text || '').replace(/\s+/g, ' ').trim();
+// The spine contract is ONE sentence per batch. Enforcement is cooperative,
+// not destructive: the LLM must put its sentence on an explicit "SENTENCE:"
+// line (survives chatty preambles), and the reply is VALIDATED by counting
+// sentence-ending punctuation with an abbreviation list — so "Dr.", "e.g." or
+// "3.50" never count as sentence ends. A multi-sentence reply triggers ONE
+// rewrite call over the same batch; if it is STILL multi-sentence it is
+// accepted as-is, because an extra sentence hurts the story far less than a
+// sentence chopped off in the middle.
+const SPINE_ABBREVIATIONS = /\b(?:Mr|Mrs|Ms|Dr|Prof|Capt|Sgt|Lt|Col|Gen|St|Ave|Sr|Jr|vs|etc|approx|dept|est|inc|no|nr|e\.g|i\.e|p\.m|a\.m|u\.s|u\.k)\./gi;
+
+function spineSentencePrompt(count) {
+    return `Summarize these ${count} roleplay messages as EXACTLY ONE past-tense sentence capturing what happened. Reply in exactly this format and nothing else:\nSENTENCE: <the one sentence>`;
+}
+
+function extractSentenceLine(raw) {
+    const t = String(raw || '').replace(/\s+/g, ' ').trim();
     if (!t) return '';
-    const m = t.match(/^[^.!?]*[.!?]+(?=\s|$)/);
-    return (m ? m[0] : t).trim();
+    const m = /SENTENCE\s*:\s*(.+)$/i.exec(t);
+    return (m ? m[1] : t).trim();
+}
+
+function countSentenceEnds(text) {
+    const cleaned = String(text || '')
+        .replace(/"[^"]*"|“[^”]*”/g, '""')                  // quoted dialogue punctuation is not a sentence end
+        .replace(SPINE_ABBREVIATIONS, m => m.slice(0, -1)) // drop abbreviation dots
+        .replace(/\d[.,]\d/g, '0')                          // decimals are not sentence ends
+        .replace(/\.{2,}|…/g, '.');                         // an ellipsis counts once
+    const matches = cleaned.match(/[.!?]+(?=[\s"')\]]|$)/g);
+    return matches ? matches.length : 0;
 }
 
 // Deterministic "story so far" spine: for every completed block of N SETTLED
@@ -278,10 +300,23 @@ async function maybeAppendStorySpine(runId, profileId, capturedChatId = '') {
 
             let sentence = '';
             try {
-                sentence = firstSentenceOnly(await callAgentLLM(
-                    `Summarize these ${slice.length} roleplay messages in ONE past-tense sentence capturing what happened. Reply with exactly one sentence and nothing else.`,
-                    transcript, profileId, 'story-spine',
+                sentence = extractSentenceLine(await callAgentLLM(
+                    spineSentencePrompt(slice.length), transcript, profileId, 'story-spine',
                 ));
+                const ends = sentence ? countSentenceEnds(sentence) : 0;
+                if (ends > 1) {
+                    // Too many sentences: ONE rewrite call over the same batch.
+                    addDebugLog('info', `[${runId}] Story spine batch ${batchIndex}: reply had ${ends} sentences — one rewrite call to condense`);
+                    const rewritten = extractSentenceLine(await callAgentLLM(
+                        `Your previous summary used more than one sentence. Condense these ${slice.length} roleplay messages into EXACTLY ONE past-tense sentence. Reply in exactly this format and nothing else:\nSENTENCE: <the one sentence>`,
+                        transcript, profileId, 'story-spine-rewrite',
+                    ));
+                    if (rewritten) sentence = rewritten;
+                    const stillEnds = countSentenceEnds(sentence);
+                    if (stillEnds > 1) {
+                        addDebugLog('info', `[${runId}] Story spine batch ${batchIndex}: still ${stillEnds} sentences after rewrite — accepting as-is (never chopped)`);
+                    }
+                }
             } catch (err) {
                 addDebugLog('info', `[${runId}] Story spine batch ${batchIndex} skipped (LLM error) — will retry next turn: ${err?.message || err}`);
                 break;
