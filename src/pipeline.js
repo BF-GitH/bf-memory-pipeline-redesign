@@ -64,13 +64,16 @@ async function countChatTokens(arr) {
     } catch { return 0; }
 }
 
-function recordRunTokens({ baselineInput, actualInput, sheetTokens }) {
+function recordRunTokens({ baselineInput, actualInput, sheetTokens, path }) {
     try {
         setRunTokens({
             baselineInput: baselineInput || 0,
             actualInput: actualInput || 0,
             sheetTokens: sheetTokens || 0,
             mainOutput: 0,
+            // 'chat' (chat-completion, trim possible) or 'text' (text-completion,
+            // no trim exists) — drives which banner the tokens panel shows.
+            path: path || 'chat',
         });
         runRecordedInput = true;
     } catch (err) {
@@ -763,7 +766,7 @@ export function initPipeline() {
             setInjectedGuard();
             const actualInput = await countChatTokens(arr);
             const sheetTokens = await countTextTokens(rec.text);
-            recordRunTokens({ baselineInput, actualInput, sheetTokens });
+            recordRunTokens({ baselineInput, actualInput, sheetTokens, path: 'chat' });
             addDebugLog('pass', `Memory sheet injected (${rec.text.length} chars${rec.seeded ? ', seed' : ''}; trim=${trimToLast || 'off'}; tokens ${baselineInput} → ${actualInput})`, {
                 subsystem: 'writer', event: 'inject.ok',
                 data: { chars: rec.text.length, seeded: !!rec.seeded, trimToLast, baselineInput, actualInput },
@@ -799,7 +802,7 @@ export function initPipeline() {
                     const actualInput = arr ? await countChatTokens(arr) : await countTextTokens(promptStr);
                     const sheetTokens = await countTextTokens(rec.text);
                     if (actualInput > 0) {
-                        recordRunTokens({ baselineInput: Math.max(0, actualInput - sheetTokens), actualInput, sheetTokens });
+                        recordRunTokens({ baselineInput: Math.max(0, actualInput - sheetTokens), actualInput, sheetTokens, path: 'text' });
                     }
                 } catch {  }
                 addDebugLog('pass', `Memory sheet injected (text-completion, ${rec.text.length} chars${rec.seeded ? ', seed' : ''})`, {

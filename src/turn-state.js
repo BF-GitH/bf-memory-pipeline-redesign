@@ -792,12 +792,18 @@ export function renderTokens() {
     const lv = (n) => L ? fmt(Number(n) || 0) : '—';
     const num = (n) => Number(n) || 0;
 
-    const trimOff = L && (num(L.baselineInput) > 0) && (num(L.actualInput) >= num(L.baselineInput) * 0.97);
+    // Text-completion APIs (Kobold, textgen, Horde …) have no trim path at all —
+    // the sheet always rides on top of the full prompt, so "turn on trim" would
+    // be misleading advice there.
+    const isTextPath = L?.path === 'text';
+    const trimOff = L && !isTextPath && (num(L.baselineInput) > 0) && (num(L.actualInput) >= num(L.baselineInput) * 0.97);
     if (banner) {
-        banner.style.display = trimOff ? 'block' : 'none';
-        banner.textContent = trimOff
-            ? 'Writer trim is OFF — the main model sees the full chat, so there are no input savings. The agent calls are pure overhead (the tradeoff for memory recall). Turn on "Context Limit" in the Writer tab to save input tokens.'
-            : '';
+        banner.style.display = (trimOff || isTextPath) ? 'block' : 'none';
+        banner.textContent = isTextPath
+            ? 'Text-completion API detected — the extension cannot trim chat history on this path, so the memory sheet is always a small extra cost (the tradeoff for memory recall). Input savings require a chat-completion API with the Writer history limit enabled.'
+            : (trimOff
+                ? 'Writer trim is OFF — the main model sees the full chat, so there are no input savings. The agent calls are pure overhead (the tradeoff for memory recall). Turn on "Context Limit" in the Writer tab to save input tokens.'
+                : '');
     }
 
     if (inputEl) {
