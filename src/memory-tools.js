@@ -45,6 +45,41 @@ function extractJsonObjects(line) {
     return found;
 }
 
+// Best-effort repair for the most common model JSON mistake: unescaped double
+// quotes INSIDE a string value, e.g. {"tool":"write_fact","args":{"value":"she said "back" firmly"}}.
+// Walks the line tracking string state; a '"' inside a string only counts as the
+// closing quote when the next non-space char is a JSON delimiter (, } ] :) or the
+// end of the line — any other '"' is content and gets escaped. Heuristic by
+// design: the caller re-parses the result and discards it if still invalid, so a
+// wrong guess can never produce a worse outcome than the original parse failure.
+function repairJsonLine(line) {
+    let out = '';
+    let inStr = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (!inStr) {
+            if (ch === '"') inStr = true;
+            out += ch;
+            continue;
+        }
+        if (ch === '\\') { out += ch + (line[i + 1] ?? ''); i++; continue; }
+        if (ch === '"') {
+            let j = i + 1;
+            while (j < line.length && /\s/.test(line[j])) j++;
+            const next = line[j];
+            if (next === undefined || next === ',' || next === '}' || next === ']' || next === ':') {
+                inStr = false;
+                out += ch;
+            } else {
+                out += '\\"';
+            }
+            continue;
+        }
+        out += ch;
+    }
+    return out;
+}
+
 export function parseAgentReply(text) {
     const out = { calls: [], sheet: null, done: false, malformed: [] };
     const raw = String(text ?? '');
@@ -79,7 +114,20 @@ export function parseAgentReply(text) {
     const tryTool = (jsonStr, strict) => {
         let obj;
         try { obj = JSON.parse(jsonStr); }
-        catch (e) { if (strict) out.malformed.push({ line: jsonStr, error: `invalid JSON (${e.message || e}) — a tool call must be ONE line of strict JSON` }); return; }
+        catch (e) {
+            // Second chance: escape unescaped quotes inside string values and
+            // re-parse, so one sloppy write_fact value doesn't burn the grace
+            // round (or abort the whole run on a second offense).
+            try { obj = JSON.parse(repairJsonLine(jsonStr)); }
+            catch {
+                if (strict) out.malformed.push({ line: jsonStr, error: `invalid JSON (${e.message || e}) — a tool call must be ONE line of strict JSON` });
+                return;
+            }
+            addDebugLog('info', 'Repaired malformed JSON tool-call line (unescaped inner quotes)', {
+                subsystem: 'agent3', event: 'toolloop.json_repaired', reason: 'JSON_REPAIRED',
+                data: { line: jsonStr.slice(0, 200) },
+            });
+        }
         if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
         const tool = String(obj.tool || '').trim();
         if (!KNOWN_TOOLS.includes(tool)) { if (strict) out.malformed.push({ line: jsonStr, error: `unknown tool "${tool || '(missing)'}" — valid tools: ${KNOWN_TOOLS.join(', ')}` }); return; }
@@ -102,6 +150,22 @@ export function parseAgentReply(text) {
                 const body = lines.slice(i + 1).filter(l => !/^\s*```/.test(l));
                 out.sheet = (inline ? inline + '\n' : '') + body.join('\n');
                 out.sheet = out.sheet.trim();
+                // Model wrote the sheet ABOVE the token (wrong order) and nothing
+                // below it: salvage the preceding section instead of failing the
+                // round with "carried no sheet content". Only lines from the first
+                // sheet-like header up to the token are taken, so tool-call lines
+                // and prose above the sheet are never swallowed.
+                if (!out.sheet) {
+                    let start = -1;
+                    for (let k = 0; k < i; k++) {
+                        if (/^\s*(SUMMARY|SCENE|TIMELINE|NEED|NOTES)\s*:/i.test(lines[k])) { start = k; break; }
+                    }
+                    if (start >= 0) {
+                        out.sheet = lines.slice(start, i)
+                            .filter(l => !/^\s*```/.test(l) && !l.trim().startsWith('{'))
+                            .join('\n').trim();
+                    }
+                }
             }
             break;
         }

@@ -2298,6 +2298,17 @@ async function fetchAttachmentContent(url) {
 
 async function deleteAttachmentFile(url) {
     try {
+        // The attachment list in extensionSettings can lag behind the server
+        // (settings saves are debounced; a reload/crash between "file deleted"
+        // and "settings persisted" leaves a stale entry pointing at a file that
+        // is already gone). ST's deleteFileFromServer raises its own
+        // "Could not delete file: File not found" toast on that 404, which our
+        // catch below cannot suppress — so probe first and treat an already-
+        // missing file as success (the goal was for it to be gone; it is).
+        try {
+            const probe = await fetch(url, { method: 'HEAD' });
+            if (probe.status === 404) return;
+        } catch {  } // probe unavailable — fall through to the normal delete
         const { deleteFileFromServer } = await import('../../../../chats.js');
         await deleteFileFromServer(url);
     } catch (e) {
