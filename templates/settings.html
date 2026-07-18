@@ -214,24 +214,31 @@
                 </div>
             </div>
 
-            <!-- Tab: Tokens -->
+            <!-- Tab: Tokens (redesign: 3 panels — Input / Agents / Total, each with last message + chat total) -->
             <div id="bf_mem_tab_tokens" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
                 <div id="bf_mem_tokens_banner" class="bf-mem-hint" style="display:none;padding:8px 10px;border-left:3px solid #ff9800;border-radius:4px;margin-bottom:8px;"></div>
                 <div class="bf-mem-section">
-                    <div class="bf-mem-section-header"><i class="fa-solid fa-coins"></i> Last Run</div>
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-right-to-bracket"></i> Input — what the main model reads
+                        <button id="bf_mem_tokens_reset" class="bf-mem-reset-btn menu_button" title="Reset chat totals"><i class="fa-solid fa-rotate-left"></i></button>
+                    </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Shows what sending the whole chat <i>would</i> have cost versus what this extension actually sent (shorter chat + memory sheet + background agent calls). A quick way to see if it's saving you money.</small>
-                        <div id="bf_mem_tokens_lastrun"><div class="bf-mem-summary-empty">No generations yet. Send a message — token comparison appears after the first pipeline run.</div></div>
+                        <small class="bf-mem-hint">Full chat as it would be sent without the extension, versus the trimmed context + memory sheet the extension actually sends. Green difference = tokens saved.</small>
+                        <div id="bf_mem_tokens_input"><div class="bf-mem-summary-empty">No generations yet. Send a message — numbers appear after the first reply.</div></div>
                     </div>
                 </div>
                 <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-chart-column"></i> This Session
-                        <button id="bf_mem_tokens_reset" class="bf-mem-reset-btn menu_button" title="Reset session totals"><i class="fa-solid fa-rotate-left"></i></button>
-                    </div>
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-brain"></i> Agents — background memory calls</div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Adds up the cost across every reply since you opened this chat, so you can see the running total. Use the reset button to start counting fresh.</small>
-                        <div id="bf_mem_tokens_session"><div class="bf-mem-summary-empty">No generations yet this session.</div></div>
+                        <small class="bf-mem-hint">What the Memory Agent and Reflection consume on top of your chat (their input and output).</small>
+                        <div id="bf_mem_tokens_agents"><div class="bf-mem-summary-empty">No generations yet.</div></div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-scale-balanced"></i> Total — with vs. without the extension</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Everything combined: main model + agents. What running this chat costs with the extension compared to running it without.</small>
+                        <div id="bf_mem_tokens_total"><div class="bf-mem-summary-empty">No generations yet.</div></div>
                     </div>
                 </div>
             </div>

@@ -64,17 +64,27 @@ async function countChatTokens(arr) {
     } catch { return 0; }
 }
 
-function recordRunTokens({ baselineInput, actualInput }) {
+function recordRunTokens({ baselineInput, actualInput, sheetTokens }) {
     try {
         setRunTokens({
             baselineInput: baselineInput || 0,
             actualInput: actualInput || 0,
+            sheetTokens: sheetTokens || 0,
             mainOutput: 0,
         });
         runRecordedInput = true;
     } catch (err) {
         addDebugLog('info', `Token recording failed (non-fatal): ${err.message || err}`);
     }
+}
+
+async function countTextTokens(text) {
+    const t = String(text ?? '');
+    if (!t) return 0;
+    try {
+        const ctx = SillyTavern.getContext();
+        return await (ctx.getTokenCountAsync?.(t) ?? 0);
+    } catch { return 0; }
 }
 
 function getCharacterInfo() {
@@ -752,7 +762,8 @@ export function initPipeline() {
             }
             setInjectedGuard();
             const actualInput = await countChatTokens(arr);
-            recordRunTokens({ baselineInput, actualInput });
+            const sheetTokens = await countTextTokens(rec.text);
+            recordRunTokens({ baselineInput, actualInput, sheetTokens });
             addDebugLog('pass', `Memory sheet injected (${rec.text.length} chars${rec.seeded ? ', seed' : ''}; trim=${trimToLast || 'off'}; tokens ${baselineInput} → ${actualInput})`, {
                 subsystem: 'writer', event: 'inject.ok',
                 data: { chars: rec.text.length, seeded: !!rec.seeded, trimToLast, baselineInput, actualInput },
@@ -776,9 +787,21 @@ export function initPipeline() {
             if (isGroupChatSkip(settings)) return;
 
             const rec = getMemorySheet();
-            const ok = injectMemoryContext(data, rec.text); 
+            const ok = injectMemoryContext(data, rec.text);
             if (ok) {
                 setInjectedGuard();
+                // Token recording (text-completion path). Injection stays first and
+                // synchronous; counting only reads. No trim happens on this path,
+                // so baseline (= prompt without the extension) is actual − sheet.
+                try {
+                    const arr = firstInjectableArray(data);
+                    const promptStr = (!arr && typeof data?.prompt === 'string') ? data.prompt : null;
+                    const actualInput = arr ? await countChatTokens(arr) : await countTextTokens(promptStr);
+                    const sheetTokens = await countTextTokens(rec.text);
+                    if (actualInput > 0) {
+                        recordRunTokens({ baselineInput: Math.max(0, actualInput - sheetTokens), actualInput, sheetTokens });
+                    }
+                } catch {  }
                 addDebugLog('pass', `Memory sheet injected (text-completion, ${rec.text.length} chars${rec.seeded ? ', seed' : ''})`, {
                     subsystem: 'writer', event: 'inject.ok',
                     data: { chars: rec.text.length, seeded: !!rec.seeded, path: 'text-completion' },

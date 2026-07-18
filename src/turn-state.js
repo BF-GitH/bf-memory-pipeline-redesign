@@ -4,8 +4,32 @@ import { getContext, escapeHtml, fmt, getCurrentChatId, isBranchChat } from './u
 
 let lastGenerated = { runId: null, timestamp: null, updates: [] };
 let lastInserted = { runId: null, timestamp: null, updates: [] };
-let lastRunTokens = null; 
-let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+let lastRunTokens = null;
+
+// Per-chat running totals (persisted in chatMetadata). memIn/memOut = Memory
+// Agent, reflIn/reflOut = Reflection — kept separate so the Agents panel can
+// split them. Older saves stored a combined agentInput/agentOutput pair;
+// normalizeSession() migrates those into the memory-agent bucket on load.
+function emptySession() {
+    return { baselineInput: 0, actualInput: 0, mainOutput: 0, sheetTokens: 0, memInput: 0, memOutput: 0, reflInput: 0, reflOutput: 0, runs: 0 };
+}
+
+function normalizeSession(raw) {
+    const s = (raw && typeof raw === 'object') ? raw : {};
+    return {
+        baselineInput: Number(s.baselineInput) || 0,
+        actualInput: Number(s.actualInput) || 0,
+        mainOutput: Number(s.mainOutput) || 0,
+        sheetTokens: Number(s.sheetTokens) || 0,
+        memInput: Number(s.memInput ?? s.agentInput) || 0,
+        memOutput: Number(s.memOutput ?? s.agentOutput) || 0,
+        reflInput: Number(s.reflInput) || 0,
+        reflOutput: Number(s.reflOutput) || 0,
+        runs: Number(s.runs) || 0,
+    };
+}
+
+let sessionTokens = emptySession();
 
 let reflection = null;
 
@@ -67,11 +91,14 @@ function loadTokensFromMeta() {
         if (stored && typeof stored === 'object') {
 
             const currentChatId = getCurrentChatId();
-            const owner = typeof stored.ownerChatId === 'string' ? stored.ownerChatId : null;
-            const inherited = !!currentChatId && owner !== null && owner !== currentChatId;
+            const owner = typeof stored.ownerChatId === 'string' ? stored.ownerChatId : '';
+            // Only a NON-EMPTY owner that differs marks a branch/inherited copy.
+            // An empty owner (saved while the chat id was briefly unavailable)
+            // must NOT wipe this chat's own totals on reload.
+            const inherited = !!currentChatId && !!owner && owner !== currentChatId;
             if (inherited) {
                 lastRunTokens = null;
-                sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+                sessionTokens = emptySession();
                 addDebugLog('info', `Tokens reset for inherited/branch chat ${currentChatId} (record owned by ${owner})`, {
                     subsystem: 'settings', event: 'tokens.reset', actor: 'SYSTEM', reason: 'BRANCH_INHERITED',
                     data: { chatId: currentChatId, ownerChatId: owner, isBranch: isBranchChat(currentChatId) },
@@ -81,9 +108,7 @@ function loadTokensFromMeta() {
                 return;
             }
             lastRunTokens = (stored.lastRun && typeof stored.lastRun === 'object') ? stored.lastRun : null;
-            sessionTokens = (stored.session && typeof stored.session === 'object')
-                ? stored.session
-                : { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+            sessionTokens = normalizeSession(stored.session);
         }
     } catch {  }
 }
@@ -99,22 +124,24 @@ function saveTokensToMeta() {
     } catch {  }
 }
 
+// One call per generation, from the injection hook: baseline = the prompt as
+// SillyTavern built it WITHOUT the extension (full chat up to the context
+// limit); actual = what was really sent (trimmed chat + memory sheet).
+// Starts a fresh lastRun record — agent/reflection/output tokens for this turn
+// arrive later via the add*/set* calls below.
 export function setRunTokens(run) {
 
     const baselineInput = Number(run?.baselineInput) || 0;
     const actualInput   = Number(run?.actualInput) || 0;
-
-    const agentInput    = Number(run?.agent3Input) || 0;
-    const agentOutput   = Number(run?.agent3Output) || 0;
+    const sheetTokens   = Number(run?.sheetTokens) || 0;
 
     lastRunTokens = { ...run, ts: Date.now(), approx: true };
 
     sessionTokens.baselineInput += baselineInput;
     sessionTokens.actualInput   += actualInput;
-    sessionTokens.agentInput    += agentInput;
-    sessionTokens.agentOutput   += agentOutput;
+    sessionTokens.sheetTokens   += sheetTokens;
 
-    if (baselineInput || actualInput || agentInput || agentOutput) {
+    if (baselineInput || actualInput) {
         sessionTokens.runs += 1;
     }
     saveTokensToMeta();
@@ -125,8 +152,8 @@ export function addAgent3Tokens({ agent3Input = 0, agent3Output = 0 } = {}) {
     const inN = Number(agent3Input) || 0;
     const outN = Number(agent3Output) || 0;
     if (!inN && !outN) return;
-    sessionTokens.agentInput += inN;
-    sessionTokens.agentOutput += outN;
+    sessionTokens.memInput += inN;
+    sessionTokens.memOutput += outN;
     if (lastRunTokens) {
         lastRunTokens.agent3Input = (Number(lastRunTokens.agent3Input) || 0) + inN;
         lastRunTokens.agent3Output = (Number(lastRunTokens.agent3Output) || 0) + outN;
@@ -139,8 +166,8 @@ export function addReflectionTokens({ reflectionInput = 0, reflectionOutput = 0 
     const inN = Number(reflectionInput) || 0;
     const outN = Number(reflectionOutput) || 0;
     if (!inN && !outN) return;
-    sessionTokens.agentInput += inN;
-    sessionTokens.agentOutput += outN;
+    sessionTokens.reflInput += inN;
+    sessionTokens.reflOutput += outN;
     if (lastRunTokens) {
         lastRunTokens.reflectionInput = (Number(lastRunTokens.reflectionInput) || 0) + inN;
         lastRunTokens.reflectionOutput = (Number(lastRunTokens.reflectionOutput) || 0) + outN;
@@ -159,7 +186,7 @@ export function setMainOutputTokens(n) {
 
 export function reloadTokensFromChat() {
     lastRunTokens = null;
-    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+    sessionTokens = emptySession();
     loadTokensFromMeta();
     renderTokens();
 }
@@ -730,67 +757,98 @@ export function setSceneTimeline(text) {
     saveSceneToMeta();
 }
 
-function renderTokens() {
-    const lastEl = document.getElementById('bf_mem_tokens_lastrun');
-    const sessEl = document.getElementById('bf_mem_tokens_session');
-    const banner = document.getElementById('bf_mem_tokens_banner');
-    if (!lastEl) return;
+// Signed diff cell: negative (saved) renders green, positive (extra cost) red.
+function diffCell(n) {
+    const cls = n < 0 ? 'bf-mem-tok-save' : (n > 0 ? 'bf-mem-tok-bad' : '');
+    return `<td class="${cls}">${(n > 0 ? '+' : '') + fmt(n)}</td>`;
+}
 
-    if (!lastRunTokens) {
-        lastEl.innerHTML = '<div class="bf-mem-summary-empty">No generations yet. Send a message — token comparison appears after the first pipeline run.</div>';
-        if (sessEl) sessEl.innerHTML = '<div class="bf-mem-summary-empty">No generations yet this session.</div>';
+// Three panels, each showing the LAST message next to the CHAT total:
+//   1. Input — what the main model would read without the extension (full chat)
+//      vs. what it actually read (trimmed context + memory sheet). Input only.
+//   2. Agents — what the background Memory Agent / Reflection calls consumed.
+//   3. Total — everything combined: without extension vs. with extension.
+export function renderTokens() {
+    const inputEl = document.getElementById('bf_mem_tokens_input');
+    const agentsEl = document.getElementById('bf_mem_tokens_agents');
+    const totalEl = document.getElementById('bf_mem_tokens_total');
+    const banner = document.getElementById('bf_mem_tokens_banner');
+    if (!inputEl && !agentsEl && !totalEl) return;
+
+    const s = sessionTokens;
+    const L = lastRunTokens;
+
+    if (!L && !s.runs) {
+        const empty = '<div class="bf-mem-summary-empty">No generations yet. Send a message — numbers appear after the first reply.</div>';
+        if (inputEl) inputEl.innerHTML = empty;
+        if (agentsEl) agentsEl.innerHTML = empty;
+        if (totalEl) totalEl.innerHTML = empty;
         if (banner) banner.style.display = 'none';
         return;
     }
 
-    const L = lastRunTokens;
+    // Last-message cell: '—' when the last run isn't known (e.g. after reload
+    // before the next reply) so the chat totals still show.
+    const lv = (n) => L ? fmt(Number(n) || 0) : '—';
+    const num = (n) => Number(n) || 0;
 
-    const rIn = L.reflectionInput || 0, rOut = L.reflectionOutput || 0;
-    const extIn = (L.actualInput || 0) + (L.agent3Input || 0) + rIn;
-    const extOut = (L.mainOutput || 0) + (L.agent3Output || 0) + rOut;
-    const netIn = extIn - (L.baselineInput || 0);   
-    const netOut = extOut - (L.mainOutput || 0);     
-
-    const trimOff = (L.baselineInput > 0) && (L.actualInput >= L.baselineInput * 0.97);
+    const trimOff = L && (num(L.baselineInput) > 0) && (num(L.actualInput) >= num(L.baselineInput) * 0.97);
     if (banner) {
         banner.style.display = trimOff ? 'block' : 'none';
         banner.textContent = trimOff
-            ? 'Writer trim is OFF — the main model sees the full chat, so there are no input savings. The agent calls below are pure overhead (the tradeoff for memory recall). Turn on "Context Limit" in the Writer tab to save input tokens.'
+            ? 'Writer trim is OFF — the main model sees the full chat, so there are no input savings. The agent calls are pure overhead (the tradeoff for memory recall). Turn on "Context Limit" in the Writer tab to save input tokens.'
             : '';
     }
 
-    const netInClass = netIn < 0 ? 'bf-mem-tok-save' : 'bf-mem-tok-bad';
-    const netInStr = (netIn < 0 ? '' : '+') + fmt(netIn);
-
-    lastEl.innerHTML = `
-        <table class="bf-mem-db-table">
-            <thead><tr><th></th><th>Input</th><th>Output</th></tr></thead>
-            <tbody>
-                <tr><td>Baseline (full chat)</td><td>${fmt(L.baselineInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
-                <tr><td>— Main model</td><td>${fmt(L.actualInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
-                <tr><td>— Memory Agent</td><td>${fmt(L.agent3Input)}</td><td>${fmt(L.agent3Output)}</td></tr>
-                <tr><td>— Reflection</td><td>${fmt(rIn)}</td><td>${fmt(rOut)}</td></tr>
-                <tr><td><b>Extension total</b></td><td><b>${fmt(extIn)}</b></td><td><b>${fmt(extOut)}</b></td></tr>
-                <tr><td><b>NET vs baseline</b></td><td class="${netInClass}">${netInStr}</td><td class="bf-mem-tok-cost">+${fmt(netOut)}</td></tr>
-            </tbody>
-        </table>
-        <small class="bf-mem-hint">Approx. token counts (local tokenizer). Negative input = saved; output overhead is the agent calls.</small>`;
-
-    if (sessEl) {
-        const s = sessionTokens;
-        const sExtIn = (s.actualInput || 0) + (s.agentInput || 0);
-        const sExtOut = (s.mainOutput || 0) + (s.agentOutput || 0);
-        const sNetIn = sExtIn - (s.baselineInput || 0);
-        const sNetClass = sNetIn < 0 ? 'bf-mem-tok-save' : 'bf-mem-tok-bad';
-        sessEl.innerHTML = `
+    if (inputEl) {
+        const lDiff = L ? num(L.actualInput) - num(L.baselineInput) : 0;
+        const sDiff = num(s.actualInput) - num(s.baselineInput);
+        inputEl.innerHTML = `
             <table class="bf-mem-db-table">
-                <thead><tr><th>${s.runs} run(s)</th><th>Input</th><th>Output</th></tr></thead>
+                <thead><tr><th></th><th>Last message</th><th>Chat total (${s.runs} run${s.runs === 1 ? '' : 's'})</th></tr></thead>
                 <tbody>
-                    <tr><td>Baseline total</td><td>${fmt(s.baselineInput)}</td><td>${fmt(s.mainOutput)}</td></tr>
-                    <tr><td>Extension total</td><td>${fmt(sExtIn)}</td><td>${fmt(sExtOut)}</td></tr>
-                    <tr><td><b>NET</b></td><td class="${sNetClass}">${(sNetIn < 0 ? '' : '+') + fmt(sNetIn)}</td><td class="bf-mem-tok-cost">+${fmt(sExtOut - (s.mainOutput || 0))}</td></tr>
+                    <tr><td>Without extension (full chat)</td><td>${lv(L?.baselineInput)}</td><td>${fmt(num(s.baselineInput))}</td></tr>
+                    <tr><td>With extension (context + memory sheet)</td><td>${lv(L?.actualInput)}</td><td>${fmt(num(s.actualInput))}</td></tr>
+                    <tr><td class="bf-mem-hint">&nbsp;&nbsp;of which memory sheet</td><td class="bf-mem-hint">${lv(L?.sheetTokens)}</td><td class="bf-mem-hint">${fmt(num(s.sheetTokens))}</td></tr>
+                    <tr><td><b>Difference</b></td>${L ? diffCell(lDiff) : '<td>—</td>'}${diffCell(sDiff)}</tr>
                 </tbody>
-            </table>`;
+            </table>
+            <small class="bf-mem-hint">Input tokens for the main model only. Negative difference (green) = the extension saved that many input tokens.</small>`;
+    }
+
+    if (agentsEl) {
+        const lMemIn = num(L?.agent3Input), lMemOut = num(L?.agent3Output);
+        const lRefIn = num(L?.reflectionInput), lRefOut = num(L?.reflectionOutput);
+        agentsEl.innerHTML = `
+            <table class="bf-mem-db-table">
+                <thead><tr><th></th><th colspan="2">Last message</th><th colspan="2">Chat total</th></tr>
+                <tr><th></th><th>In</th><th>Out</th><th>In</th><th>Out</th></tr></thead>
+                <tbody>
+                    <tr><td>Memory Agent</td><td>${lv(lMemIn)}</td><td>${lv(lMemOut)}</td><td>${fmt(num(s.memInput))}</td><td>${fmt(num(s.memOutput))}</td></tr>
+                    <tr><td>Reflection</td><td>${lv(lRefIn)}</td><td>${lv(lRefOut)}</td><td>${fmt(num(s.reflInput))}</td><td>${fmt(num(s.reflOutput))}</td></tr>
+                    <tr><td><b>Agents total</b></td><td><b>${lv(lMemIn + lRefIn)}</b></td><td><b>${lv(lMemOut + lRefOut)}</b></td><td><b>${fmt(num(s.memInput) + num(s.reflInput))}</b></td><td><b>${fmt(num(s.memOutput) + num(s.reflOutput))}</b></td></tr>
+                </tbody>
+            </table>
+            <small class="bf-mem-hint">Background LLM calls this extension makes on top of your chat. Reflection runs only every ~12 replies, so it is often 0.</small>`;
+    }
+
+    if (totalEl) {
+        const lWithoutIn = num(L?.baselineInput), lWithoutOut = num(L?.mainOutput);
+        const lWithIn = num(L?.actualInput) + num(L?.agent3Input) + num(L?.reflectionInput);
+        const lWithOut = num(L?.mainOutput) + num(L?.agent3Output) + num(L?.reflectionOutput);
+        const sWithIn = num(s.actualInput) + num(s.memInput) + num(s.reflInput);
+        const sWithOut = num(s.mainOutput) + num(s.memOutput) + num(s.reflOutput);
+        totalEl.innerHTML = `
+            <table class="bf-mem-db-table">
+                <thead><tr><th></th><th colspan="2">Last message</th><th colspan="2">Chat total</th></tr>
+                <tr><th></th><th>In</th><th>Out</th><th>In</th><th>Out</th></tr></thead>
+                <tbody>
+                    <tr><td>Without extension</td><td>${lv(lWithoutIn)}</td><td>${lv(lWithoutOut)}</td><td>${fmt(num(s.baselineInput))}</td><td>${fmt(num(s.mainOutput))}</td></tr>
+                    <tr><td>With extension</td><td>${lv(lWithIn)}</td><td>${lv(lWithOut)}</td><td>${fmt(sWithIn)}</td><td>${fmt(sWithOut)}</td></tr>
+                    <tr><td><b>Difference</b></td>${L ? diffCell(lWithIn - lWithoutIn) : '<td>—</td>'}${L ? diffCell(lWithOut - lWithoutOut) : '<td>—</td>'}${diffCell(sWithIn - num(s.baselineInput))}${diffCell(sWithOut - num(s.mainOutput))}</tr>
+                </tbody>
+            </table>
+            <small class="bf-mem-hint">The whole picture: everything the LLM reads and writes with the extension vs. without it. Approx. counts (local tokenizer).</small>`;
     }
 }
 
@@ -811,7 +869,8 @@ export function getLastInserted() {
 }
 
 export function resetSessionTokens() {
-    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+    sessionTokens = emptySession();
+    lastRunTokens = null;
     saveTokensToMeta();
     renderTokens();
 }

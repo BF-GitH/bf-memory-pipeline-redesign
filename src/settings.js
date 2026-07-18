@@ -11,7 +11,7 @@ import {
 } from './debug-log.js';
 import {
     setLastGenerated, setLastInserted, reloadFactsFromChat,
-    reloadTokensFromChat, resetSessionTokens,
+    reloadTokensFromChat, resetSessionTokens, renderTokens,
     reloadReflectionFromChat,
     reloadPyramidFromChat,
     reloadSheetFromChat,
@@ -282,6 +282,9 @@ function setupTabs() {
 
         if (tab.getAttribute('aria-controls') === 'bf_mem_tab_database') {
             refreshDatabaseView();
+        }
+        if (tab.getAttribute('aria-controls') === 'bf_mem_tab_tokens') {
+            renderTokens();
         }
     }
 
