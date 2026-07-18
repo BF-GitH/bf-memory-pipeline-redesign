@@ -600,10 +600,11 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     lines.push('[MEMORY SHEET — persistent memory; established truth for this scene; overrides older chat history]');
 
     // "Story so far:" is the deterministic append-only spine (one sentence per
-    // completed 10-message batch), joined — it grows monotonically and is never
-    // rewritten. The agent's own per-turn situational recap is kept but relabeled
-    // "Right now:" so it no longer overwrites the spine. When the spine is empty
-    // (before the first batch of 10), fall back to the agent summary as before.
+    // completed batch of spineBatchSize settled messages), joined — it grows
+    // monotonically and is never rewritten. The agent's own per-turn situational
+    // recap always renders as its own "Right now:" line. While the spine is
+    // still empty (before the first complete batch) the "Story so far:" line is
+    // simply OMITTED — no fallback text stands in for it.
     let spineText = '';
     try {
         const spine = getStorySpine();
@@ -612,12 +613,8 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         }
     } catch { spineText = ''; }
 
-    if (spineText) {
-        lines.push(`Story so far: ${spineText}`);
-        if (summary) lines.push(`Right now: ${summary}`);
-    } else if (summary) {
-        lines.push(`Story so far: ${summary}`);
-    }
+    if (spineText) lines.push(`Story so far: ${spineText}`);
+    if (summary) lines.push(`Right now: ${summary}`);
     // Scene card: the agent-declared scene name as a header, followed by the stacked
     // one-line beats accumulated across every message since this scene opened. Falls
     // back to the legacy single sceneLine only if no scene has been accumulated yet.

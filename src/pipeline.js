@@ -191,66 +191,122 @@ function toAgentMessage(m, index) {
     return { index, uid: ensureMsgUid(m), role: m.is_user ? 'USER' : 'CHAR', name: String(m.name || '').trim(), text: m.mes };
 }
 
-// Deterministic "story so far" spine: for every completed block of 10 genuine
-// messages, make ONE cheap LLM call to distil those 10 into a single past-tense
-// sentence and APPEND it to the growing spine. Append-only — a batch is never
-// re-summarized (appendStorySpineBatch guards on batchIndex). Fired once per
-// successful memory run; it only does work when a NEW complete batch exists.
-async function maybeAppendStorySpine(runId, profileId) {
+// Cut an LLM reply down to its FIRST sentence — the spine contract is one
+// sentence per batch, and prompt compliance alone doesn't guarantee it.
+function firstSentenceOnly(text) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!t) return '';
+    const m = t.match(/^[^.!?]*[.!?]+(?=\s|$)/);
+    return (m ? m[0] : t).trim();
+}
+
+// Deterministic "story so far" spine: for every completed block of N SETTLED
+// genuine messages (N = settings.spineBatchSize, default 10), make ONE cheap
+// LLM call to distil the block into a single past-tense sentence and APPEND it
+// to the growing spine. Append-only — a batch is never re-summarized. The next
+// block resumes AFTER the last covered message, located by its stable bf_uid
+// (chat-index fallback), so deleting older messages or changing the batch size
+// mid-chat can't double-cover or skip messages. Only SETTLED messages (older
+// than the hold-back) are eligible — a message that can still be swiped/edited
+// never ends up in a spine sentence. Fired once per successful memory run.
+async function maybeAppendStorySpine(runId, profileId, capturedChatId = '') {
     try {
+        const settings = getSettings();
         const ctx = SillyTavern.getContext();
         const chat = ctx.chat;
         if (!Array.isArray(chat) || chat.length === 0) return;
 
+        const liveChatId0 = String(ctx.getCurrentChatId?.() || ctx.chatId || '');
+        if (capturedChatId && liveChatId0 && liveChatId0 !== capturedChatId) {
+            addDebugLog('info', `[${runId}] Story spine skipped — chat changed before spine update (${capturedChatId} -> ${liveChatId0})`);
+            return;
+        }
+
+        const rawBatch = Number(settings?.spineBatchSize);
+        const batchSize = Number.isFinite(rawBatch) ? Math.min(30, Math.max(4, Math.floor(rawBatch))) : 10;
+
+        const rawHoldBack = Number(settings?.bufferHoldBack);
+        const holdBack = Number.isFinite(rawHoldBack) ? Math.min(10, Math.max(0, Math.floor(rawHoldBack))) : 4;
+        const maxIdx = chat.length - 1 - holdBack;
+        if (maxIdx < 0) return;
+
         const genuine = [];
-        for (let i = 0; i < chat.length; i++) {
+        for (let i = 0; i <= maxIdx; i++) {
             if (isGenuineMessage(chat[i])) genuine.push({ index: i, m: chat[i] });
         }
-        const genuineMessageCount = genuine.length;
-        const completeBatches = Math.floor(genuineMessageCount / 10);
-        if (completeBatches <= 0) return;
+        if (genuine.length === 0) return;
 
-        const done = new Set(getStorySpine().map(b => b.batchIndex));
+        const spine = getStorySpine();
+
+        // Resume AFTER the last covered message: find it by stable uid first,
+        // then by chat index (uid missing on legacy batches, or message deleted).
+        let startPos = 0;
+        if (spine.length > 0) {
+            const last = spine[spine.length - 1];
+            let pos = -1;
+            if (last.endUid) pos = genuine.findIndex(g => g.m.extra?.bf_uid === last.endUid);
+            if (pos < 0 && Number.isInteger(last.endMsg)) {
+                for (let p = genuine.length - 1; p >= 0; p--) {
+                    if (genuine[p].index <= last.endMsg) { pos = p; break; }
+                }
+            }
+            if (pos < 0) {
+                // Every message up to the last covered one was deleted — the settled
+                // survivors were never summarized, so restart coverage at the front.
+                addDebugLog('info', `[${runId}] Story spine anchor lost (covered messages deleted) — resuming coverage from the earliest settled message`);
+            }
+            startPos = pos + 1;
+        }
 
         // Catch up incrementally: at most a couple of batches per run so a long or
-        // freshly-imported chat (many complete 10-msg blocks at once) doesn't fire a
-        // burst of serial LLM calls in a single turn. The append-only guard makes
-        // spreading the backfill across turns safe.
+        // freshly-imported chat (many complete blocks at once) doesn't fire a burst
+        // of serial LLM calls in a single turn. The uid anchor makes spreading the
+        // backfill across turns safe.
         const MAX_BATCHES_PER_RUN = 2;
+        const nextIndex = spine.length > 0 ? (spine[spine.length - 1].batchIndex + 1) : 0;
         let appendedThisRun = 0;
 
-        for (let k = 0; k < completeBatches; k++) {
-            if (done.has(k)) continue;
-            if (appendedThisRun >= MAX_BATCHES_PER_RUN) break;
-            const slice = genuine.slice(k * 10, k * 10 + 10);
+        while (genuine.length - startPos >= batchSize && appendedThisRun < MAX_BATCHES_PER_RUN) {
+            const slice = genuine.slice(startPos, startPos + batchSize);
             const startMsg = slice[0].index;
             const endMsg = slice[slice.length - 1].index;
+            const endUid = ensureMsgUid(slice[slice.length - 1].m);
+            const batchIndex = nextIndex + appendedThisRun;
             const transcript = slice
                 .map(({ m }) => `${m.is_user ? 'USER' : 'CHAR'}${m.name ? ` (${String(m.name).trim()})` : ''}: ${String(m.mes || '').trim()}`)
                 .join('\n\n');
 
             let sentence = '';
             try {
-                sentence = String(await callAgentLLM(
-                    'Summarize these 10 roleplay messages in ONE past-tense sentence capturing what happened. Reply with the sentence only.',
+                sentence = firstSentenceOnly(await callAgentLLM(
+                    `Summarize these ${slice.length} roleplay messages in ONE past-tense sentence capturing what happened. Reply with exactly one sentence and nothing else.`,
                     transcript, profileId, 'story-spine',
-                ) || '').replace(/\s+/g, ' ').trim();
+                ));
             } catch (err) {
-                addDebugLog('info', `[${runId}] Story spine batch ${k} skipped (LLM error) — will retry next turn: ${err?.message || err}`);
+                addDebugLog('info', `[${runId}] Story spine batch ${batchIndex} skipped (LLM error) — will retry next turn: ${err?.message || err}`);
                 break;
             }
             if (!sentence) {
-                addDebugLog('info', `[${runId}] Story spine batch ${k} produced no sentence — will retry next turn`);
+                addDebugLog('info', `[${runId}] Story spine batch ${batchIndex} produced no sentence — will retry next turn`);
                 break;
             }
 
-            if (appendStorySpineBatch({ batchIndex: k, startMsg, endMsg, sentence })) {
-                appendedThisRun++;
-                addDebugLog('info', `[${runId}] Story spine: appended batch ${k} (msgs ${startMsg}–${endMsg}, ${sentence.length} chars)`, {
-                    subsystem: 'pipeline', event: 'spine.append',
-                    data: { batchIndex: k, startMsg, endMsg, chars: sentence.length },
-                });
+            // The LLM call awaited — re-check the chat so a mid-call switch can
+            // never write this chat's sentence into the newly-opened chat's spine.
+            const liveCtx = SillyTavern.getContext();
+            const liveChatId = String(liveCtx.getCurrentChatId?.() || liveCtx.chatId || '');
+            if (capturedChatId && liveChatId && liveChatId !== capturedChatId) {
+                addDebugLog('info', `[${runId}] Story spine batch ${batchIndex} discarded — chat changed mid-call (${capturedChatId} -> ${liveChatId})`);
+                return;
             }
+
+            if (!appendStorySpineBatch({ batchIndex, startMsg, endMsg, endUid, sentence })) break;
+            appendedThisRun++;
+            startPos += batchSize;
+            addDebugLog('info', `[${runId}] Story spine: appended batch ${batchIndex} (msgs ${startMsg}–${endMsg}, ${sentence.length} chars)`, {
+                subsystem: 'pipeline', event: 'spine.append',
+                data: { batchIndex, startMsg, endMsg, chars: sentence.length },
+            });
         }
     } catch (err) {
         addDebugLog('info', `Story spine update failed (non-fatal): ${err?.message || err}`);
@@ -487,7 +543,7 @@ async function runMemoryExtraction() {
             postStageMs.snapshotMs = Date.now() - snapStart; 
         }
 
-        await maybeAppendStorySpine(runId, agent3ProfileId);
+        await maybeAppendStorySpine(runId, agent3ProfileId, capturedChatId);
 
         successfulRunsSinceReflection++;
         const REFLECTION_INTERVAL = 12;

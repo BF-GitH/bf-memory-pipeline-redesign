@@ -81,6 +81,8 @@ const DEFAULT_SETTINGS = {
 
     bufferHoldBack: 4,
 
+    spineBatchSize: 10,
+
     enforceKnownBy: true,
 
     graphExtrasCount: 3,
@@ -141,6 +143,7 @@ function validateSettings(s) {
         addDebugLog('fail', 'bufferHoldBack (' + s.bufferHoldBack + ') >= agent2ContextMessages (' + s.agent2ContextMessages + '); clamped to ' + clamped + ' to prevent a memory gap');
         s.bufferHoldBack = clamped;
     }
+    s.spineBatchSize = Math.floor(clamp(s.spineBatchSize, 4, 30, 10));
     s.graphExtrasCount = Math.floor(clamp(s.graphExtrasCount, 0, 8, 3));
     s.catchupBatchSize = Math.floor(clamp(s.catchupBatchSize, 2, 30, 8));
     if (typeof s.enabled !== 'boolean') {
@@ -1279,6 +1282,17 @@ export async function initSettings() {
         extensionSettings.bufferHoldBack = val;
         $('#bf_mem_buffer_holdback_val').text(val);
         if (before !== val) addDebugLog('debug', `Buffer hold-back: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'bufferHoldBack' }, before, after: val });
+        saveSettings();
+    });
+
+    $('#bf_mem_spine_batch').val(extensionSettings.spineBatchSize);
+    $('#bf_mem_spine_batch_val').text(extensionSettings.spineBatchSize);
+    $('#bf_mem_spine_batch').on('input', function () {
+        const val = parseInt($(this).val(), 10);
+        const before = extensionSettings.spineBatchSize;
+        extensionSettings.spineBatchSize = val;
+        $('#bf_mem_spine_batch_val').text(val);
+        if (before !== val) addDebugLog('debug', `Story spine batch size: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'spineBatchSize' }, before, after: val });
         saveSettings();
     });
 

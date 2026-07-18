@@ -58,6 +58,11 @@
                             <small class="bf-mem-hint">The newest N messages are never mined for facts — you might still swipe or edit them. The Memory Agent only sees them as clearly-labeled tentative context for planning. <b>4</b> is the default.</small>
                         </div>
                         <div class="bf-mem-field" style="margin-top:10px;">
+                            <label>Story-spine batch size <span class="bf-mem-val" id="bf_mem_spine_batch_val">10</span></label>
+                            <input type="range" id="bf_mem_spine_batch" min="4" max="30" step="1" value="10" />
+                            <small class="bf-mem-hint">Every N settled messages are distilled into ONE "Story so far" sentence. Smaller = a more detailed story spine but more background LLM calls. <b>10</b> is the default.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:10px;">
                             <label>Bonus connected memories <span class="bf-mem-val" id="bf_mem_graph_extras_val">3</span></label>
                             <input type="range" id="bf_mem_graph_extras" min="0" max="8" step="1" value="3" />
                             <small class="bf-mem-hint">The Memory Agent staples on a few EXTRA memories connected to the scene's facts. Instead of always the top-ranked ones, it wanders the memory graph at random — restaurant → Luigi's → first date — surfacing a different connected chain each time. This sets how many to collect. <b>0</b> turns it off.</small>

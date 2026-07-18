@@ -396,12 +396,17 @@ function normalizeStorySpineBatch(raw) {
     if (!Number.isInteger(batchIndex) || batchIndex < 0) return null;
     const startMsg = Math.floor(Number(raw.startMsg));
     const endMsg = Math.floor(Number(raw.endMsg));
-    return {
+    const out = {
         batchIndex,
         startMsg: Number.isInteger(startMsg) ? startMsg : batchIndex * 10,
         endMsg: Number.isInteger(endMsg) ? endMsg : batchIndex * 10 + 9,
         sentence,
     };
+    // Stable uid of the LAST message this batch covers — the deletion-proof
+    // anchor the pipeline resumes from when computing the next batch.
+    const endUid = typeof raw.endUid === 'string' ? raw.endUid.trim() : '';
+    if (endUid) out.endUid = endUid;
+    return out;
 }
 
 function normalizeStorySpine(raw) {
