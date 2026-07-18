@@ -552,6 +552,9 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
             const category = mapLegacyCategory(String(rawCat || '').trim() || 'Unsorted');
             for (const fact of db.facts) {
                 if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
+                // Reflection cold-tiered facts stay out of the floor — otherwise a
+                // demoted-but-important-looking fact rides back in every single turn.
+                if (fact.cold === true) continue;
                 const loadBearing = clampImportance(fact.importance) >= 4 || fact.kind === 'trait';
                 if (!loadBearing) continue;
                 floorCandidates.push({ fact, category });

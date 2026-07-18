@@ -366,7 +366,10 @@ async function runMemoryExtraction() {
             cancelledRetryArmed = true;
             addDebugLog('info', 'Memory agent (post-reply): skipped — generation was stopped/cancelled; scheduling ONE retry so the completed exchange isn\'t silently dropped');
 
-            setTimeout(() => { runMemoryExtraction(); }, 0);
+            // The retry must CLEAR the cancelled flag first — nothing else resets it
+            // until the next MESSAGE_RECEIVED, so without this the retry would land
+            // right back in this branch and never do anything.
+            setTimeout(() => { pipelineCancelled = false; runMemoryExtraction(); }, 0);
         } else {
             addDebugLog('info', 'Memory agent (post-reply): still cancelled on retry — exchange left unprocessed (no further retries)');
         }
@@ -397,12 +400,21 @@ async function runMemoryExtraction() {
         const m = chat[i];
         if (!isGenuineMessage(m)) continue;
 
-        if (m.extra?.bf_mem_processed) continue;
+        // true = done; false/absent = todo. A persisted 'in-flight' stamp can only
+        // be a leftover from a run the browser/tab killed mid-flight (no extraction
+        // is running while this scan executes) — treat it as unprocessed so those
+        // messages get re-extracted instead of being skipped forever.
+        if (m.extra?.bf_mem_processed === true) continue;
         if (isTriviallyEmptyForExtraction(m.mes)) { trivialIndices.push(i); continue; }
         settledMessages.push(toAgentMessage(m, i));
     }
     if (settledMessages.length > SETTLED_BATCH_MAX) {
-        settledMessages.splice(0, settledMessages.length - SETTLED_BATCH_MAX); 
+        // Keep the OLDEST slice of the backlog: extraction must stay chronological
+        // ACROSS runs. Keeping the newest would extract the leftover OLD messages
+        // on a LATER run, letting stale values overwrite fresher state (a fact from
+        // msg 5 clobbering the update from msg 15). The dropped newer tail stays
+        // unstamped and is picked up next run.
+        settledMessages.length = SETTLED_BATCH_MAX;
     }
 
     const tentativeMessages = [];
@@ -445,11 +457,18 @@ async function runMemoryExtraction() {
 
     const BF_MEM_IN_FLIGHT = 'in-flight';
     const settledIndices = settledMessages.map(m => m.index);
+    // Stamp by stable uid, not by captured position: deleting a message while the
+    // run is in flight shifts positions, and a positional stamp would then hit the
+    // WRONG message. The uid lookup finds each settled message wherever it now
+    // sits and silently skips ones that were deleted mid-run.
+    const settledUids = new Set(settledMessages.map(m => m.uid).filter(Boolean));
     const setWatermark = (val) => {
         let changed = false;
-        for (const i of settledIndices) {
-            if (chat[i] && chat[i].extra?.bf_mem_processed !== val) {
-                chat[i].extra = { ...(chat[i].extra || {}), bf_mem_processed: val };
+        for (const msg of chat) {
+            const uid = msg?.extra?.bf_uid;
+            if (!uid || !settledUids.has(uid)) continue;
+            if (msg.extra.bf_mem_processed !== val) {
+                msg.extra = { ...msg.extra, bf_mem_processed: val };
                 changed = true;
             }
         }

@@ -1733,6 +1733,13 @@ export function upsertFact(db, fact) {
 
         const mergedInvolved = mergeInvolved(existing.involved, fact.involved);
 
+        // Tags are a UNION, not a replacement: the agent rarely re-sends tags on an
+        // update, and a plain spread would wipe the stored ones with its empty list.
+        const mergedTags = Array.from(new Set([
+            ...(Array.isArray(existing.tags) ? existing.tags : []),
+            ...(Array.isArray(fact.tags) ? fact.tags : []),
+        ]));
+
         const sal = mergeSalience(existing, fact);
 
         // History snapshots removed (v0.75): a changed fact now overwrites its live
@@ -1744,7 +1751,7 @@ export function upsertFact(db, fact) {
 
         const oldValue = existing.value;
         const updNow = Date.now();
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, tags: mergedTags, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
         if (factValuesEqual(oldValue, fact.value)) {
             addDebugLog('debug', `Fact unchanged: [${db.category}] ${existing.key}`, {
                 subsystem: 'db', event: 'fact.unchanged',
@@ -2075,6 +2082,9 @@ function mergeInvolved(existing, incoming) {
 }
 
 function mergeContext(existing, incoming) {
+    // An EXPLICIT empty string clears the note (the only way to delete one);
+    // an absent/undefined incoming note keeps the stored one.
+    if (incoming === '') return undefined;
     const inc = (typeof incoming === 'string') ? incoming.trim() : '';
     if (inc) return inc;
     const ex = (typeof existing === 'string') ? existing.trim() : '';
@@ -2104,15 +2114,19 @@ export function isMaterialFactWrite(db, fact) {
     const matched = fact.track
         ? (db?.facts?.find(f => f.key === fact.key) || null)
         : findFactMatch(db, fact.key);
-    if (!matched) return true; 
-    if (!factValuesEqual(matched.value, fact.value)) return true; 
+    if (!matched) return true;
+    if (!factValuesEqual(matched.value, fact.value)) return true;
     const norm = arr => (Array.isArray(arr) ? arr : [])
         .map(t => String(t).trim().toLowerCase())
         .filter(Boolean)
         .sort();
-    const a = norm(matched.tags);
-    const b = norm(fact.tags);
-    return a.length !== b.length || a.some((t, i) => t !== b[i]); 
+    // Tags merge as a union on write, so an update is only material when it ADDS
+    // a tag the stored fact lacks. An empty incoming list (the common case — the
+    // agent rarely re-sends tags) is NOT a change.
+    const incoming = norm(fact.tags);
+    if (incoming.length === 0) return false;
+    const stored = new Set(norm(matched.tags));
+    return incoming.some(t => !stored.has(t));
 }
 
 function normalizeFactKey(key) {

@@ -455,6 +455,9 @@ function execWriteFact(args, ctx) {
 
     const value = String(args?.value ?? '').trim();
     const note = String(args?.note ?? args?.context ?? '').trim();
+    // Distinguish "note omitted" (keep the stored note) from "note explicitly
+    // empty" (clear it) — without this a note could never be deleted.
+    const noteProvided = !!args && (Object.hasOwn(args, 'note') || Object.hasOwn(args, 'context'));
     if (!value && !note) return 'ERROR: write_fact requires a non-empty "value" (or "note")';
 
     const names = currentNames();
@@ -503,6 +506,7 @@ function execWriteFact(args, ctx) {
         scope: scopeFromCategory(category),
     };
     if (note) fact.context = note;
+    else if (noteProvided) fact.context = ''; // explicit empty note = clear it (mergeContext honors '')
     if (involved.length) fact.involved = involved;
     if (sourceIndex !== null) fact.validAt = sourceIndex;
     // Stable, position-independent origin id for this fact's source message
@@ -520,14 +524,19 @@ function execWriteFact(args, ctx) {
 
     const matched = findFactMatch(db, key);
     const changed = isMaterialFactWrite(db, fact);
-    const status = !matched ? 'NEW' : (changed ? 'UPDATED' : 'SKIPPED');
+    // A note-only edit is a REAL change and must be reported as one — the old
+    // 'SKIPPED' status persisted the new note while telling the agent (and the
+    // frontend fact lists) that nothing happened.
+    const storedNote = String(matched?.context ?? '').trim();
+    const noteChanged = !!matched && noteProvided && note !== storedNote;
+    const status = !matched ? 'NEW' : (changed ? 'UPDATED' : (noteChanged ? 'NOTE_UPDATED' : 'SKIPPED'));
 
     upsertFact(db, fact);
-    // Always mark the category dirty when upsertFact ran, so a note-only in-place
-    // edit (status SKIPPED) is still persisted to IDB. Set.add is idempotent.
+    // Always mark the category dirty when upsertFact ran, so an in-place edit is
+    // persisted to IDB regardless of status. Set.add is idempotent.
     ctx.touchedCategories.add(category);
 
-    if (changed) {
+    if (changed || noteChanged) {
 
         const stored = findFactMatch(db, fact.key);
         if (stored && ctx.index) autoLinkFact(ctx.index, stored, category, ctx.runId);
