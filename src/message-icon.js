@@ -44,8 +44,8 @@ function updateIconState(iconEl, msg) {
     iconEl.classList.toggle(ICON_PROCESSED_CLASS, processed);
 
     iconEl.title = processed
-        ? 'Scribe processed this message. Click to see the facts it produced · Shift+click to re-extract.'
-        : 'Scribe has NOT processed this message. Click to see facts (none yet) · Shift+click to extract (makes an AI call).';
+        ? 'The Memory Agent processed this message. Click to see the memories it stored · Shift+click to re-extract.'
+        : 'The Memory Agent has NOT processed this message yet. Click to see memories (none yet) · Shift+click to extract (makes an AI call).';
 }
 
 async function onIconClick(e, mesId) {
@@ -148,7 +148,7 @@ async function showMessageFacts(mesId) {
 
     let body;
     if (rows.length === 0) {
-        body = '<div class="bf-mem-summary-empty">No stored facts came from this message. Shift+click the brain icon to (re-)run extraction.</div>';
+        body = '<div class="bf-mem-summary-empty">No stored memories came from this message. Shift+click the brain icon to (re-)run extraction.</div>';
     } else {
         // Group into per-category sections like the sheet popup does.
         const byCat = new Map();
@@ -170,7 +170,7 @@ async function showMessageFacts(mesId) {
     // in the sheet popup's CSS.
     const html = `<div class="bf-mem-sheet-pop bf-mem-msgfacts" data-mesid="${mesId}">
         <div class="bf-mem-sheet-title"><i class="fa-solid fa-brain"></i> Facts from message #${mesId} <span class="bf-mem-sheet-count">${rows.length}</span></div>
-        <p style="opacity:0.7;font-size:0.9em;margin:2px 0 8px;">What the Scribe learned from this line. Expand a fact to edit or delete it. Shift+click the brain icon to re-extract.</p>
+        <p style="opacity:0.7;font-size:0.9em;margin:2px 0 8px;">Memories the Memory Agent stored from this message. Expand one to edit or delete it. Shift+click the brain icon to re-extract.</p>
         ${body}
     </div>`;
 
