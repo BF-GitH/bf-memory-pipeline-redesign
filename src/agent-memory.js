@@ -17,7 +17,7 @@ import {
 } from './recency.js';
 import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
 import { executeMemoryTool } from './memory-tools.js';
-import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent } from './turn-state.js';
+import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline } from './turn-state.js';
 import { addDebugLog } from './settings.js';
 import * as host from './host.js';
 
@@ -241,6 +241,17 @@ export async function runMemoryAgent({
         } catch (e) {
             addDebugLog('info', `[${runId}] Beat backfill failed (non-fatal): ${e?.message || e}`);
         }
+        // Attach each beat's stable message uid (extra.bf_uid, carried on the
+        // settled batch) so the scene store can de-dup by uid — raw chat indices
+        // shift when older messages are deleted, uids don't.
+        try {
+            const uidByIndex = new Map((Array.isArray(settledMessages) ? settledMessages : [])
+                .filter(m => Number.isInteger(m?.index) && m?.uid)
+                .map(m => [m.index, String(m.uid)]));
+            for (const b of parsedSheet.beats) {
+                if (!b.uid && b.msgIndex >= 0 && uidByIndex.has(b.msgIndex)) b.uid = uidByIndex.get(b.msgIndex);
+            }
+        } catch {  }
         // Scene accumulator: a fired marker closes the previous card and opens a new
         // one; then this run's newly-settled beats stack onto the current card
         // (de-duped by msgIndex inside appendSceneBeats). Persisted in chatMetadata.
@@ -273,6 +284,9 @@ export async function runMemoryAgent({
                 // explicit (even empty) PRESENT line may CLEAR the room; an
                 // omitted line leaves the previous snapshot untouched.
                 if (parsedSheet.presentProvided) setScenePresent(parsedSheet.present);
+                // Persist the freshest TIMELINE so a later run that omits the
+                // line falls back to it instead of blanking "Timeline & place".
+                if (parsedSheet.timeline) setSceneTimeline(parsedSheet.timeline);
             } catch (e) {
                 addDebugLog('fail', `[${runId}] Scene accumulator failed: ${e?.message || e}`);
             }
@@ -282,7 +296,9 @@ export async function runMemoryAgent({
     if (!extractOnly) {
         result.sheetText = composeSheet({
             summary: parsedSheet.summary,
-            timeline: parsedSheet.timeline,
+            // Fall back to the persisted last-known timeline when this run's
+            // sheet omitted the TIMELINE line, so time/place never blanks out.
+            timeline: parsedSheet.timeline || getSceneTimeline(),
             need: parsedSheet.need,
             settings,
             databases,

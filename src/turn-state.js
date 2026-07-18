@@ -484,7 +484,12 @@ function normalizeBeat(raw) {
     const sentence = typeof raw.sentence === 'string' ? raw.sentence.trim() : '';
     if (!sentence) return null;
     const msgIndex = Math.floor(Number(raw.msgIndex));
-    return { msgIndex: Number.isInteger(msgIndex) ? msgIndex : -1, sentence };
+    const out = { msgIndex: Number.isInteger(msgIndex) ? msgIndex : -1, sentence };
+    // Stable per-message id (extra.bf_uid) when the caller could resolve one —
+    // survives message deletions that shift raw chat indices.
+    const uid = typeof raw.uid === 'string' ? raw.uid.trim() : '';
+    if (uid) out.uid = uid;
+    return out;
 }
 
 const SCENE_PRESENT_CAP = 16;
@@ -526,6 +531,11 @@ function normalizeScene(raw) {
     return { startMsg: Number.isInteger(startMsg) ? startMsg : -1, name, beats, present };
 }
 
+// Closed scenes are a browsable archive in the sheet popup, but chatMetadata
+// travels with every chat save — cap the archive at the newest entries so a
+// very long roleplay can't grow the chat file without bound.
+const MAX_CLOSED_SCENES = 50;
+
 function normalizeSceneStore(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const current = normalizeScene(raw.current);
@@ -536,8 +546,10 @@ function normalizeSceneStore(raw) {
             if (ns) closed.push(ns);
         }
     }
-    if (!current && closed.length === 0) return null;
-    return { current: current || null, closed };
+    if (closed.length > MAX_CLOSED_SCENES) closed.splice(0, closed.length - MAX_CLOSED_SCENES);
+    const timeline = typeof raw.timeline === 'string' ? raw.timeline.trim() : '';
+    if (!current && closed.length === 0 && !timeline) return null;
+    return { current: current || null, closed, timeline };
 }
 
 function loadSceneFromMeta() {
@@ -560,10 +572,10 @@ function saveSceneToMeta() {
 
 function getSceneStore() {
     if (!sceneStoreLoaded) {
-        sceneStore = loadSceneFromMeta() || { current: null, closed: [] };
+        sceneStore = loadSceneFromMeta() || { current: null, closed: [], timeline: '' };
         sceneStoreLoaded = true;
     }
-    return (sceneStore && typeof sceneStore === 'object') ? sceneStore : { current: null, closed: [] };
+    return (sceneStore && typeof sceneStore === 'object') ? sceneStore : { current: null, closed: [], timeline: '' };
 }
 
 export function getCurrentScene() {
@@ -598,7 +610,10 @@ export function startScene({ startMsg = -1, name = '' } = {}) {
     // A marker pointing at an ALREADY-CLOSED scene's start index is a stale
     // re-emission (e.g. a retry replaying an old sheet) — never reopen it.
     if (s >= 0 && store.closed.some(c => c && c.startMsg === s)) return cur || null;
-    if (cur && (cur.beats.length > 0 || cur.name)) store.closed.push(cur);
+    if (cur && (cur.beats.length > 0 || cur.name)) {
+        store.closed.push(cur);
+        if (store.closed.length > MAX_CLOSED_SCENES) store.closed.splice(0, store.closed.length - MAX_CLOSED_SCENES);
+    }
     store.current = { startMsg: s, name: nm, beats: [], present: [] };
     sceneStore = store;
     sceneStoreLoaded = true;
@@ -637,6 +652,11 @@ export function appendSceneBeats(beats) {
     }
     const cur = store.current;
     const seen = new Set(cur.beats.filter(b => b.msgIndex >= 0).map(b => b.msgIndex));
+    // Primary de-dup key: the stable per-message uid (extra.bf_uid). Chat indices
+    // shift when older messages are deleted, so a raw index can be REUSED by a
+    // different message — the uid disambiguates and prevents a genuinely new beat
+    // from being swallowed by a stale index match.
+    const seenUid = new Set(cur.beats.map(b => b.uid).filter(Boolean));
     // Index-less beats (agent omitted the "| <index>") can't be de-duped by msgIndex,
     // so track their sentence text too — otherwise a re-emitted index-less beat would
     // stack a duplicate line every run.
@@ -645,7 +665,13 @@ export function appendSceneBeats(beats) {
     for (const raw of list) {
         const b = normalizeBeat(raw);
         if (!b) continue;
-        if (b.msgIndex >= 0) {
+        if (b.uid) {
+            // Skip when either key already covers this message: the uid, or the
+            // index (beats stored before uids existed carry only the index).
+            if (seenUid.has(b.uid) || (b.msgIndex >= 0 && seen.has(b.msgIndex))) continue;
+            seenUid.add(b.uid);
+            if (b.msgIndex >= 0) seen.add(b.msgIndex);
+        } else if (b.msgIndex >= 0) {
             if (seen.has(b.msgIndex)) continue;
             seen.add(b.msgIndex);
         } else {
@@ -671,14 +697,32 @@ export function appendSceneBeats(beats) {
 }
 
 export function setSceneStore(raw) {
-    sceneStore = normalizeSceneStore(raw) || { current: null, closed: [] };
+    sceneStore = normalizeSceneStore(raw) || { current: null, closed: [], timeline: '' };
     sceneStoreLoaded = true;
     saveSceneToMeta();
 }
 
 export function reloadSceneFromChat() {
-    sceneStore = loadSceneFromMeta() || { current: null, closed: [] };
+    sceneStore = loadSceneFromMeta() || { current: null, closed: [], timeline: '' };
     sceneStoreLoaded = true;
+}
+
+// Last known "Timeline & place" line. Persisted so a single agent run that
+// omits TIMELINE doesn't blank the sheet's time/place grounding — composeSheet
+// falls back to this value until a later run refreshes it.
+export function getSceneTimeline() {
+    const t = getSceneStore().timeline;
+    return typeof t === 'string' ? t : '';
+}
+
+export function setSceneTimeline(text) {
+    const t = String(text ?? '').trim();
+    if (!t) return;
+    const store = getSceneStore();
+    store.timeline = t;
+    sceneStore = store;
+    sceneStoreLoaded = true;
+    saveSceneToMeta();
 }
 
 function renderTokens() {

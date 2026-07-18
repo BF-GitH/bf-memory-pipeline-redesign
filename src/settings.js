@@ -623,9 +623,9 @@ export async function saveCurrentToActiveProfile(profileKey = null, { allowEmpty
         // Feature 4: the story spine + scene card travel WITH the DB profile, so a
         // new chat later pointed at this DB shows the story-so-far and current scene
         // instead of starting blank. Snapshot them from the current chat's metadata.
-        const { getStorySpine, getCurrentScene, getClosedScenes } = await import('./turn-state.js');
+        const { getStorySpine, getCurrentScene, getClosedScenes, getSceneTimeline } = await import('./turn-state.js');
         const storySpine = JSON.parse(JSON.stringify(getStorySpine() || []));
-        const sceneStore = JSON.parse(JSON.stringify({ current: getCurrentScene() || null, closed: getClosedScenes() || [] }));
+        const sceneStore = JSON.parse(JSON.stringify({ current: getCurrentScene() || null, closed: getClosedScenes() || [], timeline: getSceneTimeline() || '' }));
 
         extensionSettings.dbProfiles[profileName] = {
             ...extensionSettings.dbProfiles[profileName],
