@@ -1,4 +1,4 @@
-import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sameCharacter } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sameCharacter } from './database.js';
 import { getScenePresent } from './turn-state.js';
 import { addDebugLog, getSettings } from './settings.js';
 import { recencyTail, getTurnNowContext } from './recency.js';
@@ -636,36 +636,6 @@ function collectLinkCandidates(databases, seeds, alreadyFound) {
     return candidates;
 }
 
-function collectSceneCandidates(index, seeds, alreadyFound) {
-    const bySceneNo = index && index.bySceneNo;
-    if (!bySceneNo || bySceneNo.size === 0) return [];
-
-    const seedScenes = new Set();
-    for (const r of seeds) {
-        const no = r && r.fact && Number.isInteger(r.fact.sceneNo) ? r.fact.sceneNo : null;
-        if (no !== null) seedScenes.add(no);
-    }
-    if (seedScenes.size === 0) return [];
-
-    const candidates = [];
-    const emitted = new Set();
-    for (const no of seedScenes) {
-        const bucket = bySceneNo.get(no);
-        if (!bucket) continue;
-        const seedId = `scene:${no}`;
-        for (const { fact, category } of bucket) {
-            if (!fact) continue;
-            if (!isActiveFact(fact)) continue;        
-            if (!isFactVisible(fact)) continue;        
-            const id = `${category}:${fact.key}`;
-            if (alreadyFound.has(id) || emitted.has(id)) continue;
-            emitted.add(id);
-            candidates.push({ fact, category, tier: 'secondary', via: 'scene', seedId });
-        }
-    }
-    return candidates;
-}
-
 function collectRelationshipRefCandidates(index, databases, seeds, alreadyFound) {
     const candidates = [];
     const emitted = new Set();
@@ -700,7 +670,7 @@ function gatherExpansionCandidates(databases, index, results, alreadyFound, maxD
     let admittedTotal = 0;
     let cappedBySeed = 0;           
     const seedContrib = new Map();  
-    const fromCounts = { link: 0, scene: 0, ref: 0, track: 0 };
+    const fromCounts = { link: 0, ref: 0, track: 0 };
 
     const admit = (c, { perSeedCapped, demote }) => {
         if (admittedTotal >= MAX_EXPANSION_TOTAL) return null;
@@ -731,15 +701,14 @@ function gatherExpansionCandidates(databases, index, results, alreadyFound, maxD
         const refCands = collectRelationshipRefCandidates(index, databases, seeds, alreadyFound);
         const trackCands = expandSequenceTracks(databases, seeds, alreadyFound);
 
-        const sceneCands = collectSceneCandidates(index, seeds, alreadyFound);
         fromCounts.link += linkCands.length; fromCounts.ref += refCands.length;
-        fromCounts.track += trackCands.length; fromCounts.scene += sceneCands.length;
+        fromCounts.track += trackCands.length;
 
         const admittedThisHop = [];
 
         for (const c of trackCands) { const r = admit(c, { perSeedCapped: false, demote: false }); if (r) admittedThisHop.push(r); }
 
-        const ranked = [...linkCands, ...sceneCands, ...refCands].sort(
+        const ranked = [...linkCands, ...refCands].sort(
             (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
         for (const c of ranked) {
             if (admittedTotal >= MAX_EXPANSION_TOTAL) break;
@@ -917,31 +886,6 @@ export async function explainFactRetrieval(key, keywords = []) {
 const RECALL_DEFAULT_LIMIT = 20;
 const RECALL_MAX_LIMIT = 40;
 
-function detectSceneQuery(query) {
-    const q = String(query || '').trim();
-    if (!q) return null;
-    const lower = q.toLowerCase();
-
-    const numMatch = lower.match(/\bscene\s*#?\s*(?:no\.?\s*)?(\d+)\b/);
-    if (numMatch) {
-        const n = parseInt(numMatch[1], 10);
-        if (n >= 1) return n;
-    }
-
-    const trailing = lower.match(/^(?:recap|recall|summari[sz]e|recount|what happened in|tell me about)?\s*(?:the\s+)?(.+?)\s+scene\b/);
-    if (trailing && trailing[1]) {
-        const name = trailing[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
-        if (name && name !== 'the' && name.length >= 2) return name;
-    }
-
-    const leading = lower.match(/\bscene\s*:?\s+(?:the\s+)?(.+)$/);
-    if (leading && leading[1] && !numMatch) {
-        const name = leading[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
-        if (name && name.length >= 2) return name;
-    }
-    return null;
-}
-
 function detectRelationshipQuery(query) {
     const q = String(query || '').trim();
     if (!q) return null;
@@ -970,34 +914,25 @@ function detectRelationshipQuery(query) {
     return null;
 }
 
-export async function searchMemoryForRecall({ query, category, limit, scene, with: withPair } = {}) {
+export async function searchMemoryForRecall({ query, category, limit, with: withPair } = {}) {
     const q = String(query ?? '').trim();
     const catFilter = String(category ?? '').trim().toLowerCase();
     const cap = Math.min(RECALL_MAX_LIMIT, Math.max(1, Math.floor(Number(limit)) || RECALL_DEFAULT_LIMIT));
 
-    let sceneTarget = null;
-    if (scene !== undefined && scene !== null && String(scene).trim()) {
-        sceneTarget = (typeof scene === 'number') ? scene : String(scene).trim();
+    let relPair = null;
+    if (withPair !== undefined && withPair !== null && String(withPair).trim()) {
+        const parts = String(withPair)
+            .split(/\s*(?:,|&|\+|\band\b|\bwith\b)\s*/i)
+            .map(s => s.trim())
+            .filter(Boolean);
+        if (parts.length >= 2) relPair = [parts[0], parts[1]];
+        else if (parts.length === 1) relPair = [parts[0], ''];
     } else if (q) {
-        sceneTarget = detectSceneQuery(q);
+        const detected = detectRelationshipQuery(q);
+        if (detected) relPair = detected;
     }
 
-    let relPair = null; 
-    if (sceneTarget === null) {
-        if (withPair !== undefined && withPair !== null && String(withPair).trim()) {
-            const parts = String(withPair)
-                .split(/\s*(?:,|&|\+|\band\b|\bwith\b)\s*/i)
-                .map(s => s.trim())
-                .filter(Boolean);
-            if (parts.length >= 2) relPair = [parts[0], parts[1]];
-            else if (parts.length === 1) relPair = [parts[0], ''];
-        } else if (q) {
-            const detected = detectRelationshipQuery(q);
-            if (detected) relPair = detected;
-        }
-    }
-
-    if (!q && sceneTarget === null && relPair === null) {
+    if (!q && relPair === null) {
         return { text: 'No query provided. Pass a keyword query (or a Category/key handle) to search memory.', count: 0 };
     }
 
@@ -1026,23 +961,6 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
             ? formatFactsForWriter(cappedRel.map(r => ({ fact: r.fact, category: r.category, tier: 'primary' })))
             : `No relationship history found between ${nameA}${nameB ? ` and ${nameB}` : ''}.`;
         return { text: relText, count: cappedRel.length };
-    }
-
-    if (sceneTarget !== null) {
-        let sceneRows = getFactsByScene(databases, sceneTarget);
-        if (catFilter) sceneRows = sceneRows.filter(r => String(r.category).toLowerCase() === catFilter);
-        const ctxS = host.getCtx();
-        const namesS = ctxS ? { charName: ctxS.characters?.[ctxS.characterId]?.name || '', userName: ctxS.name1 || '' } : null;
-        sceneRows = sceneRows.filter(r => isFactVisible(r.fact, namesS));
-        const cappedScene = sceneRows.slice(0, cap);
-        addDebugLog('debug', `Scene recall: "${String(sceneTarget).slice(0, 60)}" → ${cappedScene.length}/${sceneRows.length} fact(s)`, {
-            subsystem: 'retrieval', event: 'retrieval.scene_recall',
-            data: { scene: String(sceneTarget).slice(0, 60), returned: cappedScene.length, total: sceneRows.length, includesColdAndSuperseded: true },
-        });
-        const sceneText = cappedScene.length
-            ? formatFactsForWriter(cappedScene.map(r => ({ fact: r.fact, category: r.category, tier: 'primary' })))
-            : `No facts found for scene "${String(sceneTarget)}".`;
-        return { text: sceneText, count: cappedScene.length };
     }
 
     const index = await getMemoryIndex();
@@ -1112,7 +1030,7 @@ export async function searchMemoryForRecall({ query, category, limit, scene, wit
     } else {
         const presentCats = Object.keys(databases).filter(cat => (databases[cat]?.facts?.length > 0));
         hint = presentCats.length
-            ? ` Try a broader or different keyword, a character or place name, a "Category/key" handle, or one of the categories present in memory: ${presentCats.slice(0, 12).join(', ')}${presentCats.length > 12 ? ', …' : ''}. You can also recall a scene (scene:) or a relationship history (with:).`
+            ? ` Try a broader or different keyword, a character or place name, a "Category/key" handle, or one of the categories present in memory: ${presentCats.slice(0, 12).join(', ')}${presentCats.length > 12 ? ', …' : ''}. You can also recall a relationship history (with:).`
             : ' Memory is nearly empty, so there may be nothing to recall yet.';
     }
     return { text: `No stored facts match "${q}"${catFilter ? ` in category "${category}"` : ''}.${hint}`, count: 0 };

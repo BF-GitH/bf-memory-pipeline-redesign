@@ -935,7 +935,6 @@ export function buildMemoryIndex(databases) {
     const byCatAspect = new Map();
     const bySubject = new Map();
     const byToken = new Map();
-    const bySceneNo = new Map();
     const aspectCounts = new Map();
     let totalFacts = 0;
     const nameReg = new Map();
@@ -960,8 +959,6 @@ export function buildMemoryIndex(databases) {
             collectFactNames(nameReg, fact);
             for (const tok of factTokens(fact)) add(byToken, tok, entry);
 
-            if (Number.isInteger(fact.sceneNo) && fact.sceneNo >= 1) add(bySceneNo, fact.sceneNo, entry);
-
             if (isHotFact(fact)) {
                 let m = aspectCounts.get(category);
                 if (!m) { m = new Map(); aspectCounts.set(category, m); }
@@ -970,7 +967,7 @@ export function buildMemoryIndex(databases) {
         }
     }
     _nameRegistry = nameReg;
-    return { byCatAspect, bySubject, byToken, bySceneNo, aspectCounts, totalFacts };
+    return { byCatAspect, bySubject, byToken, aspectCounts, totalFacts };
 }
 
 // ── CHARACTER NAME REGISTRY ──────────────────────────────────────────────────
@@ -2013,11 +2010,6 @@ function normalizeSalienceFields(fact) {
 
     const tone = normalizeTone(fact?.tone);
     if (tone) out.tone = tone;
-
-    if (Number.isInteger(fact?.sceneNo) && fact.sceneNo >= 1) {
-        out.sceneNo = fact.sceneNo;
-        if (typeof fact?.sceneName === 'string' && fact.sceneName.trim()) out.sceneName = fact.sceneName.trim();
-    }
     return out;
 }
 
@@ -2045,16 +2037,6 @@ function mergeSalience(existing, incoming) {
     const exTone = normalizeTone(existing?.tone);
     if (incTone) out.tone = incTone;
     else if (exTone) out.tone = exTone;
-
-    const exNo = Number.isInteger(existing?.sceneNo) ? existing.sceneNo : null;
-    const incNo = Number.isInteger(incoming?.sceneNo) ? incoming.sceneNo : null;
-    if (exNo !== null) {
-        out.sceneNo = exNo;
-        if (existing?.sceneName) out.sceneName = existing.sceneName;
-    } else if (incNo !== null) {
-        out.sceneNo = incNo;
-        if (incoming?.sceneName) out.sceneName = incoming.sceneName;
-    }
     return out;
 }
 
@@ -2507,47 +2489,6 @@ export function getTrackSteps(databases, track) {
     return steps;
 }
 
-export function getFactsByScene(databases, scene) {
-
-    let wantNo = null;
-    let wantName = '';
-    if (typeof scene === 'number') {
-        const n = Math.floor(scene);
-        if (Number.isInteger(n) && n >= 1) wantNo = n;
-    } else if (typeof scene === 'string') {
-        const s = scene.trim();
-        if (/^\d+$/.test(s)) {
-            const n = parseInt(s, 10);
-            if (n >= 1) wantNo = n;
-        } else if (s) {
-            wantName = s.toLowerCase();
-        }
-    }
-    if (wantNo === null && !wantName) return [];
-
-    const out = [];
-    for (const [category, db] of Object.entries(databases || {})) {
-        for (const fact of (db.facts || [])) {
-            if (!fact || typeof fact !== 'object') continue;
-            let hit = false;
-            if (wantNo !== null) {
-                hit = Number.isInteger(fact.sceneNo) && fact.sceneNo === wantNo;
-            } else if (wantName) {
-                hit = typeof fact.sceneName === 'string' && fact.sceneName.trim().toLowerCase() === wantName;
-            }
-            if (hit) out.push({ fact, category });
-        }
-    }
-
-    out.sort((a, b) => {
-        const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : Number.MAX_SAFE_INTEGER;
-        const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : Number.MAX_SAFE_INTEGER;
-        if (av !== bv) return av - bv;
-        return String(a.fact.key).localeCompare(String(b.fact.key));
-    });
-    return out;
-}
-
 const RELATIONSHIP_THREAD_MAX = 16;
 
 function normalizeRelationshipName(name) {
@@ -2604,9 +2545,6 @@ export function getRelationshipMomentThread(databases, nameA, nameB, opts = {}) 
         const xv = Number.isInteger(x.fact.validAt) ? x.fact.validAt : Number.MAX_SAFE_INTEGER;
         const yv = Number.isInteger(y.fact.validAt) ? y.fact.validAt : Number.MAX_SAFE_INTEGER;
         if (xv !== yv) return xv - yv;
-        const xs = Number.isInteger(x.fact.sceneNo) ? x.fact.sceneNo : Number.MAX_SAFE_INTEGER;
-        const ys = Number.isInteger(y.fact.sceneNo) ? y.fact.sceneNo : Number.MAX_SAFE_INTEGER;
-        if (xs !== ys) return xs - ys;
         const xu = Number(x.fact.lastUpdated) || 0;
         const yu = Number(y.fact.lastUpdated) || 0;
         if (xu !== yu) return xu - yu;

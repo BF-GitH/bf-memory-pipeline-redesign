@@ -580,9 +580,26 @@ export function getClosedScenes() {
 export function startScene({ startMsg = -1, name = '' } = {}) {
     const store = getSceneStore();
     const cur = store.current;
+    const s0 = Math.floor(Number(startMsg));
+    const s = Number.isInteger(s0) ? s0 : -1;
+    const nm = String(name || '').trim();
+    // Idempotency guard: agents sometimes re-emit the marker for the scene that
+    // is already open (same start index, or same name without a usable index).
+    // Without this the open card would be closed and reopened, fragmenting its
+    // beats across duplicate cards. Treat a repeat as "scene continues".
+    if (cur) {
+        const sameStart = s >= 0 && s === cur.startMsg;
+        const sameName = !!nm && !!cur.name && nm.toLowerCase() === cur.name.toLowerCase();
+        if (sameStart || (sameName && s < 0)) {
+            if (nm && !cur.name) { cur.name = nm; saveSceneToMeta(); }
+            return cur;
+        }
+    }
+    // A marker pointing at an ALREADY-CLOSED scene's start index is a stale
+    // re-emission (e.g. a retry replaying an old sheet) — never reopen it.
+    if (s >= 0 && store.closed.some(c => c && c.startMsg === s)) return cur || null;
     if (cur && (cur.beats.length > 0 || cur.name)) store.closed.push(cur);
-    const s = Math.floor(Number(startMsg));
-    store.current = { startMsg: Number.isInteger(s) ? s : -1, name: String(name || '').trim(), beats: [], present: [] };
+    store.current = { startMsg: s, name: nm, beats: [], present: [] };
     sceneStore = store;
     sceneStoreLoaded = true;
     saveSceneToMeta();
@@ -640,7 +657,13 @@ export function appendSceneBeats(beats) {
         added++;
     }
     if (added === 0) return false;
-    cur.beats.sort((a, b) => (a.msgIndex < 0 || b.msgIndex < 0) ? 0 : a.msgIndex - b.msgIndex);
+    // Transitive comparator: index-less beats sort to the end (stable, so they
+    // keep their insertion order); indexed beats sort strictly by msgIndex.
+    cur.beats.sort((a, b) => {
+        const ai = a.msgIndex >= 0 ? a.msgIndex : Number.MAX_SAFE_INTEGER;
+        const bi = b.msgIndex >= 0 ? b.msgIndex : Number.MAX_SAFE_INTEGER;
+        return ai - bi;
+    });
     sceneStore = store;
     sceneStoreLoaded = true;
     saveSceneToMeta();

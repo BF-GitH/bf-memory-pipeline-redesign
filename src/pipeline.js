@@ -343,6 +343,7 @@ async function runMemoryExtraction() {
 
     const capturedDbProfile = settings.activeDbProfile;
     const capturedCharAvatar = ctx0.characters?.[ctx0.characterId]?.avatar || '';
+    const capturedChatId = String(ctx0.getCurrentChatId?.() || ctx0.chatId || '');
     const startTime = Date.now();
 
     const pending = getPendingRun();
@@ -449,12 +450,16 @@ async function runMemoryExtraction() {
 
         const liveCtx = SillyTavern.getContext();
         const currentCharAvatar = liveCtx.characters?.[liveCtx.characterId]?.avatar || '';
-        if (currentCharAvatar !== capturedCharAvatar) {
-            addDebugLog('fail', `[${runId}] Character changed mid-extraction (${capturedCharAvatar} -> ${currentCharAvatar}) — withholding watermark/sheet`);
+        const currentChatId = String(liveCtx.getCurrentChatId?.() || liveCtx.chatId || '');
+        // Guard BOTH character switches and chat/branch switches (same character,
+        // different chat) — either way the sheet/watermark must not be applied to
+        // the chat that is now active.
+        if (currentCharAvatar !== capturedCharAvatar || (capturedChatId && currentChatId && currentChatId !== capturedChatId)) {
+            addDebugLog('fail', `[${runId}] Character or chat changed mid-extraction (${capturedCharAvatar}/${capturedChatId} -> ${currentCharAvatar}/${currentChatId}) — withholding watermark/sheet`);
             if (typeof toastr !== 'undefined') {
-                toastr.warning('BF Memory: extraction result discarded — you switched characters');
+                toastr.warning('BF Memory: extraction result discarded — you switched characters or chats');
             }
-            setWatermark(false); 
+            setWatermark(false);
             setLastInserted(committed);
             return;
         }

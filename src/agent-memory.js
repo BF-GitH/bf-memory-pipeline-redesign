@@ -15,7 +15,7 @@ import {
     getTurnNowContext, splitInjectionSections, buildPrecedencePreamble,
     STATE_SECTION_HEADER, CHRONO_SECTION_HEADER,
 } from './recency.js';
-import { callAgentLLMWithTools } from './llm-call.js';
+import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
 import { executeMemoryTool } from './memory-tools.js';
 import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent } from './turn-state.js';
 import { addDebugLog } from './settings.js';
@@ -23,6 +23,13 @@ import * as host from './host.js';
 
 function getSettingsSafe() {
     try { return host.getExtensionSettings(); } catch { return null; }
+}
+
+function currentChatIdSafe() {
+    try {
+        const c = host.getCtx();
+        return String(c?.getCurrentChatId?.() || c?.chatId || '');
+    } catch { return ''; }
 }
 
 const KEY_INVENTORY_CAP = 200;
@@ -123,6 +130,10 @@ export async function runMemoryAgent({
 } = {}) {
     const result = { sheetText: null, applied: [], error: null, tokensIn: 0, tokensOut: 0, rounds: 0, toolCallCount: 0 };
     const settings = getSettingsSafe() || {};
+    // Captured at run start: scene/sheet state may only be written back into THIS
+    // chat — if the user switches chats mid-run, the results are dropped instead
+    // of contaminating the other chat's metadata.
+    const runChatId = currentChatIdSafe();
 
     let databases, index;
     try {
@@ -222,18 +233,49 @@ export async function runMemoryAgent({
     }
 
     if (!extractOnly && parsedSheet) {
+        // BEAT coverage enforcement: repair index-less beats and, for settled
+        // messages the agent skipped entirely, fetch the missing sentence via a
+        // tiny dedicated call (no full system prompt).
+        try {
+            await backfillMissingBeats({ parsedSheet, settledMessages, profileId, runId, signal });
+        } catch (e) {
+            addDebugLog('info', `[${runId}] Beat backfill failed (non-fatal): ${e?.message || e}`);
+        }
         // Scene accumulator: a fired marker closes the previous card and opens a new
         // one; then this run's newly-settled beats stack onto the current card
         // (de-duped by msgIndex inside appendSceneBeats). Persisted in chatMetadata.
-        try {
-            if (parsedSheet.sceneMarker) startScene(parsedSheet.sceneMarker);
-            if (parsedSheet.beats.length > 0) appendSceneBeats(parsedSheet.beats);
-            // PRESENT is a snapshot of who is in the scene right now; replace,
-            // don't accumulate. Applied after startScene so a new scene gets a
-            // fresh list instead of inheriting the previous room's people.
-            if (parsedSheet.present.length > 0) setScenePresent(parsedSheet.present);
-        } catch (e) {
-            addDebugLog('fail', `[${runId}] Scene accumulator failed: ${e?.message || e}`);
+        const liveChatId = currentChatIdSafe();
+        if (runChatId && liveChatId && liveChatId !== runChatId) {
+            addDebugLog('fail', `[${runId}] Scene accumulator skipped — chat changed mid-run (${runChatId} -> ${liveChatId}); nothing was written into the other chat`, {
+                subsystem: 'agent3', event: 'scene.skipped', reason: 'CHAT_CHANGED',
+            });
+        } else {
+            try {
+                const marker = parsedSheet.sceneMarker;
+                const markerStart = (marker && Number.isInteger(marker.startMsg)) ? marker.startMsg : -1;
+                if (marker && markerStart >= 0) {
+                    // Partition around the marker: beats for messages BEFORE the
+                    // marker's start index belong to the scene that is about to
+                    // close — stack them first, then open the new card, then add
+                    // the new scene's beats.
+                    const before = parsedSheet.beats.filter(b => b.msgIndex >= 0 && b.msgIndex < markerStart);
+                    const after = parsedSheet.beats.filter(b => !(b.msgIndex >= 0 && b.msgIndex < markerStart));
+                    if (before.length > 0) appendSceneBeats(before);
+                    startScene(marker);
+                    if (after.length > 0) appendSceneBeats(after);
+                } else {
+                    if (marker) startScene(marker);
+                    if (parsedSheet.beats.length > 0) appendSceneBeats(parsedSheet.beats);
+                }
+                // PRESENT is a snapshot of who is in the scene right now; replace,
+                // don't accumulate. Applied after startScene so a new scene gets a
+                // fresh list instead of inheriting the previous room's people. An
+                // explicit (even empty) PRESENT line may CLEAR the room; an
+                // omitted line leaves the previous snapshot untouched.
+                if (parsedSheet.presentProvided) setScenePresent(parsedSheet.present);
+            } catch (e) {
+                addDebugLog('fail', `[${runId}] Scene accumulator failed: ${e?.message || e}`);
+            }
         }
     }
 
@@ -331,8 +373,64 @@ function buildAgentUserPrompt({
     }
 }
 
+// BEAT coverage enforcement: the prompt asks for exactly one BEAT per settled
+// message, but that is only prompt compliance. Repair pass:
+//   1. Index-less beats (agent dropped the "| <index>") are adopted onto the
+//      still-uncovered settled indices in emission order — BEAT lines are
+//      emitted in message order, so this recovers the mapping.
+//   2. Any settled message STILL without a beat gets ONE tiny dedicated LLM
+//      call ("summarize this one message in one sentence") — deliberately not
+//      the full memory-agent system prompt.
+const BEAT_BACKFILL_MAX = 6;
+
+async function backfillMissingBeats({ parsedSheet, settledMessages = [], profileId = null, runId = '', signal = null } = {}) {
+    const beats = Array.isArray(parsedSheet?.beats) ? parsedSheet.beats : [];
+    const covered = new Set(beats.filter(b => Number.isInteger(b.msgIndex) && b.msgIndex >= 0).map(b => b.msgIndex));
+    const missing = (Array.isArray(settledMessages) ? settledMessages : [])
+        .map(m => m?.index)
+        .filter(i => Number.isInteger(i) && i >= 0 && !covered.has(i))
+        .sort((a, b) => a - b);
+    if (missing.length === 0) return;
+
+    for (const b of beats) {
+        if (missing.length === 0) break;
+        if (!(Number.isInteger(b.msgIndex) && b.msgIndex >= 0)) b.msgIndex = missing.shift();
+    }
+    if (missing.length === 0) {
+        addDebugLog('info', `[${runId}] Beat repair: adopted index-less beat(s) onto the uncovered settled message(s) — no LLM call needed`, {
+            subsystem: 'agent3', event: 'beat.repair',
+        });
+        return;
+    }
+
+    const todo = missing.slice(0, BEAT_BACKFILL_MAX);
+    if (missing.length > todo.length) {
+        addDebugLog('info', `[${runId}] Beat backfill: ${missing.length} beat(s) missing, capping dedicated calls at ${BEAT_BACKFILL_MAX} this run (rest stays missing)`);
+    }
+    const byIndex = new Map((Array.isArray(settledMessages) ? settledMessages : []).map(m => [m.index, m]));
+    for (const idx of todo) {
+        const m = byIndex.get(idx);
+        if (!m || !String(m.text || '').trim()) continue;
+        let sentence = '';
+        try {
+            sentence = String(await callAgentLLM(
+                'You summarize ONE roleplay message as ONE terse past-tense sentence (third person, max 25 words). Reply with the sentence only — no preamble, no quotes.',
+                renderMessageLine(m), profileId, 'beat-backfill', signal,
+            ) || '').replace(/\s+/g, ' ').trim();
+        } catch { sentence = ''; }
+        if (sentence) {
+            beats.push({ msgIndex: idx, sentence });
+            addDebugLog('info', `[${runId}] Beat backfill: msg #${idx} got its sentence via a dedicated call`, {
+                subsystem: 'agent3', event: 'beat.backfill', data: { msgIndex: idx },
+            });
+        } else {
+            addDebugLog('info', `[${runId}] Beat backfill: dedicated call for msg #${idx} returned nothing — beat stays missing`);
+        }
+    }
+}
+
 function parseSheetBlock(text) {
-    const out = { summary: '', sceneMarker: null, beats: [], timeline: '', present: [], need: [], error: null };
+    const out = { summary: '', sceneMarker: null, beats: [], timeline: '', present: [], presentProvided: false, need: [], error: null };
     const raw = String(text ?? '').trim();
     if (!raw) {
         out.error = 'empty sheet block';
@@ -376,6 +474,9 @@ function parseSheetBlock(text) {
         const m = /^(SUMMARY|TIMELINE|PRESENT|NEED)\s*:\s*(.*)$/i.exec(line);
         if (m) {
             current = m[1].toUpperCase();
+            // A PRESENT header that appeared at all (even with an empty/"none"
+            // list) is an explicit snapshot — lets the agent CLEAR the room.
+            if (current === 'PRESENT') out.presentProvided = true;
             if (m[2].trim()) buf[current].push(m[2].trim());
             continue;
         }

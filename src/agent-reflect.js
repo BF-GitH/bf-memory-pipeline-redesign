@@ -173,9 +173,6 @@ function collectRecentMoments(databases) {
         const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : -1;
         const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : -1;
         if (av !== bv) return bv - av;
-        const as = Number.isInteger(a.fact.sceneNo) ? a.fact.sceneNo : -1;
-        const bs = Number.isInteger(b.fact.sceneNo) ? b.fact.sceneNo : -1;
-        if (as !== bs) return bs - as;
         return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
     });
     return out.slice(0, MAX_MOMENTS_FOR_CALLBACK);
@@ -245,9 +242,8 @@ function buildReflectInput({ databases, reevalCandidates = [], changedShelves = 
         const mLines = recentMoments.map(c => {
             const f = c.fact;
             const note = (typeof f.context === 'string' && f.context.trim()) ? f.context.trim() : String(f.value ?? '').trim();
-            const scene = Number.isInteger(f.sceneNo) ? ` (scene ${f.sceneNo}${f.sceneName ? `·${f.sceneName}` : ''})` : '';
             const tone = (typeof f.tone === 'string' && f.tone.trim()) ? ` (${f.tone.trim()})` : '';
-            return `[${c.id}]${scene} ${note.slice(0, 140)}${tone}`;
+            return `[${c.id}] ${note.slice(0, 140)}${tone}`;
         });
         parts.push(`## Recent moments (name 0-2 #CALLBACK echo-links between these by exact id; newest first)\n${mLines.join('\n')}`);
     }

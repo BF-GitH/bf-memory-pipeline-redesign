@@ -4,7 +4,7 @@ function computeNowContext() {
         const chat = SillyTavern.getContext()?.chat;
         if (Array.isArray(chat) && chat.length > 0) msgIndex = chat.length - 1;
     } catch {  }
-    return { msgIndex, sceneNo: null, storyNowMs: null };
+    return { msgIndex, storyNowMs: null };
 }
 
 let _turnCtxKey = '';

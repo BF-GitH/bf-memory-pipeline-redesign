@@ -1,6 +1,6 @@
 import { getSettings, setPipelineEnabled, addDebugLog, saveCurrentToActiveProfile } from './settings.js';
 import { ensurePopup, Popup, POPUP_TYPE, escapeHtml } from './ui-util.js';
-import { getMemorySheetText } from './turn-state.js';
+import { getMemorySheetText, getClosedScenes } from './turn-state.js';
 
 const MACRO_FACT_CAP = 40;        
 const MACRO_VALUE_CHARS = 120;    
@@ -269,6 +269,31 @@ function renderSheetHtml(text) {
         if (s.present) p.push('<div class="bf-mem-sheet-card"><div class="bf-mem-sheet-label"><i class="fa-solid fa-users"></i> Present</div><div class="bf-mem-sheet-val">' + sheetMarkdown(s.present) + '</div></div>');
         p.push('</div>');
     }
+
+    // Earlier (closed) scene cards — collapsed archive so past scenes stay
+    // browsable instead of living invisibly in chatMetadata. Newest first.
+    try {
+        const closed = getClosedScenes();
+        if (Array.isArray(closed) && closed.length > 0) {
+            p.push('<div class="bf-mem-sheet-section">');
+            p.push('<div class="bf-mem-sheet-section-head"><i class="fa-solid fa-clapperboard"></i> Earlier scenes <span class="bf-mem-sheet-count">' + closed.length + '</span></div>');
+            for (const sc of [...closed].reverse()) {
+                const beats = Array.isArray(sc?.beats) ? sc.beats : [];
+                const name = String(sc?.name || '').trim() || '(unnamed scene)';
+                const startTag = Number.isInteger(sc?.startMsg) && sc.startMsg >= 0 ? ' <span class="bf-mem-fact-tag">from #' + sc.startMsg + '</span>' : '';
+                p.push('<details class="bf-mem-fact">'
+                    + '<summary class="bf-mem-fact-sum"><span class="bf-mem-fact-key">' + escapeHtml(name) + '</span>'
+                    + '<span class="bf-mem-fact-preview">' + beats.length + ' beat(s)</span></summary>'
+                    + '<div class="bf-mem-fact-body">'
+                    + (beats.length
+                        ? '<ul class="bf-mem-sheet-beats">' + beats.map(b => '<li>' + escapeHtml(String(b?.sentence || '')) + '</li>').join('') + '</ul>'
+                        : '<div class="bf-mem-fact-detail">(no beats recorded)</div>')
+                    + startTag
+                    + '</div></details>');
+            }
+            p.push('</div>');
+        }
+    } catch {  }
 
     if (s.summary) {
         p.push('<div class="bf-mem-sheet-card bf-mem-sheet-summary">'
