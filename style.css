@@ -43,7 +43,7 @@
 }
 .bf-mem-review-group-header:first-child { margin-top: 0; }
 
-/* ELI5 "what does this do?" explainer boxes (Writer/Scribe tabs) */
+/* ELI5 "what does this do?" explainer boxes (Writer/Memory Agent tabs) */
 .bf-mem-eli5 {
     margin: 4px 0 12px;
     border: 1px solid rgba(109,179,255,0.35);

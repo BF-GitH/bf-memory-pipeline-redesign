@@ -27,7 +27,7 @@ const LOG_SUBSYSTEMS = new Set([
 const SUBSYSTEM_DISPLAY = {
     agent2: 'Writer',
     writer: 'Writer',
-    agent3: 'Scribe',
+    agent3: 'Memory Agent',
     agent4: 'Librarian',
     finder: 'Librarian',
 };

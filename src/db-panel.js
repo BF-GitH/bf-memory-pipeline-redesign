@@ -72,7 +72,7 @@ export async function showSpiderwebPopup() {
     if (connectedIdx.length === 0) {
         const msg = `<div class="bf-mem-db-browser"><h4>🕸 Memory Web</h4>
             <p>No connections to draw yet. You have <b>${totalFacts}</b> fact(s), but none are linked to each other.</p>
-            <p class="bf-mem-hint">Links form automatically as the Scribe records related facts (auto-linking) and during reflection. Keep chatting and they'll appear here.</p></div>`;
+            <p class="bf-mem-hint">Links form automatically as the Memory Agent records related facts (auto-linking) and during reflection. Keep chatting and they'll appear here.</p></div>`;
         await new Popup(msg, POPUP_TYPE.TEXT, '', { wide: true }).show();
         return;
     }
