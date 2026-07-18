@@ -487,6 +487,23 @@ function normalizeBeat(raw) {
     return { msgIndex: Number.isInteger(msgIndex) ? msgIndex : -1, sentence };
 }
 
+const SCENE_PRESENT_CAP = 16;
+
+function normalizePresent(raw) {
+    const out = [];
+    const seen = new Set();
+    for (const entry of (Array.isArray(raw) ? raw : [])) {
+        const n = String(entry ?? '').trim().replace(/^@/, '');
+        if (!n) continue;
+        const k = n.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(n);
+        if (out.length >= SCENE_PRESENT_CAP) break;
+    }
+    return out;
+}
+
 function normalizeScene(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const name = typeof raw.name === 'string' ? raw.name.trim() : '';
@@ -504,8 +521,9 @@ function normalizeScene(raw) {
             beats.push(b);
         }
     }
-    if (!name && beats.length === 0 && !Number.isInteger(startMsg)) return null;
-    return { startMsg: Number.isInteger(startMsg) ? startMsg : -1, name, beats };
+    const present = normalizePresent(raw.present);
+    if (!name && beats.length === 0 && present.length === 0 && !Number.isInteger(startMsg)) return null;
+    return { startMsg: Number.isInteger(startMsg) ? startMsg : -1, name, beats, present };
 }
 
 function normalizeSceneStore(raw) {
@@ -564,11 +582,30 @@ export function startScene({ startMsg = -1, name = '' } = {}) {
     const cur = store.current;
     if (cur && (cur.beats.length > 0 || cur.name)) store.closed.push(cur);
     const s = Math.floor(Number(startMsg));
-    store.current = { startMsg: Number.isInteger(s) ? s : -1, name: String(name || '').trim(), beats: [] };
+    store.current = { startMsg: Number.isInteger(s) ? s : -1, name: String(name || '').trim(), beats: [], present: [] };
     sceneStore = store;
     sceneStoreLoaded = true;
     saveSceneToMeta();
     return store.current;
+}
+
+// Who is physically in the current scene (agent-reported via the sheet's
+// PRESENT line). Replaces the whole list each time — presence is a snapshot,
+// not an accumulator. Auto-opens an unnamed scene card when none is active.
+export function setScenePresent(names) {
+    const present = normalizePresent(names);
+    const store = getSceneStore();
+    if (!store.current) store.current = { startMsg: -1, name: '', beats: [], present: [] };
+    store.current.present = present;
+    sceneStore = store;
+    sceneStoreLoaded = true;
+    saveSceneToMeta();
+    return present;
+}
+
+export function getScenePresent() {
+    const cur = getSceneStore().current;
+    return (cur && Array.isArray(cur.present)) ? cur.present : [];
 }
 
 // Append newly-settled beats to the current card, de-duping by msgIndex. Auto-opens
@@ -579,7 +616,7 @@ export function appendSceneBeats(beats) {
     const store = getSceneStore();
     if (!store.current) {
         const first = normalizeBeat(list[0]);
-        store.current = { startMsg: (first && first.msgIndex >= 0) ? first.msgIndex : -1, name: '', beats: [] };
+        store.current = { startMsg: (first && first.msgIndex >= 0) ? first.msgIndex : -1, name: '', beats: [], present: [] };
     }
     const cur = store.current;
     const seen = new Set(cur.beats.filter(b => b.msgIndex >= 0).map(b => b.msgIndex));

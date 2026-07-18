@@ -935,9 +935,10 @@ export function buildMemoryIndex(databases) {
     const byCatAspect = new Map();
     const bySubject = new Map();
     const byToken = new Map();
-    const bySceneNo = new Map(); 
+    const bySceneNo = new Map();
     const aspectCounts = new Map();
     let totalFacts = 0;
+    const nameReg = new Map();
 
     const add = (map, key, entry) => {
         if (!key) return;
@@ -956,6 +957,7 @@ export function buildMemoryIndex(databases) {
             const aspect = deriveAspect(fact);
             add(byCatAspect, `${catLower}||${aspect}`, entry);
             add(bySubject, deriveSubject(fact), entry);
+            collectFactNames(nameReg, fact);
             for (const tok of factTokens(fact)) add(byToken, tok, entry);
 
             if (Number.isInteger(fact.sceneNo) && fact.sceneNo >= 1) add(bySceneNo, fact.sceneNo, entry);
@@ -967,7 +969,87 @@ export function buildMemoryIndex(databases) {
             }
         }
     }
+    _nameRegistry = nameReg;
     return { byCatAspect, bySubject, byToken, bySceneNo, aspectCounts, totalFacts };
+}
+
+// ── CHARACTER NAME REGISTRY ──────────────────────────────────────────────────
+// Maps every name/alias a character has been referred to by → their canonical
+// subject token (the key prefix their facts live under), so "Trish Mitchells"
+// resolves to the same character as "Trish". Rebuilt as a side effect of
+// buildMemoryIndex (which already walks every fact); while empty, sameCharacter
+// falls back to first-name matching so nothing depends on build order.
+const NAME_ASPECTS = new Set([
+    'name', 'aliases', 'birth_name', 'true_name', 'codename', 'epithet',
+    'past_alias', 'middle_name', 'surname', 'identity', 'nickname',
+]);
+
+let _nameRegistry = new Map();
+
+function normCharName(s) {
+    return String(s || '').trim().toLowerCase()
+        .replace(/^@/, '')
+        .replace(/[_]+/g, ' ')
+        .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function registerNameInto(reg, name, subject) {
+    const n = normCharName(name);
+    if (!n || !subject) return;
+    if (!reg.has(n)) reg.set(n, subject);
+}
+
+function collectFactNames(reg, fact) {
+    const sc = normalizeScope(fact?.scope);
+    if (sc && sc !== 'character') return;
+    const subject = deriveSubject(fact);
+    if (!subject) return;
+    registerNameInto(reg, subject, subject);
+    for (const a of (Array.isArray(fact.aliases) ? fact.aliases : [])) registerNameInto(reg, a, subject);
+    const aspect = deriveAspect(fact);
+    if (!NAME_ASPECTS.has(aspect)) return;
+    const value = String(fact.value || '').trim();
+    if (!value || value.length > 80) return;
+    if (aspect === 'aliases' || aspect === 'past_alias') {
+        for (const part of value.split(/[,;/]|\baka\b/i)) registerNameInto(reg, part, subject);
+    } else {
+        registerNameInto(reg, value, subject);
+    }
+}
+
+// Direct registry lookup only — returns '' for unknown names (no guessing).
+export function lookupCharacterAlias(name) {
+    return _nameRegistry.get(normCharName(name)) || '';
+}
+
+// Immediate registration (e.g. right after an add_alias write) so resolution
+// works within the same run, before the index is next rebuilt.
+export function registerCharacterAlias(alias, canonicalToken) {
+    const token = String(canonicalToken || '').trim().toLowerCase();
+    if (!token) return;
+    registerNameInto(_nameRegistry, alias, token);
+}
+
+// Canonical subject token for any way of writing a character's name. Registry
+// hit wins (full phrase, then first name); otherwise the first name token is
+// the best guess — which also makes "Trish" match "Trish Mitchells" cold.
+export function resolveCharacterToken(name) {
+    const n = normCharName(resolveGenericSubjectToken(normCharName(name)));
+    if (!n) return '';
+    const direct = _nameRegistry.get(n);
+    if (direct) return direct;
+    const first = n.split(' ')[0];
+    return _nameRegistry.get(first) || first;
+}
+
+export function sameCharacter(a, b) {
+    const na = normCharName(a), nb = normCharName(b);
+    if (!na || !nb) return false;
+    if (na === nb) return true;
+    const ta = resolveCharacterToken(na);
+    return !!ta && ta === resolveCharacterToken(nb);
 }
 
 export async function getMemoryIndex() {

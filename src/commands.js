@@ -155,7 +155,7 @@ function parseFactLine(line) {
 }
 
 function parseSheetText(text) {
-    const out = { summary: '', rightNow: '', scene: '', sceneBeats: [], timeline: '', notes: '', precedence: '', sections: [] };
+    const out = { summary: '', rightNow: '', scene: '', sceneBeats: [], timeline: '', present: '', notes: '', precedence: '', sections: [] };
     let cur = null;
     let inScene = false; // collecting the stacked one-line beats under a Scene header
     const startSection = (label) => { cur = { label, facts: [] }; out.sections.push(cur); inScene = false; };
@@ -171,6 +171,7 @@ function parseSheetText(text) {
         if ((m = /^Right now:\s*(.*)$/i.exec(line))) { out.rightNow = m[1]; cur = null; inScene = false; continue; }
         if ((m = /^Scene:\s*(.*)$/i.exec(line))) { out.scene = m[1]; cur = null; inScene = true; continue; }
         if ((m = /^Timeline & place:\s*(.*)$/i.exec(line))) { out.timeline = m[1]; cur = null; inScene = false; continue; }
+        if ((m = /^Present:\s*(.*)$/i.exec(line))) { out.present = m[1]; cur = null; inScene = false; continue; }
         if ((m = /^Notes:\s*(.*)$/i.exec(line))) { out.notes = m[1]; cur = null; inScene = false; continue; }
         if (line.startsWith(SHEET_STATE_PREFIX)) { startSection('Current state'); continue; }
         if (line.startsWith(SHEET_CHRONO_PREFIX)) { startSection('Chronology'); continue; }
@@ -253,7 +254,7 @@ function renderSheetHtml(text) {
     p.push('<div class="bf-mem-sheet-pop">');
     p.push('<div class="bf-mem-sheet-title"><i class="fa-solid fa-file-lines"></i> BF Memory Sheet</div>');
 
-    if (s.scene || s.sceneBeats.length || s.timeline) {
+    if (s.scene || s.sceneBeats.length || s.timeline || s.present) {
         p.push('<div class="bf-mem-sheet-meta">');
         if (s.scene || s.sceneBeats.length) {
             let sceneVal = s.scene ? sheetMarkdown(s.scene) : '';
@@ -265,6 +266,7 @@ function renderSheetHtml(text) {
             p.push('<div class="bf-mem-sheet-card"><div class="bf-mem-sheet-label"><i class="fa-solid fa-location-dot"></i> Scene</div><div class="bf-mem-sheet-val">' + sceneVal + '</div></div>');
         }
         if (s.timeline) p.push('<div class="bf-mem-sheet-card"><div class="bf-mem-sheet-label"><i class="fa-solid fa-clock"></i> Timeline &amp; place</div><div class="bf-mem-sheet-val">' + sheetMarkdown(s.timeline) + '</div></div>');
+        if (s.present) p.push('<div class="bf-mem-sheet-card"><div class="bf-mem-sheet-label"><i class="fa-solid fa-users"></i> Present</div><div class="bf-mem-sheet-val">' + sheetMarkdown(s.present) + '</div></div>');
         p.push('</div>');
     }
 

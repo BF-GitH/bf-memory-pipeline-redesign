@@ -17,7 +17,7 @@ import {
 } from './recency.js';
 import { callAgentLLMWithTools } from './llm-call.js';
 import { executeMemoryTool } from './memory-tools.js';
-import { getStorySpine, getCurrentScene, startScene, appendSceneBeats } from './turn-state.js';
+import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent } from './turn-state.js';
 import { addDebugLog } from './settings.js';
 import * as host from './host.js';
 
@@ -45,6 +45,7 @@ To use a tool, reply with tool-call lines. Each tool call is ONE line of strict 
 {"tool":"read_facts","args":{"category":"People","keys":["monika_name","monika_mood"]}}
 {"tool":"write_fact","args":{"category":"People","key":"monika_mood","value":"...","note":"...","known_by":["Monika"],"aspect":"mood","importance":3}}
 {"tool":"search","args":{"query":"who owns the bakery"}}
+{"tool":"add_alias","args":{"name":"Trish","alias":"Trish Mitchells"}}
 
 After your reply, the system executes the calls and sends the results back as one user message starting with "TOOL RESULTS:". You may then call more tools or finish. You may emit several tool-call lines in one reply. Do NOT wrap calls in markdown fences; do NOT pretty-print the JSON across lines.
 
@@ -54,6 +55,7 @@ TOOLS:
 - read_facts {category, keys[]} — the full stored line for each requested key.
 - search {query} — keyword search across the whole store.
 - write_fact {category, key, value, note?, known_by?, aspect?, importance?, kind?} — store one fact (or update the key's current value).
+- add_alias {name, alias} — record that two names are the SAME character (e.g. "Trish" is later introduced in full as "Trish Mitchells"). From then on both names resolve to one character everywhere: her existing memories surface when either name comes up, and who-knows lists match under either name. BEFORE writing facts for a seemingly NEW character, search their first name — if they already exist under a shorter/older name, call add_alias and keep using the EXISTING key prefix instead of starting a duplicate.
 
 HARD LIMITS: at most 6 rounds (replies by you) and 20 tool calls per session. Be economical: usually one read round (list/search what's relevant), then ONE final reply with your write_fact lines followed by the #SHEET block.
 
@@ -66,9 +68,11 @@ SUMMARY: <a FRESH, situational high-level recap written for THIS upcoming beat �
 SCENE_MARKER: <startMsgIndex> | <short scene name>
 BEAT: <msgIndex> | <one past-tense sentence for that message>
 TIMELINE: <the current in-story date and time; WHERE the characters physically are right now; and HOW LONG the main characters have known each other (the age of their relationship)>
+PRESENT: <comma-separated names of every character physically in the current scene, e.g. "Maria, Tom">
 NEED: Category/key, Category/key, ...
 
 - SUMMARY is REQUIRED. TIMELINE should almost always be present. NEED may be omitted.
+- PRESENT: keep it CURRENT every turn — everyone physically in the scene right now (main pair AND named NPCs), nobody who has left. It drives two things: it is the DEFAULT known_by for facts you store without an explicit list, and stored memories known to a listed character become visible to the storyteller while that character is in the scene.
 - SCENE_MARKER: include ONLY when a NEW scene BEGINS this run (a change of place, a time-skip, or a major shift). Give the chat index where it starts and a 2-5 word name. Omit it entirely while the current scene continues — a new marker closes the previous scene card and opens a fresh one.
 - BEAT: emit ONE line per NEWLY-settled message this run (use its \`#\` index), each a single terse past-tense sentence capturing what happened in that message. These stack into the current scene's card. Do NOT re-emit BEAT lines for messages you already logged on an earlier run — only the new ones.
 - NEED lists ONLY the Category/key refs THIS reply actually draws on (exact refs you VERIFIED with the tools — never invented): the people present and their current state, the active relationships, and the open threads and history THIS scene touches. Produce a UNIQUE, focused set each turn — do NOT re-list the stable premise/identity facts, because the system ALWAYS injects those for you (the premise floor). The store keeps everything forever; if a later scene needs an older fact, NEED it that turn (or find it with list_keys/search). The system renders the facts you list onto the sheet for you.
@@ -86,7 +90,7 @@ Store LASTING facts — anything the STORY still tracks 50 messages from now. Be
 - importance: 1-5 (5 = core identity like a name/species, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial).
 - kind: \`trait\` (durable identity), \`state\` (a durable-but-changeable condition — a job, an injury, who holds a key object, an ongoing goal), \`event\` (something that happened), \`moment\` (a significant emotional scene beat, remembered with feeling). (Do NOT use \`state\` for transient mood or the room-of-the-moment — those are excluded; see below.)
 - note: optional short prose — a meaningful verbatim quote, a disambiguation, or a one-line summary of a complex beat. Keep the atomic value TOO.
-- known_by: ONLY for secrets/restricted knowledge (list who knows). Omit for anything openly shared — it defaults to the present pair.
+- known_by: list EVERYONE who knows this fact — the characters present in the scene when it came up PLUS anyone the statement itself implies knows it: the source of the information, and the participants who lived it. Example: at the police station Maria tells Tom that Martha told her that James had an affair with Trish → known_by:["Maria","Tom","Martha","James","Trish"] — Martha (the source) and James and Trish (they lived it) count as knowers even if they have never appeared in the chat before. Omitting known_by defaults to the characters currently PRESENT in the scene, so an explicit list is only needed when the knowers differ from the room (secrets, second-hand reveals, absent participants).
 - RELATIONSHIPS: file pair dynamics under Relationships with a stable pair key (\`monika_bernd_status\`, \`monika_bernd_trust\`) and an abstract aspect (trust/romance/debt/status_of_relationship). Update the pair's single status record when the dynamic MATERIALLY changes.
 
 DO NOT STORE: transient poses/moods, current emotional weather, scene atmosphere, the room they happen to be in this moment, food eaten, items momentarily in hand, [OOC:] meta, reported/historical speech, negative facts ("no favorite revealed"). Those ambient here-and-now details belong on the SCENE and TIMELINE lines of the sheet, NOT in the store.
@@ -224,6 +228,10 @@ export async function runMemoryAgent({
         try {
             if (parsedSheet.sceneMarker) startScene(parsedSheet.sceneMarker);
             if (parsedSheet.beats.length > 0) appendSceneBeats(parsedSheet.beats);
+            // PRESENT is a snapshot of who is in the scene right now; replace,
+            // don't accumulate. Applied after startScene so a new scene gets a
+            // fresh list instead of inheriting the previous room's people.
+            if (parsedSheet.present.length > 0) setScenePresent(parsedSheet.present);
         } catch (e) {
             addDebugLog('fail', `[${runId}] Scene accumulator failed: ${e?.message || e}`);
         }
@@ -324,13 +332,13 @@ function buildAgentUserPrompt({
 }
 
 function parseSheetBlock(text) {
-    const out = { summary: '', sceneMarker: null, beats: [], timeline: '', need: [], error: null };
+    const out = { summary: '', sceneMarker: null, beats: [], timeline: '', present: [], need: [], error: null };
     const raw = String(text ?? '').trim();
     if (!raw) {
         out.error = 'empty sheet block';
         return out;
     }
-    const buf = { SUMMARY: [], TIMELINE: [], NEED: [] };
+    const buf = { SUMMARY: [], TIMELINE: [], PRESENT: [], NEED: [] };
     let current = null;
     for (const rawLine of raw.split('\n')) {
         const line = rawLine.trim();
@@ -365,7 +373,7 @@ function parseSheetBlock(text) {
             continue;
         }
 
-        const m = /^(SUMMARY|TIMELINE|NEED)\s*:\s*(.*)$/i.exec(line);
+        const m = /^(SUMMARY|TIMELINE|PRESENT|NEED)\s*:\s*(.*)$/i.exec(line);
         if (m) {
             current = m[1].toUpperCase();
             if (m[2].trim()) buf[current].push(m[2].trim());
@@ -376,6 +384,12 @@ function parseSheetBlock(text) {
     }
     out.summary = buf.SUMMARY.join(' ').trim();
     out.timeline = buf.TIMELINE.join(' ').trim();
+
+    for (const name of buf.PRESENT.join(',').split(',')) {
+        const n = name.trim().replace(/^[-*]\s*/, '');
+        if (!n || /^\(?none\)?$/i.test(n)) continue;
+        out.present.push(n);
+    }
 
     for (const ref of buf.NEED.join(',').split(',')) {
         const r = ref.trim().replace(/^[-*]\s*/, '');
@@ -508,6 +522,10 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         lines.push(`Scene: ${sceneLine}`);
     }
     if (timeline) lines.push(`Timeline & place: ${timeline}`);
+    try {
+        const present = getScenePresent();
+        if (present.length > 0) lines.push(`Present: ${present.join(', ')}`);
+    } catch {  }
     lines.push(buildPrecedencePreamble(nowCtx));
 
     const renderSection = (header, sectionRows) => {

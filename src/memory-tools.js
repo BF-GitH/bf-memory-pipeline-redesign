@@ -13,14 +13,17 @@ import {
     normalizeAspect,
     canonicalizeLeafSurface,
     deriveAspect,
+    lookupCharacterAlias,
+    registerCharacterAlias,
 } from './database.js';
 import { isFactVisible, buildFactLine, retrieveFacts, formatFactsForWriter, extractContextKeywords } from './fact-retrieval.js';
+import { getScenePresent } from './turn-state.js';
 import { getTurnNowContext } from './recency.js';
 import { addDebugLog } from './settings.js';
 import { wordTokens, keyToken } from './tokenize.js';
 import * as host from './host.js';
 
-const KNOWN_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'write_fact', 'search'];
+const KNOWN_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'write_fact', 'search', 'add_alias'];
 
 const LIST_KEYS_CAP = 80;
 
@@ -158,7 +161,7 @@ export function parseAgentReply(text) {
                 if (!out.sheet) {
                     let start = -1;
                     for (let k = 0; k < i; k++) {
-                        if (/^\s*(SUMMARY|SCENE|TIMELINE|NEED|NOTES)\s*:/i.test(lines[k])) { start = k; break; }
+                        if (/^\s*(SUMMARY|SCENE|TIMELINE|PRESENT|NEED|NOTES)\s*:/i.test(lines[k])) { start = k; break; }
                     }
                     if (start >= 0) {
                         out.sheet = lines.slice(start, i)
@@ -184,7 +187,7 @@ export function parseAgentReply(text) {
     if (!out.done && out.calls.length === 0 && out.malformed.length === 0) {
         let start = -1;
         for (let i = 0; i < lines.length; i++) {
-            if (/^\s*(SUMMARY|SCENE|TIMELINE|NEED|NOTES)\s*:/i.test(lines[i])) { start = i; break; }
+            if (/^\s*(SUMMARY|SCENE|TIMELINE|PRESENT|NEED|NOTES)\s*:/i.test(lines[i])) { start = i; break; }
         }
         if (start >= 0) {
             const body = lines.slice(start).filter(l => !/^\s*```/.test(l)).join('\n').trim();
@@ -205,6 +208,7 @@ export async function executeMemoryTool(call, ctx) {
             case 'read_facts': return execReadFacts(args, ctx);
             case 'search': return await execSearch(args, ctx);
             case 'write_fact': return execWriteFact(args, ctx);
+            case 'add_alias': return execAddAlias(args, ctx);
             default: return `ERROR: unknown tool "${tool}"`;
         }
     } catch (e) {
@@ -333,6 +337,97 @@ function subjectFromKey(key) {
     return us > 0 ? k.slice(0, us) : k;
 }
 
+// If the key's leading token(s) are a REGISTERED alias of an existing character
+// ("trish_mitchells_affair" or "patricia_job" where Patricia ≡ Trish), rewrite
+// the prefix to the canonical subject token so all facts about one character
+// share one subject. Only fires on explicit registry knowledge — unknown names
+// pass through untouched.
+function resolveAliasKeyPrefix(key) {
+    const us = key.indexOf('_');
+    const first = us > 0 ? key.slice(0, us) : key;
+    const tail = us > 0 ? key.slice(us + 1) : '';
+    if (tail) {
+        // Two leading tokens may be a full name ("trish_mitchells_affair").
+        const us2 = tail.indexOf('_');
+        const second = us2 > 0 ? tail.slice(0, us2) : '';
+        const rest = us2 > 0 ? tail.slice(us2 + 1) : '';
+        if (second && rest) {
+            const canonTwo = lookupCharacterAlias(`${first} ${second}`);
+            if (canonTwo) return `${canonTwo}_${rest}`;
+        }
+    }
+    const canon = lookupCharacterAlias(first);
+    if (canon && canon !== first) return tail ? `${canon}_${tail}` : canon;
+    return key;
+}
+
+// add_alias {name, alias} — record that two names are the SAME character.
+// Persists as a People fact "<subject>_aliases" (so it survives, exports and
+// snapshots like any other fact) and feeds the in-memory name registry that
+// knownBy checks, retrieval and key resolution consult.
+function execAddAlias(args, ctx) {
+    if (!ctx || typeof ctx !== 'object' || !ctx.databases) return 'ERROR: add_alias has no database context';
+    if (!(ctx.touchedCategories instanceof Set)) ctx.touchedCategories = new Set();
+    const name = String(args?.name || '').trim().replace(/^@/, '');
+    const alias = String(args?.alias || '').trim().replace(/^@/, '');
+    if (!name || !alias) return 'ERROR: add_alias requires args.name and args.alias';
+    if (name.toLowerCase() === alias.toLowerCase()) return 'ERROR: name and alias are identical';
+
+    // Canonical subject: whichever side the store already knows, else the
+    // first-name token of "name".
+    const token = lookupCharacterAlias(name)
+        || lookupCharacterAlias(alias)
+        || keyToken(name.split(/\s+/)[0]);
+    if (!token) return 'ERROR: add_alias could not derive a subject token';
+
+    const category = 'People';
+    if (!ctx.databases[category]) ctx.databases[category] = createEmptyDatabase(category);
+    const db = ctx.databases[category];
+    const key = `${token}_aliases`;
+
+    const existing = findFactMatch(db, key);
+    const merged = new Set();
+    const addName = (n) => { const t = String(n || '').trim(); if (t) merged.add(t); };
+    if (existing) {
+        String(existing.value || '').split(/[,;]/).forEach(addName);
+        (Array.isArray(existing.aliases) ? existing.aliases : []).forEach(addName);
+    }
+    addName(name);
+    addName(alias);
+
+    const list = [...merged];
+    const sourceIndex = Number.isInteger(ctx.sourceIndex) ? ctx.sourceIndex : null;
+    const fact = {
+        key,
+        value: list.join(', '),
+        tags: [],
+        aliases: list,
+        knownBy: [],
+        relationships: { primary: [], secondary: [], tertiary: [] },
+        source: sourceIndex !== null ? `msg_${sourceIndex}` : `agent_${ctx.runId || 'run'}`,
+        importance: 4,
+        kind: 'trait',
+        aspect: 'aliases',
+        subject: token,
+        scope: 'character',
+        context: `Names used for the same character: ${list.join(', ')}`,
+    };
+    if (sourceIndex !== null) fact.validAt = sourceIndex;
+    if (ctx.srcId) fact.srcId = ctx.srcId;
+
+    upsertFact(db, fact);
+    ctx.touchedCategories.add(category);
+
+    // Make the link resolvable immediately (same run), before the memory index
+    // is next rebuilt.
+    for (const n of list) registerCharacterAlias(n, token);
+
+    addDebugLog('info', `Memory Agent add_alias: "${alias}" ≡ "${name}" (subject "${token}")`, {
+        subsystem: 'agent3', event: 'memtool.add_alias', data: { token, names: list, runId: ctx.runId || '' },
+    });
+    return `OK "${alias}" and "${name}" now resolve to the same character (People/${key}: ${list.join(', ')})`;
+}
+
 function scopeFromCategory(category) {
     switch (String(category || '').toLowerCase()) {
         case 'events': return 'event';
@@ -364,12 +459,20 @@ function execWriteFact(args, ctx) {
 
     const names = currentNames();
     key = resolveGenericKeyPrefix(key, names);
+    key = resolveAliasKeyPrefix(key);
 
     let knownBy = (Array.isArray(args?.known_by) ? args.known_by : [])
         .map(n => String(n ?? '').trim().replace(/^@/, '').trim())
         .filter(Boolean);
     if (knownBy.length === 0) {
-        knownBy = [...new Set([names.charName, names.userName].filter(Boolean))];
+        // No explicit witness list: default to everyone physically in the scene
+        // (agent-reported PRESENT line), not just the main char/user pair —
+        // NPCs in the room heard it too. The pair is the last resort only.
+        let present = [];
+        try { present = getScenePresent(); } catch { present = []; }
+        knownBy = present.length > 0
+            ? [...new Set(present)]
+            : [...new Set([names.charName, names.userName].filter(Boolean))];
     } else {
         knownBy = [...new Set(knownBy)];
     }

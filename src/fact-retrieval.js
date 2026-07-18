@@ -1,4 +1,5 @@
-import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sameCharacter } from './database.js';
+import { getScenePresent } from './turn-state.js';
 import { addDebugLog, getSettings } from './settings.js';
 import { recencyTail, getTurnNowContext } from './recency.js';
 import { wordTokens, tokenSet, cleanWord, isCapitalizedWord, cjkTokens } from './tokenize.js';
@@ -33,9 +34,9 @@ const FALLBACK_MAPPINGS = {
 
 export function isFactVisible(fact, names = null) {
     const kb = (fact && fact.knownBy) || [];
-    if (kb.length === 0) return true; 
+    if (kb.length === 0) return true;
     const s = getSettings();
-    if (s && s.enforceKnownBy === false) return true; 
+    if (s && s.enforceKnownBy === false) return true;
     let charName = names?.charName;
     let userName = names?.userName;
     if (charName === undefined || userName === undefined) {
@@ -43,15 +44,22 @@ export function isFactVisible(fact, names = null) {
         charName = ctx.characters?.[ctx.characterId]?.name || '';
         userName = ctx.name1 || '';
     }
-    const cn = String(charName).trim().toLowerCase();
-    const un = String(userName).trim().toLowerCase();
+    const cn = String(charName).trim();
+    const un = String(userName).trim();
+    // A fact is visible when ANYONE currently in the scene knows it — the main
+    // pair, or any NPC on the scene's PRESENT list. Name comparison is
+    // alias-aware (sameCharacter), so "Trish" on the knownBy list matches a
+    // scene where she appears as "Trish Mitchells".
+    let present = [];
+    try { present = getScenePresent(); } catch { present = []; }
     return kb.some(name => {
-        const n = String(name).trim().toLowerCase();
+        const n = String(name).trim();
         if (!n) return false;
-        if (n === '{{char}}' || n === '{{user}}' || n === 'everyone' || n === 'all') return true;
-        if (cn && n === cn) return true;
-        if (un && n === un) return true;
-        return false;
+        const nl = n.toLowerCase();
+        if (nl === '{{char}}' || nl === '{{user}}' || nl === 'everyone' || nl === 'all') return true;
+        if (cn && sameCharacter(n, cn)) return true;
+        if (un && sameCharacter(n, un)) return true;
+        return present.some(p => sameCharacter(n, p));
     });
 }
 
