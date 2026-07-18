@@ -141,71 +141,46 @@ async function showMessageFacts(mesId) {
         if (typeof toastr !== 'undefined') toastr.info('Popup API unavailable on this build.', 'BF Memory');
         return;
     }
+    // Same renderer + Edit/Delete handler the Memory Sheet popup uses, so the
+    // per-message view is the identical expandable fact list.
+    const { renderStoredFactHtml, onSheetPopupClick } = await import('./commands.js');
     const rows = await collectFactsForMessage(mesId);
 
-    const body = rows.length === 0
-        ? '<div class="bf-mem-summary-empty">No stored facts came from this message. Shift+click the brain icon to (re-)run extraction.</div>'
-        : rows.map(({ category, fact }) => {
-            const val = String(fact.value ?? '').trim();
-            const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
-            const shown = val || note;
-            return `<div class="bf-mem-fact-item" data-cat="${escapeHtmlMsg(category)}" data-key="${escapeHtmlMsg(fact.key)}" style="display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid var(--SmartThemeBorderColor,#444);">
-                <span style="flex:1;min-width:0;"><span class="bf-mem-category">${escapeHtmlMsg(category)}</span> <strong>${escapeHtmlMsg(fact.key)}</strong>${shown ? ` = ${escapeHtmlMsg(shown.slice(0, 160))}` : ''}</span>
-                <button class="bf-mem-msgfact-del menu_button" data-cat="${escapeHtmlMsg(category)}" data-key="${escapeHtmlMsg(fact.key)}" title="Delete this fact">✕</button>
-            </div>`;
-        }).join('');
+    let body;
+    if (rows.length === 0) {
+        body = '<div class="bf-mem-summary-empty">No stored facts came from this message. Shift+click the brain icon to (re-)run extraction.</div>';
+    } else {
+        // Group into per-category sections like the sheet popup does.
+        const byCat = new Map();
+        for (const { category, fact } of rows) {
+            if (!byCat.has(category)) byCat.set(category, []);
+            byCat.get(category).push(fact);
+        }
+        const parts = [];
+        for (const [category, facts] of byCat) {
+            parts.push('<div class="bf-mem-sheet-section">');
+            parts.push(`<div class="bf-mem-sheet-section-head">${escapeHtmlMsg(category)} <span class="bf-mem-sheet-count">${facts.length}</span></div>`);
+            for (const fact of facts) parts.push(renderStoredFactHtml(category, fact));
+            parts.push('</div>');
+        }
+        body = parts.join('');
+    }
 
-    const html = `<div class="bf-mem-msgfacts" data-mesid="${mesId}">
-        <h3>Facts from message #${mesId} <span style="opacity:0.6;font-weight:normal;">(${rows.length})</span></h3>
-        <p style="opacity:0.7;font-size:0.9em;margin:2px 0 8px;">What the Scribe learned from this line. Delete anything wrong. Shift+click the brain icon to re-extract.</p>
-        <div class="bf-mem-msgfacts-list">${body}</div>
+    // The bf-mem-sheet-pop wrapper is what scopes onSheetPopupClick and pulls
+    // in the sheet popup's CSS.
+    const html = `<div class="bf-mem-sheet-pop bf-mem-msgfacts" data-mesid="${mesId}">
+        <div class="bf-mem-sheet-title"><i class="fa-solid fa-brain"></i> Facts from message #${mesId} <span class="bf-mem-sheet-count">${rows.length}</span></div>
+        <p style="opacity:0.7;font-size:0.9em;margin:2px 0 8px;">What the Scribe learned from this line. Expand a fact to edit or delete it. Shift+click the brain icon to re-extract.</p>
+        ${body}
     </div>`;
 
     const popup = new _Popup(html, _POPUP_TYPE.TEXT, '', { okButton: 'Close', wide: true, allowVerticalScrolling: true });
-    const shown = popup.show();
-    const root = popup.dlg || popup.content || document;
-
-    root.querySelector?.('.bf-mem-msgfacts-list')?.addEventListener('click', async (ev) => {
-        const btn = ev.target.closest('.bf-mem-msgfact-del');
-        if (!btn) return;
-        const category = btn.getAttribute('data-cat');
-        const key = btn.getAttribute('data-key');
-        if (!category || !key) return;
-        btn.disabled = true;
-        try {
-            const { getAllDatabases, removeFact, saveDatabase } = await import('./database.js');
-            const dbs = await getAllDatabases();
-            const db = dbs[category];
-            let deleted = false;
-            if (db) { removeFact(db, key); await saveDatabase(db); deleted = true; }
-
-            const row = btn.closest('.bf-mem-fact-item');
-            if (row) row.remove();
-            addDebugLog('info', `Per-msg viewer: deleted ${category}/${key} (from msg ${mesId})`, {
-                subsystem: 'settings', event: 'fact.deleted', actor: 'USER', data: { category, key, mesId },
-            });
-
-            // Mirror the delete into the active per-chat profile so a chat-switch
-            // autoload doesn't resurrect it from settings.json (IDB-only writes are
-            // wiped and reloaded from the profile). Same helper the pipeline runs
-            // after a committed memory run.
-            if (deleted) {
-                try {
-                    const { saveCurrentToActiveProfile } = await import('./settings.js');
-                    await saveCurrentToActiveProfile();
-                } catch (mirrorErr) {
-                    addDebugLog('fail', `Per-msg viewer: failed to mirror delete of ${category}/${key} to active profile: ${mirrorErr.message || mirrorErr}`);
-                }
-            }
-            if (typeof toastr !== 'undefined') toastr.success(`Deleted ${category}/${key}`, 'BF Memory', { timeOut: 2000 });
-        } catch (err) {
-            btn.disabled = false;
-            addDebugLog('fail', `Per-msg viewer delete failed for ${category}/${key}: ${err.message || err}`);
-            if (typeof toastr !== 'undefined') toastr.error(`Delete failed: ${err.message || err}`, 'BF Memory');
-        }
-    });
-
-    await shown;
+    document.addEventListener('click', onSheetPopupClick, true);
+    try {
+        await popup.show();
+    } finally {
+        document.removeEventListener('click', onSheetPopupClick, true);
+    }
 }
 
 function injectAllIcons() {

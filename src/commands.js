@@ -1,4 +1,4 @@
-import { getSettings, setPipelineEnabled, addDebugLog } from './settings.js';
+import { getSettings, setPipelineEnabled, addDebugLog, saveCurrentToActiveProfile } from './settings.js';
 import { ensurePopup, Popup, POPUP_TYPE, escapeHtml } from './ui-util.js';
 import { getMemorySheetText } from './turn-state.js';
 
@@ -227,6 +227,26 @@ function renderFact(f) {
         + '</details>';
 }
 
+// Render one REAL stored fact (from database.js) with the exact same expandable
+// <details> UI the Memory Sheet popup uses — key + preview in the summary,
+// value/note, tags, ref and Edit/Delete controls in the body. Used by the
+// per-message brain-icon popup so both viewers look and behave identically.
+export function renderStoredFactHtml(category, fact) {
+    const val = String(fact?.value ?? '').trim();
+    const note = String(fact?.context ?? '').trim();
+    const detail = val && note ? `${val}\n*${note}*` : (val || note);
+    const knownBy = Array.isArray(fact?.knownBy) ? fact.knownBy.join(', ') : String(fact?.knownBy || '');
+    const key = String(fact?.key || '').trim();
+    return renderFact({
+        knownBy,
+        category: String(category || '').trim(),
+        key,
+        ref: `${String(category || '').trim()}/${key}`,
+        detail,
+        raw: '',
+    });
+}
+
 function renderSheetHtml(text) {
     const s = parseSheetText(text);
     const p = [];
@@ -287,6 +307,18 @@ async function resolveStoredFact(category, key) {
     return { cat, db, fact };
 }
 
+// Mirror an IDB write into the active per-chat profile so a chat-switch
+// autoload doesn't resurrect the old state from settings.json (IDB-only writes
+// are wiped and reloaded from the profile). Same helper the pipeline runs
+// after a committed memory run.
+async function mirrorToActiveProfile(what) {
+    try {
+        await saveCurrentToActiveProfile();
+    } catch (err) {
+        addDebugLog('fail', `Sheet popup: failed to mirror ${what} to active profile: ${err?.message || err}`);
+    }
+}
+
 async function deleteSheetFact(factEl, btn, category, key) {
     // Two-step confirm on the button itself — no nested modal.
     if (btn.dataset.armed !== '1') {
@@ -308,6 +340,7 @@ async function deleteSheetFact(factEl, btn, category, key) {
         if (!db) { toast('warning', `Category "${category}" not in store`); return; }
         removeFact(db, fact ? fact.key : key);
         await saveDatabase(db);
+        await mirrorToActiveProfile(`delete of ${cat}/${fact ? fact.key : key}`);
         factEl.remove();
         addDebugLog('info', `Sheet popup: deleted fact ${cat}/${fact ? fact.key : key}`, {
             subsystem: 'settings', event: 'sheet.fact.delete', actor: 'USER', data: { category: cat, key: fact ? fact.key : key },
@@ -378,6 +411,7 @@ async function editSheetFact(factEl, category, key) {
             if (changed) {
                 fact.lastUpdated = Date.now();
                 await saveDatabase(db);
+                await mirrorToActiveProfile(`edit of ${cat}/${fact.key}`);
                 addDebugLog('info', `Sheet popup: edited fact ${cat}/${fact.key}`, {
                     subsystem: 'settings', event: 'sheet.fact.edit', actor: 'USER', data: { category: cat, key: fact.key },
                 });
@@ -395,8 +429,9 @@ async function editSheetFact(factEl, category, key) {
 }
 
 // One delegated handler for every Edit/Delete button inside the sheet popup.
-// Capture phase so we run before the <details> toggles.
-function onSheetPopupClick(e) {
+// Capture phase so we run before the <details> toggles. Exported so the
+// per-message brain-icon popup can reuse it for its identical fact rows.
+export function onSheetPopupClick(e) {
     const editBtn = e.target.closest?.('.bf-mem-fact-edit');
     const delBtn = e.target.closest?.('.bf-mem-fact-del');
     const btn = editBtn || delBtn;
