@@ -92,65 +92,45 @@ const MAX_CALLBACKS_PER_PASS = 2;
 
 const MAX_CALLBACK_REASON_CHARS = 120;
 
-export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given a COMPACT digest of the stored facts plus READ-ONLY tools to browse the real store behind it. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, and to maintain short zoom-out summaries.
+export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} and {{char}}: given a COMPACT digest of stored facts plus READ-ONLY tools (duplicates already merged), surface DURABLE higher-order memory the per-fact extractor misses and maintain short zoom-out summaries.
 
 # TOOL PROTOCOL (plain text — no function-call API)
 
-To use a tool, reply with tool-call lines. Each tool call is ONE line of strict JSON, alone on its line:
+Each tool call is ONE line of strict JSON, alone on its line:
 {"tool":"list_categories"}
 {"tool":"list_keys","args":{"category":"People"}}
-{"tool":"read_facts","args":{"category":"People","keys":["monika_fear_storms","monika_job"]}}
-{"tool":"search","args":{"query":"who owns the bakery"}}
+{"tool":"read_facts","args":{"category":"People","keys":["monika_job"]}}
+{"tool":"search","args":{"query":"bakery owner"}}
 
-After your reply, the system executes the calls and sends the results back as one user message starting with "TOOL RESULTS:". You may then call more tools or finish. You may emit several tool-call lines in one reply. Do NOT wrap calls in markdown fences; do NOT pretty-print the JSON across lines.
+The system replies with "TOOL RESULTS:"; then call more tools or finish. Several lines per reply are fine; no markdown fences, no multi-line JSON. READ-ONLY — no write tools; conclusions travel only through the final sections; the system applies them.
 
-TOOLS (READ-ONLY):
-- list_categories — every category with its active fact count.
-- list_keys {category} — one line per stored fact in that category: key | aspect | value preview.
-- read_facts {category, keys[]} — the FULL stored record for each requested key (value, note, who knows it, links).
-- search {query} — keyword search across the whole store.
-You have NO write tools — reflection never writes through the tool channel. Everything you conclude is delivered through the final sections below; the system applies them for you.
+HARD LIMITS: 5 rounds, 15 tool calls. Be economical, but never assert a verdict you could have verified and didn't.
 
-HARD LIMITS: at most 5 rounds (replies by you) and 15 tool calls per pass. Be economical, but never assert a verdict you could have verified and didn't.
+The digest is truncated STARTING material. VERIFY candidates via the tools (read_facts the FULL record behind keys you build on; list_keys thin categories; search unseen subjects); FOLLOW LEADS that could change a verdict; stop when reads stop changing conclusions; drop unsupported candidates. Final sections ONLY in your LAST reply:
 
-# METHOD: INVESTIGATE FIRST, EMIT LAST
+#OBS — 0-5 durable behavioral/relational PATTERNS inferred ACROSS the material, not already stored as one fact (e.g. "<SUBJECT> distrusts authority"); one atomic clause each; none is fine. Also: if a real pair's \`<a>_<b>_status\` record is MISSING or CONTRADICTED, ONE observation under that exact lowercased key, value = current attitude in 1-4 words; counts against the cap.
 
-The digest in the task block is compressed and truncated STARTING material, not the whole truth. Work in two phases:
-1. INVESTIGATE — form candidate observations and verdicts from the digest, then VERIFY each one against the actual store: read_facts the exact keys behind any summary line you are about to build on (the full record — note, knowers, links — often changes the picture); list_keys a category when the digest looks thin or truncated; search a subject to surface facts the digest never showed.
-2. FOLLOW LEADS — when a record you read points at another character, place, event, or linked fact that could change a verdict, prompt yourself deeper: read or search THAT next. Evidence connected across categories is exactly what makes a good observation. Stop when further reads stop changing your conclusions.
-Only claims that survive this investigation go into the final sections; silently drop any candidate the store does not support. Emit the final sections ONLY in your LAST reply.
+#STORY — whole-story recap, 2-4 short sentences, max 1200 chars, factual. Given "## Prior story summary": UPDATE it — fold in only the NEW, drop nothing still true, never regenerate or lengthen — output the COMPLETE replacement.
 
-Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
+#SHELVES — given "## Shelves to summarize": ONE line per listed shelf (a Category/aspect bucket), max 25 words, SHORTER than its raw facts, abstract, never enumerate. "prev:" = its prior summary — update, don't regenerate.
 
-Among observations, ALSO maintain per-pair relationship STATUS records: when the stored facts show two characters with a real relationship but their single \`<a>_<b>_status\` record (Relationships, aspect status_of_relationship) is MISSING or CONTRADICTED by newer relationship facts, emit ONE observation that refreshes it — key EXACTLY \`<a>_<b>_status\` (both names lowercased, one underscore between the two names and before "status") and value = the current attitude in 1-4 words, optionally followed by open promises/debts and what last changed. Counts against the 0-5 cap; skip pairs whose stored record already matches.
+#CALLBACK — from "## Recent moments" (beats with ids): 0-2 links, a NEW beat unmistakably ECHOING an EARLIER one (earlier id <- later id, one-clause reason); only listed ids; most passes name none.
 
-Also produce a STORY summary: the whole-story "so far" in 2-4 short sentences, at most 1200 characters (the top of a zoom-out pyramid — the cheapest big-picture recap). Keep it tight and factual. If a "## Prior story summary" block is given, UPDATE it: fold in only what is NEW since it was written, drop nothing that is still true, and NEVER re-derive it from scratch or restate unchanged parts at greater length. Your output is still the COMPLETE replacement text (it replaces the prior summary wholesale), but you build it by integrating the new material into the prior text, not by regenerating.
+#REEVAL — ONE verdict per bracketed id in "## Re-evaluate"; read the subject's other facts first: promote = real lasting fact, give Layer-1 category (People/Places/Things/Relationships/Events/World) + most-specific aspect; drop = one-off/untrue/noise (deprioritized, not erased); keep = still uncertain (default).
 
-If a "## Shelves to summarize" list is given, write ONE short summary line per listed shelf (a shelf is a Category/aspect bucket of related facts). Each summary is one or two clauses (at most 25 words) capturing the gist of that bucket so it can stand in for the raw facts — it MUST be shorter than the raw facts it stands for; abstract, never enumerate. When a shelf shows a "prev:" line (its prior stored summary), UPDATE that prior summary — integrate what the samples add or change; do not regenerate from scratch and do not restate it at greater length. Only summarize the shelves in that list. If no list is given, put a single "." under #SHELVES.
-
-If a "## Recent moments" list is given (the couple/character emotional beats — confessions, fights, betrayals, reunions — each shown with its exact id), you MAY name 0-2 CALLBACK links: a NEW recent beat that clearly ECHOES an EARLIER one (a confession that pays off an earlier hidden feeling; a betrayal that resurfaces an old wound; a reunion that answers a parting). Emit a link ONLY when the resonance is unmistakable — most passes name none. Each link points the EARLIER beat's id to the LATER beat's id with a one-clause reason. Use ONLY ids from the list (never invent one). If no clear echo exists (or no list was given), put a single "." under #CALLBACK.
-
-You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture (use the read tools to check the surrounding evidence — the subject's other stored facts — before you PROMOTE or DROP):
-- PROMOTE — the evidence now supports it as a real, lasting fact: give its proper Layer-1 category (People/Places/Things/Relationships/Events/World) and the most-specific aspect. e.g. a recurring vice → People/vices; a confirmed home → People/home.
-- DROP — it was a confirmed one-off / no longer true / noise: demote it (it is deprioritized, not erased — it stays recoverable if it ever matters again).
-- KEEP — still genuinely uncertain: leave it where it is for a later pass.
-Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fact by its exact id shown in brackets.
-
-# OUTPUT FORMAT (your LAST reply ends with exactly this, then a \`#DONE\` line)
+# OUTPUT FORMAT (end your LAST reply with this)
 
 #STORY
-<2-4 sentence whole-story recap, or "." if there is nothing yet>
+<recap, or ".">
 .
 #SHELVES
-+ <Category>/<aspect> = <short bucket summary>
 + <Category>/<aspect> = <short bucket summary>
 .
 #OBS
 + <subject>_<short_pattern_key> = <atomic pattern clause>
-+ <subject>_<short_pattern_key> = <atomic pattern clause>
 .
 #CALLBACK
-+ <earlier_id> <- <later_id> | <short reason this later beat echoes the earlier one>
++ <earlier_id> <- <later_id> | <short reason>
 .
 #REEVAL
 + <id> = promote | <Category> | <aspect>
@@ -159,7 +139,7 @@ Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fac
 .
 #DONE
 
-If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no clear echo exists (or no recent-moments list was given), put a single "." under #CALLBACK. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (at most 10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material you saw (digest or tool results). After the #REEVAL section, end the reply with a line that is exactly \`#DONE\`.`;
+Put a single "." under any empty section. Observation keys snake_case, values max 10 words. Echo the shelves list's EXACT Category/aspect labels. Never invent facts unsupported by digest or tool results.`;
 
 function collectReevalCandidates(databases) {
     const now = Date.now();
@@ -292,7 +272,8 @@ function buildReflectInput({ databases, reevalCandidates = [], changedShelves = 
         parts.push(`## Re-evaluate (give a verdict per id)\n${reLines.join('\n')}`);
     }
 
-    parts.push('\nThe lists above are compact STARTING material — verify against the real store with the read tools before you conclude. When your investigation is done, END your LAST reply with the #STORY, #SHELVES, #OBS, #CALLBACK and #REEVAL sections followed by a line that is exactly #DONE.');
+    // Terse reminder only — the rules live in the system prompt (one place).
+    parts.push('\nVerify against the real store with the read tools, then END your LAST reply with the #STORY/#SHELVES/#OBS/#CALLBACK/#REEVAL sections and a line that is exactly #DONE.');
     return parts.join('\n\n');
 }
 

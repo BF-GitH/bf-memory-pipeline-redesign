@@ -103,6 +103,7 @@ async function onIconClick(e, mesId) {
         if (n > 0) await saveCurrentToActiveProfile();
 
         updateIconState(iconEl, msg);
+        updateCatchupBadge();
         if (typeof toastr !== 'undefined') {
             toastr.success(`Memory Agent: ${n} facts stored from msg ${mesId}`, 'BF Memory', { timeOut: 3000 });
         }
@@ -185,6 +186,38 @@ async function showMessageFacts(mesId) {
 
 function injectAllIcons() {
     document.querySelectorAll('.mes[mesid]').forEach(el => injectIcon(el));
+    updateCatchupBadge();
+}
+
+// Catch-up badge: a small pill above the send form (same anchor as the working
+// indicator in pipeline.js) showing how many settled messages the memory
+// pipeline has not extracted yet. Visible only while the backlog is non-zero;
+// re-checked from every repaint path (watermark commits, renders, deletes,
+// chat switches), so it disappears on its own as extraction catches up.
+// Dynamic import of pipeline.js: pipeline.js dynamically imports this module,
+// so a static back-edge would create an import cycle.
+const CATCHUP_BADGE_ID = 'bf_mem_catchup_badge';
+
+function updateCatchupBadge() {
+    import('./pipeline.js').then(({ computeCatchupLag }) => {
+        const { count } = computeCatchupLag();
+        let badge = document.getElementById(CATCHUP_BADGE_ID);
+        if (count <= 0) {
+            if (badge) badge.style.display = 'none';
+            return;
+        }
+        if (!badge) {
+            badge = document.createElement('div');
+            badge.id = CATCHUP_BADGE_ID;
+            badge.className = 'bf-mem-catchup-badge';
+            const sendForm = document.getElementById('send_form');
+            if (!sendForm?.parentNode) return;
+            sendForm.parentNode.insertBefore(badge, sendForm);
+        }
+        badge.title = `${count} settled message(s) not yet extracted into memory. The context window is widened so they are never trimmed away; the badge disappears as the pipeline catches up.`;
+        badge.innerHTML = `<i class="fa-solid fa-brain"></i> ${count} behind`;
+        badge.style.display = '';
+    }).catch(() => {  });
 }
 
 // Re-read every on-screen message's processed state and repaint its brain icon.
@@ -207,10 +240,13 @@ export function initMessageIcons() {
     eventSource.on(eventTypes.CHARACTER_MESSAGE_RENDERED, (mesId) => {
         const el = document.querySelector(`.mes[mesid="${mesId}"]`);
         injectIcon(el);
+        // A new message shifts the settled window — the backlog may have grown.
+        updateCatchupBadge();
     });
     eventSource.on(eventTypes.USER_MESSAGE_RENDERED, (mesId) => {
         const el = document.querySelector(`.mes[mesid="${mesId}"]`);
         injectIcon(el);
+        updateCatchupBadge();
     });
     eventSource.on(eventTypes.MESSAGE_UPDATED, (mesId) => {
         const el = document.querySelector(`.mes[mesid="${mesId}"]`);
@@ -221,6 +257,8 @@ export function initMessageIcons() {
             ctx.saveChatDebounced?.();
         }
         injectIcon(el);
+        // The edit cleared the watermark — the message is unprocessed again.
+        updateCatchupBadge();
     });
 
     eventSource.on(eventTypes.MESSAGE_SWIPED, (mesId) => {

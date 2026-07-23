@@ -5,6 +5,14 @@ import * as host from './host.js';
 
 const LLM_TIMEOUT_MS = 300000;          // per-attempt cap (300s). Generous on purpose: a slow reasoning model or a self-hosted bridge (e.g. Claude Code CLI on Termux) chewing a ~20k-char prompt can take several minutes. The memory agent runs in the BACKGROUND (post-reply, detached), so a long wait never blocks the chat.
 const LLM_WALLCLOCK_BUDGET_MS = 300000; // total budget (300s) across the (up to 2) attempts of a single round.
+// Total tool-loop budget across ALL rounds of one run (10 min). Deliberately
+// looser than the per-round budgets above: a slow-but-progressing extraction
+// (e.g. 6 rounds x 70s ≈ 7 min) must never die mid-run while every individual
+// round is fine. Checked BETWEEN rounds only — an in-flight round is never
+// chopped, the loop just refuses to start another one past the budget, and
+// exhaustion is logged distinctly (toolloop.budget) so it can't be mistaken
+// for a single-round timeout.
+const TOOL_LOOP_BUDGET_MS = 600000;
 
 const lastSystemHashByAgent = new Map();   
 let lastPersonaName = undefined;            
@@ -159,6 +167,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
 }
 
 async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown', externalSignal = null) {
+    const callStart = Date.now();
 
     const systemPrompt = (Array.isArray(messages) && messages[0]?.role === 'system')
         ? String(messages[0].content || '')
@@ -216,7 +225,10 @@ async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown
             }
             try {
                 const result = await callAgentLLMOnce(messages, profileId, agent, callCtrl.signal);
-                if (result && result.trim()) return result;
+                if (result && result.trim()) {
+                    recordAgentCallSafe({ ok: true, ms: Date.now() - callStart, agent, profileId: profileId || null });
+                    return result;
+                }
                 if (attempt === 1) {
                     addDebugLog('info', 'LLM returned empty response, retrying once...');
                 }
@@ -241,9 +253,16 @@ async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown
     }
 
     if (lastError) {
+        // A user cancel is not a transport fault — it must not paint the Health
+        // 'Agent connection' row red.
+        const userCancel = lastError.name === 'AbortError' && /cancel/i.test(String(lastError.message || ''));
+        if (!userCancel) {
+            recordAgentCallSafe({ ok: false, ms: Date.now() - callStart, agent, profileId: profileId || null, error: String(lastError.message || lastError).slice(0, 200) });
+        }
         addDebugLog('fail', `LLM call failed: ${lastError.message || lastError}`);
         throw lastError;
     }
+    recordAgentCallSafe({ ok: false, ms: Date.now() - callStart, agent, profileId: profileId || null, error: 'empty response / budget exhausted' });
     addDebugLog('fail', 'LLM returned empty response / budget exhausted');
     throw new Error('LLM returned empty response');
 }
@@ -325,6 +344,11 @@ function healthModSafe() {
 async function recordToolUseSafe(agentTag, toolName, epoch = null) {
     try { (await healthModSafe())?.recordToolUse(agentTag, toolName, epoch); } catch {  }
 }
+// Bridge/connection telemetry: every agent-LLM call outcome feeds the Health
+// tab's 'Agent connection' row (fire-and-forget — never blocks the call path).
+async function recordAgentCallSafe(payload) {
+    try { (await healthModSafe())?.recordHealthEvent('agentCall', payload); } catch {  }
+}
 async function getToolUsageEpochSafe() {
     try { return (await healthModSafe())?.getToolUsageEpoch() ?? null; } catch { return null; }
 }
@@ -382,11 +406,21 @@ export async function callAgentLLMWithTools({
         { role: 'system', content: String(systemPrompt || '') },
         { role: 'user', content: String(userPrompt || '') },
     ];
-    let graceUsed = false; 
+    let graceUsed = false;
+    const loopStart = Date.now();
 
     for (let round = 1; round <= maxRounds; round++) {
         if (signal?.aborted) {
             out.error = 'aborted before round ' + round;
+            break;
+        }
+        // Total-run budget (between rounds only — never chops an in-flight round).
+        if (round > 1 && Date.now() - loopStart >= TOOL_LOOP_BUDGET_MS) {
+            out.error = `run budget exhausted after ${Math.round((Date.now() - loopStart) / 1000)}s (${round - 1} round(s) completed, budget ${TOOL_LOOP_BUDGET_MS / 1000}s)`;
+            addDebugLog('fail', `[${agent}] Tool-loop total run budget exhausted: ${out.error}`, {
+                subsystem: 'agent3', event: 'toolloop.budget', reason: 'RUN_BUDGET',
+                data: { agent, rounds: round - 1, toolCallCount: out.toolCallCount, budgetMs: TOOL_LOOP_BUDGET_MS },
+            });
             break;
         }
         out.rounds = round;

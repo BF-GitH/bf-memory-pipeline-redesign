@@ -252,6 +252,12 @@
                         <button id="bf_mem_health_recheck" class="bf-mem-reset-btn menu_button" title="Run the self-test again">
                             <i class="fa-solid fa-arrows-rotate"></i> Re-check
                         </button>
+                        <button id="bf_mem_health_copy_prompt" class="bf-mem-reset-btn menu_button" title="Copy the last generation's FULL post-injection prompt (after trim + sheet) to the clipboard as JSON">
+                            <i class="fa-solid fa-copy"></i> Copy last prompt
+                        </button>
+                        <button id="bf_mem_health_testconn" class="bf-mem-reset-btn menu_button" title="Send a tiny test request through the agent connection (dedicated profile or main API, 15s timeout) to check the bridge is awake — useful for self-hosted bridges like Claude Code on Termux">
+                            <i class="fa-solid fa-tower-broadcast"></i> Test connection
+                        </button>
                     </div>
                     <div class="bf-mem-section-body">
                         <small class="bf-mem-hint">One row per pipeline step: green = working, yellow = degraded, red = broken, gray = no data yet this session.</small>

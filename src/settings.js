@@ -1610,6 +1610,61 @@ export async function initSettings() {
 
     $('#bf_mem_health_recheck').on('click', () => renderHealthTab());
 
+    // Auto-refresh: re-render the Health tab (when visible) after every recorded
+    // health event — i.e. after each agent run/injection — instead of requiring
+    // the Re-check button. The listener is debounced on the health.js side.
+    import('./health.js').then(m => m.setHealthChangeListener(() => {
+        const panel = document.getElementById('bf_mem_tab_health');
+        if (panel && panel.style.display !== 'none') renderHealthTab();
+    })).catch(() => {  });
+
+    // Bridge liveness probe: one tiny request through the SAME transport the
+    // background agents use (dedicated profile or main API). 15s cap — a probe
+    // must answer fast or the bridge counts as asleep. The call outcome lands in
+    // the 'agentCall' health event, so the row updates via the auto-refresh.
+    $('#bf_mem_health_testconn').on('click', async function () {
+        const btn = this;
+        btn.disabled = true;
+        try {
+            const { callAgentLLM } = await import('./llm-call.js');
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(new DOMException('Connection test timed out after 15s', 'TimeoutError')), 15000);
+            const reply = await callAgentLLM('Reply with the single word OK.', 'ping', extensionSettings.agent3Profile || null, 'health-ping', ctrl.signal);
+            clearTimeout(timer);
+            if (reply && reply.trim()) {
+                toastr.success('Agent connection OK', 'BF Memory');
+            } else {
+                // callAgentLLM swallows transport errors into '' — the real error
+                // is in the debug log and the Health row.
+                toastr.error('Agent connection test failed — see the Health row / debug log', 'BF Memory');
+            }
+        } catch (err) {
+            toastr.error(`Agent connection test failed: ${err?.message || err}`, 'BF Memory');
+        } finally {
+            btn.disabled = false;
+            renderHealthTab();
+        }
+    });
+
+    // Sent-prompt proof: copies the last generation's FULL post-injection
+    // message array (role + text, after trim + sheet) as JSON. Clipboard-bound,
+    // so nothing is HTML-escaped. Dynamic import — pipeline.js statically
+    // imports this module, a static back-edge would close a cycle.
+    $('#bf_mem_health_copy_prompt').on('click', async () => {
+        try {
+            const { getLastSentPrompt } = await import('./pipeline.js');
+            const snap = getLastSentPrompt();
+            if (!snap || !Array.isArray(snap.messages) || snap.messages.length === 0) {
+                toastr.info('No generation captured yet this session', 'BF Memory');
+                return;
+            }
+            await navigator.clipboard.writeText(JSON.stringify(snap.messages, null, 2));
+            toastr.success(`Copied ${snap.messages.length} message(s) — post-injection prompt (${snap.path} path)`, 'BF Memory');
+        } catch (err) {
+            toastr.error(`Copy failed: ${err?.message || err}`, 'BF Memory');
+        }
+    });
+
     $('#bf_mem_debug').prop('checked', extensionSettings.debugMode).on('change', function () {
         extensionSettings.debugMode = $(this).prop('checked');
         saveSettings();

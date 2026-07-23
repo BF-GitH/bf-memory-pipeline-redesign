@@ -35,21 +35,32 @@ function currentChatIdSafe() {
 
 const KEY_INVENTORY_CAP = 200;
 
+// Connection-class failure classifier, shared with pipeline.js's timeout
+// auto-retry: transport-level errors (timeout, abort, wall-clock/run budget,
+// network/fetch) that a later retry against the same endpoint can plausibly
+// recover from. Protocol/cap errors (the endpoint demonstrably responds and
+// simply misbehaved) never match — retrying those would just repeat the run.
+export function isConnectionFailure(msg) {
+    const s = String(msg || '');
+    // Protocol errors embed MODEL-authored text after a fixed prefix (e.g. an
+    // invented tool name like "fetch_memory" inside 'malformed protocol reply
+    // (second offense): unknown tool ...'), so they must be excluded BEFORE the
+    // substring test — a hallucinated name containing "fetch"/"network" must
+    // not reclassify a deterministic protocol failure as a retryable one.
+    if (/^malformed protocol reply/i.test(s)) return false;
+    return /timed out|abort|wall-clock|budget|network|fetch/i.test(s);
+}
+
 const TEMPORAL_GROUNDING_RULE = `
 
-# OBSERVATION DATE (TIME GROUNDING)
-The user data block gives a \`## Observation date\` (the real-world time the newest message was observed). Resolve RELATIVE time expressions to ABSOLUTE dates relative to it — e.g. "yesterday" → the day before that date, "last week" → "the week of <date>", "two years ago" → the year. Store the absolute form (in the value or note), not the relative word, so the fact doesn't rot. If no observation date is given, leave time expressions as-is.`;
+# OBSERVATION DATE
+The task block's \`## Observation date\` = real-world time the newest message was observed. Resolve RELATIVE time ("yesterday", "two years ago") to ABSOLUTE dates against it so facts don't rot; none given → leave as-is.`;
 
-export const DEFAULT_MEMORY_AGENT_PROMPT = `You are the EXTRACTION AGENT for an ongoing roleplay between {{user}} (the human player) and {{char}} (the AI character). You run in the BACKGROUND after each reply — the storyteller model never sees you. You do TWO jobs in ONE tool-using session:
-
-1. EXTRACT — store new LASTING facts from the SETTLED messages into the memory database (write_fact / link_facts / add_alias).
-2. SELECT — decide which STORED memories the NEXT storyteller reply will need, and list them on a NEED line.
-
-You do NOT write the memory sheet, the scene beats, or the timeline — separate fixed passes handle those. Your ONLY outputs are tool calls and a NEED line, then #DONE.
+export const DEFAULT_MEMORY_AGENT_PROMPT = `You are the EXTRACTION AGENT for a roleplay between {{user}} (human) and {{char}} (AI character), running in the BACKGROUND after each reply. TWO jobs in one tool session: EXTRACT — store new LASTING facts from the SETTLED messages; SELECT — list the STORED memories the NEXT storyteller reply needs on a NEED line. Sheet, beats and timeline are separate passes. Only outputs: tool calls, a NEED line, #DONE.
 
 # TOOL PROTOCOL (plain text — no function-call API)
 
-To use a tool, reply with tool-call lines. Each tool call is ONE line of strict JSON, alone on its line:
+Each tool call is ONE line of strict JSON, alone on its line:
 {"tool":"list_categories"}
 {"tool":"list_keys","args":{"category":"People"}}
 {"tool":"read_facts","args":{"category":"People","keys":["monika_name","monika_mood"]}}
@@ -58,65 +69,46 @@ To use a tool, reply with tool-call lines. Each tool call is ONE line of strict 
 {"tool":"add_alias","args":{"name":"Trish","alias":"Trish Mitchells"}}
 {"tool":"link_facts","args":{"from":"Events:tom_affair_jessica","to":"Events:jessica_visit_awkward","reason":"explains why the visit was awkward"}}
 
-After your reply, the system executes the calls and sends the results back as one user message starting with "TOOL RESULTS:". You may then call more tools or finish. You may emit several tool-call lines in one reply. Do NOT wrap calls in markdown fences; do NOT pretty-print the JSON across lines.
+The system replies with one "TOOL RESULTS:" message; then call more tools or finish. Several lines per reply are fine; no markdown fences, no multi-line JSON.
+- add_alias: two names = SAME character. Before writing a seemingly NEW character, search their first name; if stored under an older name, add_alias and reuse the EXISTING key prefix.
+- link_facts: link two STORED facts ("Category:key" refs VERIFIED via tools, never guessed) when a NEW fact retroactively explains an OLD one, as in the example above (new affair fact explains the old awkward visit). Max 5 links per fact; re-linking is a no-op.
 
-TOOLS:
-- list_categories — every category with its active fact count. Start here when unsure what exists.
-- list_keys {category} — one line per stored fact: key | aspect | value preview.
-- read_facts {category, keys[]} — the full stored line for each requested key.
-- search {query} — keyword search across the whole store.
-- write_fact {category, key, value, note?, known_by?, aspect?, importance?, kind?} — store one fact (or update the key's current value).
-- add_alias {name, alias} — record that two names are the SAME character (e.g. "Trish" ≡ "Trish Mitchells"); both then resolve to one character everywhere (memories, who-knows lists). BEFORE writing facts for a seemingly NEW character, search their first name — if they exist under an older/shorter name, add_alias and keep the EXISTING key prefix instead of starting a duplicate.
-- link_facts {from, to, reason} — declare a semantic link between two STORED facts, each ref "Category:key" (VERIFIED via tools, never guessed). Use it when a NEW fact retroactively explains or connects to an OLD one you found via search/read_facts: store the new fact, then link_facts it to the old one — e.g. new Events:tom_affair_jessica linked to old Events:jessica_visit_awkward, reason "explains why that visit was awkward". Linked facts surface together on future sheets. Max 5 agent links per fact; re-linking the same pair is a harmless no-op.
-
-HARD LIMITS: at most 8 rounds (replies by you) and 24 tool calls per session.
-
-CALIBRATE DEPTH to the turn, not a flat budget:
-- LIGHT turn (small talk, one obvious fact): one read round, then ONE final reply with your write_fact lines and the NEED line.
-- DENSE turn (new character, backstory reveal, secret, possible contradiction with something stored): SPEND extra rounds. Query the relevant categories/keys BEFORE writing — e.g. the message says "Maria likes apples": list_keys People / search "maria food" first; an existing preference key turns up, so write into that existing key structure instead of creating a duplicate. Follow up on suspicious hits, and link_facts what connects.
-Either way the FINAL reply carries the write_fact (and link_facts) lines, then the NEED line, then #DONE.
+HARD LIMITS: at most 8 rounds and 24 tool calls per session. LIGHT turn (small talk): one read round, then the final reply. DENSE turn (new character, backstory, secret, contradiction): spend extra rounds; check BEFORE writing — "Maria likes apples" → search "maria food" first; write into the existing preference key, don't duplicate.
 
 # FINAL REPLY
 
-Your write_fact / link_facts / add_alias calls come first (bare protocol JSON, one per line). Then, on a FULL run, ONE line:
+Write calls first (bare JSON, one per line), then on a FULL run ONE line:
 
 NEED: Category/key, Category/key, ...
 
-End your LAST reply with a line that is exactly \`#DONE\` (nothing else on that line).
+End your LAST reply with a line that is exactly \`#DONE\` (nothing else on it).
+- NEED: ONLY refs the NEXT reply will draw on (VERIFIED via tools, never invented) — people present and their state, active relationships, open threads THIS scene touches. Do NOT re-list stable premise/identity facts (auto-injected); older facts can be NEEDed later; omit NEED when nothing beyond that is needed. Read tools in the final reply are ignored.
+- EXTRACT-ONLY runs (task block says so): no NEED line — writes, then \`#DONE\`.
 
-- NEED lists ONLY the Category/key refs the NEXT storyteller reply will actually draw on (exact refs VERIFIED with the tools — never invented): people present and their current state, active relationships, open threads THIS scene touches. Keep it a UNIQUE, focused set each turn — do NOT re-list stable premise/identity facts; the system ALWAYS injects those (the premise floor). The store keeps everything forever; if a later scene needs an older fact, NEED it that turn (or list_keys/search). The system renders the listed facts onto the sheet.
-- write_fact/link_facts lines and the NEED line share the final reply, BEFORE the \`#DONE\` line (writes are executed, NEED is read off the reply). Read tools in that reply are ignored.
-- NEED may be omitted when nothing beyond the premise floor is needed.
-- EXTRACT-ONLY runs (the task block says so): omit the NEED line; just end with \`#DONE\` after your writes.
+# WHAT TO STORE
 
-# WHAT TO STORE (write_fact)
+LASTING facts — anything the story still tracks 50 messages on. Under-storing is the common failure; reveal turns hold many facts. Mine DIALOGUE too — confessions, preferences, promises, decisions live in quotes.
+- ATOMIC value, 1-5 words (up to 10 for a real backstory reveal); one property per fact — split multi-attribute statements; verb goes in the KEY (\`monika_eyes\` = \`green\`).
+- key: snake_case, subject-prefixed (\`monika_fear_storms\`); reuse the EXISTING key (verified) when updating a changeable state.
+- category / aspect: from the task-block taxonomy menu — category one of People, Places, Things, Relationships, Events, World, Unsorted (catch-all); aspect the most specific LEAF (near-misses snap; nothing fits → Unsorted / \`misc\`).
+- importance: 1-5 (5 = core identity, 3 = ordinary, 1 = trivial).
+- kind: \`trait\` (durable identity), \`state\` (durable-but-changeable — job, injury, goal; NOT transient mood/room), \`event\`, \`moment\` (emotional beat).
+- note: optional short prose (quote, disambiguation, summary); keep the atomic value too.
+- known_by: EVERYONE who knows it — those present PLUS the source and implied participants: Maria tells Tom that Martha said James had an affair with Trish → ["Maria","Tom","Martha","James","Trish"]. Omitted = those PRESENT; list only when knowers differ (secrets, second-hand, absentees).
+- Relationships: pair dynamics under a stable pair key (\`monika_bernd_trust\`) with abstract aspect (trust/romance/debt/status_of_relationship); update its status record when the dynamic MATERIALLY changes.
 
-Store LASTING facts — anything the STORY still tracks 50 messages from now. Be THOROUGH: most turns carry 1-5 minable lasting facts, and a dense reveal turn (introductions, backstory, world lore, confessions) can have many more. Under-storing is the common failure — if a detail would matter to a future scene, store it. Read dialogue, not just narration — confessions, opinions, preferences, promises, decisions, and reveals live in quotes.
-
-- ATOMIC values: 1-5 words per fact (a genuine backstory reveal may use up to 10). One property per fact; split multi-attribute statements into several write_fact calls. Encode the verb in the KEY (\`monika_eyes\` = \`green\`, not \`monika\` = "has green eyes").
-- key: snake_case, prefixed by the subject's name (\`monika_fear_storms\`, \`bernd_job\`). Reuse an EXISTING key (verified via tools) when updating a changeable state — the update OVERWRITES the stored value in place, so carry any history that still matters into the note (see UPDATING A CHANGED FACT below).
-- category: one of the Layer-1 categories from the menu in the task block (People, Places, Things, Relationships, Events, World, Unsorted). Unsorted is the catch-all for genuinely unclear facts.
-- aspect: the most specific LEAF label within the category (see the taxonomy menu in the task block), e.g. \`fears\`, \`career\`, \`tattoos\`. A near-miss is snapped to the canonical leaf; if nothing fits, use category Unsorted with aspect \`misc\`.
-- importance: 1-5 (5 = core identity like a name/species, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial).
-- kind: \`trait\` (durable identity), \`state\` (a durable-but-changeable condition — a job, an injury, who holds a key object, an ongoing goal), \`event\` (something that happened), \`moment\` (a significant emotional scene beat, remembered with feeling). (Do NOT use \`state\` for transient mood or the room-of-the-moment — those are excluded; see below.)
-- note: optional short prose — a meaningful verbatim quote, a disambiguation, or a one-line summary of a complex beat. Keep the atomic value TOO.
-- known_by: list EVERYONE who knows this fact — those present when it came up PLUS anyone the statement implies knows it: the source, and the participants who lived it. Example: Maria tells Tom that Martha told her James had an affair with Trish → known_by:["Maria","Tom","Martha","James","Trish"] — the source and the participants count even if they never appeared in the chat. Omitted known_by defaults to the characters currently PRESENT, so an explicit list is only needed when the knowers differ from the room (secrets, second-hand reveals, absent participants).
-- RELATIONSHIPS: file pair dynamics under Relationships with a stable pair key (\`monika_bernd_status\`, \`monika_bernd_trust\`) and an abstract aspect (trust/romance/debt/status_of_relationship). Update the pair's single status record when the dynamic MATERIALLY changes.
-
-DO NOT STORE: transient poses/moods, current emotional weather, scene atmosphere, the room they happen to be in this moment, food eaten, items momentarily in hand, [OOC:] meta, reported/historical speech, negative facts ("no favorite revealed"). Those ambient here-and-now details belong on the sheet's scene/timeline lines (a separate fixed pass writes those), NOT in the store.
+DO NOT STORE: transient poses/moods, atmosphere, the current room, food eaten, items in hand, [OOC:] meta, reported/historical speech, negative facts ("no favorite revealed") — the scene/timeline passes cover those.
 
 # UPDATING A CHANGED FACT
 
-When a stored fact's value changes, reuse the SAME key (never invent a variant) — the update overwrites the record in place; there is no separate history copy. Before finishing, for every character, relationship, and open thread active this scene, check whether its stored state changed and update it. Write:
-- value: the NEW current state, atomic (e.g. \`Tokyo\`) — this is what the system compares to detect the change.
-- note: a SELF-CONTAINED sentence giving the CURRENT state AND the meaningful past — the system shows the note INSTEAD of the value, so ALWAYS restate the current state ("moved from Berlin" alone would hide that she now lives in Tokyo). Example: value \`Tokyo\`, note \`Now lives in Tokyo; previously lived in Berlin, revealed this scene\`.
-- The note is OVERWRITTEN on each update (not merged), so always write the COMPLETE note — the current state plus any earlier state that still matters. Don't hoard every prior value; keep only the history the story still cares about.
-
-DELTA-ONLY: never re-write a fact whose stored value is UNCHANGED (check with the tools first — an identical re-write is wasted work). But when the value genuinely CHANGED, you MUST write the new value — that IS the update, not waste.
+Reuse the SAME key — updates OVERWRITE in place, no history copy. Before finishing, check every character, relationship, and open thread active this scene for changed state.
+- value: the NEW state, atomic (\`Tokyo\`).
+- note: SELF-CONTAINED, shown INSTEAD of the value — restate the current state plus the past that still matters: value \`Tokyo\`, note \`Now lives in Tokyo; previously lived in Berlin, revealed this scene\`. Notes overwrite, never merge — write the complete note.
+DELTA-ONLY: never re-write an UNCHANGED value (check first); a genuinely CHANGED value MUST be written.
 
 # TENTATIVE MESSAGES
 
-Messages in the block marked "TENTATIVE" may still be swiped/edited. They may inform your NEED planning, but you MUST NOT write_fact anything from them — extract only from the SETTLED messages.` + TEMPORAL_GROUNDING_RULE;
+"TENTATIVE" messages may still be swiped/edited: use for NEED planning only — NEVER write_fact from them; extract only from SETTLED messages.` + TEMPORAL_GROUNDING_RULE;
 
 // Call B (BEATS) — single-shot, no tools. Turns the newly-settled messages into
 // one terse past-tense beat each, parsed back by number. Fixed prompt: NOT
@@ -126,18 +118,14 @@ export const DEFAULT_BEATS_PROMPT = `You convert roleplay messages into terse sc
 // Call C (SHEET HEAD) — single-shot, no tools. Writes the situational recap and
 // scene framing lines in the exact format parseSheetBlock understands. Fixed
 // prompt: NOT affected by the settings override.
-export const DEFAULT_HEAD_PROMPT = `You write the HEAD of a roleplay memory sheet: a short situational recap and the current scene framing. You are given the character brief, the most recent messages, the current scene card, and the prior head. Output EXACTLY these lines and nothing else (omit a line only where noted):
+export const DEFAULT_HEAD_PROMPT = `You write the HEAD of a roleplay memory sheet from the given brief, messages, scene card and prior head. Output EXACTLY these lines and nothing else:
 
-SUMMARY: <a FRESH, situational high-level recap for the UPCOMING beat — the premise plus whatever the coming scene actually leans on. Re-write it for where the story now stands; do NOT retell the whole history. Stay high-level and situational.>
+SUMMARY: <FRESH situational recap for the UPCOMING beat — premise plus what the coming scene leans on; re-write for where the story stands, don't retell history>
 SCENE_MARKER: <startMsgIndex> | <2-5 word scene name>
-TIMELINE: <the current in-story date and time; WHERE the characters physically are right now; and HOW LONG the main characters have known each other (the age of their relationship)>
-PRESENT: <comma-separated names of every character physically in the current scene, e.g. "Maria, Tom">
+TIMELINE: <in-story date/time; WHERE the characters are; how long the mains have known each other>
+PRESENT: <comma-separated names of everyone physically in the scene, e.g. "Maria, Tom">
 
-- SUMMARY is REQUIRED. TIMELINE should almost always be present.
-- SCENE_MARKER: include ONLY when a NEW scene BEGINS in the recent messages (a change of place, a time-skip, or a major shift). Give the chat index — the "#N" of the message where it starts — then a 2-5 word name. OMIT the line entirely while the current scene continues.
-- PRESENT: everyone physically in the scene RIGHT NOW (main pair AND named NPCs), nobody who has left. Keep it current.
-
-Reply with only those lines. No #SHEET header, no BEAT lines, no NEED line, no commentary.` + TEMPORAL_GROUNDING_RULE;
+SUMMARY is REQUIRED; TIMELINE almost always. SCENE_MARKER only when a NEW scene BEGINS in the recent messages (place change, time-skip, major shift) — the "#N" index where it starts, then the name; OMIT while the scene continues. PRESENT: everyone there RIGHT NOW (mains AND named NPCs), nobody who left. No #SHEET header, no BEAT/NEED lines, no commentary.` + TEMPORAL_GROUNDING_RULE;
 
 export async function runMemoryAgent({
     settledMessages = [],
@@ -278,7 +266,7 @@ export async function runMemoryAgent({
     // state for a run the pipeline is about to discard. Only non-connection
     // failures (protocol/cap errors: the endpoint demonstrably responds) keep
     // the per-call isolation below.
-    if (loop.error && /timed out|abort|wall-clock|budget/i.test(String(loop.error))) {
+    if (loop.error && isConnectionFailure(loop.error)) {
         result.error = loop.error;
         return result;
     }

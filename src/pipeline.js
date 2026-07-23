@@ -1,5 +1,5 @@
 import { injectMemoryContext } from './agent-writer.js';
-import { runMemoryAgent } from './agent-memory.js';
+import { runMemoryAgent, isConnectionFailure } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { cancelInFlightLLM, callAgentLLM } from './llm-call.js';
 import { extractSentenceLine, countSentenceEnds } from './sentence-util.js';
@@ -23,6 +23,63 @@ let memoryExtractionInFlight = false;
 let extractionRetryAfterBusy = false;
 let cancelledRetryArmed = false;
 
+// Timeout auto-retry (single-flight): a connection-class extraction failure
+// (timeout/abort/network/fetch — never a protocol error) schedules ONE
+// automatic retry after 20s instead of waiting for the next user message. A
+// SECOND consecutive connection failure parks the backlog until the next
+// message (the per-message watermarks make waiting safe). User-cancelled runs
+// never auto-retry, and a genuine run always supersedes a pending auto-retry.
+const CONNECTION_RETRY_DELAY_MS = 20000;
+let connectionRetryTimer = null;
+let connectionFailureStreak = 0;
+
+// Post-injection proof for the Health tab's "Copy last prompt" button: the FULL
+// message array of the last generation AS SENT (after trim + sheet injection).
+// Session-only, capped at ~2 MB serialized, cleared on chat switch. External
+// capture tools (e.g. bf-cache-verify) hook the same event BEFORE this
+// extension's injection and therefore show a prompt WITHOUT sheet/trim — this
+// snapshot is the ground truth taken AFTER.
+const LAST_PROMPT_CAP_CHARS = 2 * 1024 * 1024;
+let lastSentPrompt = null; // { ts, path, messages: [{ role, text }] }
+
+function contentToText(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        // Multimodal parts: keep the text pieces, drop binary payloads.
+        return content.map(p => (typeof p === 'string' ? p : String(p?.text ?? ''))).join('\n');
+    }
+    return String(content ?? '');
+}
+
+function capturePostInjectionPrompt(arr, path, promptString = null) {
+    try {
+        let messages;
+        if (Array.isArray(arr)) {
+            messages = arr.map(m => ({ role: String(m?.role || ''), text: contentToText(m?.content) }));
+        } else if (typeof promptString === 'string') {
+            // Text-completion string prompt: one pseudo-message carries it all.
+            messages = [{ role: 'prompt', text: promptString }];
+        } else {
+            return;
+        }
+        // Cap at ~2 MB serialized: drop the OLDEST messages first — the newest
+        // carry the injected sheet and the actual exchange, which is the proof.
+        let total = JSON.stringify(messages).length;
+        while (messages.length > 1 && total > LAST_PROMPT_CAP_CHARS) {
+            total -= JSON.stringify(messages[0]).length + 1;
+            messages.shift();
+        }
+        if (messages.length === 1 && total > LAST_PROMPT_CAP_CHARS) {
+            messages[0] = { role: messages[0].role, text: messages[0].text.slice(0, LAST_PROMPT_CAP_CHARS) };
+        }
+        lastSentPrompt = { ts: Date.now(), path, messages };
+    } catch {  }
+}
+
+export function getLastSentPrompt() {
+    return lastSentPrompt;
+}
+
 // --- User-visible error stream (separate from the debug log) ---------------
 // A memory-pipeline run failing must NOT interrupt chat (the run is post-reply
 // and every branch is already caught) — it should only raise a toast. Throttled
@@ -43,6 +100,40 @@ function toastPipelineError(msg) {
         lastErrToastAt = now;
         toastr.error(String(msg), 'BF Memory', { timeOut: 6000, preventDuplicates: true });
     } catch {  }
+}
+
+// Auto-retry decision point for a failed extraction run. Only connection-class
+// failures qualify (isConnectionFailure — timeout/abort/network/fetch/budget);
+// protocol errors would just repeat identically. Cancelled-by-user runs never
+// auto-retry (the user asked for silence, and the abort error they produced is
+// indistinguishable from a network abort). One retry per failure streak; the
+// streak resets on the next user message or a successful run.
+function maybeScheduleConnectionRetry(runId, errMsg) {
+    if (!isConnectionFailure(errMsg)) return;
+    if (pipelineCancelled) {
+        addDebugLog('info', `[${runId}] Connection-class failure on a cancelled run — no auto-retry (user cancel wins)`, {
+            subsystem: 'pipeline', event: 'extraction.auto_retry', reason: 'CANCELLED',
+        });
+        return;
+    }
+    connectionFailureStreak++;
+    if (connectionFailureStreak >= 2) {
+        addDebugLog('info', `[${runId}] Connection failure #${connectionFailureStreak} in a row — auto-retry already spent, extraction parked until the next message (watermarks keep the backlog safe)`, {
+            subsystem: 'pipeline', event: 'extraction.retry_parked', reason: 'SECOND_CONNECTION_FAILURE',
+            data: { streak: connectionFailureStreak, error: String(errMsg).slice(0, 200) },
+        });
+        return;
+    }
+    if (connectionRetryTimer) return; // single-flight: never stack retries
+    addDebugLog('info', `[${runId}] Connection-class failure (${String(errMsg).slice(0, 120)}) — ONE automatic retry in ${CONNECTION_RETRY_DELAY_MS / 1000}s`, {
+        subsystem: 'pipeline', event: 'extraction.auto_retry',
+        data: { delayMs: CONNECTION_RETRY_DELAY_MS, error: String(errMsg).slice(0, 200) },
+    });
+    toastPipelineError(`Memory update hit a connection error — retrying automatically in ${CONNECTION_RETRY_DELAY_MS / 1000}s`);
+    connectionRetryTimer = setTimeout(() => {
+        connectionRetryTimer = null;
+        runMemoryExtraction();
+    }, CONNECTION_RETRY_DELAY_MS);
 }
 
 function firstInjectableArray(data) {
@@ -151,6 +242,10 @@ export function cancelActiveRun(reason = 'cancel') {
     clearInjectedGuard();
     runRecordedInput = false;
 
+    // A user cancel also withdraws any pending timeout auto-retry — the parked
+    // exchange stays safe behind the watermarks until the next message.
+    if (connectionRetryTimer) { clearTimeout(connectionRetryTimer); connectionRetryTimer = null; }
+
     try { cancelInFlightLLM(reason); } catch {  }
     hideWorkingIndicator();
     updateStatus('idle');
@@ -175,6 +270,47 @@ function clearInjectedGuard() {
 
 function isGenuineMessage(m) {
     return !!(m && m.mes && !m.is_system && !m.extra?.type);
+}
+
+// Depth-and-count view of the extraction backlog. A message is "behind" when
+// it is GENUINE, SETTLED (index <= chat.length-1-holdBack, so the hold-back no
+// longer protects it) and not yet stamped bf_mem_processed === true. `lag` is
+// the keep-depth from the newest message that still covers the OLDEST such
+// message (chat.length - oldestIndex): trimming to the last `lag` messages
+// never cuts an unprocessed message out of context. `count` is how many such
+// messages exist (the user-facing backlog number). Both 0 when caught up.
+// No stored state — recomputed from the per-message watermarks, so the value
+// shrinks back on its own as extraction stamps messages.
+export function computeCatchupLag() {
+    try {
+        const settings = getSettings();
+        const ctx = SillyTavern.getContext();
+        const chat = ctx?.chat;
+        if (!Array.isArray(chat) || chat.length === 0) return { lag: 0, count: 0 };
+
+        // Same hold-back clamp as runMemoryExtraction: 0..10, fallback 4.
+        const rawHoldBack = Number(settings?.bufferHoldBack);
+        const holdBack = Number.isFinite(rawHoldBack) ? Math.min(10, Math.max(0, Math.floor(rawHoldBack))) : 4;
+        const maxIdx = chat.length - 1 - holdBack;
+
+        let oldest = -1;
+        let count = 0;
+        for (let i = 0; i <= maxIdx; i++) {
+            const m = chat[i];
+            if (!isGenuineMessage(m)) continue;
+            if (m.extra?.bf_mem_processed === true) continue;
+            // Same trivial-empty filter as runMemoryExtraction: those messages
+            // get stamped processed without an LLM call, so counting them here
+            // would show a "behind" backlog no extraction run will ever shrink.
+            if (isTriviallyEmptyForExtraction(m.mes)) continue;
+            if (oldest < 0) oldest = i;
+            count++;
+        }
+        if (oldest < 0) return { lag: 0, count: 0 };
+        return { lag: chat.length - oldest, count };
+    } catch {
+        return { lag: 0, count: 0 };
+    }
 }
 
 // Build a stable, position-independent id for a message the first time we touch
@@ -351,8 +487,11 @@ async function runMemoryExtraction() {
             extractionRetryAfterBusy = true;
             addDebugLog('info', 'Memory agent (post-reply): prior extraction still committing — ONE retry chained to its completion');
         }
-        return; 
+        return;
     }
+    // A run that actually starts supersedes any pending timeout auto-retry
+    // (single-flight — the timer-fired call nulls the handle before landing here).
+    if (connectionRetryTimer) { clearTimeout(connectionRetryTimer); connectionRetryTimer = null; }
     const settings = getSettings();
     if (!settings || !settings.enabled) return;
     if (isInternalCall()) return; 
@@ -426,6 +565,11 @@ async function runMemoryExtraction() {
         }
         SillyTavern.getContext().saveChatDebounced?.();
         addDebugLog('info', `Memory agent (post-reply): ${trivialIndices.length} trivially-empty settled msg(s) stamped processed without an LLM call`);
+        // Repaint icons + catch-up badge now: a trivial-only run returns at the
+        // "no settled messages" early-return below, before setWatermark (the
+        // usual repaint trigger) ever runs, which would leave the just-stamped
+        // messages' icons — and a stale "N behind" badge — on screen.
+        import('./message-icon.js').then(m => m.refreshMessageIcons?.()).catch(() => {});
     }
 
     // Only run once there is at least one SETTLED message to extract (index
@@ -530,6 +674,7 @@ async function runMemoryExtraction() {
             recordHealthEvent('extraction', { status: 'fail', error: memoryResult?.error || 'no result', calls: memoryResult?.calls || null });
 
             setWatermark(false);
+            maybeScheduleConnectionRetry(runId, memoryResult?.error || 'no result');
             return;
         }
 
@@ -609,6 +754,7 @@ async function runMemoryExtraction() {
         });
         setLastInserted(committed);
         recordHealthEvent('extraction', { status: 'ok', writes: committed.length, rounds: memoryResult.rounds, durationMs: Date.now() - startTime, calls: memoryResult.calls || null });
+        connectionFailureStreak = 0; // a clean run ends any connection-failure streak
 
         if (memoryResult.sheetText) {
             setMemorySheet(memoryResult.sheetText, { runId, sourceMessageIndex: chat.length - 1 });
@@ -639,6 +785,7 @@ async function runMemoryExtraction() {
         addDebugLog('fail', `[${runId}] Memory agent (post-reply) failed (non-fatal): ${err.message || err}`);
         recordHealthEvent('extraction', { status: 'fail', error: err.message || String(err), calls: memoryResult?.calls || null });
         toastPipelineError(`Memory update failed: ${err.message || err}`);
+        maybeScheduleConnectionRetry(runId, err.message || String(err));
 
         if (!reachedCommit) {
             try {
@@ -776,8 +923,14 @@ export function initPipeline() {
             const settings = getSettings();
             if (!settings || !settings.enabled) return;
             if (data?.dryRun) return;
-            if (isInternalCall()) return; 
-            if (pipelineJustInjected) return; 
+            // NO isInternalCall() guard here: internal agent calls dispatch via
+            // CMRS or a direct backend fetch and never route through ST's generate
+            // pipeline, so this event only fires for a GENUINE user generation.
+            // Guarding silently dropped sheet injection AND lag-aware trim whenever
+            // the user generated while a background run (e.g. the delayed
+            // connection auto-retry, up to 10 min of tool loop) held
+            // internalCallDepth raised.
+            if (pipelineJustInjected) return;
             if (isGroupChatSkip(settings)) return;
 
             const rec = getMemorySheet(); 
@@ -788,7 +941,25 @@ export function initPipeline() {
             // Trim is independent of sheet state: history stays bounded even when the
             // sheet is empty or still the seed skeleton (0 keeps trim off).
             const trimToLast = Math.max(0, Math.floor(settings.agent2ContextMessages || 0));
-            const result = injectMemoryContext(data, rec.text, { trimToLast });
+
+            // NEVER trim away an unprocessed message: when the memory pipeline is
+            // behind the chat, widen the window to the lag depth so every settled-
+            // but-unprocessed message stays in the storyteller's context (the sheet
+            // does not cover it yet — cutting it would open a memory gap). As
+            // extraction catches up the watermarks shrink the lag and the window
+            // returns to the configured N on its own — no extra state.
+            const { lag, count: lagCount } = computeCatchupLag();
+            const effectiveTrim = trimToLast === 0 ? 0 : Math.max(trimToLast, lag);
+            if (effectiveTrim !== trimToLast) {
+                addDebugLog('debug', `History trim widened ${trimToLast} → ${effectiveTrim} (memory pipeline ${lagCount} message(s) behind)`, {
+                    subsystem: 'writer', event: 'inject.lag_hold',
+                    data: { configured: trimToLast, lag, effective: effectiveTrim },
+                });
+            }
+            const result = injectMemoryContext(data, rec.text, { trimToLast: effectiveTrim });
+            // Ground-truth capture AFTER trim + injection, on every outcome — the
+            // prompt is sent regardless of whether the sheet made it in.
+            capturePostInjectionPrompt(arr, 'chat');
             if (!result.injected) {
                 if (result.reason === 'EMPTY_SHEET') {
                     recordHealthEvent('injection', { status: 'empty', path: 'chat', trimmedCount: result.trimmedCount });
@@ -814,10 +985,26 @@ export function initPipeline() {
             const actualInput = await countChatTokens(arr);
             const sheetTokens = await countTextTokens(rec.text);
             recordRunTokens({ baselineInput, actualInput, sheetTokens, path: 'chat' });
-            recordHealthEvent('injection', { status: 'ok', path: 'chat', baselineInput, actualInput, sheetTokens, trimmedCount: result.trimmedCount });
-            addDebugLog('pass', `Memory sheet injected (${rec.text.length} chars${rec.seeded ? ', seed' : ''}; trim=${trimToLast || 'off'}; tokens ${baselineInput} → ${actualInput})`, {
+            // Post-injection snapshot: what was ACTUALLY sent after trim + sheet
+            // (external capture tools hook this event BEFORE our injection and
+            // show a misleading pre-injection prompt — this is the ground truth).
+            const chatMsgs = Array.isArray(arr)
+                ? arr.filter(m => m && (m.role === 'user' || m.role === 'assistant')).length
+                : undefined;
+            recordHealthEvent('injection', {
+                status: 'ok', path: 'chat', baselineInput, actualInput, sheetTokens,
+                trimmedCount: result.trimmedCount, trimToLast, effectiveTrim, lag,
+                totalMsgs: Array.isArray(arr) ? arr.length : undefined,
+                chatMsgs,
+                sheetPresent: !!String(rec.text || '').trim(),
+                sheetChars: String(rec.text || '').length,
+            });
+            const trimTxt = effectiveTrim !== trimToLast
+                ? `trim=${effectiveTrim} (widened from ${trimToLast}, lag ${lag})`
+                : `trim=${trimToLast || 'off'}`;
+            addDebugLog('pass', `Memory sheet injected (${rec.text.length} chars${rec.seeded ? ', seed' : ''}; ${trimTxt}; tokens ${baselineInput} → ${actualInput})`, {
                 subsystem: 'writer', event: 'inject.ok',
-                data: { chars: rec.text.length, seeded: !!rec.seeded, trimToLast, trimmedCount: result.trimmedCount, baselineInput, actualInput },
+                data: { chars: rec.text.length, seeded: !!rec.seeded, trimToLast, effectiveTrim, lag, trimmedCount: result.trimmedCount, baselineInput, actualInput },
             });
         } catch (err) {
 
@@ -834,8 +1021,10 @@ export function initPipeline() {
             } catch {  }
             const settings = getSettings();
             if (!settings || !settings.enabled) return;
-            if (isInternalCall()) return;
-            if (pipelineJustInjected) return; 
+            // No isInternalCall() guard — same reasoning as the chat-completion
+            // handler above: internal calls never fire this event, and guarding
+            // dropped injection for user generations during background runs.
+            if (pipelineJustInjected) return;
             if (isGroupChatSkip(settings)) return;
 
             const rec = getMemorySheet();
@@ -845,16 +1034,32 @@ export function initPipeline() {
                 // Token recording (text-completion path). Injection stays first and
                 // synchronous; counting only reads. No trim happens on this path,
                 // so baseline (= prompt without the extension) is actual − sheet.
+                let arr = null;
+                let actualInput = 0;
                 try {
-                    const arr = firstInjectableArray(data);
+                    arr = firstInjectableArray(data);
                     const promptStr = (!arr && typeof data?.prompt === 'string') ? data.prompt : null;
-                    const actualInput = arr ? await countChatTokens(arr) : await countTextTokens(promptStr);
+                    actualInput = arr ? await countChatTokens(arr) : await countTextTokens(promptStr);
                     const sheetTokens = await countTextTokens(rec.text);
                     if (actualInput > 0) {
                         recordRunTokens({ baselineInput: Math.max(0, actualInput - sheetTokens), actualInput, sheetTokens, path: 'text' });
                     }
+                    // Ground-truth capture AFTER injection (string prompts become
+                    // one pseudo-message; no trim exists on this path).
+                    capturePostInjectionPrompt(arr, 'text', promptStr);
                 } catch {  }
-                recordHealthEvent('injection', { status: 'ok', path: 'text' });
+                // Post-injection snapshot with what this path has: message count
+                // (when the payload is an array), sheet size, total tokens.
+                recordHealthEvent('injection', {
+                    status: 'ok', path: 'text',
+                    totalMsgs: Array.isArray(arr) ? arr.length : undefined,
+                    chatMsgs: Array.isArray(arr)
+                        ? arr.filter(m => m && (m.role === 'user' || m.role === 'assistant')).length
+                        : undefined,
+                    sheetPresent: !!String(rec.text || '').trim(),
+                    sheetChars: String(rec.text || '').length,
+                    actualInput,
+                });
                 addDebugLog('pass', `Memory sheet injected (text-completion, ${rec.text.length} chars${rec.seeded ? ', seed' : ''})`, {
                     subsystem: 'writer', event: 'inject.ok',
                     data: { chars: rec.text.length, seeded: !!rec.seeded, path: 'text-completion' },
@@ -883,6 +1088,9 @@ export function initPipeline() {
         clearInjectedGuard();
 
         pipelineCancelled = false;
+        // A new message un-parks a second-consecutive-failure backlog: the run it
+        // triggers gets a fresh auto-retry allowance.
+        connectionFailureStreak = 0;
         updateStatus('idle');
 
         const shouldRecordOutput = runRecordedInput;
@@ -935,6 +1143,9 @@ export function initPipeline() {
 
         extractionRetryAfterBusy = false;
         cancelledRetryArmed = false;
+        if (connectionRetryTimer) { clearTimeout(connectionRetryTimer); connectionRetryTimer = null; }
+        connectionFailureStreak = 0;
+        lastSentPrompt = null; // session/chat-scoped prompt proof — never crosses chats
         groupSkipToastShown = false;
         lastErrToastMsg = '';
         lastErrToastAt = 0;

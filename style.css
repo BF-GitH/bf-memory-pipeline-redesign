@@ -398,6 +398,24 @@
     transition: width 0.3s ease;
 }
 
+/* Catch-up badge: small pill above the send form showing how many settled
+   messages the memory pipeline has not extracted yet. Rendered/hidden by
+   message-icon.js updateCatchupBadge(); only visible while the count > 0. */
+.bf-mem-catchup-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    align-self: flex-start;
+    margin: 2px 0;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: #ffb300;             /* amber = behind, matches the health warn dot */
+    background: rgba(255, 179, 0, 0.12);
+    border: 1px solid rgba(255, 179, 0, 0.4);
+}
+
 .bf-mem-empty {
     color: #777;
     font-size: 12px;

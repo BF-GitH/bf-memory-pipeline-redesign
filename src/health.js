@@ -52,6 +52,23 @@ export function getToolUsage() {
 export function recordHealthEvent(key, payload) {
     if (!key) return;
     healthEvents[String(key)] = { ts: Date.now(), ...(payload && typeof payload === 'object' ? payload : {}) };
+    notifyHealthChange();
+}
+
+// Auto-refresh plumbing: settings.js registers a listener that re-renders the
+// Health tab when it is visible. Debounced so a burst of events at the end of
+// a run (injection + extraction + spine) repaints once, not once per event.
+let healthChangeListener = null;
+let healthNotifyTimer = null;
+export function setHealthChangeListener(fn) {
+    healthChangeListener = (typeof fn === 'function') ? fn : null;
+}
+function notifyHealthChange() {
+    if (!healthChangeListener || healthNotifyTimer) return;
+    healthNotifyTimer = setTimeout(() => {
+        healthNotifyTimer = null;
+        try { healthChangeListener(); } catch {  }
+    }, 800);
 }
 
 // Same stale-green reasoning as the session-only store: events from chat A must
@@ -60,6 +77,7 @@ export function clearHealthEvents() {
     for (const key of Object.keys(healthEvents)) delete healthEvents[key];
     for (const key of Object.keys(toolUsage)) delete toolUsage[key];
     toolUsageEpoch++; // invalidates records from loops started before the reset
+    notifyHealthChange(); // a visible Health tab must not keep showing the old chat
 }
 
 function ev(key) {
@@ -92,6 +110,19 @@ export async function buildHealthReport() {
         ? { id: 'profile', label: 'Agent LLM profile', status: 'ok', detail: 'dedicated connection profile configured' }
         : { id: 'profile', label: 'Agent LLM profile', status: 'warn', detail: 'uses main API profile' });
 
+    // b2. Agent connection (bridge). Fed by every agent-LLM call outcome
+    // (llm-call.js records 'agentCall'); user cancels are never recorded.
+    // Covers self-hosted bridges (e.g. Claude Code CLI on Termux) that can be
+    // asleep/unreachable while the main chat API still works fine.
+    const bridge = ev('agentCall');
+    if (!bridge) {
+        steps.push({ id: 'bridge', label: 'Agent connection', status: 'none', detail: 'no agent call this session yet — use Test connection' });
+    } else if (bridge.ok) {
+        steps.push({ id: 'bridge', label: 'Agent connection', status: 'ok', detail: `${bridge.profileId ? 'agent profile' : 'main API'} reachable — last call ${(Math.max(0, Number(bridge.ms) || 0) / 1000).toFixed(1)}s (${bridge.agent || 'agent'})`, ts: bridge.ts });
+    } else {
+        steps.push({ id: 'bridge', label: 'Agent connection', status: 'fail', detail: `last ${bridge.profileId ? 'agent-profile' : 'main-API'} call failed after ${(Math.max(0, Number(bridge.ms) || 0) / 1000).toFixed(1)}s: ${bridge.error || 'unknown error'}`, ts: bridge.ts });
+    }
+
     // c. Memory sheet. getMemorySheet() auto-seeds, so null only on a hard failure.
     let sheet = null;
     try { sheet = getMemorySheet(); } catch {  }
@@ -113,11 +144,37 @@ export async function buildHealthReport() {
     if (!inj) {
         steps.push({ id: 'injection', label: 'Prompt injection', status: 'none', detail: 'no generation observed yet' });
     } else if (inj.status === 'ok') {
-        const tokens = (Number(inj.baselineInput) || Number(inj.actualInput))
-            ? `, tokens ${Number(inj.baselineInput) || 0} → ${Number(inj.actualInput) || 0}`
-            : '';
-        const trimmed = Number.isFinite(Number(inj.trimmedCount)) ? `, trimmed ${Number(inj.trimmedCount)} msg(s)` : '';
-        steps.push({ id: 'injection', label: 'Prompt injection', status: 'ok', detail: `injected (${inj.path || 'chat'} path${tokens}${trimmed})`, ts: inj.ts });
+        const kFmt = (n) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+        if (Number.isFinite(Number(inj.totalMsgs))) {
+            // Post-injection snapshot: what was ACTUALLY sent after trim + sheet.
+            // External capture tools hook the prompt event BEFORE this extension's
+            // injection and show a pre-injection prompt — this row is ground truth.
+            const parts = [];
+            if (Number.isFinite(Number(inj.chatMsgs))) parts.push(`${Number(inj.chatMsgs)} chat`);
+            parts.push(inj.sheetPresent ? `sheet ${kFmt(Number(inj.sheetChars) || 0)} chars` : 'no sheet');
+            const tokens = Number(inj.actualInput) > 0 ? `, ~${kFmt(Number(inj.actualInput))} tokens` : '';
+            let trimTxt = '';
+            if ((inj.path || 'chat') === 'chat') {
+                const cfg = Math.max(0, Number(inj.trimToLast) || 0);
+                const eff = Math.max(0, Number(inj.effectiveTrim) || 0);
+                trimTxt = cfg === 0 ? ', trim off' : (eff > cfg ? `, trim ${cfg} (+${eff - cfg} lag)` : `, trim ${cfg}`);
+            }
+            const pathTxt = inj.path === 'text' ? ' — text path' : '';
+            steps.push({
+                id: 'injection', label: 'Prompt injection', status: 'ok',
+                detail: `sent ${Number(inj.totalMsgs)} msgs (${parts.join(' + ')})${tokens}${trimTxt}${pathTxt}`,
+                ts: inj.ts,
+            });
+        } else {
+            // Pre-snapshot event shape (or a string-prompt text path) — old detail.
+            // Text-path events never carry baselineInput: a missing baseline must
+            // not render as "tokens 0 → N" (that would claim a 0-token prompt).
+            const base = Number(inj.baselineInput) || 0;
+            const act = Number(inj.actualInput) || 0;
+            const tokens = base ? `, tokens ${base} → ${act}` : (act ? `, ~${act} tokens` : '');
+            const trimmed = Number.isFinite(Number(inj.trimmedCount)) ? `, trimmed ${Number(inj.trimmedCount)} msg(s)` : '';
+            steps.push({ id: 'injection', label: 'Prompt injection', status: 'ok', detail: `injected (${inj.path || 'chat'} path${tokens}${trimmed})`, ts: inj.ts });
+        }
     } else if (inj.status === 'empty') {
         steps.push({ id: 'injection', label: 'Prompt injection', status: 'warn', detail: 'sheet was empty at generation time — nothing injected', ts: inj.ts });
     } else {
@@ -137,6 +194,31 @@ export async function buildHealthReport() {
     } else {
         const lastTrim = Number.isFinite(Number(inj.trimmedCount)) ? `, last run removed ${Number(inj.trimmedCount)}` : '';
         steps.push({ id: 'trim', label: 'History trim', status: 'ok', detail: `keeps last ${trimN} messages${lastTrim}` });
+    }
+
+    // e2. Catch-up — settled-but-unprocessed backlog. When behind, the trim
+    // window auto-widens to the lag depth (pipeline.js computeCatchupLag) so an
+    // unprocessed message is never cut out of the storyteller's context.
+    // Dynamic import: pipeline.js statically imports this module, so a static
+    // back-edge would create an import cycle.
+    try {
+        const { computeCatchupLag } = await import('./pipeline.js');
+        const { lag, count } = computeCatchupLag();
+        if (count === 0) {
+            steps.push({ id: 'catchup', label: 'Catch-up', status: 'ok', detail: 'up to date' });
+        } else if (trimN === 0) {
+            steps.push({ id: 'catchup', label: 'Catch-up', status: 'warn', detail: `${count} message(s) behind — trim is off, full history keeps them in context` });
+        } else if (inj && inj.path === 'text') {
+            // Widening only exists on the chat-completion path; the text path
+            // never trims, so the backlog stays in context via full history —
+            // claiming a "widened" window here would contradict the trim row.
+            steps.push({ id: 'catchup', label: 'Catch-up', status: 'warn', detail: `${count} message(s) behind — the text-completion path never trims, full history keeps them in context` });
+        } else {
+            const effective = Math.max(trimN, lag);
+            steps.push({ id: 'catchup', label: 'Catch-up', status: 'warn', detail: `${count} message(s) behind — context window widens to ${effective} (chat-completion path)` });
+        }
+    } catch {
+        steps.push({ id: 'catchup', label: 'Catch-up', status: 'none', detail: 'backlog state unavailable' });
     }
 
     // f. Memory agent (extraction) — ONE row. When the run reported per-call
