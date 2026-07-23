@@ -268,9 +268,14 @@ async function renderHealthTab() {
         const { buildHealthReport, formatHealthAge } = await import('./health.js');
         const steps = await buildHealthReport();
         list.innerHTML = steps.map(step => {
+            // Section headers (per-agent tool telemetry) render without a dot;
+            // their tool rows carry `indent` to nest visually under the header.
+            if (step.header) {
+                return `<div class="bf-mem-health-section">${escapeHtml(step.label)}</div>`;
+            }
             const status = ['ok', 'warn', 'fail', 'none'].includes(step.status) ? step.status : 'none';
             const when = step.ts ? `<span class="bf-mem-health-ts">${escapeHtml(formatHealthAge(step.ts))}</span>` : '';
-            return `<div class="bf-mem-health-row">
+            return `<div class="bf-mem-health-row${step.indent ? ' indent' : ''}">
                 <span class="bf-mem-health-dot ${status}"></span>
                 <span class="bf-mem-health-label">${escapeHtml(step.label)}</span>
                 <span class="bf-mem-health-detail">${escapeHtml(step.detail || '')}</span>

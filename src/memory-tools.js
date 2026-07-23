@@ -7,6 +7,8 @@ import {
     createEmptyDatabase,
     applyCrossKeySupersedeRules,
     autoLinkFact,
+    linkFactsExplicit,
+    AGENT_LINK_MAX,
     isMaterialFactWrite,
     normalizeKind,
     clampImportance,
@@ -23,7 +25,14 @@ import { addDebugLog } from './settings.js';
 import { wordTokens, keyToken } from './tokenize.js';
 import * as host from './host.js';
 
-const KNOWN_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'write_fact', 'search', 'add_alias'];
+// Exported so the Health tab can list the memory agent's tool roster without
+// hardcoding it — this constant is the single source of truth for valid tools.
+export const KNOWN_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'write_fact', 'search', 'add_alias', 'link_facts'];
+
+// Read-only subset handed to the reflection pass — reflection must never write
+// through the tool channel (its writes go through the parsed #OBS/#REEVAL/#SHELVES
+// pipeline in agent-reflect.js). Also the Health tab's reflection tool roster.
+export const REFLECTION_READ_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'search'];
 
 const LIST_KEYS_CAP = 80;
 
@@ -209,6 +218,7 @@ export async function executeMemoryTool(call, ctx) {
             case 'search': return await execSearch(args, ctx);
             case 'write_fact': return execWriteFact(args, ctx);
             case 'add_alias': return execAddAlias(args, ctx);
+            case 'link_facts': return execLinkFacts(args, ctx);
             default: return `ERROR: unknown tool "${tool}"`;
         }
     } catch (e) {
@@ -260,7 +270,7 @@ function execListKeys(args, ctx) {
     let total = 0;
     for (const fact of db.facts) {
         if (!isActiveFact(fact)) continue;
-        if (!isFactVisible(fact, names)) continue; 
+        if (!ctx?.bypassVisibility && !isFactVisible(fact, names)) continue;
         total++;
         if (lines.length >= LIST_KEYS_CAP) continue; 
         const aspect = deriveAspect(fact);
@@ -288,11 +298,33 @@ function execReadFacts(args, ctx) {
 
         const key = rawKey.includes('/') ? rawKey.slice(rawKey.lastIndexOf('/') + 1).trim() : rawKey;
         const fact = db ? findFactMatch(db, key) : null;
-        if (!fact || !isActiveFact(fact) || !isFactVisible(fact, names)) {
+        if (!fact || !isActiveFact(fact) || (!ctx?.bypassVisibility && !isFactVisible(fact, names))) {
             lines.push(`${category}/${key}: (not found)`);
             continue;
         }
-        lines.push(buildFactLine(fact, category, nowCtx));
+        let line = buildFactLine(fact, category, nowCtx);
+        // Surface the fact's link refs (buildFactLine deliberately omits them
+        // from injected sheets) — the reflection prompt promises them and the
+        // agents are told to follow linked-fact leads. agentLinks reasons ride
+        // along as "(why)" on their matching ref.
+        const rels = fact.relationships || {};
+        const linked = [...new Set([
+            ...(Array.isArray(rels.primary) ? rels.primary : []),
+            ...(Array.isArray(rels.secondary) ? rels.secondary : []),
+        ])].filter(Boolean);
+        if (linked.length) {
+            const reasons = new Map();
+            for (const l of (Array.isArray(fact.agentLinks) ? fact.agentLinks : [])) {
+                const why = String(l?.reason || '').trim();
+                if (l?.ref && why) reasons.set(String(l.ref).trim().toLowerCase(), why);
+            }
+            const shown = linked.map(ref => {
+                const why = reasons.get(String(ref).trim().toLowerCase());
+                return why ? `${ref} (${why})` : ref;
+            });
+            line += `\n    linked: ${shown.join(', ')}`;
+        }
+        lines.push(line);
     }
     return lines.join('\n');
 }
@@ -308,7 +340,7 @@ async function execSearch(args, ctx) {
     const result = await retrieveFacts(needed, contextKeywords);
     const names = currentNames();
     const visible = (result?.facts || [])
-        .filter(r => r && r.fact && isActiveFact(r.fact) && isFactVisible(r.fact, names))
+        .filter(r => r && r.fact && isActiveFact(r.fact) && (ctx?.bypassVisibility || isFactVisible(r.fact, names)))
         .slice(0, SEARCH_RESULT_CAP);
     if (visible.length === 0) return `(no stored facts matched "${query.slice(0, 80)}")`;
     return formatFactsForWriter(visible);
@@ -426,6 +458,73 @@ function execAddAlias(args, ctx) {
         subsystem: 'agent3', event: 'memtool.add_alias', data: { token, names: list, runId: ctx.runId || '' },
     });
     return `OK "${alias}" and "${name}" now resolve to the same character (People/${key}: ${list.join(', ')})`;
+}
+
+// link_facts {from, to, reason} — agent-declared semantic link between two
+// STORED facts ("Category:key" on both sides). Persists through the SAME graph
+// storage autoLinkFact uses (relationships.primary refs, both directions) so
+// the existing expansion/walk machinery surfaces one fact when the other is on
+// the sheet; the reason rides along in fact.agentLinks for the DB panel.
+function parseFactRef(raw) {
+    const s = String(raw || '').trim();
+    const sep = s.search(/[:/]/);
+    if (sep <= 0 || sep >= s.length - 1) return null;
+    const category = mapLegacyCategory(s.slice(0, sep).trim());
+    const key = s.slice(sep + 1).trim();
+    if (!category || !key) return null;
+    return { category, key };
+}
+
+function execLinkFacts(args, ctx) {
+    if (!ctx || typeof ctx !== 'object' || !ctx.databases) return 'ERROR: link_facts has no database context';
+    if (!(ctx.touchedCategories instanceof Set)) ctx.touchedCategories = new Set();
+
+    const fromRef = parseFactRef(args?.from);
+    const toRef = parseFactRef(args?.to);
+    if (!fromRef || !toRef) return 'ERROR: link_facts requires args.from and args.to as "Category:key" refs';
+
+    const resolve = (ref) => {
+        const db = ctx.databases[ref.category];
+        if (!db) return null;
+        let fact = findFactMatch(db, ref.key);
+        if (!fact) {
+            // Apply the same key canonicalization write_fact applies on store
+            // (generic char/user prefix, registered alias prefix), so a link
+            // emitted in the same reply as the write_fact that rewrote the key
+            // ("char_secret" stored as "monika_secret") still resolves.
+            let key = keyToken(ref.key);
+            if (key) {
+                key = resolveGenericKeyPrefix(key, currentNames());
+                key = resolveAliasKeyPrefix(key);
+                if (key !== ref.key) fact = findFactMatch(db, key);
+            }
+        }
+        return (fact && isActiveFact(fact)) ? fact : null;
+    };
+    const fromFact = resolve(fromRef);
+    if (!fromFact) return `ERROR: link_facts found no active fact ${fromRef.category}/${fromRef.key} — verify the ref with list_keys/read_facts`;
+    const toFact = resolve(toRef);
+    if (!toFact) return `ERROR: link_facts found no active fact ${toRef.category}/${toRef.key} — verify the ref with list_keys/read_facts`;
+
+    const status = linkFactsExplicit(fromFact, fromRef.category, toFact, toRef.category, args?.reason, ctx.runId || '');
+    if (status === 'invalid') return 'ERROR: link_facts cannot link a fact to itself';
+    if (status === 'ambiguous') return `ERROR: link_facts cannot represent this link — ${fromRef.category}/${fromFact.key} and ${toRef.category}/${toFact.key} are different facts sharing the same key, and link refs are keyed by fact key alone; rewrite one fact under a distinct key first`;
+    if (status === 'capped') return `ERROR: agent-link cap reached (${AGENT_LINK_MAX} per fact) — link not added`;
+    // 'duplicate' is a no-op success: the connection is already declared.
+    if (status === 'duplicate') return `OK ${fromRef.category}/${fromFact.key} and ${toRef.category}/${toFact.key} are already linked (no change)`;
+
+    // Stamp both categories like a fact write would — the rehydrate recency
+    // guards read db.updatedAt, and a link-only session must not look stale.
+    const linkStamp = Date.now();
+    if (ctx.databases[fromRef.category]) ctx.databases[fromRef.category].updatedAt = linkStamp;
+    if (ctx.databases[toRef.category]) ctx.databases[toRef.category].updatedAt = linkStamp;
+    ctx.touchedCategories.add(fromRef.category);
+    ctx.touchedCategories.add(toRef.category);
+    addDebugLog('info', `Memory Agent link_facts: ${fromRef.category}/${fromFact.key} <-> ${toRef.category}/${toFact.key}`, {
+        subsystem: 'agent3', event: 'memtool.link_facts',
+        data: { from: `${fromRef.category}:${fromFact.key}`, to: `${toRef.category}:${toFact.key}`, reason: String(args?.reason || '').trim(), runId: ctx.runId || '' },
+    });
+    return `OK linked ${fromRef.category}/${fromFact.key} <-> ${toRef.category}/${toFact.key}`;
 }
 
 function scopeFromCategory(category) {

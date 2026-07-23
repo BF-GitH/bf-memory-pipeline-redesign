@@ -60,8 +60,14 @@ function findNearKeyConflicts(databases, threshold = NEAR_KEY_THRESHOLD) {
     return pairs;
 }
 import { addDebugLog, setReflection, getSummaryPyramid, setSummaryPyramid } from './settings.js';
-import { callAgentLLM } from './llm-call.js';
+import { callAgentLLM, callAgentLLMWithTools } from './llm-call.js';
+import { executeMemoryTool, REFLECTION_READ_TOOLS } from './memory-tools.js';
 import * as host from './host.js';
+
+// Agentic-reflection budget — deliberately tighter than the memory agent's
+// 6 rounds / 20 calls: reflection verifies and follows leads, it does not extract.
+const REFLECT_MAX_ROUNDS = 5;
+const REFLECT_MAX_TOOL_CALLS = 15;
 
 const MAX_FACT_SUMMARY_CHARS = 4000;
 
@@ -86,7 +92,33 @@ const MAX_CALLBACKS_PER_PASS = 2;
 
 const MAX_CALLBACK_REASON_CHARS = 120;
 
-export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, and to maintain short zoom-out summaries.
+export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given a COMPACT digest of the stored facts plus READ-ONLY tools to browse the real store behind it. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, and to maintain short zoom-out summaries.
+
+# TOOL PROTOCOL (plain text — no function-call API)
+
+To use a tool, reply with tool-call lines. Each tool call is ONE line of strict JSON, alone on its line:
+{"tool":"list_categories"}
+{"tool":"list_keys","args":{"category":"People"}}
+{"tool":"read_facts","args":{"category":"People","keys":["monika_fear_storms","monika_job"]}}
+{"tool":"search","args":{"query":"who owns the bakery"}}
+
+After your reply, the system executes the calls and sends the results back as one user message starting with "TOOL RESULTS:". You may then call more tools or finish. You may emit several tool-call lines in one reply. Do NOT wrap calls in markdown fences; do NOT pretty-print the JSON across lines.
+
+TOOLS (READ-ONLY):
+- list_categories — every category with its active fact count.
+- list_keys {category} — one line per stored fact in that category: key | aspect | value preview.
+- read_facts {category, keys[]} — the FULL stored record for each requested key (value, note, who knows it, links).
+- search {query} — keyword search across the whole store.
+You have NO write tools — reflection never writes through the tool channel. Everything you conclude is delivered through the final sections below; the system applies them for you.
+
+HARD LIMITS: at most 5 rounds (replies by you) and 15 tool calls per pass. Be economical, but never assert a verdict you could have verified and didn't.
+
+# METHOD: INVESTIGATE FIRST, EMIT LAST
+
+The digest in the task block is compressed and truncated STARTING material, not the whole truth. Work in two phases:
+1. INVESTIGATE — form candidate observations and verdicts from the digest, then VERIFY each one against the actual store: read_facts the exact keys behind any summary line you are about to build on (the full record — note, knowers, links — often changes the picture); list_keys a category when the digest looks thin or truncated; search a subject to surface facts the digest never showed.
+2. FOLLOW LEADS — when a record you read points at another character, place, event, or linked fact that could change a verdict, prompt yourself deeper: read or search THAT next. Evidence connected across categories is exactly what makes a good observation. Stop when further reads stop changing your conclusions.
+Only claims that survive this investigation go into the final sections; silently drop any candidate the store does not support. Emit the final sections ONLY in your LAST reply.
 
 Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
 
@@ -98,13 +130,13 @@ If a "## Shelves to summarize" list is given, write ONE short summary line per l
 
 If a "## Recent moments" list is given (the couple/character emotional beats — confessions, fights, betrayals, reunions — each shown with its exact id), you MAY name 0-2 CALLBACK links: a NEW recent beat that clearly ECHOES an EARLIER one (a confession that pays off an earlier hidden feeling; a betrayal that resurfaces an old wound; a reunion that answers a parting). Emit a link ONLY when the resonance is unmistakable — most passes name none. Each link points the EARLIER beat's id to the LATER beat's id with a one-clause reason. Use ONLY ids from the list (never invent one). If no clear echo exists (or no list was given), put a single "." under #CALLBACK.
 
-You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture:
+You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture (use the read tools to check the surrounding evidence — the subject's other stored facts — before you PROMOTE or DROP):
 - PROMOTE — the evidence now supports it as a real, lasting fact: give its proper Layer-1 category (People/Places/Things/Relationships/Events/World) and the most-specific aspect. e.g. a recurring vice → People/vices; a confirmed home → People/home.
 - DROP — it was a confirmed one-off / no longer true / noise: demote it (it is deprioritized, not erased — it stays recoverable if it ever matters again).
 - KEEP — still genuinely uncertain: leave it where it is for a later pass.
 Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fact by its exact id shown in brackets.
 
-# OUTPUT FORMAT (exactly this, nothing else)
+# OUTPUT FORMAT (your LAST reply ends with exactly this, then a \`#DONE\` line)
 
 #STORY
 <2-4 sentence whole-story recap, or "." if there is nothing yet>
@@ -125,8 +157,9 @@ Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fac
 + <id> = drop
 + <id> = keep
 .
+#DONE
 
-If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no clear echo exists (or no recent-moments list was given), put a single "." under #CALLBACK. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (at most 10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material.`;
+If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no clear echo exists (or no recent-moments list was given), put a single "." under #CALLBACK. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (at most 10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material you saw (digest or tool results). After the #REEVAL section, end the reply with a line that is exactly \`#DONE\`.`;
 
 function collectReevalCandidates(databases) {
     const now = Date.now();
@@ -259,7 +292,7 @@ function buildReflectInput({ databases, reevalCandidates = [], changedShelves = 
         parts.push(`## Re-evaluate (give a verdict per id)\n${reLines.join('\n')}`);
     }
 
-    parts.push('\nNow output ONLY the #STORY, #SHELVES, #OBS, #CALLBACK and #REEVAL sections.');
+    parts.push('\nThe lists above are compact STARTING material — verify against the real store with the read tools before you conclude. When your investigation is done, END your LAST reply with the #STORY, #SHELVES, #OBS, #CALLBACK and #REEVAL sections followed by a line that is exactly #DONE.');
     return parts.join('\n\n');
 }
 
@@ -396,7 +429,7 @@ export async function runReflection({ runId = '', prevReflection = null, charact
         const totalFacts = Object.values(databases).reduce((n, db) => n + (db.facts?.length || 0), 0);
         if (totalFacts === 0) {
             addDebugLog('info', `[${runId}] Reflection skipped (nothing to consolidate)`);
-            return { summary: '', observations: [], merged: 0, tokensIn: 0, tokensOut: 0 };
+            return { summary: '', observations: [], merged: 0, rounds: 0, toolCallCount: 0, tokensIn: 0, tokensOut: 0 };
         }
 
         let totalMerged = 0;
@@ -471,12 +504,75 @@ export async function runReflection({ runId = '', prevReflection = null, charact
         dataParts.push(buildReflectInput({ databases, reevalCandidates, changedShelves, recentMoments, priorStory: (priorPyramid && priorPyramid.story) || '' }));
         const userPrompt = substitute(dataParts.join('\n\n'));
 
-        addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
+        addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars (tool loop, max ${REFLECT_MAX_ROUNDS} rounds / ${REFLECT_MAX_TOOL_CALLS} tool calls)`);
 
-        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'reflection');
-        let tokensIn = await host.getTokenCount(systemPrompt + '\n' + userPrompt);
-        let tokensOut = await host.getTokenCount(resultStr);
-        addDebugLog('info', `[${runId}] Reflection LLM reply (${resultStr.length} chars):\n${resultStr}`);
+        // Read-only tool context over the same in-memory store the writes below
+        // mutate. The executor REJECTS every non-read tool — reflection's writes
+        // go exclusively through the parsed #OBS/#CALLBACK/#REEVAL/#SHELVES
+        // pipeline further down, never through the tool channel.
+        const toolCtx = {
+            runId,
+            databases,
+            index,
+            settings,
+            applied: [],
+            touchedCategories: new Set(),
+            // The digest above lists ALL active facts with no knownBy filter, so
+            // the read tools must not apply current-scene visibility gating —
+            // otherwise a fact known only to an absent NPC shows in the digest
+            // but reads back "(not found)", corrupting PROMOTE/DROP verdicts.
+            bypassVisibility: true,
+        };
+        const executeReadOnlyTool = (call) => {
+            const tool = String(call?.tool || '');
+            if (!REFLECTION_READ_TOOLS.includes(tool)) {
+                return `ERROR: tool "${tool}" is not available to reflection — this pass is READ-ONLY (allowed: ${REFLECTION_READ_TOOLS.join(', ')}). Deliver conclusions through the final #OBS/#REEVAL sections instead.`;
+            }
+            return executeMemoryTool(call, toolCtx);
+        };
+
+        // extractOnly makes the loop's final token #DONE — the #STORY..#REEVAL
+        // sections ride in the same (last) reply, above that token.
+        const loop = await callAgentLLMWithTools({
+            systemPrompt,
+            userPrompt,
+            profileId,
+            agent: 'reflection',
+            agentTag: 'reflection',
+            maxRounds: REFLECT_MAX_ROUNDS,
+            maxToolCalls: REFLECT_MAX_TOOL_CALLS,
+            executeTool: executeReadOnlyTool,
+            extractOnly: true,
+            // Grace-round example must be a tool this READ-ONLY pass accepts —
+            // the default write_fact example would steer a confused model into
+            // a guaranteed rejection.
+            protocolExample: '{"tool":"read_facts","args":{"category":"People","keys":["x_name"]}}',
+        });
+        let tokensIn = loop.tokensInApprox || 0;
+        let tokensOut = loop.tokensOutApprox || 0;
+        const rounds = loop.rounds || 0;
+        const toolCallCount = loop.toolCallCount || 0;
+
+        // The final sections travel in the reply that carried the #DONE token —
+        // take the last non-empty reply from the loop transcript.
+        let resultStr = '';
+        for (let i = (loop.transcript || []).length - 1; i >= 0; i--) {
+            const r = String(loop.transcript[i]?.reply || '');
+            if (r.trim()) { resultStr = r; break; }
+        }
+
+        if (loop.error) {
+            addDebugLog('fail', `[${runId}] Reflection tool loop failed: ${loop.error} (${rounds} round(s), ${toolCallCount} tool call(s))`, {
+                subsystem: 'reflection', event: 'reflection.toolloop', reason: 'LOOP_ERROR',
+                data: { rounds, toolCallCount, error: loop.error },
+            });
+            return { summary: '', observations: [], merged: totalMerged, rounds, toolCallCount, tokensIn, tokensOut, error: loop.error };
+        }
+
+        addDebugLog('info', `[${runId}] Reflection tool loop done: ${rounds} round(s), ${toolCallCount} tool call(s); final reply (${resultStr.length} chars):\n${resultStr}`, {
+            subsystem: 'reflection', event: 'reflection.toolloop',
+            data: { rounds, toolCallCount, tools: (loop.transcript || []).flatMap(t => t.toolCalls || []) },
+        });
 
         const parsed = parseReflectResult(resultStr);
 
@@ -497,7 +593,12 @@ export async function runReflection({ runId = '', prevReflection = null, charact
                         subsystem: 'reflection', event: 'summary.compression_guard', reason: 'NOT_SMALLER',
                         data: { failing, queued: changedShelves.length },
                     });
-                    const repairUserPrompt = userPrompt + '\n\nYour #SHELVES summaries were not shorter than the source facts. Rewrite the SAME source memories more abstractly instead of adding detail; do not introduce new facts.';
+                    // Repair stays SINGLE-SHOT even though the main pass is a tool
+                    // loop: the investigation already happened, so the loop's final
+                    // text rides along as context and tools are explicitly off.
+                    const repairUserPrompt = userPrompt
+                        + `\n\n## Your previous final sections (rework these)\n${resultStr}`
+                        + '\n\nYour #SHELVES summaries were not shorter than the source facts. Do NOT call any tools now — re-emit the COMPLETE final sections (#STORY/#SHELVES/#OBS/#CALLBACK/#REEVAL), rewriting the SAME source memories more abstractly instead of adding detail; do not introduce new facts. End with a line that is exactly #DONE.';
                     const retryStr = await callAgentLLM(systemPrompt, repairUserPrompt, profileId, 'reflection');
                     tokensIn += await host.getTokenCount(systemPrompt + '\n' + repairUserPrompt);
                     tokensOut += await host.getTokenCount(retryStr);
@@ -687,10 +788,13 @@ export async function runReflection({ runId = '', prevReflection = null, charact
             addDebugLog('pass', `[${runId}] Re-evaluation: promoted ${promoted}, dropped ${dropped} (from ${reevalCandidates.length} candidate(s))`);
         }
 
-        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, callbacks=${callbacksWritten}, reeval(+${promoted}/-${dropped})`);
-        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, callbacks: callbacksWritten, promoted, dropped, tokensIn, tokensOut };
+        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, callbacks=${callbacksWritten}, reeval(+${promoted}/-${dropped}), rounds=${rounds}, toolCalls=${toolCallCount}`, {
+            subsystem: 'reflection', event: 'reflection.done',
+            data: { merged: totalMerged, observations: written, callbacks: callbacksWritten, promoted, dropped, rounds, toolCallCount },
+        });
+        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, callbacks: callbacksWritten, promoted, dropped, rounds, toolCallCount, tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Reflection error (non-fatal): ${error.message || error}`);
-        return { summary: '', observations: [], tokensIn: 0, tokensOut: 0, error: error.message || String(error) };
+        return { summary: '', observations: [], rounds: 0, toolCallCount: 0, tokensIn: 0, tokensOut: 0, error: error.message || String(error) };
     }
 }

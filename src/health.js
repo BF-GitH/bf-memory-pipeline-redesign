@@ -7,6 +7,7 @@
 import { getSettings, getMemorySheet, getStorySpine, getCurrentScene } from './settings.js';
 import { getDebugLogEntries } from './debug-log.js';
 import { getContext } from './ui-util.js';
+import { KNOWN_TOOLS as MEMORY_AGENT_TOOLS, REFLECTION_READ_TOOLS } from './memory-tools.js';
 
 // Matches BEAT_MAX_CHARS in agent-memory.js — a beat past this slipped through
 // the brevity enforcement (or predates it) and bloats every injected sheet.
@@ -17,6 +18,37 @@ const RECENT_LOG_WINDOW = 50;
 
 const healthEvents = {};
 
+// Session-scoped per-agent tool telemetry: { [agentTag]: { [tool]: { count, lastTs } } }.
+// agentTag is 'memory' or 'reflection'. Recorded from the tool-loop choke point
+// in llm-call.js AFTER the executor returns success, so only tool calls that
+// actually EXECUTED are counted — parse attempts, malformed calls, rejected
+// calls (reflection's read-only gate) and failed calls never show up here.
+const toolUsage = {};
+
+// Bumped on every clearHealthEvents (CHAT_CHANGED). A tool loop still in
+// flight across a chat switch carries the OLD epoch on its records, which are
+// dropped — the previous chat's calls never bleed into the new chat's rows.
+let toolUsageEpoch = 0;
+
+export function getToolUsageEpoch() {
+    return toolUsageEpoch;
+}
+
+export function recordToolUse(agentTag, toolName, epoch = null) {
+    if (epoch !== null && epoch !== toolUsageEpoch) return; // stale loop from before a chat switch
+    const tag = String(agentTag || '').trim();
+    const tool = String(toolName || '').trim();
+    if (!tag || !tool) return;
+    const byTool = toolUsage[tag] || (toolUsage[tag] = {});
+    const entry = byTool[tool] || (byTool[tool] = { count: 0, lastTs: 0 });
+    entry.count++;
+    entry.lastTs = Date.now();
+}
+
+export function getToolUsage() {
+    return toolUsage;
+}
+
 export function recordHealthEvent(key, payload) {
     if (!key) return;
     healthEvents[String(key)] = { ts: Date.now(), ...(payload && typeof payload === 'object' ? payload : {}) };
@@ -26,6 +58,8 @@ export function recordHealthEvent(key, payload) {
 // not report as chat B's health. Called from the pipeline's CHAT_CHANGED reset.
 export function clearHealthEvents() {
     for (const key of Object.keys(healthEvents)) delete healthEvents[key];
+    for (const key of Object.keys(toolUsage)) delete toolUsage[key];
+    toolUsageEpoch++; // invalidates records from loops started before the reset
 }
 
 function ev(key) {
@@ -160,7 +194,10 @@ export async function buildHealthReport() {
     if (!refl) {
         steps.push({ id: 'reflection', label: 'Reflection', status: 'none', detail: 'has not run yet (runs every ~12 replies)' });
     } else if (refl.status === 'ok') {
-        steps.push({ id: 'reflection', label: 'Reflection', status: 'ok', detail: `last pass ${Number(refl.durationMs) || 0}ms`, ts: refl.ts });
+        const loopInfo = Number(refl.rounds) > 0
+            ? `, ${Number(refl.rounds)} round(s), ${Number(refl.toolCallCount) || 0} tool call(s)`
+            : '';
+        steps.push({ id: 'reflection', label: 'Reflection', status: 'ok', detail: `last pass ${Number(refl.durationMs) || 0}ms${loopInfo}`, ts: refl.ts });
     } else {
         steps.push({ id: 'reflection', label: 'Reflection', status: 'fail', detail: String(refl.error || 'reflection failed'), ts: refl.ts });
     }
@@ -181,6 +218,28 @@ export async function buildHealthReport() {
     steps.push(failCount > 0
         ? { id: 'errors', label: 'Recent errors', status: 'warn', detail: scanned ? `${failCount} failure(s) in the last ${scanned} log entries` : `${failCount} recorded failure(s) this session` }
         : { id: 'errors', label: 'Recent errors', status: 'ok', detail: scanned ? `no failures in the last ${scanned} log entries` : 'no failures recorded this session' });
+
+    // k. Per-agent tool telemetry — which tools each agent has and when each was
+    // last actually executed this session. `header: true` rows are section
+    // headers (no dot), `indent: true` rows nest under them.
+    const toolRow = (tag, tool) => {
+        const u = toolUsage[tag]?.[tool];
+        return (u && u.count > 0)
+            ? { id: `tools_${tag}_${tool}`, label: tool, status: 'ok', detail: `${u.count} call(s), last ${ageText(u.lastTs)}`, indent: true }
+            : { id: `tools_${tag}_${tool}`, label: tool, status: 'none', detail: 'never used', indent: true };
+    };
+
+    steps.push({ id: 'tools_memory', label: 'Memory agent tools', header: true });
+    // Known roster first (stable order), then any extras that showed up in the
+    // usage store but are not in the constant (future-proofing, should be rare).
+    const memoryExtras = Object.keys(toolUsage['memory'] || {}).filter(t => !MEMORY_AGENT_TOOLS.includes(t));
+    for (const tool of [...MEMORY_AGENT_TOOLS, ...memoryExtras]) steps.push(toolRow('memory', tool));
+
+    steps.push({ id: 'tools_reflection', label: 'Reflection tools', header: true });
+    // Reflection's fixed read-only roster first (stable order), then any extras
+    // recorded under the tag that are not in the constant (future-proofing).
+    const reflectionExtras = Object.keys(toolUsage['reflection'] || {}).filter(t => !REFLECTION_READ_TOOLS.includes(t));
+    for (const tool of [...REFLECTION_READ_TOOLS, ...reflectionExtras]) steps.push(toolRow('reflection', tool));
 
     return steps;
 }

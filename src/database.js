@@ -1733,6 +1733,12 @@ export function upsertFact(db, fact) {
 
         const mergedInvolved = mergeInvolved(existing.involved, fact.involved);
 
+        // agentLinks union like tags/relationships — a plain spread would let
+        // the incoming fact's list wholesale replace the stored one, dropping
+        // the {ref, category, reason} records the surviving fact still needs
+        // (dedupeDatabase re-feeds duplicates through here).
+        const mergedAgentLinks = mergeAgentLinks(existing.agentLinks, fact.agentLinks);
+
         // Tags are a UNION, not a replacement: the agent rarely re-sends tags on an
         // update, and a plain spread would wipe the stored ones with its empty list.
         const mergedTags = Array.from(new Set([
@@ -1751,7 +1757,7 @@ export function upsertFact(db, fact) {
 
         const oldValue = existing.value;
         const updNow = Date.now();
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, tags: mergedTags, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, tags: mergedTags, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...(mergedAgentLinks ? { agentLinks: mergedAgentLinks } : {}), ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
         if (factValuesEqual(oldValue, fact.value)) {
             addDebugLog('debug', `Fact unchanged: [${db.category}] ${existing.key}`, {
                 subsystem: 'db', event: 'fact.unchanged',
@@ -2137,6 +2143,24 @@ function normalizeFactKey(key) {
     return k;
 }
 
+// Union of agentLinks entries, deduped by ref+category. Returns undefined when
+// neither side carries any so facts from older profiles never gain the field.
+function mergeAgentLinks(existing, incoming) {
+    const e = Array.isArray(existing) ? existing : [];
+    const i = Array.isArray(incoming) ? incoming : [];
+    if (e.length === 0 && i.length === 0) return undefined;
+    const out = [];
+    const seen = new Set();
+    for (const l of [...e, ...i]) {
+        if (!l || typeof l !== 'object' || !l.ref) continue;
+        const id = `${String(l.ref).trim().toLowerCase()}|${String(l.category || '').trim().toLowerCase()}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(l);
+    }
+    return out.length ? out : undefined;
+}
+
 function mergeRelationships(existing, incoming) {
     const result = { primary: [], secondary: [], tertiary: [] };
     for (const tier of ['primary', 'secondary', 'tertiary']) {
@@ -2257,6 +2281,65 @@ export function autoLinkFact(index, fact, category, runId) {
         data: { key: fact.key, category, primary: primary.length, secondary: secondary.length, targets: [...primary, ...secondary] },
     });
     return { primary, secondary };
+}
+
+// Agent-declared semantic links (the link_facts tool). Stored two ways so no
+// downstream reader changes: the partner's key ref goes into
+// relationships.primary on BOTH facts (the exact shape autoLinkFact writes, so
+// relationship-ref expansion and graph extras walk the link for free), and
+// fact.agentLinks records { ref, category, reason } so the DB panel can show
+// WHY the agent linked them. agentLinks is optional — facts from older
+// profiles simply lack the field and keep working unchanged.
+export const AGENT_LINK_MAX = 5;
+
+function agentLinkList(fact) {
+    if (!Array.isArray(fact.agentLinks)) fact.agentLinks = [];
+    return fact.agentLinks;
+}
+
+// Bidirectional, atomic: caps are checked BEFORE either side mutates, so a
+// rejected link never half-applies. Returns 'linked' | 'duplicate' | 'capped'
+// | 'invalid' (same fact on both sides) | 'ambiguous' (two DIFFERENT facts
+// whose bare-key refs collide — the categoryless ref scheme cannot represent
+// that link, and the caller must report the real cause, not "self-link").
+export function linkFactsExplicit(fromFact, fromCategory, toFact, toCategory, reason, runId) {
+    const fromRef = autoLinkRef(fromFact);
+    const toRef = autoLinkRef(toFact);
+    if (!fromRef || !toRef || fromFact === toFact) return 'invalid';
+    if (fromRef === toRef) return 'ambiguous';
+    const fromLinks = agentLinkList(fromFact);
+    const toLinks = agentLinkList(toFact);
+    // Duplicate detection must match ref AND category: same-key facts in
+    // different categories are distinct link partners, and conflating them
+    // produced one-sided mutations that broke the atomicity guarantee above.
+    // A legacy entry without a category is treated as a match (lenient).
+    const sameLink = (l, ref, cat) => l && String(l.ref || '') === ref
+        && (l.category == null || String(l.category) === String(cat));
+    const dupFrom = fromLinks.some(l => sameLink(l, toRef, toCategory));
+    const dupTo = toLinks.some(l => sameLink(l, fromRef, fromCategory));
+    if (dupFrom && dupTo) return 'duplicate';
+    if (!dupFrom && fromLinks.length >= AGENT_LINK_MAX) return 'capped';
+    if (!dupTo && toLinks.length >= AGENT_LINK_MAX) return 'capped';
+    const why = String(reason || '').trim();
+    // Stamp mutated facts like upsertFact does — the rehydrate clobber-guard
+    // and tombstone adoption judge category freshness by these fields, and an
+    // unstamped link-only change would look older than it is and get discarded.
+    const linkNow = Date.now();
+    if (!dupFrom) {
+        fromFact.relationships = mergeRelationships(fromFact.relationships, { primary: [toRef], secondary: [], tertiary: [] });
+        fromLinks.push({ ref: toRef, category: toCategory, reason: why });
+        fromFact.lastUpdated = linkNow;
+    }
+    if (!dupTo) {
+        toFact.relationships = mergeRelationships(toFact.relationships, { primary: [fromRef], secondary: [], tertiary: [] });
+        toLinks.push({ ref: fromRef, category: fromCategory, reason: why });
+        toFact.lastUpdated = linkNow;
+    }
+    addDebugLog('info', `Agent-linked facts: [${fromCategory}] ${fromFact.key} <-> [${toCategory}] ${toFact.key}${why ? ` (${why})` : ''}`, {
+        subsystem: 'db', event: 'fact.agentlink', runId,
+        data: { from: `${fromCategory}:${fromFact.key}`, to: `${toCategory}:${toFact.key}`, reason: why },
+    });
+    return 'linked';
 }
 
 export function removeFact(db, key) {

@@ -54,6 +54,7 @@ To use a tool, reply with tool-call lines. Each tool call is ONE line of strict 
 {"tool":"write_fact","args":{"category":"People","key":"monika_mood","value":"...","note":"...","known_by":["Monika"],"aspect":"mood","importance":3}}
 {"tool":"search","args":{"query":"who owns the bakery"}}
 {"tool":"add_alias","args":{"name":"Trish","alias":"Trish Mitchells"}}
+{"tool":"link_facts","args":{"from":"Events:tom_affair_jessica","to":"Events:jessica_visit_awkward","reason":"explains why the visit was awkward"}}
 
 After your reply, the system executes the calls and sends the results back as one user message starting with "TOOL RESULTS:". You may then call more tools or finish. You may emit several tool-call lines in one reply. Do NOT wrap calls in markdown fences; do NOT pretty-print the JSON across lines.
 
@@ -63,9 +64,15 @@ TOOLS:
 - read_facts {category, keys[]} — the full stored line for each requested key.
 - search {query} — keyword search across the whole store.
 - write_fact {category, key, value, note?, known_by?, aspect?, importance?, kind?} — store one fact (or update the key's current value).
-- add_alias {name, alias} — record that two names are the SAME character (e.g. "Trish" is later introduced in full as "Trish Mitchells"). From then on both names resolve to one character everywhere: her existing memories surface when either name comes up, and who-knows lists match under either name. BEFORE writing facts for a seemingly NEW character, search their first name — if they already exist under a shorter/older name, call add_alias and keep using the EXISTING key prefix instead of starting a duplicate.
+- add_alias {name, alias} — record that two names are the SAME character (e.g. "Trish" ≡ "Trish Mitchells"); both then resolve to one character everywhere (memories, who-knows lists). BEFORE writing facts for a seemingly NEW character, search their first name — if they exist under an older/shorter name, add_alias and keep the EXISTING key prefix instead of starting a duplicate.
+- link_facts {from, to, reason} — declare a semantic link between two STORED facts, each ref "Category:key" (VERIFIED via tools, never guessed). Use it when a NEW fact retroactively explains or connects to an OLD one you found via search/read_facts: store the new fact, then link_facts it to the old one — e.g. new Events:tom_affair_jessica linked to old Events:jessica_visit_awkward, reason "explains why that visit was awkward". Linked facts surface together on future sheets. Max 5 agent links per fact; re-linking the same pair is a harmless no-op.
 
-HARD LIMITS: at most 6 rounds (replies by you) and 20 tool calls per session. Be economical: usually one read round (list/search what's relevant), then ONE final reply with your write_fact lines followed by the #SHEET block.
+HARD LIMITS: at most 8 rounds (replies by you) and 24 tool calls per session.
+
+CALIBRATE DEPTH to the turn, not a flat budget:
+- LIGHT turn (small talk, one obvious fact): one read round, then ONE final reply with your write_fact lines and the #SHEET block.
+- DENSE turn (new character, backstory reveal, secret, possible contradiction with something stored): SPEND extra rounds. Query the relevant categories/keys BEFORE writing — e.g. the message says "Maria likes apples": list_keys People / search "maria food" first; an existing preference key turns up, so write into that existing key structure instead of creating a duplicate. Follow up on suspicious hits, and link_facts what connects.
+Either way the FINAL reply carries the write_fact (and link_facts) lines plus the #SHEET block.
 
 # FINAL BLOCK
 
@@ -83,8 +90,8 @@ NEED: Category/key, Category/key, ...
 - PRESENT: keep it CURRENT every turn — everyone physically in the scene right now (main pair AND named NPCs), nobody who has left. It drives two things: it is the DEFAULT known_by for facts you store without an explicit list, and stored memories known to a listed character become visible to the storyteller while that character is in the scene.
 - SCENE_MARKER: include ONLY when a NEW scene BEGINS this run (a change of place, a time-skip, or a major shift). Give the chat index where it starts and a 2-5 word name. Omit it entirely while the current scene continues — a new marker closes the previous scene card and opens a fresh one.
 - BEAT: emit ONE line per NEWLY-settled message this run (use its \`#\` index), each a single terse past-tense sentence capturing what happened in that message. These stack into the current scene's card. Do NOT re-emit BEAT lines for messages you already logged on an earlier run — only the new ones.
-- NEED lists ONLY the Category/key refs THIS reply actually draws on (exact refs you VERIFIED with the tools — never invented): the people present and their current state, the active relationships, and the open threads and history THIS scene touches. Produce a UNIQUE, focused set each turn — do NOT re-list the stable premise/identity facts, because the system ALWAYS injects those for you (the premise floor). The store keeps everything forever; if a later scene needs an older fact, NEED it that turn (or find it with list_keys/search). The system renders the facts you list onto the sheet for you.
-- write_fact lines MAY appear in the same reply, BEFORE the #SHEET block (they are executed, then the sheet is accepted). Read tools in that reply are ignored.
+- NEED lists ONLY the Category/key refs THIS reply actually draws on (exact refs VERIFIED with the tools — never invented): people present and their current state, active relationships, open threads THIS scene touches. Keep it a UNIQUE, focused set each turn — do NOT re-list stable premise/identity facts; the system ALWAYS injects those (the premise floor). The store keeps everything forever; if a later scene needs an older fact, NEED it that turn (or list_keys/search). The system renders the listed facts onto the sheet.
+- write_fact/link_facts lines MAY appear in the same reply, BEFORE the #SHEET block (executed, then the sheet is accepted). Read tools in that reply are ignored.
 - EXTRACT-ONLY runs (the task block says so): do NOT emit #SHEET; end with a line that is exactly \`#DONE\` instead.
 
 # WHAT TO STORE (write_fact)
@@ -98,7 +105,7 @@ Store LASTING facts — anything the STORY still tracks 50 messages from now. Be
 - importance: 1-5 (5 = core identity like a name/species, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial).
 - kind: \`trait\` (durable identity), \`state\` (a durable-but-changeable condition — a job, an injury, who holds a key object, an ongoing goal), \`event\` (something that happened), \`moment\` (a significant emotional scene beat, remembered with feeling). (Do NOT use \`state\` for transient mood or the room-of-the-moment — those are excluded; see below.)
 - note: optional short prose — a meaningful verbatim quote, a disambiguation, or a one-line summary of a complex beat. Keep the atomic value TOO.
-- known_by: list EVERYONE who knows this fact — the characters present in the scene when it came up PLUS anyone the statement itself implies knows it: the source of the information, and the participants who lived it. Example: at the police station Maria tells Tom that Martha told her that James had an affair with Trish → known_by:["Maria","Tom","Martha","James","Trish"] — Martha (the source) and James and Trish (they lived it) count as knowers even if they have never appeared in the chat before. Omitting known_by defaults to the characters currently PRESENT in the scene, so an explicit list is only needed when the knowers differ from the room (secrets, second-hand reveals, absent participants).
+- known_by: list EVERYONE who knows this fact — those present when it came up PLUS anyone the statement implies knows it: the source, and the participants who lived it. Example: Maria tells Tom that Martha told her James had an affair with Trish → known_by:["Maria","Tom","Martha","James","Trish"] — the source and the participants count even if they never appeared in the chat. Omitted known_by defaults to the characters currently PRESENT, so an explicit list is only needed when the knowers differ from the room (secrets, second-hand reveals, absent participants).
 - RELATIONSHIPS: file pair dynamics under Relationships with a stable pair key (\`monika_bernd_status\`, \`monika_bernd_trust\`) and an abstract aspect (trust/romance/debt/status_of_relationship). Update the pair's single status record when the dynamic MATERIALLY changes.
 
 DO NOT STORE: transient poses/moods, current emotional weather, scene atmosphere, the room they happen to be in this moment, food eaten, items momentarily in hand, [OOC:] meta, reported/historical speech, negative facts ("no favorite revealed"). Those ambient here-and-now details belong on the SCENE and TIMELINE lines of the sheet, NOT in the store.
@@ -107,7 +114,7 @@ DO NOT STORE: transient poses/moods, current emotional weather, scene atmosphere
 
 When a stored fact's value changes, reuse the SAME key (never invent a variant) — the update overwrites the record in place; there is no separate history copy. Before finishing, for every character, relationship, and open thread active this scene, check whether its stored state changed and update it. Write:
 - value: the NEW current state, atomic (e.g. \`Tokyo\`) — this is what the system compares to detect the change.
-- note: a SELF-CONTAINED sentence giving the CURRENT state AND the meaningful past, because the system shows the note INSTEAD of the value to the storyteller. ALWAYS restate the current state — a note that only said "moved from Berlin" would hide that she now lives in Tokyo. Example: value \`Tokyo\`, note \`Now lives in Tokyo; previously lived in Berlin, revealed this scene\`.
+- note: a SELF-CONTAINED sentence giving the CURRENT state AND the meaningful past — the system shows the note INSTEAD of the value, so ALWAYS restate the current state ("moved from Berlin" alone would hide that she now lives in Tokyo). Example: value \`Tokyo\`, note \`Now lives in Tokyo; previously lived in Berlin, revealed this scene\`.
 - The note is OVERWRITTEN on each update (not merged), so always write the COMPLETE note — the current state plus any earlier state that still matters. Don't hoard every prior value; keep only the history the story still cares about.
 
 DELTA-ONLY: never re-write a fact whose stored value is UNCHANGED (check with the tools first — an identical re-write is wasted work). But when the value genuinely CHANGED, you MUST write the new value — that IS the update, not waste.
@@ -184,8 +191,10 @@ export async function runMemoryAgent({
         userPrompt,
         profileId,
         agent: 'memory-agent',
-        maxRounds: 6,
-        maxToolCalls: 20,
+        agentTag: 'memory',
+        // Keep in sync with the HARD LIMITS line in DEFAULT_MEMORY_AGENT_PROMPT.
+        maxRounds: 8,
+        maxToolCalls: 24,
         executeTool: (call) => executeMemoryTool(call, ctx),
         extractOnly,
         signal,

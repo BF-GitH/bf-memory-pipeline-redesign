@@ -314,15 +314,36 @@ function approxMessagesTokens(messages) {
     return Math.ceil(chars / 4);
 }
 
+// Tool-usage telemetry for the Health tab. Dynamic import because a static one
+// would close a cycle: llm-call.js -> health.js -> settings.js -> agent-memory.js
+// -> llm-call.js. Cached after first load; failures never break the tool loop.
+let _healthModPromise = null;
+function healthModSafe() {
+    if (!_healthModPromise) _healthModPromise = import('./health.js').catch(() => null);
+    return _healthModPromise;
+}
+async function recordToolUseSafe(agentTag, toolName, epoch = null) {
+    try { (await healthModSafe())?.recordToolUse(agentTag, toolName, epoch); } catch {  }
+}
+async function getToolUsageEpochSafe() {
+    try { return (await healthModSafe())?.getToolUsageEpoch() ?? null; } catch { return null; }
+}
+
 export async function callAgentLLMWithTools({
     systemPrompt,
     userPrompt,
     profileId = null,
     agent = 'memory-agent',
-    maxRounds = 6,
-    maxToolCalls = 20,
+    // Health-tab telemetry tag ('memory' | 'reflection'); null disables recording.
+    agentTag = null,
+    maxRounds = 8,
+    maxToolCalls = 24,
     executeTool,
     extractOnly = false,
+    // Example tool-call line shown in the grace-round correction. Callers with
+    // a restricted roster (reflection is read-only) pass a tool their executor
+    // actually accepts, so a confused model is never steered into a rejection.
+    protocolExample = null,
     signal = null,
 } = {}) {
     const out = {
@@ -339,6 +360,23 @@ export async function callAgentLLMWithTools({
         out.error = 'callAgentLLMWithTools requires an executeTool function';
         return out;
     }
+    // Telemetry epoch captured at loop start: recordToolUse drops calls whose
+    // epoch predates the last CHAT_CHANGED reset, so a loop still in flight
+    // across a chat switch cannot repopulate the new chat's just-cleared store.
+    const telemetryEpoch = agentTag ? await getToolUsageEpochSafe() : null;
+    // Single choke point for every REAL tool execution — both normal rounds and
+    // write_fact calls riding alongside the final block go through here, while
+    // parse attempts that never execute are deliberately not counted. Recording
+    // happens AFTER the executor returns and only when the call neither threw
+    // nor was rejected/failed (executors signal both as 'ERROR: ...' strings),
+    // so the Health tab counts only tool calls that actually executed.
+    const runTool = async (call) => {
+        const result = await executeTool(call);
+        if (agentTag && call?.tool && !/^\s*ERROR\b/.test(String(result ?? ''))) {
+            await recordToolUseSafe(agentTag, call.tool, telemetryEpoch);
+        }
+        return result;
+    };
     const finalToken = extractOnly ? '#DONE' : '#SHEET';
     const messages = [
         { role: 'system', content: String(systemPrompt || '') },
@@ -408,7 +446,8 @@ export async function callAgentLLMWithTools({
                 data: { agent, round, detail: String(detail).slice(0, 200) },
             });
             messages.push({ role: 'assistant', content: reply });
-            messages.push({ role: 'user', content: `ERROR: ${detail}. Re-emit as bare protocol: put each tool call alone on its own line as strict JSON, e.g.\n{"tool":"write_fact","args":{"category":"People","key":"x_name","value":"..."}}\nand end with a line that is exactly ${finalToken} (nothing else on that line).` });
+            const example = protocolExample || '{"tool":"write_fact","args":{"category":"People","key":"x_name","value":"..."}}';
+            messages.push({ role: 'user', content: `ERROR: ${detail}. Re-emit as bare protocol: put each tool call alone on its own line as strict JSON, e.g.\n${example}\nand end with a line that is exactly ${finalToken} (nothing else on that line).` });
             continue;
         }
 
@@ -421,12 +460,26 @@ export async function callAgentLLMWithTools({
         if (parsed.done) {
 
             if (parsed.calls.length > 0) {
-                const writes = parsed.calls.filter(c => c.tool === 'write_fact');
+                // write_fact AND link_facts may ride alongside the final block.
+                // Emission order is preserved so a link_facts line can target a
+                // fact written just above it in the same reply.
+                const writes = parsed.calls.filter(c => c.tool === 'write_fact' || c.tool === 'link_facts');
                 for (const call of writes) {
                     if (signal?.aborted) break;
                     out.toolCallCount++;
-                    try { await executeTool(call); }
-                    catch (e) { addDebugLog('fail', `write_fact alongside final block threw: ${e?.message || e}`, { subsystem: 'agent3', event: 'toolloop.write_error', data: { agent, round } }); }
+                    try {
+                        const result = await runTool(call);
+                        // Final-round calls get no feedback round, so a failure
+                        // must be surfaced here or it vanishes entirely —
+                        // executeMemoryTool never throws, it returns the error
+                        // as an 'ERROR: ...' string.
+                        if (/^\s*ERROR\b/.test(String(result ?? ''))) {
+                            addDebugLog('fail', `[${agent}] ${call.tool} alongside final block failed (no retry round): ${String(result).slice(0, 300)}`, {
+                                subsystem: 'agent3', event: 'toolloop.write_error', reason: 'FINAL_WRITE_FAILED',
+                                data: { agent, round, tool: call.tool, line: String(call.line || '').slice(0, 300), result: String(result).slice(0, 300) },
+                            });
+                        }
+                    } catch (e) { addDebugLog('fail', `write_fact alongside final block threw: ${e?.message || e}`, { subsystem: 'agent3', event: 'toolloop.write_error', data: { agent, round } }); }
                 }
                 if (writes.length < parsed.calls.length) {
                     entry.note = `${parsed.calls.length - writes.length} read tool call(s) ignored (final block present)`;
@@ -448,7 +501,7 @@ export async function callAgentLLMWithTools({
             out.toolCallCount++;
             let result;
             try {
-                result = await executeTool(call);
+                result = await runTool(call);
             } catch (e) {
                 result = `ERROR: ${call.tool} failed internally (${e?.message || e})`;
             }

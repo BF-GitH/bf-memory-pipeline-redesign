@@ -689,10 +689,18 @@ async function maybeRunReflection() {
 
         try { await saveCurrentToActiveProfile(settings.activeDbProfile); } catch {  }
         const reflectionMs = Date.now() - reflectStart;
-        recordHealthEvent('reflection', { status: 'ok', durationMs: reflectionMs });
-        addDebugLog('info', `[${pending.runId}] Reflection pass complete (${reflectionMs}ms)`, {
+        const reflRounds = Number(reflResult?.rounds) || 0;
+        const reflToolCalls = Number(reflResult?.toolCallCount) || 0;
+        // A loop error surfaces as reflResult.error (runReflection never throws
+        // for it) — report it as a fail instead of a false green.
+        if (reflResult?.error) {
+            recordHealthEvent('reflection', { status: 'fail', error: reflResult.error, rounds: reflRounds, toolCallCount: reflToolCalls });
+        } else {
+            recordHealthEvent('reflection', { status: 'ok', durationMs: reflectionMs, rounds: reflRounds, toolCallCount: reflToolCalls });
+        }
+        addDebugLog('info', `[${pending.runId}] Reflection pass complete (${reflectionMs}ms, ${reflRounds} round(s), ${reflToolCalls} tool call(s))`, {
             subsystem: 'reflection', event: 'reflection.run',
-            data: { agent: 'reflection', profileId: pending.profileId || null, success: true, durationMs: reflectionMs },
+            data: { agent: 'reflection', profileId: pending.profileId || null, success: !reflResult?.error, durationMs: reflectionMs, rounds: reflRounds, toolCallCount: reflToolCalls },
         });
         addDebugLog('debug', `[${pending.runId}] Stage timing (reflection): reflection=${reflectionMs}ms`, {
             runId: pending.runId, subsystem: 'pipeline', event: 'pipeline.timing',
