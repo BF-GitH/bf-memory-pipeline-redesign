@@ -16,6 +16,7 @@ import {
     STATE_SECTION_HEADER, CHRONO_SECTION_HEADER,
 } from './recency.js';
 import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
+import { countSentenceEnds } from './sentence-util.js';
 import { executeMemoryTool } from './memory-tools.js';
 import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline } from './turn-state.js';
 import { addDebugLog } from './settings.js';
@@ -252,6 +253,14 @@ export async function runMemoryAgent({
                 if (!b.uid && b.msgIndex >= 0 && uidByIndex.has(b.msgIndex)) b.uid = uidByIndex.get(b.msgIndex);
             }
         } catch {  }
+        // Brevity enforcement runs HERE — the single choke point where the final
+        // beat list (parsed + repaired + backfilled) exists, before either scene
+        // path hands beats to appendSceneBeats/startScene.
+        try {
+            await enforceBeatBrevity(parsedSheet.beats, profileId, runId, signal);
+        } catch (e) {
+            addDebugLog('info', `[${runId}] Beat brevity enforcement failed (non-fatal): ${e?.message || e}`);
+        }
         // Scene accumulator: a fired marker closes the previous card and opens a new
         // one; then this run's newly-settled beats stack onto the current card
         // (de-duped by msgIndex inside appendSceneBeats). Persisted in chatMetadata.
@@ -443,6 +452,75 @@ async function backfillMissingBeats({ parsedSheet, settledMessages = [], profile
             addDebugLog('info', `[${runId}] Beat backfill: dedicated call for msg #${idx} returned nothing — beat stays missing`);
         }
     }
+}
+
+// Scene-beat brevity: the sheet contract is ONE terse sentence per beat, but a
+// misbehaving agent sometimes emits a whole paragraph as one BEAT line and it
+// would pollute every future sheet via the scene card. Same pattern as the
+// story spine: detect violators, make ONE batched rewrite call, and anything
+// still over the cap afterwards is accepted as-is (never chopped) — truncating
+// a sentence mid-thought would corrupt the scene card.
+const BEAT_MAX_WORDS = 30;
+const BEAT_MAX_CHARS = 300;
+const BEAT_CAP_WORDS = 25;
+
+function beatViolates(sentence) {
+    const s = String(sentence || '').trim();
+    if (!s) return false;
+    return countSentenceEnds(s) > 1 || s.split(/\s+/).length > BEAT_MAX_WORDS || s.length > BEAT_MAX_CHARS;
+}
+
+async function enforceBeatBrevity(beats, profileId = null, runId = '', signal = null) {
+    const violators = (Array.isArray(beats) ? beats : []).filter(b => beatViolates(b?.sentence));
+    if (violators.length === 0) return;
+
+    let rewrittenCount = 0;
+    let reply = '';
+    let callError = null;
+    try {
+        const numbered = violators
+            .map((b, i) => `${i + 1}. ${String(b.sentence).replace(/\s+/g, ' ').trim()}`)
+            .join('\n');
+        reply = String(await callAgentLLM(
+            `Each numbered line below is an over-long roleplay scene beat. Rewrite EACH line as EXACTLY ONE terse past-tense sentence (max ${BEAT_CAP_WORDS} words) keeping its meaning. Reply STRICTLY as the same numbered lines ("1. <sentence>") and nothing else.`,
+            numbered, profileId, 'beat-brevity', signal,
+        ) || '');
+    } catch (err) { reply = ''; callError = err; }
+
+    // callAgentLLM swallows transport/auth errors and returns '' — an empty reply
+    // means the rewrite call itself produced nothing. That must surface at fail
+    // level: the info summary below is identical whether the call died or the
+    // rewrite output was merely rejected, and Health counts only 'fail' entries.
+    if (!reply) {
+        addDebugLog('fail', `[${runId}] Beat brevity rewrite call returned nothing${callError ? ` (${callError.message || callError})` : ''} — ${violators.length} over-long beat(s) kept as-is`, {
+            subsystem: 'agent3', event: 'beat.brevity.call_failed',
+            data: { violators: violators.length },
+        });
+    }
+
+    if (reply) {
+        const byNumber = new Map();
+        for (const line of reply.split('\n')) {
+            const lm = /^\s*(\d+)\s*[.):]\s*(.+)$/.exec(line);
+            if (lm) byNumber.set(parseInt(lm[1], 10), lm[2].trim());
+        }
+        violators.forEach((b, i) => {
+            const candidate = byNumber.get(i + 1);
+            // The rewrite replaces the beat ONLY when it now passes the check.
+            if (candidate && !beatViolates(candidate)) {
+                b.sentence = candidate;
+                rewrittenCount++;
+            }
+        });
+    }
+
+    // Beats still over the cap (or when the rewrite call failed) stay unchopped.
+    const acceptedAsIsCount = violators.length - rewrittenCount;
+
+    addDebugLog('info', `[${runId}] Beat brevity: ${violators.length} over-long beat(s) — ${rewrittenCount} rewritten, ${acceptedAsIsCount} accepted as-is (never chopped)`, {
+        subsystem: 'agent3', event: 'beat.brevity',
+        data: { violators: violators.length, rewritten: rewrittenCount, acceptedAsIs: acceptedAsIsCount },
+    });
 }
 
 function parseSheetBlock(text) {

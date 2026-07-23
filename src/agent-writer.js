@@ -4,26 +4,33 @@ function writerLog(level, message, opts = {}) {
         .catch(() => {  });
 }
 
+// Returns { injected, trimmedCount, reason }. Trimming runs BEFORE the empty-injection
+// check so history is bounded even when the sheet has nothing to inject; an empty sheet
+// is therefore not a container failure (reason 'EMPTY_SHEET' vs 'NO_CONTAINER').
 export function injectMemoryContext(data, injection, options = {}) {
-    if (!injection) return false;
     const trimToLast = Math.max(0, options.trimToLast || 0);
 
     const arrCandidate = firstMessageArray(data);
+    const trimmedCount = (arrCandidate && trimToLast > 0) ? trimChatHistory(arrCandidate, trimToLast) : 0;
+
+    if (!injection) {
+        return { injected: false, trimmedCount, reason: 'EMPTY_SHEET' };
+    }
+
     if (arrCandidate) {
-        if (trimToLast > 0) trimChatHistory(arrCandidate, trimToLast);
-        return injectIntoMessages(arrCandidate, injection);
+        return { injected: injectIntoMessages(arrCandidate, injection), trimmedCount, reason: null };
     }
 
     if (data && typeof data.prompt === 'string') {
         data.prompt = injection + '\n\n' + data.prompt;
-        return true;
+        return { injected: true, trimmedCount, reason: null };
     }
 
     writerLog('fail', 'injectMemoryContext: no usable prompt container on this event payload', {
         subsystem: 'writer', event: 'inject.failed', reason: 'NO_CONTAINER',
         data: describeInjectPayload(data),
     });
-    return false;
+    return { injected: false, trimmedCount, reason: 'NO_CONTAINER' };
 }
 
 function firstMessageArray(data) {
@@ -50,8 +57,9 @@ function describeInjectPayload(data) {
     return out;
 }
 
+// Returns the number of messages removed.
 function trimChatHistory(messages, keepLast) {
-    if (!Array.isArray(messages)) return;
+    if (!Array.isArray(messages)) return 0;
 
     const isChatMsg = (m) => m && (m.role === 'user' || m.role === 'assistant');
     let chatCount = 0;
@@ -59,16 +67,19 @@ function trimChatHistory(messages, keepLast) {
         if (isChatMsg(m)) chatCount++;
     }
     let removeCount = chatCount - keepLast;
-    if (removeCount <= 0) return;
+    if (removeCount <= 0) return 0;
 
+    let removed = 0;
     for (let i = 0; i < messages.length && removeCount > 0;) {
         if (isChatMsg(messages[i])) {
             messages.splice(i, 1);
             removeCount--;
+            removed++;
         } else {
             i++;
         }
     }
+    return removed;
 }
 
 function injectIntoMessages(messages, injection) {

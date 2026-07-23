@@ -258,6 +258,30 @@ function reloadProfiles() {
     }
 }
 
+// Health tab: pull-based self-test. Dynamic import keeps health.js out of this
+// module's static graph (health.js imports settings.js for live getters).
+async function renderHealthTab() {
+    const list = document.getElementById('bf_mem_health_list');
+    if (!list) return;
+    list.innerHTML = '<div class="bf-mem-summary-empty">Checking&hellip;</div>';
+    try {
+        const { buildHealthReport, formatHealthAge } = await import('./health.js');
+        const steps = await buildHealthReport();
+        list.innerHTML = steps.map(step => {
+            const status = ['ok', 'warn', 'fail', 'none'].includes(step.status) ? step.status : 'none';
+            const when = step.ts ? `<span class="bf-mem-health-ts">${escapeHtml(formatHealthAge(step.ts))}</span>` : '';
+            return `<div class="bf-mem-health-row">
+                <span class="bf-mem-health-dot ${status}"></span>
+                <span class="bf-mem-health-label">${escapeHtml(step.label)}</span>
+                <span class="bf-mem-health-detail">${escapeHtml(step.detail || '')}</span>
+                ${when}
+            </div>`;
+        }).join('');
+    } catch (err) {
+        list.innerHTML = `<div class="bf-mem-summary-empty">Health check failed: ${escapeHtml(err?.message || String(err))}</div>`;
+    }
+}
+
 function setupTabs() {
     const tablist = document.querySelector('.bf-mem-tabs[role="tablist"]');
     if (!tablist) return;
@@ -285,6 +309,9 @@ function setupTabs() {
         }
         if (tab.getAttribute('aria-controls') === 'bf_mem_tab_tokens') {
             renderTokens();
+        }
+        if (tab.getAttribute('aria-controls') === 'bf_mem_tab_health') {
+            renderHealthTab();
         }
     }
 
@@ -1575,6 +1602,8 @@ export async function initSettings() {
 
         resetSessionTokens();
     });
+
+    $('#bf_mem_health_recheck').on('click', () => renderHealthTab());
 
     $('#bf_mem_debug').prop('checked', extensionSettings.debugMode).on('change', function () {
         extensionSettings.debugMode = $(this).prop('checked');

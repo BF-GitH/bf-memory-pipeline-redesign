@@ -23,6 +23,7 @@
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_prompts" tabindex="-1">System Prompts</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_tokens" tabindex="-1">Tokens</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_health" tabindex="-1">Health</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
             </div>
 
@@ -239,6 +240,22 @@
                     <div class="bf-mem-section-body">
                         <small class="bf-mem-hint">Everything combined: main model + agents. What running this chat costs with the extension compared to running it without.</small>
                         <div id="bf_mem_tokens_total"><div class="bf-mem-summary-empty">No generations yet.</div></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Health (traffic-light self-test of the whole memory pipeline) -->
+            <div id="bf_mem_tab_health" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-heart-pulse"></i> Pipeline health
+                        <button id="bf_mem_health_recheck" class="bf-mem-reset-btn menu_button" title="Run the self-test again">
+                            <i class="fa-solid fa-arrows-rotate"></i> Re-check
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">One row per pipeline step: green = working, yellow = degraded, red = broken, gray = no data yet this session.</small>
+                        <div id="bf_mem_health_list" class="bf-mem-health-list"></div>
                     </div>
                 </div>
             </div>

@@ -1225,3 +1225,57 @@
     color: #888;
 }
 .bf-mem-fact-edit-box .bf-mem-fact-edit-input + .bf-mem-edit-label { margin-top: 10px; }
+
+/* Health tab: traffic-light self-test rows */
+.bf-mem-health-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.bf-mem-health-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 8px;
+    background: var(--SmartThemeBlurTintColor, #1e1e30);
+    border: 1px solid var(--SmartThemeBorderColor, #3a3a4a);
+    border-radius: 4px;
+}
+
+.bf-mem-health-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #888;
+    flex-shrink: 0;
+    align-self: center;
+}
+
+.bf-mem-health-dot.ok { background: #4caf50; }
+.bf-mem-health-dot.warn { background: #ffb300; }
+.bf-mem-health-dot.fail { background: #ef5350; }
+.bf-mem-health-dot.none { background: #888; }
+
+.bf-mem-health-label {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--SmartThemeBodyColor, #ddd);
+    white-space: nowrap;
+    flex: 0 0 auto;
+}
+
+.bf-mem-health-detail {
+    font-size: 11px;
+    color: #999;
+    flex: 1;
+    min-width: 0;
+    word-break: break-word;
+}
+
+.bf-mem-health-ts {
+    font-size: 10px;
+    color: #666;
+    white-space: nowrap;
+    flex: 0 0 auto;
+}

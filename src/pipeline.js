@@ -2,6 +2,8 @@ import { injectMemoryContext } from './agent-writer.js';
 import { runMemoryAgent } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { cancelInFlightLLM, callAgentLLM } from './llm-call.js';
+import { extractSentenceLine, countSentenceEnds } from './sentence-util.js';
+import { recordHealthEvent, clearHealthEvents } from './health.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getReflection, getMemorySheet, setMemorySheet, getStorySpine, appendStorySpineBatch, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
 
 let internalCallDepth = 0;
@@ -206,33 +208,13 @@ function toAgentMessage(m, index) {
 
 // The spine contract is ONE sentence per batch. Enforcement is cooperative,
 // not destructive: the LLM must put its sentence on an explicit "SENTENCE:"
-// line (survives chatty preambles), and the reply is VALIDATED by counting
-// sentence-ending punctuation with an abbreviation list — so "Dr.", "e.g." or
-// "3.50" never count as sentence ends. A multi-sentence reply triggers ONE
-// rewrite call over the same batch; if it is STILL multi-sentence it is
-// accepted as-is, because an extra sentence hurts the story far less than a
-// sentence chopped off in the middle.
-const SPINE_ABBREVIATIONS = /\b(?:Mr|Mrs|Ms|Dr|Prof|Capt|Sgt|Lt|Col|Gen|St|Ave|Sr|Jr|vs|etc|approx|dept|est|inc|no|nr|e\.g|i\.e|p\.m|a\.m|u\.s|u\.k)\./gi;
-
+// line (survives chatty preambles), and the reply is VALIDATED with the shared
+// sentence-util counters. A multi-sentence reply triggers ONE rewrite call over
+// the same batch; if it is STILL multi-sentence it is accepted as-is, because
+// an extra sentence hurts the story far less than a sentence chopped off in
+// the middle.
 function spineSentencePrompt(count) {
     return `Summarize these ${count} roleplay messages as EXACTLY ONE past-tense sentence capturing what happened. Reply in exactly this format and nothing else:\nSENTENCE: <the one sentence>`;
-}
-
-function extractSentenceLine(raw) {
-    const t = String(raw || '').replace(/\s+/g, ' ').trim();
-    if (!t) return '';
-    const m = /SENTENCE\s*:\s*(.+)$/i.exec(t);
-    return (m ? m[1] : t).trim();
-}
-
-function countSentenceEnds(text) {
-    const cleaned = String(text || '')
-        .replace(/"[^"]*"|“[^”]*”/g, '""')                  // quoted dialogue punctuation is not a sentence end
-        .replace(SPINE_ABBREVIATIONS, m => m.slice(0, -1)) // drop abbreviation dots
-        .replace(/\d[.,]\d/g, '0')                          // decimals are not sentence ends
-        .replace(/\.{2,}|…/g, '.');                         // an ellipsis counts once
-    const matches = cleaned.match(/[.!?]+(?=[\s"')\]]|$)/g);
-    return matches ? matches.length : 0;
 }
 
 // Deterministic "story so far" spine: for every completed block of N SETTLED
@@ -349,6 +331,7 @@ async function maybeAppendStorySpine(runId, profileId, capturedChatId = '') {
             }
 
             if (!appendStorySpineBatch({ batchIndex, startMsg, endMsg, endUid, sentence })) break;
+            recordHealthEvent('spine', { status: 'ok', batchIndex, endMsg });
             appendedThisRun++;
             startPos += batchSize;
             addDebugLog('info', `[${runId}] Story spine: appended batch ${batchIndex} (msgs ${startMsg}–${endMsg}, ${sentence.length} chars)`, {
@@ -544,6 +527,7 @@ async function runMemoryExtraction() {
                 data: { agent: 'memory-agent', profileId: agent3ProfileId, success: false, error: memoryResult.error, durationMs: Date.now() - startTime },
             });
             if (memoryResult?.error) toastPipelineError(`Memory update failed: ${memoryResult.error}`);
+            recordHealthEvent('extraction', { status: 'fail', error: memoryResult?.error || 'no result' });
 
             setWatermark(false);
             return;
@@ -597,6 +581,7 @@ async function runMemoryExtraction() {
             },
         });
         setLastInserted(committed);
+        recordHealthEvent('extraction', { status: 'ok', writes: committed.length, rounds: memoryResult.rounds, durationMs: Date.now() - startTime });
 
         if (memoryResult.sheetText) {
             setMemorySheet(memoryResult.sheetText, { runId, sourceMessageIndex: chat.length - 1 });
@@ -625,6 +610,7 @@ async function runMemoryExtraction() {
     } catch (err) {
 
         addDebugLog('fail', `[${runId}] Memory agent (post-reply) failed (non-fatal): ${err.message || err}`);
+        recordHealthEvent('extraction', { status: 'fail', error: err.message || String(err) });
         toastPipelineError(`Memory update failed: ${err.message || err}`);
 
         if (!reachedCommit) {
@@ -703,6 +689,7 @@ async function maybeRunReflection() {
 
         try { await saveCurrentToActiveProfile(settings.activeDbProfile); } catch {  }
         const reflectionMs = Date.now() - reflectStart;
+        recordHealthEvent('reflection', { status: 'ok', durationMs: reflectionMs });
         addDebugLog('info', `[${pending.runId}] Reflection pass complete (${reflectionMs}ms)`, {
             subsystem: 'reflection', event: 'reflection.run',
             data: { agent: 'reflection', profileId: pending.profileId || null, success: true, durationMs: reflectionMs },
@@ -712,6 +699,7 @@ async function maybeRunReflection() {
             data: { phase: 'reflection', reflectionMs, totalMs: reflectionMs },
         });
     } catch (err) {
+        recordHealthEvent('reflection', { status: 'fail', error: err.message || String(err) });
         addDebugLog('fail', `Reflection pass failed (non-fatal): ${err.message || err}`, {
             subsystem: 'reflection', event: 'reflection.run', reason: 'ERROR',
             data: { agent: 'reflection', profileId: pending.profileId || null, success: false, error: err.message || String(err), durationMs: Date.now() - reflectStart },
@@ -755,24 +743,43 @@ export function initPipeline() {
             const arr = firstInjectableArray(data);
             const baselineInput = await countChatTokens(arr);
 
-            const trimToLast = rec.seeded ? 0 : Math.max(0, Math.floor(settings.agent2ContextMessages || 0));
-            const ok = injectMemoryContext(data, rec.text, { trimToLast });
-            if (!ok) {
-                addDebugLog('fail', 'Memory sheet injection failed — no usable prompt container', {
-                    subsystem: 'writer', event: 'inject.failed', reason: 'NO_CONTAINER',
-                });
+            // Trim is independent of sheet state: history stays bounded even when the
+            // sheet is empty or still the seed skeleton (0 keeps trim off).
+            const trimToLast = Math.max(0, Math.floor(settings.agent2ContextMessages || 0));
+            const result = injectMemoryContext(data, rec.text, { trimToLast });
+            if (!result.injected) {
+                if (result.reason === 'EMPTY_SHEET') {
+                    recordHealthEvent('injection', { status: 'empty', path: 'chat', trimmedCount: result.trimmedCount });
+                    addDebugLog('info', `Memory sheet is empty — injection skipped (trim ${result.trimmedCount > 0 ? `removed ${result.trimmedCount} messages` : 'did not remove anything'})`, {
+                        subsystem: 'writer', event: 'inject.empty_sheet',
+                        data: { trimToLast, trimmedCount: result.trimmedCount },
+                    });
+                } else {
+                    recordHealthEvent('injection', { status: 'fail', path: 'chat', reason: 'no usable prompt container' });
+                    addDebugLog('fail', 'Memory sheet injection failed — no usable prompt container', {
+                        subsystem: 'writer', event: 'inject.failed', reason: 'NO_CONTAINER',
+                    });
+                }
                 return;
+            }
+            if (rec.seeded) {
+                addDebugLog('info', `Memory sheet is still the seed skeleton — injected as-is (trim ${result.trimmedCount > 0 ? `removed ${result.trimmedCount} messages` : 'did not remove anything'})`, {
+                    subsystem: 'writer', event: 'inject.seeded',
+                    data: { trimToLast, trimmedCount: result.trimmedCount },
+                });
             }
             setInjectedGuard();
             const actualInput = await countChatTokens(arr);
             const sheetTokens = await countTextTokens(rec.text);
             recordRunTokens({ baselineInput, actualInput, sheetTokens, path: 'chat' });
+            recordHealthEvent('injection', { status: 'ok', path: 'chat', baselineInput, actualInput, sheetTokens, trimmedCount: result.trimmedCount });
             addDebugLog('pass', `Memory sheet injected (${rec.text.length} chars${rec.seeded ? ', seed' : ''}; trim=${trimToLast || 'off'}; tokens ${baselineInput} → ${actualInput})`, {
                 subsystem: 'writer', event: 'inject.ok',
-                data: { chars: rec.text.length, seeded: !!rec.seeded, trimToLast, baselineInput, actualInput },
+                data: { chars: rec.text.length, seeded: !!rec.seeded, trimToLast, trimmedCount: result.trimmedCount, baselineInput, actualInput },
             });
         } catch (err) {
 
+            recordHealthEvent('injection', { status: 'fail', path: 'chat', reason: err.message || String(err) });
             addDebugLog('fail', `Sheet injection failed (non-fatal): ${err.message || err}`);
         }
     });
@@ -790,8 +797,8 @@ export function initPipeline() {
             if (isGroupChatSkip(settings)) return;
 
             const rec = getMemorySheet();
-            const ok = injectMemoryContext(data, rec.text);
-            if (ok) {
+            const result = injectMemoryContext(data, rec.text);
+            if (result.injected) {
                 setInjectedGuard();
                 // Token recording (text-completion path). Injection stays first and
                 // synchronous; counting only reads. No trim happens on this path,
@@ -805,16 +812,25 @@ export function initPipeline() {
                         recordRunTokens({ baselineInput: Math.max(0, actualInput - sheetTokens), actualInput, sheetTokens, path: 'text' });
                     }
                 } catch {  }
+                recordHealthEvent('injection', { status: 'ok', path: 'text' });
                 addDebugLog('pass', `Memory sheet injected (text-completion, ${rec.text.length} chars${rec.seeded ? ', seed' : ''})`, {
                     subsystem: 'writer', event: 'inject.ok',
                     data: { chars: rec.text.length, seeded: !!rec.seeded, path: 'text-completion' },
                 });
+            } else if (result.reason === 'EMPTY_SHEET') {
+                recordHealthEvent('injection', { status: 'empty', path: 'text' });
+                addDebugLog('info', 'Memory sheet is empty — injection skipped (text-completion, no trim on this path)', {
+                    subsystem: 'writer', event: 'inject.empty_sheet',
+                    data: { path: 'text-completion' },
+                });
             } else {
+                recordHealthEvent('injection', { status: 'fail', path: 'text', reason: 'no usable prompt container' });
                 addDebugLog('fail', 'Memory sheet injection failed (text-completion) — no usable prompt container', {
                     subsystem: 'writer', event: 'inject.failed', reason: 'NO_CONTAINER',
                 });
             }
         } catch (err) {
+            recordHealthEvent('injection', { status: 'fail', path: 'text', reason: err.message || String(err) });
             addDebugLog('fail', `Sheet injection failed (text-completion, non-fatal): ${err.message || err}`);
         }
     });
@@ -883,6 +899,9 @@ export function initPipeline() {
 
         successfulRunsSinceReflection = 0;
         reflectionPending = null;
+
+        // Event-backed health rows must not carry the previous chat's results.
+        clearHealthEvents();
 
         setPendingRun(null);
         endRun();
