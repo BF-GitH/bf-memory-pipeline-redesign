@@ -527,7 +527,7 @@ async function runMemoryExtraction() {
                 data: { agent: 'memory-agent', profileId: agent3ProfileId, success: false, error: memoryResult.error, durationMs: Date.now() - startTime },
             });
             if (memoryResult?.error) toastPipelineError(`Memory update failed: ${memoryResult.error}`);
-            recordHealthEvent('extraction', { status: 'fail', error: memoryResult?.error || 'no result' });
+            recordHealthEvent('extraction', { status: 'fail', error: memoryResult?.error || 'no result', calls: memoryResult?.calls || null });
 
             setWatermark(false);
             return;
@@ -571,6 +571,33 @@ async function runMemoryExtraction() {
             return;
         }
 
+        // Isolated extraction failure: Call A (facts + NEED) failed, but the beat
+        // and sheet-head passes still refreshed the sheet. Commit the sheet, but
+        // HOLD the watermark FALSE so this exchange re-extracts next run. Writes
+        // Call A salvaged before erroring are already in the working store — they
+        // must be snapshotted like the success path does, or a later profile load
+        // would rebuild from a stale snapshot and drop them. Skip the
+        // spine/reflection steps this run.
+        if (memoryResult.extractionError) {
+            addDebugLog('fail', `[${runId}] Extraction failed (sheet still refreshed, watermark held): ${memoryResult.extractionError}`, {
+                subsystem: 'agent3', event: 'agent3.run', reason: 'EXTRACTION_FAILED',
+                data: { agent: 'memory-agent', profileId: agent3ProfileId, success: false, error: memoryResult.extractionError, durationMs: Date.now() - startTime },
+            });
+            toastPipelineError(`Memory extraction failed: ${memoryResult.extractionError}`);
+            recordHealthEvent('extraction', { status: 'fail', error: memoryResult.extractionError, calls: memoryResult.calls || null });
+            setLastInserted(committed);
+            if (memoryResult.sheetText) {
+                setMemorySheet(memoryResult.sheetText, { runId, sourceMessageIndex: chat.length - 1 });
+            }
+            if (committed.length > 0) {
+                const snapStart = Date.now();
+                await saveCurrentToActiveProfile(capturedDbProfile);
+                postStageMs.snapshotMs = Date.now() - snapStart;
+            }
+            setWatermark(false);
+            return;
+        }
+
         addDebugLog('info', `[${runId}] Memory agent: ${committed.length} committed write(s), ${memoryResult.rounds} round(s), ${memoryResult.toolCallCount} tool call(s)`, {
             subsystem: 'agent3', event: 'agent3.run',
             data: {
@@ -581,7 +608,7 @@ async function runMemoryExtraction() {
             },
         });
         setLastInserted(committed);
-        recordHealthEvent('extraction', { status: 'ok', writes: committed.length, rounds: memoryResult.rounds, durationMs: Date.now() - startTime });
+        recordHealthEvent('extraction', { status: 'ok', writes: committed.length, rounds: memoryResult.rounds, durationMs: Date.now() - startTime, calls: memoryResult.calls || null });
 
         if (memoryResult.sheetText) {
             setMemorySheet(memoryResult.sheetText, { runId, sourceMessageIndex: chat.length - 1 });
@@ -610,7 +637,7 @@ async function runMemoryExtraction() {
     } catch (err) {
 
         addDebugLog('fail', `[${runId}] Memory agent (post-reply) failed (non-fatal): ${err.message || err}`);
-        recordHealthEvent('extraction', { status: 'fail', error: err.message || String(err) });
+        recordHealthEvent('extraction', { status: 'fail', error: err.message || String(err), calls: memoryResult?.calls || null });
         toastPipelineError(`Memory update failed: ${err.message || err}`);
 
         if (!reachedCommit) {
@@ -632,12 +659,19 @@ async function runMemoryExtraction() {
 
         try {
             const postTotalMs = Date.now() - startTime;
+            // agent3 wall time covers the whole 3-call split; the per-call
+            // breakdown (extract tool-loop, then beats/head concurrently) comes
+            // from runMemoryAgent's stageMs.
+            const sub = memoryResult?.stageMs || null;
+            const subTxt = sub
+                ? ` (extract=${sub.extractMs ?? '-'}ms beats=${sub.beatsMs ?? '-'}ms head=${sub.headMs ?? '-'}ms)`
+                : '';
             addDebugLog('debug',
-                `[${runId}] Stage timing (post-reply): agent3=${postStageMs.agent3Ms ?? '-'}ms ` +
+                `[${runId}] Stage timing (post-reply): agent3=${postStageMs.agent3Ms ?? '-'}ms${subTxt} ` +
                 `snapshot=${postStageMs.snapshotMs ?? '-'}ms total=${postTotalMs}ms`,
                 {
                     runId, subsystem: 'pipeline', event: 'pipeline.timing',
-                    data: { phase: 'post-reply', ...postStageMs, totalMs: postTotalMs },
+                    data: { phase: 'post-reply', ...postStageMs, ...(sub || {}), totalMs: postTotalMs },
                 },
             );
         } catch {  }

@@ -580,8 +580,16 @@ function normalizeSceneStore(raw) {
     }
     if (closed.length > MAX_CLOSED_SCENES) closed.splice(0, closed.length - MAX_CLOSED_SCENES);
     const timeline = typeof raw.timeline === 'string' ? raw.timeline.trim() : '';
-    if (!current && closed.length === 0 && !timeline) return null;
-    return { current: current || null, closed, timeline };
+    const needRefs = [];
+    if (Array.isArray(raw.needRefs)) {
+        for (const r of raw.needRefs) {
+            const category = typeof r?.category === 'string' ? r.category.trim() : '';
+            const key = typeof r?.key === 'string' ? r.key.trim() : '';
+            if (category && key) needRefs.push({ category, key });
+        }
+    }
+    if (!current && closed.length === 0 && !timeline && needRefs.length === 0) return null;
+    return { current: current || null, closed, timeline, needRefs };
 }
 
 function loadSceneFromMeta() {
@@ -604,10 +612,10 @@ function saveSceneToMeta() {
 
 function getSceneStore() {
     if (!sceneStoreLoaded) {
-        sceneStore = loadSceneFromMeta() || { current: null, closed: [], timeline: '' };
+        sceneStore = loadSceneFromMeta() || { current: null, closed: [], timeline: '', needRefs: [] };
         sceneStoreLoaded = true;
     }
-    return (sceneStore && typeof sceneStore === 'object') ? sceneStore : { current: null, closed: [], timeline: '' };
+    return (sceneStore && typeof sceneStore === 'object') ? sceneStore : { current: null, closed: [], timeline: '', needRefs: [] };
 }
 
 export function getCurrentScene() {
@@ -683,6 +691,21 @@ export function appendSceneBeats(beats) {
         store.current = { startMsg: (first && first.msgIndex >= 0) ? first.msgIndex : -1, name: '', beats: [], present: [] };
     }
     const cur = store.current;
+    // Replay guard: a watermark-held retry regenerates beats for messages whose
+    // beats already live in a CLOSED card (the previous run's marker partition
+    // put them there before Call A failed). The de-dup sets below only see the
+    // CURRENT card, so check closed cards too — by stable uid, and for uid-less
+    // beats by index but only BELOW the current card's start (indices can be
+    // reused after message deletions; below-start a beat can only belong to an
+    // already-closed scene).
+    const closedUid = new Set();
+    const closedIdx = new Set();
+    for (const c of (Array.isArray(store.closed) ? store.closed : [])) {
+        for (const cb of (Array.isArray(c?.beats) ? c.beats : [])) {
+            if (cb?.uid) closedUid.add(cb.uid);
+            if (Number.isInteger(cb?.msgIndex) && cb.msgIndex >= 0) closedIdx.add(cb.msgIndex);
+        }
+    }
     const seen = new Set(cur.beats.filter(b => b.msgIndex >= 0).map(b => b.msgIndex));
     // Primary de-dup key: the stable per-message uid (extra.bf_uid). Chat indices
     // shift when older messages are deleted, so a raw index can be REUSED by a
@@ -697,6 +720,8 @@ export function appendSceneBeats(beats) {
     for (const raw of list) {
         const b = normalizeBeat(raw);
         if (!b) continue;
+        if (b.uid && closedUid.has(b.uid)) continue;
+        if (!b.uid && b.msgIndex >= 0 && cur.startMsg >= 0 && b.msgIndex < cur.startMsg && closedIdx.has(b.msgIndex)) continue;
         if (b.uid) {
             // Skip when either key already covers this message: the uid, or the
             // index (beats stored before uids existed carry only the index).
@@ -729,13 +754,13 @@ export function appendSceneBeats(beats) {
 }
 
 export function setSceneStore(raw) {
-    sceneStore = normalizeSceneStore(raw) || { current: null, closed: [], timeline: '' };
+    sceneStore = normalizeSceneStore(raw) || { current: null, closed: [], timeline: '', needRefs: [] };
     sceneStoreLoaded = true;
     saveSceneToMeta();
 }
 
 export function reloadSceneFromChat() {
-    sceneStore = loadSceneFromMeta() || { current: null, closed: [], timeline: '' };
+    sceneStore = loadSceneFromMeta() || { current: null, closed: [], timeline: '', needRefs: [] };
     sceneStoreLoaded = true;
 }
 
@@ -752,6 +777,30 @@ export function setSceneTimeline(text) {
     if (!t) return;
     const store = getSceneStore();
     store.timeline = t;
+    sceneStore = store;
+    sceneStoreLoaded = true;
+    saveSceneToMeta();
+}
+
+// Last SUCCESSFUL NEED selection (Call A). Persisted so an isolated extraction
+// failure can re-render the previous run's NEED rows instead of dropping every
+// below-floor fact row from the sheet until a later successful run refreshes it.
+// An explicit empty selection is stored too — "none needed" must not resurrect
+// stale rows forever.
+export function getLastNeedRefs() {
+    const refs = getSceneStore().needRefs;
+    return Array.isArray(refs) ? refs : [];
+}
+
+export function setLastNeedRefs(refs) {
+    const out = [];
+    for (const r of (Array.isArray(refs) ? refs : [])) {
+        const category = typeof r?.category === 'string' ? r.category.trim() : '';
+        const key = typeof r?.key === 'string' ? r.key.trim() : '';
+        if (category && key) out.push({ category, key });
+    }
+    const store = getSceneStore();
+    store.needRefs = out;
     sceneStore = store;
     sceneStoreLoaded = true;
     saveSceneToMeta();

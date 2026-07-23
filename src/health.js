@@ -139,10 +139,49 @@ export async function buildHealthReport() {
         steps.push({ id: 'trim', label: 'History trim', status: 'ok', detail: `keeps last ${trimN} messages${lastTrim}` });
     }
 
-    // f. Memory agent (extraction).
+    // f. Memory agent (extraction) — ONE row. When the run reported per-call
+    // outcomes (3-call split: extract tool-loop / beats / sheet-head), render
+    // the composite detail; the row's dot is the worst sub-call outcome. An
+    // extract failure is red (facts/NEED lost, watermark held); a beats/head
+    // failure only yellow (non-fatal — the sheet still composed around it).
     const ext = ev('extraction');
+    const extractionComposite = (calls) => {
+        if (!calls || typeof calls !== 'object') return null;
+        const parts = [];
+        let worst = 'ok';
+        const bump = (s) => { if (s === 'fail') worst = 'fail'; else if (worst !== 'fail') worst = 'warn'; };
+        const e = calls.extract;
+        if (e) {
+            if (e.status === 'ok') parts.push(`extract ok (${Number(e.writes) || 0} write(s), ${Number(e.rounds) || 0} round(s))`);
+            else { parts.push(`extract FAIL (${String(e.error || 'error').slice(0, 80)})`); bump('fail'); }
+        }
+        const b = calls.beats;
+        if (b) {
+            const ratio = `${Number(b.got) || 0}/${Number(b.want) || 0}`;
+            if (b.status === 'ok') parts.push(`beats ok (${ratio})`);
+            else if (b.status === 'partial') { parts.push(`beats partial (${ratio})`); bump('warn'); }
+            else { parts.push(`beats FAIL (${ratio})`); bump('warn'); }
+        }
+        const h = calls.head;
+        if (h) {
+            if (h.status === 'ok') parts.push('head ok');
+            else { parts.push(`head FAIL (${String(h.error || 'error').slice(0, 80)})`); bump('warn'); }
+        }
+        return parts.length > 0 ? { status: worst, detail: parts.join(' · ') } : null;
+    };
+    const composite = ext ? extractionComposite(ext.calls) : null;
     if (!ext) {
         steps.push({ id: 'extraction', label: 'Memory agent', status: 'none', detail: 'no extraction run yet this session' });
+    } else if (composite) {
+        // A pipeline-level failure AFTER a clean agent run (commit guard, throw
+        // in a later step) must not render as an all-green composite.
+        let compStatus = composite.status;
+        let compDetail = composite.detail;
+        if (ext.status === 'fail' && compStatus !== 'fail') {
+            compStatus = 'fail';
+            compDetail += ` · run FAIL (${String(ext.error || 'error').slice(0, 80)})`;
+        }
+        steps.push({ id: 'extraction', label: 'Memory agent', status: compStatus, detail: compDetail, ts: ext.ts });
     } else if (ext.status === 'ok') {
         steps.push({
             id: 'extraction', label: 'Memory agent', status: 'ok',
