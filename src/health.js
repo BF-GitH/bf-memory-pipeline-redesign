@@ -50,6 +50,28 @@ export function getToolUsage() {
     return toolUsage;
 }
 
+// Raw event store, for the test-run export. buildHealthReport() renders these
+// into rows and throws the rest away — the row says "extract FAIL (timeout)"
+// but not the profileId, the duration, or the per-call `calls` breakdown the
+// event actually carried. An export wants the record, not the sentence built
+// from it.
+//
+// Deep-copied, not spread: the `extraction` payload embeds the run's own
+// `memoryResult.calls` object by reference, so a shallow copy would hand a
+// caller a live sub-object. Payloads are plain data (recordHealthEvent is only
+// ever passed object literals of scalars plus that one nested object), so a
+// JSON round trip is a complete copy; if one ever is not, fall back to the
+// shallow copy rather than returning nothing.
+export function getHealthEvents() {
+    const out = {};
+    for (const [key, value] of Object.entries(healthEvents)) {
+        if (!value || typeof value !== 'object') { out[key] = value; continue; }
+        try { out[key] = JSON.parse(JSON.stringify(value)); }
+        catch { out[key] = { ...value }; }
+    }
+    return out;
+}
+
 export function recordHealthEvent(key, payload) {
     if (!key) return;
     healthEvents[String(key)] = { ts: Date.now(), ...(payload && typeof payload === 'object' ? payload : {}) };
@@ -325,6 +347,11 @@ export async function buildHealthReport() {
     }
 
     // j. Recent errors — scan the newest debug-log entries (newest first).
+    // getDebugLogEntries() returns ORDINARY entries only — trace captures live on
+    // their own ring (debug-log.js). That separation is load-bearing at this
+    // window size: one recorded turn emits ~51 captures, none of them failures,
+    // so a shared ring would fill all 50 slots with a single turn and this row
+    // would report "no failures" while real ones sat just below the window.
     let failCount = 0;
     let scanned = 0;
     try {

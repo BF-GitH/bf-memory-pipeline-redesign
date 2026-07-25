@@ -21,7 +21,7 @@ import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
 import { countSentenceEnds } from './sentence-util.js';
 import { executeMemoryTool, stripThinkBlocks } from './memory-tools.js';
 import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline, getLastNeedRefs, setLastNeedRefs, getRecoveredRefs, tickRecoveredRefs, markRecoveredRefs } from './turn-state.js';
-import { addDebugLog } from './settings.js';
+import { addDebugLog, isTraceRecording, traceCapture, newTraceCallId } from './settings.js';
 import * as host from './host.js';
 
 function getSettingsSafe() {
@@ -267,6 +267,22 @@ export async function runMemoryAgent({
     let stickyRecovered = [];
     try { stickyRecovered = getRecoveredRefs(); } catch { stickyRecovered = []; }
 
+    // One correlation id for Call A, covering its inputs (captured here), its
+    // prompts/transcript/tool traffic (captured inside llm-call.js) and its
+    // parsed NEED selection. runId alone cannot do this: one run makes three
+    // calls. Minted ONLY while recording — newTraceCallId builds a string, and
+    // the off path is not allowed to pay for one.
+    const extractCallId = isTraceRecording() ? newTraceCallId('extract') : null;
+    // Call A's tool context gets the same id. memory-tools.js stamps it onto every
+    // memtool.* capture (traceOpts), so the tool layer's before/after record
+    // images group into the SAME export bucket as the prompts, per-round replies
+    // and tool-call lines llm-call.js records under this id. Without it they land
+    // in a sibling "(no call id)" block that a reader has to interleave by seq
+    // with the very tool call whose arguments produced them. Assigned rather than
+    // declared in the literal above because ctx is built before the recording
+    // gate is consulted; null when recording is off, which costs grouping only.
+    ctx.traceCallId = extractCallId;
+
     // Backward-facing NEED signal. Built ONCE here rather than inside the prompt
     // builder so the branch it took can be logged: whether the prior sheet is
     // provably the one that stood above the reply being judged decides whether
@@ -285,6 +301,10 @@ export async function runMemoryAgent({
     const extractPrompt = buildExtractionUserPrompt({
         settledMessages, tentativeMessages, characterInfo, userPersona,
         observationDate, extractOnly, databases, index, settings, injectedSection,
+        // Trace ids only — the builder's OUTPUT is unchanged by them. The store-
+        // candidates block exists nowhere but inside that function, so the
+        // capture has to happen there.
+        runId, traceCallId: extractCallId,
     });
 
     const injectedLastTurn = injectedSection ? injectedSection.refs.length : 0;
@@ -306,6 +326,33 @@ export async function runMemoryAgent({
         });
     }
 
+    // The omission-recovery list AS THE AGENT RECEIVED IT. The log above carries
+    // only counts, and only on a degraded status; what decides whether a memory
+    // could be recovered at all is the CONTENT — which refs the list declares
+    // already-injected (the prompt forbids re-listing those), which carry the
+    // `(recovered)` tag that exempts them, and the header that states how much
+    // authority the whole list has. Header and body are captured rather than the
+    // parsed ref array because they are the bytes that shipped: the body is
+    // capped at INJECTED_REFS_CAP lines and tagged, the array is neither.
+    if (injectedSection) {
+        traceCapture('agent3.recovery.injected', () => ({
+            status: injectedSection.status,
+            reason: injectedSection.reason,
+            why: injectedSection.why,
+            truncated: injectedSection.truncated,
+            refsTotal: injectedSection.refs.length,
+            bufferHoldBack: holdBack,
+            sheetSourceMessageIndex: injectedSection.sheetSourceMessageIndex,
+            newestJudgedMessageIndex: injectedSection.newestJudgedMessageIndex,
+            sheetRunId: injectedSection.sheetRunId,
+            header: injectedSection.header,
+            body: injectedSection.body,
+            // The set as it stood BEFORE this run's bookkeeping — the one that
+            // produced the `(recovered)` tags in the body above.
+            stickyBefore: stickyRecovered.map(r => `${r.category}/${r.key}`),
+        }), { runId, callId: extractCallId, reason: injectedSection.reason });
+    }
+
     addDebugLog('info', `[${runId}] Extraction agent start: ${settledMessages.length} settled, ${tentativeMessages.length} tentative msg(s), extractOnly=${extractOnly}, injected-last-turn=${injectedLastTurn} ref(s) [${injectedSection ? injectedSection.status : 'SKIPPED'}], ${stickyRecovered.length} sticky recovered ref(s) (user prompt ${extractPrompt.length} chars)`, {
         subsystem: 'agent3', event: 'agent3.extract',
         data: {
@@ -318,13 +365,49 @@ export async function runMemoryAgent({
         },
     });
 
+    // Hoisted out of the call argument so the trace below reports the prompt that
+    // was ACTUALLY sent rather than a second copy of the same expression, which
+    // could drift from it.
+    const extractOverride = String(settings?.memoryAgentPrompt || '').trim();
+    const extractSystemPrompt = extractOverride || DEFAULT_MEMORY_AGENT_PROMPT;
+
+    // WHICH system prompt ran — deliberately NOT its text. The prompt BODY is the
+    // call layer's to capture: every systemPrompt/userPrompt string ends up in
+    // llm-call.js, so a second copy here would store the same multi-KB block
+    // twice per recorded run. What that layer cannot recover is where the string
+    // came from — an override and the built-in default arrive as one
+    // indistinguishable `systemPrompt` argument. That is the half worth having:
+    // a saved override is a full COPY of whatever the default said when the user
+    // last edited it, so a stale one silently predates every rule added since,
+    // and "the agent ignores an instruction that is right there in the prompt"
+    // is otherwise undiagnosable. traceCallId is threaded into the call below so
+    // the two halves land under one id.
+    traceCapture('agent3.prompt.extract', () => ({
+        call: 'extract',
+        source: extractOverride ? 'settings-override' : 'built-in-default',
+        overrideChars: extractOverride.length,
+        defaultChars: DEFAULT_MEMORY_AGENT_PROMPT.length,
+        // An override that matches the default byte-for-byte is inert; one that
+        // differs is the case worth looking at.
+        differsFromDefault: extractOverride ? extractOverride !== DEFAULT_MEMORY_AGENT_PROMPT : false,
+        extraInstructionsChars: String(settings?.memoryPrompt || '').trim().length,
+        userPromptChars: extractPrompt.length,
+        extractOnly,
+    }), { runId, callId: extractCallId, note: 'prompt TEXT belongs to the llm-call layer; traceCallId ties the two' });
+
     const extractStart = Date.now();
     const loop = await callAgentLLMWithTools({
-        systemPrompt: (String(settings?.memoryAgentPrompt || '').trim() || DEFAULT_MEMORY_AGENT_PROMPT),
+        systemPrompt: extractSystemPrompt,
         userPrompt: extractPrompt,
         profileId,
         agent: 'memory-agent',
         agentTag: 'memory',
+        // Correlation only — llm-call.js stamps these onto its own captures so
+        // this call's prompt bodies, per-round replies, tool arguments and tool
+        // results land under the same ids as the inputs traced above. Both are
+        // plain strings, so there is no lifetime or mutation concern.
+        runId,
+        traceCallId: extractCallId,
         // Keep in sync with the HARD LIMITS line in DEFAULT_MEMORY_AGENT_PROMPT.
         maxRounds: 8,
         maxToolCalls: 24,
@@ -429,6 +512,21 @@ export async function runMemoryAgent({
         // sheet carried.
         try { need = getLastNeedRefs(); } catch { need = []; }
     }
+
+    // What Call A actually SELECTED. The RECOVERED line is the whole point of the
+    // omission-recovery feature and nothing logs its content: the sticky log
+    // further down fires only when the set changes, and reports the set rather
+    // than this turn's picks. `need` is captured after the RECOVERED merge above,
+    // i.e. exactly the list composeSheet is about to resolve — so a ref that is
+    // here but absent from the composed sheet was dropped by a resolve rule
+    // (cold-tiered, inactive, invisible, over the NEED cap), which is the shape
+    // of "my memory went missing".
+    traceCapture('agent3.need.selection', () => ({
+        source: loop.error ? 'fallback:getLastNeedRefs (Call A failed)' : 'transcript',
+        loopError: loop.error || null,
+        need: need.map(r => `${r.category}/${r.key}`),
+        recovered: recovered.map(r => `${r.category}/${r.key}`),
+    }), { runId, callId: extractCallId });
 
     // ===================================================================
     // CALL B (BEATS) + CALL C (SHEET HEAD) — both single-shot, no tools, and
@@ -574,6 +672,23 @@ export async function runMemoryAgent({
         runId,
     });
 
+    // THE SHEET TEXT, per run. Only its char count was ever logged, and only the
+    // CURRENT sheet is stored — it is overwritten every turn, so there has never
+    // been any history of what was injected on the turn a memory went missing.
+    // This is the capture that answers that question. `sourceMessageIndex` is the
+    // newest SETTLED message this run judged (the same index its fact writes are
+    // stamped with); the persisted sheet record carries its own index, stamped by
+    // setMemorySheet at COMMIT time, which is later and can differ under lag.
+    traceCapture('agent3.sheet.composed', () => ({
+        sourceMessageIndex: sourceIndex,
+        sourceUid: sourceUid || null,
+        newestJudgedMessageIndex,
+        chars: result.sheetText.length,
+        needCount: need.length,
+        stickyCount: stickyRecovered.length,
+        sheetText: result.sheetText,
+    }), { runId, note: 'text injected into the NEXT storyteller turn' });
+
     addDebugLog('pass', `[${runId}] Memory Agent done: ${ctx.applied.length} write(s), ${loop.rounds} round(s), ${loop.toolCallCount} tool call(s), ${beats.length} beat(s), sheet ${result.sheetText.length} chars${result.extractionError ? ' (extraction FAILED — sheet refreshed, watermark held)' : ''}`, {
         subsystem: 'agent3', event: 'agent.run',
         data: {
@@ -617,6 +732,7 @@ function capLines(text, max, footer) {
 function buildExtractionUserPrompt({
     settledMessages, tentativeMessages, characterInfo, userPersona,
     observationDate, extractOnly, databases, index, settings, injectedSection,
+    runId = '', traceCallId = null,
 }) {
     const parts = [];
 
@@ -677,6 +793,20 @@ function buildExtractionUserPrompt({
         const candidates = buildRecoveryCandidates({
             tentativeMessages, databases, injectedRefs: injectedSection.refs,
         });
+        // The other half of the recovery evidence, and the half that carries
+        // VALUES. Nothing logs it at any level — not even a count — so when the
+        // agent concludes a fumble had no fact behind it there is currently no
+        // way to tell whether the fact was offered and ignored or never offered.
+        // An EMPTY block is captured too: "the candidate scan found nothing" and
+        // "the agent overlooked a row" are different bugs and look identical from
+        // the outside.
+        traceCapture('agent3.recovery.candidates', () => ({
+            count: candidates.length,
+            cap: CANDIDATE_FACTS_CAP,
+            valueChars: CANDIDATE_VALUE_CHARS,
+            injectedExcluded: injectedSection.refs.length,
+            candidates,
+        }), { runId, callId: traceCallId });
         if (candidates.length > 0) {
             parts.push(`## Store candidates (stored facts the list above does NOT cover, about who/what the OMISSION CHECK reply names — then, with whatever room is left, who/what the tentative replies just before it name, since a hedge often withholds the subject the reply BEFORE it introduced. VALUES shown; this is evidence for spotting an omission, not a NEED list)\n${candidates.join('\n')}`);
         }
@@ -1016,9 +1146,29 @@ async function runBeatsCall({ settledMessages = [], profileId = null, runId = ''
     const start = Date.now();
     const numbered = msgs.map((m, i) => `${i + 1}. ${renderMessageLine(m)}`).join('\n');
     out.tokensIn = Math.ceil((DEFAULT_BEATS_PROMPT.length + numbered.length) / 4);
+
+    // Call B's PROVENANCE, and only that. `numbered` is the user prompt, and the
+    // call layer already captures every dispatched system/user body — so the text
+    // is threaded to it via callAgentLLM's trailing `trace` argument below rather
+    // than copied into a second entry here. Passing that argument is what makes
+    // the deferral safe: without it the call layer's copy carries no runId and no
+    // callId, so nothing ties it to the run that produced it.
+    //
+    // What is left is the half no call layer can see: systemPrompt here is
+    // DEFAULT_BEATS_PROMPT unconditionally — the memoryAgentPrompt override
+    // reaches Call A ONLY. "I edited the agent prompt and the beats did not
+    // change" is expected behaviour, and should be readable rather than inferred.
+    const beatsCallId = isTraceRecording() ? newTraceCallId('beats') : null;
+    traceCapture('agent3.prompt.beats', () => ({
+        call: 'beats',
+        source: 'built-in-default (no settings override reaches this call)',
+        systemChars: DEFAULT_BEATS_PROMPT.length,
+        userPromptChars: numbered.length,
+        messages: msgs.length,
+    }), { runId, callId: beatsCallId, note: 'prompt TEXT rides the llm-call layer under this callId' });
     let reply = '';
     try {
-        reply = String(await callAgentLLM(DEFAULT_BEATS_PROMPT, numbered, profileId, 'beats', signal) || '');
+        reply = String(await callAgentLLM(DEFAULT_BEATS_PROMPT, numbered, profileId, 'beats', signal, { runId, callId: beatsCallId }) || '');
     } catch (e) { reply = ''; out.error = String(e?.message || e); }
     out.tokensOut = Math.ceil(reply.length / 4);
     out.durationMs = Date.now() - start;
@@ -1128,9 +1278,26 @@ async function runHeadCall({
         priorSheetText, reflection, observationDate,
     });
     out.tokensIn = Math.ceil((DEFAULT_HEAD_PROMPT.length + userPrompt.length) / 4);
+
+    // Call C's provenance — same split as Call B: the assembled prompt travels to
+    // the call layer through `trace`, this entry carries what that layer cannot
+    // know. The composition matters more here than anywhere else in this file:
+    // buildHeadUserPrompt assembles the prior head, the current scene card, the
+    // spine tail and the rolling reflection summary, and every one of those is
+    // read out of a store THIS SAME RUN is about to overwrite, so the captured
+    // prompt is the only surviving copy of the state Call C actually saw.
+    const headCallId = isTraceRecording() ? newTraceCallId('head') : null;
+    traceCapture('agent3.prompt.head', () => ({
+        call: 'head',
+        source: 'built-in-default (no settings override reaches this call)',
+        systemChars: DEFAULT_HEAD_PROMPT.length,
+        userPromptChars: userPrompt.length,
+        settled: (Array.isArray(settledMessages) ? settledMessages : []).length,
+        tentative: (Array.isArray(tentativeMessages) ? tentativeMessages : []).length,
+    }), { runId, callId: headCallId, note: 'prompt TEXT rides the llm-call layer under this callId' });
     let reply = '';
     try {
-        reply = String(await callAgentLLM(DEFAULT_HEAD_PROMPT, userPrompt, profileId, 'sheet-head', signal) || '');
+        reply = String(await callAgentLLM(DEFAULT_HEAD_PROMPT, userPrompt, profileId, 'sheet-head', signal, { runId, callId: headCallId }) || '');
     } catch (e) { reply = ''; out.error = String(e?.message || e); }
     out.tokensOut = Math.ceil(reply.length / 4);
     out.durationMs = Date.now() - start;
@@ -1203,6 +1370,11 @@ async function backfillMissingBeats({ beats: beatsArg, settledMessages = [], pro
             sentence = String(await callAgentLLM(
                 'You summarize ONE roleplay message as ONE terse past-tense sentence (third person, max 25 words). Reply with the sentence only — no preamble, no quotes.',
                 renderMessageLine(m), profileId, 'beat-backfill', signal,
+                // Correlation only. Minted per call rather than per batch so the
+                // export can tell six backfills apart; without a trace argument
+                // the call layer's prompt/reply capture for these would carry no
+                // run and no call id at all.
+                isTraceRecording() ? { runId, callId: newTraceCallId('beat-backfill') } : null,
             ) || '').replace(/\s+/g, ' ').trim();
         } catch { sentence = ''; }
         if (sentence) {
@@ -1246,6 +1418,8 @@ async function enforceBeatBrevity(beats, profileId = null, runId = '', signal = 
         reply = String(await callAgentLLM(
             `Each numbered line below is an over-long roleplay scene beat. Rewrite EACH line as EXACTLY ONE terse past-tense sentence (max ${BEAT_CAP_WORDS} words) keeping its meaning. Reply STRICTLY as the same numbered lines ("1. <sentence>") and nothing else.`,
             numbered, profileId, 'beat-brevity', signal,
+            // Correlation only — same reason as the backfill call above.
+            isTraceRecording() ? { runId, callId: newTraceCallId('beat-brevity') } : null,
         ) || '');
     } catch (err) { reply = ''; callError = err; }
 

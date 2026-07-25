@@ -1,4 +1,4 @@
-import { addDebugLog } from './settings.js';
+import { addDebugLog, isTraceRecording, traceCapture } from './settings.js';
 
 import { parseAgentReply, REFLECTION_WRITE_TOOLS } from './memory-tools.js';
 import * as host from './host.js';
@@ -54,6 +54,37 @@ function cheapHash(str) {
         h = Math.imul(h, 0x01000193);
     }
     return (h >>> 0).toString(36);
+}
+
+// Trace event namespace, keyed on the agent that owns the call.
+//
+// This file is shared transport: it serves the memory agent, reflection, the
+// story spine and the health ping, but it used to stamp every capture with the
+// memory agent's own prefix (`agent3.`). So a reader filtering `reflect.` in the
+// Debug tab saw agent-reflect.js's captures and NONE of reflection's prompts,
+// replies or tool results — the owning agent was recoverable only from the
+// payload's `agent` field. The values below are the prefixes the owning modules
+// already use for their own captures (agent-memory.js emits `agent3.*`,
+// agent-reflect.js emits `reflect.*`), so one prefix now selects a whole pass.
+// beats / sheet-head / beat-backfill / beat-brevity are the memory agent's own
+// sub-calls and stay under `agent3`.
+const TRACE_NS_BY_AGENT = {
+    'memory-agent': 'agent3',
+    'beats': 'agent3',
+    'sheet-head': 'agent3',
+    'beat-backfill': 'agent3',
+    'beat-brevity': 'agent3',
+    'reflection': 'reflect',
+    'story-spine': 'spine',
+    'story-spine-rewrite': 'spine',
+    'health-ping': 'health',
+};
+// An unlisted agent falls back to `llm.` rather than to any one agent's prefix:
+// a capture filed under the WRONG agent is worse than one filed under none, and
+// the payload's `agent` field names the caller either way. Only ever called from
+// inside an isTraceRecording() block, so this costs nothing when off.
+function traceNs(agent) {
+    return TRACE_NS_BY_AGENT[String(agent || '')] || 'llm';
 }
 
 const _activeControllers = new Set();
@@ -181,29 +212,40 @@ async function callViaCMRS(profileId, messages, signal) {
     return text;
 }
 
-export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, agent = 'unknown', externalSignal = null) {
+// `trace` is optional test-run correlation, `{ runId, callId }` (both plain
+// strings, see newTraceCallId). Positional and last because this function's
+// contract is positional and every existing caller passes at most five
+// arguments — beats, sheet-head, story-spine, the reflection repair retry and
+// the health ping keep working untouched. Building the little object
+// unconditionally at a single-shot call site costs one allocation per LLM call,
+// which is nothing; inside the tool loop, where it would be one per ROUND, it is
+// built only while recording (see callAgentLLMWithTools).
+export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, agent = 'unknown', externalSignal = null, trace = null) {
     // Legacy string-returning contract (used by the reflection agent): swallow the
     // failure and return '' so callers that expect a plain string keep working.
     try {
         return await callAgentLLMMessages([
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
-        ], profileId, agent, externalSignal);
+        ], profileId, agent, externalSignal, trace);
     } catch (err) {
         addDebugLog('info', `callAgentLLM returning empty after failure: ${err?.message || err}`);
         return '';
     }
 }
 
-async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown', externalSignal = null) {
+async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown', externalSignal = null, trace = null) {
     const callStart = Date.now();
 
     const systemPrompt = (Array.isArray(messages) && messages[0]?.role === 'system')
         ? String(messages[0].content || '')
         : '';
+    // Hoisted out of the try below so the trace block further down can name the
+    // exact hash the cache log reports. cheapHash walks a string and cannot
+    // throw, so nothing that needed the guard has left it.
+    const sysHash = cheapHash(systemPrompt);
     try {
-        const sysHash = cheapHash(systemPrompt);
-        const sysTokens = Math.round((String(systemPrompt || '').length) / 4); 
+        const sysTokens = Math.round((String(systemPrompt || '').length) / 4);
         const prevHash = lastSystemHashByAgent.get(agent);
         const systemPromptStable = prevHash !== undefined && prevHash === sysHash;
         lastSystemHashByAgent.set(agent, sysHash);
@@ -213,7 +255,12 @@ async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown
         lastPersonaName = personaName;
         addDebugLog('debug', `Cache eligibility [${agent}]: systemPromptStable=${systemPromptStable}, ~${sysTokens} sys tokens${personaChanged ? ', persona CHANGED' : ''}`, {
             subsystem: 'cache', event: 'cache.eligibility',
-            data: { agent, systemPromptStable, systemPromptTokens: sysTokens, personaChanged, note: 'server-side cache HITS are not observable from the extension; this is prefix-stability only' },
+            // systemPromptHash rides along unconditionally (a few bytes) so EVERY
+            // call is attributable to a specific prompt text — including in the
+            // persisted log, where the full-text trace never goes. It is also
+            // what makes the once-per-call system capture below checkable rather
+            // than merely asserted.
+            data: { agent, systemPromptStable, systemPromptTokens: sysTokens, systemPromptHash: sysHash, personaChanged, note: 'server-side cache HITS are not observable from the extension; this is prefix-stability only' },
         });
 
         if (prevHash !== undefined && !systemPromptStable && !personaChanged) {
@@ -223,6 +270,52 @@ async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown
             });
         }
     } catch {  }
+
+    // ---- Test-run capture (no-op unless the record switch is on) --------------
+    // isTraceRecording() gates the WHOLE block, not just the payloads: with
+    // recording off this costs one function call and one property read, and not
+    // a single object literal, closure or .map() is allocated.
+    //
+    // The two prompt BODIES are captured once per LLM CALL, not once per round.
+    // The key is trace.round: callAgentLLMWithTools builds its messages array
+    // once and afterwards only PUSHES to it, so messages[0] and the first user
+    // message are byte-identical on every round of a call — round 1 is the only
+    // round on which they are new. A single-shot callAgentLLM passes no round at
+    // all, which is likewise "capture it". The claim is verifiable instead of
+    // asserted: cache.eligibility above reports systemPromptHash on EVERY round,
+    // so a reader who ever sees that hash change within one callId knows this
+    // capture missed a variant.
+    if (isTraceRecording()) {
+        const traceRound = trace?.round ?? null;
+        const topts = { runId: trace?.runId, callId: trace?.callId, round: traceRound };
+        // The namespace of the AGENT, not of this file — see TRACE_NS_BY_AGENT.
+        const ns = traceNs(agent);
+        if (traceRound === null || traceRound === 1) {
+            traceCapture(`${ns}.prompt.system`, () => ({
+                agent, hash: sysHash, chars: systemPrompt.length, system: systemPrompt,
+            }), topts);
+            // A separate entry, deliberately: the trace string budget is per
+            // ENTRY, so pairing a 10k system prompt with a 20k task block would
+            // truncate both. Apart, each gets the full per-string cap.
+            traceCapture(`${ns}.prompt.user`, () => {
+                const um = (Array.isArray(messages) ? messages : []).find(m => m?.role === 'user');
+                const text = String(um?.content || '');
+                return { agent, chars: text.length, user: text };
+            }, topts);
+        }
+        // What was actually handed to the transport THIS round. Bodies are not
+        // repeated here — every one of them is captured elsewhere (system/user
+        // above, each assistant turn as <ns>.reply.raw, each TOOL RESULTS block
+        // as its per-call <ns>.tool.call entries, the grace correction as
+        // <ns>.prompt.correction). This is the manifest that proves the order
+        // and lets a reader reassemble the exact array from those parts, at a few
+        // dozen bytes instead of re-dumping the whole conversation every round.
+        traceCapture(`${ns}.request.shape`, () => ({
+            agent, profileId: profileId || null,
+            parts: (Array.isArray(messages) ? messages : [])
+                .map(m => ({ role: m?.role || '?', chars: String(m?.content || '').length })),
+        }), topts);
+    }
 
     const callCtrl = new AbortController();
     _activeControllers.add(callCtrl);
@@ -256,6 +349,34 @@ async function callAgentLLMMessages(messages, profileId = null, agent = 'unknown
                 const result = await callAgentLLMOnce(messages, profileId, agent, callCtrl.signal);
                 if (result && result.trim()) {
                     recordAgentCallSafe({ ok: true, ms: Date.now() - callStart, agent, profileId: profileId || null });
+                    // The reply, for SINGLE-SHOT calls only. Until now the only
+                    // reply capture lived in callAgentLLMWithTools, so beats,
+                    // sheet-head, story-spine, beat-backfill, beat-brevity and the
+                    // reflection repair retry showed a prompt going in and nothing
+                    // coming out — for sheet-head that meant the head reply was
+                    // invisible and only the composed sheet survived.
+                    //
+                    // Keyed on round == null because the tool loop is the only
+                    // caller that passes a round, and it emits its own
+                    // <ns>.reply.raw per round WITH the parse verdict alongside.
+                    // Without this test that reply would be captured twice, at
+                    // full length, doubling the entry's cost for nothing.
+                    //
+                    // Only a non-empty success reaches here: an empty reply is
+                    // retried and a failed call already lands in the ordinary log
+                    // at fail level, so neither is silently absent.
+                    if (isTraceRecording() && (trace?.round ?? null) === null) {
+                        traceCapture(`${traceNs(agent)}.reply.raw`, () => {
+                            const text = String(result);
+                            return {
+                                agent, singleShot: true, replyChars: text.length,
+                                // Last field: the entry's shared char budget is
+                                // spent in key order, so a long reply can be cut
+                                // without taking the metadata above it with it.
+                                reply: text,
+                            };
+                        }, { runId: trace?.runId, callId: trace?.callId });
+                    }
                     return result;
                 }
                 if (attempt === 1) {
@@ -399,6 +520,15 @@ export async function callAgentLLMWithTools({
     // model is never steered into a rejection.
     protocolExample = null,
     signal = null,
+    // Test-run trace correlation, both plain strings, both optional.
+    // runId MUST be passed explicitly: it is populated automatically only inside
+    // beginRun/endRun, and reflection runs entirely outside that window, so
+    // relying on the ambient one would silently produce null-run traces for half
+    // the pipeline. traceCallId comes from newTraceCallId('extract'|'reflect'|…)
+    // and is what ties one system prompt, one task block and every round of this
+    // loop together — runId alone cannot, because one run makes several calls.
+    runId = null,
+    traceCallId = null,
 } = {}) {
     const out = {
         sheet: null,
@@ -457,7 +587,10 @@ export async function callAgentLLMWithTools({
         out.tokensInApprox += approxMessagesTokens(messages);
         let reply;
         try {
-            reply = await callAgentLLMMessages(messages, profileId, agent, signal);
+            // Built only while recording: off, this is one property read and a
+            // null, so a run that is not being traced allocates nothing per round.
+            const traceCtx = isTraceRecording() ? { runId, callId: traceCallId, round } : null;
+            reply = await callAgentLLMMessages(messages, profileId, agent, signal, traceCtx);
         } catch (err) {
             // No fallback — surface the real reason. Normalize timeouts/budget
             // aborts into a plain "timed out" message so the toast is honest.
@@ -488,6 +621,35 @@ export async function callAgentLLMWithTools({
         out.transcript.push(entry);
 
         const isChatter = parsed.calls.length === 0 && !parsed.done && parsed.malformed.length === 0;
+        // The reply in full, EXACTLY ONCE per round, for every outcome — good
+        // round, malformed round, round that carries the final block. Nothing is
+        // computed that did not already exist: out.transcript has held this text
+        // all along. The callers do read it back (both scan it for the last
+        // non-empty reply), but neither ever LOGS it, so until now the only round
+        // whose reply reached a log was a failing one, sliced to 4000 chars.
+        //
+        // Placed BEFORE that failure branch and never repeated inside it, so the
+        // trace layer emits one reply entry per round and no more. The pre-existing
+        // toolloop.rawreply entry below is untouched — it is the fail-level,
+        // PERSISTED, 4000-char record and it must keep working when recording is
+        // off; the note here points a reader at it so the overlap is stated
+        // rather than discovered.
+        if (isTraceRecording()) {
+            traceCapture(`${traceNs(agent)}.reply.raw`, () => ({
+                agent, round, replyChars: reply.length,
+                toolCalls: parsed.calls.map(c => c.tool),
+                malformedCount: parsed.malformed.length,
+                done: !!parsed.done, isChatter,
+                // Last field: the entry's shared char budget is spent in key
+                // order, so the verdict above always survives intact.
+                reply,
+            }), {
+                runId, callId: traceCallId, round,
+                note: (parsed.malformed.length > 0 || isChatter)
+                    ? 'protocol parse failed — this is the full text; the fail-level toolloop.rawreply entry carries the same reply sliced to 4000 chars'
+                    : undefined,
+            });
+        }
         if (parsed.malformed.length > 0 || isChatter) {
             const detail = parsed.malformed.length > 0
                 ? parsed.malformed[0].error
@@ -511,7 +673,17 @@ export async function callAgentLLMWithTools({
             });
             messages.push({ role: 'assistant', content: reply });
             const example = protocolExample || '{"tool":"write_fact","args":{"category":"People","key":"x_name","value":"..."}}';
-            messages.push({ role: 'user', content: `ERROR: ${detail}. Re-emit as bare protocol: put each tool call alone on its own line as strict JSON, e.g.\n${example}\nand end with a line that is exactly ${finalToken} (nothing else on that line).` });
+            const correction = `ERROR: ${detail}. Re-emit as bare protocol: put each tool call alone on its own line as strict JSON, e.g.\n${example}\nand end with a line that is exactly ${finalToken} (nothing else on that line).`;
+            messages.push({ role: 'user', content: correction });
+            // Injected context the model actually saw, and the only piece of the
+            // conversation not reconstructible from the other captures: the
+            // grace correction is the sole message this file writes itself, and
+            // `detail` is elsewhere logged only sliced to 200 chars.
+            if (isTraceRecording()) {
+                traceCapture(`${traceNs(agent)}.prompt.correction`, () => ({
+                    agent, round, detail: String(detail), correction,
+                }), { runId, callId: traceCallId, round });
+            }
             continue;
         }
 
@@ -527,11 +699,29 @@ export async function callAgentLLMWithTools({
                 // Emission order is preserved so a link_facts line can target a
                 // fact written just above it in the same reply.
                 const writes = parsed.calls.filter(c => FINAL_BLOCK_WRITE_TOOLS.includes(c.tool));
-                for (const call of writes) {
+                for (const [wIdx, call] of writes.entries()) {
                     if (signal?.aborted) break;
                     out.toolCallCount++;
                     try {
                         const result = await runTool(call);
+                        // Same one-entry-per-call shape as the normal-round loop
+                        // below; finalBlock marks the writes that rode alongside
+                        // the closing block and therefore never got a feedback
+                        // round. See the comment there for why args and result
+                        // share an entry.
+                        if (isTraceRecording()) {
+                            traceCapture(`${traceNs(agent)}.tool.call`, () => {
+                                const res = String(result ?? '');
+                                return {
+                                    agent, round, index: wIdx, tool: call?.tool || null, finalBlock: true,
+                                    args: call?.args ?? null,
+                                    line: String(call?.line || ''),
+                                    resultChars: res.length,
+                                    isError: /^\s*ERROR\b/.test(res),
+                                    result: res,
+                                };
+                            }, { runId, callId: traceCallId, round, step: wIdx });
+                        }
                         // Final-round calls get no feedback round, so a failure
                         // must be surfaced here or it vanishes entirely —
                         // executeMemoryTool never throws, it returns the error
@@ -542,7 +732,20 @@ export async function callAgentLLMWithTools({
                                 data: { agent, round, tool: call.tool, line: String(call.line || '').slice(0, 300), result: String(result).slice(0, 300) },
                             });
                         }
-                    } catch (e) { addDebugLog('fail', `write_fact alongside final block threw: ${e?.message || e}`, { subsystem: 'agent3', event: 'toolloop.write_error', data: { agent, round } }); }
+                    } catch (e) {
+                        addDebugLog('fail', `write_fact alongside final block threw: ${e?.message || e}`, { subsystem: 'agent3', event: 'toolloop.write_error', data: { agent, round } });
+                        // The existing line above names the error but not the
+                        // CALL; without this the arguments of the one write that
+                        // blew up would be the only ones missing from the trace.
+                        if (isTraceRecording()) {
+                            traceCapture(`${traceNs(agent)}.tool.call`, () => ({
+                                agent, round, index: wIdx, tool: call?.tool || null, finalBlock: true,
+                                args: call?.args ?? null,
+                                line: String(call?.line || ''),
+                                threw: String(e?.message || e),
+                            }), { runId, callId: traceCallId, round, step: wIdx, reason: 'TOOL_THREW' });
+                        }
+                    }
                 }
                 // Everything else on the final round is thrown away. Split the
                 // two cases: an ignored read is free, a dropped WRITE is a
@@ -579,7 +782,7 @@ export async function callAgentLLMWithTools({
         }
 
         const resultParts = [];
-        for (const call of parsed.calls) {
+        for (const [callIdx, call] of parsed.calls.entries()) {
             if (signal?.aborted) break;
             out.toolCallCount++;
             let result;
@@ -587,6 +790,32 @@ export async function callAgentLLMWithTools({
                 result = await runTool(call);
             } catch (e) {
                 result = `ERROR: ${call.tool} failed internally (${e?.message || e})`;
+            }
+            // THE capture that makes "what was this write based on" answerable.
+            // resultParts is assembled here, fed to the next round and then
+            // discarded, so a read_facts payload the model repaired against has
+            // never been recoverable after the fact.
+            //
+            // Arguments and result share ONE entry rather than being paired by a
+            // correlation rule: call N and result N cannot drift apart if they
+            // were never apart. `index`/`step` is the call's position within the
+            // round, which is also its position in the TOOL RESULTS block the
+            // model reads next. `result` is the last key because the entry's char
+            // budget is spent in key order — a 40k read_facts dump gets cut, the
+            // arguments that produced it never do, and either cut is listed in
+            // the entry's __truncated manifest.
+            if (isTraceRecording()) {
+                traceCapture(`${traceNs(agent)}.tool.call`, () => {
+                    const res = String(result ?? '');
+                    return {
+                        agent, round, index: callIdx, tool: call?.tool || null, finalBlock: false,
+                        args: call?.args ?? null,
+                        line: String(call?.line || ''),
+                        resultChars: res.length,
+                        isError: /^\s*ERROR\b/.test(res),
+                        result: res,
+                    };
+                }, { runId, callId: traceCallId, round, step: callIdx });
             }
             resultParts.push(`${call.line}\n${result}`);
         }

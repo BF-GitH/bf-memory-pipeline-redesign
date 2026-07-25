@@ -198,7 +198,7 @@ function pickMergeWinner(sideA, sideB) {
     if (upd(sideB) !== upd(sideA)) return upd(sideB) > upd(sideA) ? [sideB, sideA] : [sideA, sideB];
     return [sideA, sideB];
 }
-import { addDebugLog, setReflection, getSummaryPyramid, setSummaryPyramid } from './settings.js';
+import { addDebugLog, isTraceRecording, traceCapture, newTraceCallId, setReflection, getSummaryPyramid, setSummaryPyramid } from './settings.js';
 import { callAgentLLM, callAgentLLMWithTools } from './llm-call.js';
 import { executeMemoryTool, REFLECTION_TOOLS, restoreSightingStamp } from './memory-tools.js';
 import * as host from './host.js';
@@ -628,7 +628,12 @@ function buildFactDigest(databases) {
     return { text: lines.join('\n'), shown: lines.length, dropped, cold, total: rows.length };
 }
 
-function buildReflectInput({ runId = '', databases, reevalCandidates = [], changedShelves = [], recentMoments = [], conflictPairs = [], priorStory = '', recentMessages = [], recentMessagesTruncated = false }) {
+// `traceCallId` is correlation only — it never changes what this function
+// returns. Every expensive input block is RENDERED here and nowhere else, so a
+// capture at the call site could only ever see the joined result; the point of
+// capturing each block on its own entry is that each then gets the full
+// per-entry string budget instead of sharing one.
+function buildReflectInput({ runId = '', traceCallId = null, databases, reevalCandidates = [], changedShelves = [], recentMoments = [], conflictPairs = [], priorStory = '', recentMessages = [], recentMessagesTruncated = false }) {
     const parts = [];
 
     if (typeof priorStory === 'string' && priorStory.trim()) {
@@ -649,15 +654,26 @@ function buildReflectInput({ runId = '', databases, reevalCandidates = [], chang
     // "reflection never notices X" is diagnosable instead of mysterious.
     if (digest.dropped > 0) {
         addDebugLog('info', `[${runId}] Reflection digest truncated: ${digest.shown} of ${digest.total} repairable fact(s) shown (cap ${MAX_FACT_SUMMARY_CHARS} chars, ranked importance → trait → recency); ${digest.dropped} row(s) are invisible to this pass's error hunt`, {
-            subsystem: 'reflection', event: 'reflection.digest', reason: 'TRUNCATED',
+            runId, subsystem: 'reflection', event: 'reflection.digest', reason: 'TRUNCATED',
             data: { shown: digest.shown, total: digest.total, dropped: digest.dropped, coldExcluded: digest.cold, capChars: MAX_FACT_SUMMARY_CHARS },
         });
     } else if (digest.cold > 0) {
         addDebugLog('info', `[${runId}] Reflection digest: all ${digest.shown} repairable fact(s) shown; ${digest.cold} cold-tiered row(s) excluded (every repair path refuses them)`, {
-            subsystem: 'reflection', event: 'reflection.digest',
+            runId, subsystem: 'reflection', event: 'reflection.digest',
             data: { shown: digest.shown, total: digest.total, dropped: 0, coldExcluded: digest.cold, capChars: MAX_FACT_SUMMARY_CHARS },
         });
     }
+
+    // The digest AS RENDERED. The two logs above report how many rows made it;
+    // this reports WHICH — and the ordering policy above only pays off if the
+    // resulting order can be inspected. A repair the pass never proposed is
+    // explained either by a row missing from here or by a row present here that
+    // the evidence did not falsify, and those are opposite fixes.
+    traceCapture('reflect.input.digest', () => ({
+        shown: digest.shown, total: digest.total, dropped: digest.dropped,
+        coldExcluded: digest.cold, capChars: MAX_FACT_SUMMARY_CHARS,
+        text: digest.text,
+    }), { runId, callId: traceCallId });
 
     if (Array.isArray(changedShelves) && changedShelves.length) {
         const shelfLines = changedShelves.map(s => {
@@ -666,6 +682,15 @@ function buildReflectInput({ runId = '', databases, reevalCandidates = [], chang
             const prev = (typeof s.prevText === 'string' && s.prevText.trim()) ? `\n    prev: ${s.prevText.trim()}` : '';
             return `+ ${s.category}/${s.aspect} (${s.factCount} fact${s.factCount === 1 ? '' : 's'})${sample}${prev}`;
         });
+        // The shelves list carries the SAMPLE facts and each shelf's prior
+        // summary — the compression guard later rules a proposal "not shorter
+        // than its source facts" against exactly these samples, and only the
+        // bucket keys are logged today, so the comparison cannot be checked.
+        traceCapture('reflect.input.shelves', () => ({
+            count: shelfLines.length,
+            buckets: changedShelves.map(s => s.bucketKey),
+            lines: shelfLines,
+        }), { runId, callId: traceCallId });
         parts.push(`## Shelves to summarize (one short summary per shelf, echo the exact Category/aspect label)\n${shelfLines.join('\n')}`);
     }
 
@@ -687,6 +712,15 @@ function buildReflectInput({ runId = '', databases, reevalCandidates = [], chang
             const body = val ? ` = ${val}` : '';
             return `[${c.id}] ${c.category}/${c.key}${body}${note}`;
         });
+        // The re-eval candidates as OFFERED. #REEVAL verdicts are applied by id,
+        // and the id→fact mapping is a per-pass Map that is gone the moment the
+        // pass returns — so a promote/drop in the log cannot be traced back to
+        // the row it ruled on without this.
+        traceCapture('reflect.input.reeval', () => ({
+            count: reLines.length,
+            ids: reevalCandidates.map(c => c.id),
+            lines: reLines,
+        }), { runId, callId: traceCallId });
         parts.push(`## Re-evaluate (give a verdict per id)\n${reLines.join('\n')}`);
     }
 
@@ -703,6 +737,21 @@ function buildReflectInput({ runId = '', databases, reevalCandidates = [], chang
             const vb = String(p.b.fact.value ?? '').trim().slice(0, MAX_CONFLICT_VALUE_CHARS);
             return `[${p.id}] ${p.a.category}/${p.a.fact.key} = ${va}\n      VS ${p.b.category}/${p.b.fact.key} = ${vb}`;
         });
+        // The contradiction pairs as OFFERED, both sides with their refs. Same
+        // problem as the re-eval ids: conflictById is a per-pass Map, and the
+        // rendered values are clipped to MAX_CONFLICT_VALUE_CHARS, so the pair
+        // the model actually read is not recoverable from the store afterwards —
+        // a #CONFLICT verdict rewrites one side and cold-tiers the other.
+        traceCapture('reflect.input.conflicts', () => ({
+            count: cLines.length,
+            cap: MAX_CONFLICT_PAIRS_SHOWN,
+            pairs: conflictPairs.map(p => ({
+                id: p.id,
+                a: `${p.a.category}/${p.a.fact.key}`,
+                b: `${p.b.category}/${p.b.fact.key}`,
+            })),
+            lines: cLines,
+        }), { runId, callId: traceCallId });
         parts.push(`## Contradictions to resolve (one verdict per id; "both" if they can honestly coexist)\n${cLines.join('\n')}`);
     }
 
@@ -714,7 +763,39 @@ function buildReflectInput({ runId = '', databases, reevalCandidates = [], chang
     // highest — a 12k-char block the model skims is 12k chars wasted. See
     // MAX_STORY_EVIDENCE_CHARS for the cost this placement is buying.
     const story = renderStoryEvidence(recentMessages);
+
+    // The evidence window, on its OWN entry so it gets the whole per-entry string
+    // budget — MAX_STORY_EVIDENCE_CHARS (12000) is exactly the trace's per-string
+    // cap, so a full window arrives uncut here and would not if it shared an
+    // entry with the digest. Today only the message COUNT and the index bounds
+    // reach the log, which is the one input a "reflection never notices X" report
+    // most needs and the only one nothing keeps: the window is a slice of live
+    // chat that shifts on every edit, swipe or delete.
+    //
+    // NEUTRALISED, not raw — story.text is the string that was SENT. Three
+    // reasons, in order of weight. (1) The trace exists to answer "what did the
+    // model see"; the model saw ❴ ❵ and the "| " gutter, so a raw capture would
+    // disagree with the prompt and could not explain a reply that echoes an
+    // ornament brace. (2) A trace is exported to a file and pasted into issues
+    // and chat windows — often back into an LLM. Re-materialising raw
+    // `{"tool":...}`-shaped roleplay inside that document rebuilds, one layer
+    // further out, exactly the injection surface neutralizeEvidence closes; the
+    // substitutions are 1:1 in UTF-16 and purely visual, so a human reader loses
+    // nothing. (3) The clamp counts neutralised characters, so a raw capture
+    // would also show a different span than the one that shipped.
     if (story.text) {
+        // Reached only with a non-empty window, so the index reads below are safe.
+        traceCapture('reflect.input.story', () => ({
+            messages: story.count,
+            clamped: story.clamped,
+            truncatedByCaller: !!recentMessagesTruncated,
+            capChars: MAX_STORY_EVIDENCE_CHARS,
+            chars: story.text.length,
+            fromIndex: recentMessages[0]?.index ?? null,
+            toIndex: recentMessages[recentMessages.length - 1]?.index ?? null,
+            text: story.text,
+        }), { runId, callId: traceCallId, note: 'neutralised exactly as sent' });
+
         const partial = (recentMessagesTruncated || story.clamped)
             ? ' — PARTIAL: older messages were dropped to fit, so a subject absent here proves nothing'
             : '';
@@ -961,6 +1042,15 @@ function contextChanged(captured) {
 // prevReflection was accepted and never read by anything in this file; removed
 // rather than left as a parameter that documents a feature that does not exist.
 export async function runReflection({ runId = '', characterInfo = '', userPersona = '', profileId = null, recentMessages = [], recentMessagesTruncated = false, signal = null } = {}) {
+    // Every addDebugLog below passes `runId` in its OPTIONS, not only inside the
+    // message string. It has to: reflection runs after endRun() (pipeline.js), so
+    // addDebugLog's automatic currentRunId is null here, and every outcome entry —
+    // the repairs, the conflict verdicts, the re-eval promotes and drops — would
+    // otherwise land with entry.runId === null. That puts them in the Debug tab's
+    // "Ungrouped" bucket and, in the test-run export, leaves them unjoinable to
+    // the reflect.parsed.sections capture that PROPOSED them: comparing proposed
+    // against applied would mean string-matching a run id out of a message.
+    //
     // Captured BEFORE the first await so every later write can be checked
     // against the context the pass was actually armed for.
     const runCtx = captureRunContext();
@@ -969,7 +1059,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
 
         const totalFacts = Object.values(databases).reduce((n, db) => n + (db.facts?.length || 0), 0);
         if (totalFacts === 0) {
-            addDebugLog('info', `[${runId}] Reflection skipped (nothing to consolidate)`);
+            addDebugLog('info', `[${runId}] Reflection skipped (nothing to consolidate)`, { runId });
             return { summary: '', observations: [], merged: 0, rounds: 0, toolCallCount: 0, tokensIn: 0, tokensOut: 0 };
         }
 
@@ -978,7 +1068,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         const earlyDrift = contextChanged(runCtx);
         if (earlyDrift) {
             addDebugLog('fail', `[${runId}] Reflection abandoned before it started — ${earlyDrift.field} changed while the store was loading (${earlyDrift.from} -> ${earlyDrift.to}); nothing was written`, {
-                subsystem: 'reflection', event: 'reflection.done', reason: 'CONTEXT_CHANGED',
+                runId, subsystem: 'reflection', event: 'reflection.done', reason: 'CONTEXT_CHANGED',
                 data: { field: earlyDrift.field, from: earlyDrift.from, to: earlyDrift.to, stage: 'load' },
             });
             return { summary: '', observations: [], merged: 0, rounds: 0, toolCallCount: 0, tokensIn: 0, tokensOut: 0, error: `${earlyDrift.field} changed mid-pass` };
@@ -992,13 +1082,13 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                     databases[category] = cleaned;
                     await saveDatabase(cleaned);
                     totalMerged += merged;
-                    addDebugLog('info', `[${runId}] Dedupe-janitor: merged ${merged} duplicate fact(s) in ${category}`);
+                    addDebugLog('info', `[${runId}] Dedupe-janitor: merged ${merged} duplicate fact(s) in ${category}`, { runId });
                 }
             } catch (err) {
-                addDebugLog('fail', `[${runId}] Dedupe-janitor failed for ${category} (non-fatal): ${err.message || err}`);
+                addDebugLog('fail', `[${runId}] Dedupe-janitor failed for ${category} (non-fatal): ${err.message || err}`, { runId });
             }
         }
-        if (totalMerged > 0) addDebugLog('pass', `[${runId}] Dedupe-janitor merged ${totalMerged} duplicate fact(s) total`);
+        if (totalMerged > 0) addDebugLog('pass', `[${runId}] Dedupe-janitor merged ${totalMerged} duplicate fact(s) total`, { runId });
 
         // Contradiction scan. The pairs it finds are offered to the reflection
         // pass as "## Contradictions to resolve" and come back as #CONFLICT
@@ -1073,14 +1163,14 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
 
                 if (surviving > 0) {
                     addDebugLog('info', `[${runId}] Contradiction scan: ${surviving} unsettled conflict(s) detected, offering ${conflictPairs.length} to the reflection pass (cap ${MAX_CONFLICT_PAIRS_SHOWN})`, {
-                        subsystem: 'reflection', event: 'conflict.scan',
+                        runId, subsystem: 'reflection', event: 'conflict.scan',
                         data: { detected: surviving, offered: conflictPairs.length, interval, run: reflectRuns, settledMemo: settled.size, pairs: conflictPairs.map(p => p.pairId) },
                     });
                 } else {
                     // Explicitly logged now. The silent-zero case is what let the
                     // scan-starvation bug hide for as long as it did.
                     addDebugLog('info', `[${runId}] Contradiction scan: no unsettled conflicts (${settled.size} pair(s) already ruled coexisting in this chat)`, {
-                        subsystem: 'reflection', event: 'conflict.scan', reason: 'NONE_UNSETTLED',
+                        runId, subsystem: 'reflection', event: 'conflict.scan', reason: 'NONE_UNSETTLED',
                         data: { detected: 0, interval, run: reflectRuns, settledMemo: settled.size },
                     });
                 }
@@ -1088,14 +1178,22 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         } catch (err) {
             conflictPairs = [];
             addDebugLog('fail', `[${runId}] Contradiction scan failed (non-fatal): ${err.message || err}`, {
-                subsystem: 'reflection', event: 'conflict.scan', reason: 'ERROR',
+                runId, subsystem: 'reflection', event: 'conflict.scan', reason: 'ERROR',
             });
         }
 
         const settings = host.getExtensionSettings();
         const substitute = host.getSubstituteParams();
 
-        const systemPrompt = substitute(settings?.reflectionPrompt || DEFAULT_REFLECT_PROMPT);
+        // One correlation id for the whole reflection pass — its inputs, its
+        // prompts, its tool loop and its parsed proposals. Minted only while
+        // recording (newTraceCallId builds a string). runId must be passed
+        // explicitly everywhere below: reflection runs AFTER endRun(), so the
+        // debug log's own currentRunId is null by the time we get here.
+        const traceCallId = isTraceRecording() ? newTraceCallId('reflect') : null;
+
+        const reflectOverride = settings?.reflectionPrompt;
+        const systemPrompt = substitute(reflectOverride || DEFAULT_REFLECT_PROMPT);
         // A saved override is a FULL copy of whatever DEFAULT_REFLECT_PROMPT said
         // when the user last edited it, so an older one still declares READ-ONLY
         // tools, the old 5/15 budget and no #CONFLICT section. Everything
@@ -1103,10 +1201,33 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         // "reflection never repairs anything" has to be diagnosable from the log.
         if (typeof settings?.reflectionPrompt === 'string' && settings.reflectionPrompt.trim()) {
             addDebugLog('info', `[${runId}] Reflection is running a CUSTOM prompt override (${settings.reflectionPrompt.length} chars) — the repair tools and #CONFLICT are only offered by the built-in default; a stale copy silently disables both`, {
-                subsystem: 'reflection', event: 'reflection.prompt_override', reason: 'CUSTOM_PROMPT',
+                runId, subsystem: 'reflection', event: 'reflection.prompt_override', reason: 'CUSTOM_PROMPT',
                 data: { chars: settings.reflectionPrompt.length },
             });
         }
+
+        // WHICH system prompt ran, not its text — the prompt BODY is the call
+        // layer's to capture (every dispatched string ends up in llm-call.js) and
+        // one copy of a multi-KB body is enough. The provenance is the half that
+        // layer cannot see: `systemPrompt` reaches it as a single string with no
+        // trace of whether it came from the user's saved override or the built-in
+        // default. `overrideActive` mirrors the truthiness test the line above
+        // ACTUALLY uses (not the trimmed one the info log tests), so a
+        // whitespace-only override — which does take effect — reads as active.
+        traceCapture('reflect.prompt.system', () => ({
+            call: 'reflect',
+            source: reflectOverride ? 'settings-override' : 'built-in-default',
+            overrideActive: !!reflectOverride,
+            overrideChars: typeof reflectOverride === 'string' ? reflectOverride.length : 0,
+            defaultChars: DEFAULT_REFLECT_PROMPT.length,
+            // A stale override is a full COPY of an older default: it still
+            // declares read-only tools and carries no #CONFLICT section, so the
+            // repair tools and conflict resolution are silently off.
+            differsFromDefault: typeof reflectOverride === 'string' && !!reflectOverride
+                ? reflectOverride !== DEFAULT_REFLECT_PROMPT
+                : false,
+            substitutedChars: systemPrompt.length,
+        }), { runId, callId: traceCallId, note: 'prompt TEXT belongs to the llm-call layer; traceCallId ties the two' });
 
         const reevalCandidates = collectReevalCandidates(databases);
         const reevalById = new Map(reevalCandidates.map(c => [c.id, c]));
@@ -1122,7 +1243,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         const changedShelves = index ? pickChangedShelves(index, priorPyramid) : [];
         if (changedShelves.length) {
             addDebugLog('info', `[${runId}] Summary pyramid: ${changedShelves.length} changed shelf(s) queued for summary (cap ${MAX_SHELVES_PER_PASS}): ${changedShelves.map(s => `${s.category}/${s.aspect}`).join(', ')}`, {
-                subsystem: 'reflection', event: 'summary.shelves',
+                runId, subsystem: 'reflection', event: 'summary.shelves',
                 data: { queued: changedShelves.length, cap: MAX_SHELVES_PER_PASS, buckets: changedShelves.map(s => s.bucketKey) },
             });
         }
@@ -1132,26 +1253,53 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         if (userPersona) dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
         const storyMessages = Array.isArray(recentMessages) ? recentMessages : [];
         dataParts.push(buildReflectInput({
-            runId, databases, reevalCandidates, changedShelves, recentMoments, conflictPairs,
+            runId, traceCallId, databases, reevalCandidates, changedShelves, recentMoments, conflictPairs,
             priorStory: (priorPyramid && priorPyramid.story) || '',
             recentMessages: storyMessages,
             recentMessagesTruncated: !!recentMessagesTruncated,
         }));
         const userPrompt = substitute(dataParts.join('\n\n'));
 
-        addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars (tool loop, max ${REFLECT_MAX_ROUNDS} rounds / ${REFLECT_MAX_TOOL_CALLS} tool calls / ${REFLECT_MAX_WRITES} writes)`);
+        // The assembled prompt, POST-substitution. Its components are already on
+        // their own entries above, so this is deliberately the one capture the
+        // per-string cap will bite (digest 4000 + story 12000 + the rest): what it
+        // adds over the components is the two things they cannot show — the
+        // section ORDER the model read them in, and the effect of
+        // substituteParams, which runs only here and rewrites {{macros}} that the
+        // component captures still contain verbatim. Every cut is listed in the
+        // entry's own __truncated manifest, and `sections` survives the cut, so
+        // the layout stays readable even when the tail of the text does not.
+        //
+        // `sections` is the span between consecutive `## ` headers. Evidence lines
+        // all carry the "| " gutter, so nothing inside the untrusted block can
+        // forge a header; a literal `## ` line in the character card or persona
+        // can, and would show up as one more (harmless, correctly measured) row.
+        traceCapture('reflect.prompt.user', () => {
+            const heads = [...userPrompt.matchAll(/^## .*$/gm)];
+            return {
+                chars: userPrompt.length,
+                preSubstituteChars: dataParts.join('\n\n').length,
+                sections: heads.map((h, i) => ({
+                    header: h[0],
+                    chars: (i + 1 < heads.length ? heads[i + 1].index : userPrompt.length) - h.index,
+                })),
+                userPrompt,
+            };
+        }, { runId, callId: traceCallId, note: 'components are captured whole on the reflect.input.* entries' });
+
+        addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars (tool loop, max ${REFLECT_MAX_ROUNDS} rounds / ${REFLECT_MAX_TOOL_CALLS} tool calls / ${REFLECT_MAX_WRITES} writes)`, { runId });
         // The error hunt is only possible with evidence; an empty window means
         // the pass degrades to the old memory-vs-memory behavior, and that has to
         // be visible in the log or "reflection never finds anything" is
         // undiagnosable.
         if (storyMessages.length === 0) {
             addDebugLog('info', `[${runId}] Reflection has NO story evidence this pass — it can only check memory against memory, so a fact contradicted by the narrative cannot be found`, {
-                subsystem: 'reflection', event: 'reflection.story_evidence', reason: 'NO_EVIDENCE',
+                runId, subsystem: 'reflection', event: 'reflection.story_evidence', reason: 'NO_EVIDENCE',
                 data: { messages: 0 },
             });
         } else {
             addDebugLog('info', `[${runId}] Reflection story evidence: ${storyMessages.length} raw message(s)${recentMessagesTruncated ? ' (window truncated — partial record of its span)' : ''}`, {
-                subsystem: 'reflection', event: 'reflection.story_evidence',
+                runId, subsystem: 'reflection', event: 'reflection.story_evidence',
                 data: { messages: storyMessages.length, truncated: !!recentMessagesTruncated, fromIndex: storyMessages[0]?.index ?? null, toIndex: storyMessages[storyMessages.length - 1]?.index ?? null },
             });
         }
@@ -1163,6 +1311,15 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         // #OBS/#CALLBACK/#REEVAL/#SHELVES/#CONFLICT pipeline further down.
         const toolCtx = {
             runId,
+            // The SAME id this pass hands callAgentLLMWithTools below, so the
+            // tool layer's captures (memory-tools.js traceOpts) group into the
+            // same export bucket as the prompts, replies and tool-call lines
+            // llm-call.js records under it. Without it the before/after images of
+            // a repair sit in a sibling "(no call id)" block that a reader has to
+            // interleave by seq with the tool call that performed it. Null when
+            // recording is off — the id is minted only then, and a null costs
+            // grouping, never a capture.
+            traceCallId,
             databases,
             index,
             settings,
@@ -1221,6 +1378,14 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
             // steer a model recovering from a protocol error straight into the
             // read-before-write gate — a guaranteed second failure.
             protocolExample: '{"tool":"read_facts","args":{"category":"People","keys":["x_name"]}}',
+            // Correlation only — llm-call.js stamps these onto its own captures
+            // so this pass's prompt bodies, per-round replies, tool arguments and
+            // tool results land under the same ids as the inputs traced above.
+            // runId MUST travel explicitly: reflection runs after endRun(), so
+            // the debug log has no current run to fall back on. Both are plain
+            // strings, so there is no lifetime or mutation concern.
+            runId,
+            traceCallId,
             signal,
         });
         let tokensIn = loop.tokensInApprox || 0;
@@ -1259,7 +1424,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         const drift = contextChanged(runCtx);
         if (drift) {
             addDebugLog('fail', `[${runId}] Reflection ABANDONED after ${rounds} round(s) — ${drift.field} changed mid-pass (${drift.from} -> ${drift.to}); ${toolCtx.applied.length} repair(s) and every section verdict were discarded UNSAVED rather than risking another chat's store`, {
-                subsystem: 'reflection', event: 'reflection.done', reason: 'CONTEXT_CHANGED',
+                runId, subsystem: 'reflection', event: 'reflection.done', reason: 'CONTEXT_CHANGED',
                 data: {
                     field: drift.field, from: drift.from, to: drift.to, stage: 'toolloop',
                     rounds, toolCallCount, discardedRepairs: toolCtx.applied.length,
@@ -1279,26 +1444,46 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
             if (!databases[cat]) continue;
             try {
                 await saveDatabase(databases[cat]);
-                addDebugLog('pass', `[${runId}] Reflection saved database "${cat}" (${databases[cat].facts.length} facts)`);
+                addDebugLog('pass', `[${runId}] Reflection saved database "${cat}" (${databases[cat].facts.length} facts)`, { runId });
             } catch (e) {
-                addDebugLog('fail', `[${runId}] Reflection failed to save database "${cat}": ${e?.message || e}`);
+                addDebugLog('fail', `[${runId}] Reflection failed to save database "${cat}": ${e?.message || e}`, { runId });
             }
         }
 
         if (loop.error) {
             addDebugLog('fail', `[${runId}] Reflection tool loop failed: ${loop.error} (${rounds} round(s), ${toolCallCount} tool call(s), ${toolCtx.applied.length} repair(s) already persisted)`, {
-                subsystem: 'reflection', event: 'reflection.toolloop', reason: 'LOOP_ERROR',
+                runId, subsystem: 'reflection', event: 'reflection.toolloop', reason: 'LOOP_ERROR',
                 data: { rounds, toolCallCount, toolWrites: toolCtx.applied.length, error: loop.error },
             });
             return { summary: '', observations: [], merged: totalMerged, toolWrites: toolCtx.applied.length, rounds, toolCallCount, tokensIn, tokensOut, error: loop.error };
         }
 
         addDebugLog('info', `[${runId}] Reflection tool loop done: ${rounds} round(s), ${toolCallCount} tool call(s); final reply (${resultStr.length} chars):\n${resultStr}`, {
-            subsystem: 'reflection', event: 'reflection.toolloop',
+            runId, subsystem: 'reflection', event: 'reflection.toolloop',
             data: { rounds, toolCallCount, tools: (loop.transcript || []).flatMap(t => t.toolCalls || []) },
         });
 
         const parsed = parseReflectResult(resultStr);
+
+        // WHAT THE PASS PROPOSED, before anything applies it. Every apply block
+        // below logs its own outcome, but a proposal that never becomes an
+        // outcome currently leaves no trace at all, and the three ways that
+        // happens are indistinguishable from the outcome logs: the model never
+        // emitted the section, the section did not parse (a verdict id it
+        // invented, a merge with no value, a shelf label without a slash), or it
+        // parsed and the apply block refused it. Captured HERE rather than after
+        // the compression guard because the guard REPLACES parsed.shelves —
+        // this is the only point at which the reply's own proposals exist.
+        traceCapture('reflect.parsed.sections', () => ({
+            replyChars: resultStr.length,
+            summaryChars: parsed.summary.length,
+            summary: parsed.summary,
+            shelves: parsed.shelves,
+            observations: parsed.observations,
+            callbacks: parsed.callbacks,
+            reevals: parsed.reevals,
+            conflicts: parsed.conflicts,
+        }), { runId, callId: traceCallId, note: 'proposed; the apply blocks log what actually landed' });
 
         try {
             if (settings?.reflectionCompressionGuard !== false && changedShelves.length && (parsed.shelves || []).length) {
@@ -1314,7 +1499,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                 }
                 if (failing.length) {
                     addDebugLog('info', `[${runId}] Compression guard tripped: ${failing.length} shelf summary(ies) not shorter than their source facts — retrying once`, {
-                        subsystem: 'reflection', event: 'summary.compression_guard', reason: 'NOT_SMALLER',
+                        runId, subsystem: 'reflection', event: 'summary.compression_guard', reason: 'NOT_SMALLER',
                         data: { failing, queued: changedShelves.length },
                     });
                     // Repair stays SINGLE-SHOT even though the main pass is a tool
@@ -1323,10 +1508,30 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                     const repairUserPrompt = userPrompt
                         + `\n\n## Your previous final sections (rework these)\n${resultStr}`
                         + '\n\nYour #SHELVES summaries were not shorter than the source facts. Do NOT call any tools now — re-emit the COMPLETE final sections (#STORY/#SHELVES/#OBS/#CALLBACK/#REEVAL/#CONFLICT), rewriting the SAME source memories more abstractly instead of adding detail; do not introduce new facts. End with a line that is exactly #DONE.';
-                    const retryStr = await callAgentLLM(systemPrompt, repairUserPrompt, profileId, 'reflection');
+                    // Its OWN callId, not the pass's: this is a second LLM call
+                    // with a different user prompt (the whole original plus the
+                    // rejected sections), and the trace contract is one callId per
+                    // call — reusing the pass's would put two different prompt
+                    // bodies under one id and make the export unreadable.
+                    // externalSignal stays null (it always was) so the trailing
+                    // trace argument can be reached.
+                    const retryTrace = isTraceRecording() ? { runId, callId: newTraceCallId('reflect-retry') } : null;
+                    const retryStr = await callAgentLLM(systemPrompt, repairUserPrompt, profileId, 'reflection', null, retryTrace);
                     tokensIn += await host.getTokenCount(systemPrompt + '\n' + repairUserPrompt);
                     tokensOut += await host.getTokenCount(retryStr);
                     const reparsed = parseReflectResult(retryStr);
+                    // The retry is a SECOND proposal. Only its shelves matter,
+                    // and only for the buckets in `failing`: the merge below
+                    // drops those from the first proposal and re-admits a retry
+                    // shelf just where it came back shorter than its source
+                    // facts. The guard's own log counts repaired vs still-too-
+                    // long, which cannot tell "the retry omitted that shelf"
+                    // from "the retry re-emitted it just as long".
+                    traceCapture('reflect.parsed.retry', () => ({
+                        replyChars: retryStr.length,
+                        failing,
+                        shelves: reparsed.shelves,
+                    }), { runId, callId: retryTrace?.callId ?? null, reason: 'COMPRESSION_GUARD' });
                     const retryByKey = new Map((reparsed.shelves || []).map(sh => [`${String(sh.category).toLowerCase()}||${String(sh.aspect).toLowerCase()}`, sh]));
                     const failingSet = new Set(failing);
 
@@ -1345,14 +1550,14 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                         .filter(sh => !failingSet.has(`${String(sh.category).toLowerCase()}||${String(sh.aspect).toLowerCase()}`))
                         .concat(accepted);
                     addDebugLog(stillFailing ? 'info' : 'pass', `[${runId}] Compression guard retry: ${accepted.length} shelf(s) repaired, ${stillFailing} still too long (prior summary kept)`, {
-                        subsystem: 'reflection', event: 'summary.compression_guard', reason: stillFailing ? 'RETRY_PARTIAL' : 'RETRY_OK',
+                        runId, subsystem: 'reflection', event: 'summary.compression_guard', reason: stillFailing ? 'RETRY_PARTIAL' : 'RETRY_OK',
                         data: { repaired: accepted.length, stillFailing },
                     });
                 }
             }
         } catch (err) {
             addDebugLog('fail', `[${runId}] Compression guard failed (non-fatal): ${err.message || err}`, {
-                subsystem: 'reflection', event: 'summary.compression_guard', reason: 'ERROR',
+                runId, subsystem: 'reflection', event: 'summary.compression_guard', reason: 'ERROR',
             });
         }
 
@@ -1378,13 +1583,13 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
             }
             if (refreshed > 0) {
                 addDebugLog('info', `[${runId}] Summary pyramid: refreshed ${refreshed} shelf summary(ies); ${Object.keys(mergedShelves).length} shelf(s) stored total`, {
-                    subsystem: 'reflection', event: 'summary.shelves',
+                    runId, subsystem: 'reflection', event: 'summary.shelves',
                     data: { refreshed, totalStored: Object.keys(mergedShelves).length, buckets: parsed.shelves.map(s => `${s.category}/${s.aspect}`) },
                 });
             }
         } catch (err) {
             addDebugLog('fail', `[${runId}] Summary pyramid update failed (non-fatal): ${err.message || err}`, {
-                subsystem: 'reflection', event: 'summary.shelves', reason: 'ERROR',
+                runId, subsystem: 'reflection', event: 'summary.shelves', reason: 'ERROR',
             });
         }
 
@@ -1419,10 +1624,10 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                 try {
                     await saveDatabase(databases[category]);
                 } catch (err) {
-                    addDebugLog('fail', `[${runId}] Reflection failed to save observations to "${category}": ${err.message || err}`);
+                    addDebugLog('fail', `[${runId}] Reflection failed to save observations to "${category}": ${err.message || err}`, { runId });
                 }
             }
-            addDebugLog('pass', `[${runId}] Reflection wrote ${written} observation(s) (${[...savedCategories].join(', ')})`);
+            addDebugLog('pass', `[${runId}] Reflection wrote ${written} observation(s) (${[...savedCategories].join(', ')})`, { runId });
         }
 
         let callbacksWritten = 0;
@@ -1440,16 +1645,16 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
             callbackModified.add(earlier.category);
             callbacksWritten++;
             addDebugLog('info', `[${runId}] Reflection callback-link: [${earlier.category}] ${earlier.key} <- [${later.category}] ${later.key}${cb.reason ? ` | ${cb.reason}` : ''}`, {
-                subsystem: 'reflection', event: 'callback.linked', reason: 'ECHO',
+                runId, subsystem: 'reflection', event: 'callback.linked', reason: 'ECHO',
                 data: { fromCategory: earlier.category, fromKey: earlier.key, toCategory: later.category, toKey: later.key, reason: cb.reason || '' },
             });
         }
         for (const category of callbackModified) {
             try { await saveDatabase(databases[category]); }
-            catch (err) { addDebugLog('fail', `[${runId}] Callback-link failed to save "${category}": ${err.message || err}`); }
+            catch (err) { addDebugLog('fail', `[${runId}] Callback-link failed to save "${category}": ${err.message || err}`, { runId }); }
         }
         if (callbacksWritten > 0) {
-            addDebugLog('pass', `[${runId}] Reflection authored ${callbacksWritten} callback-link(s) (cap ${MAX_CALLBACKS_PER_PASS}, from ${recentMoments.length} recent moment(s))`);
+            addDebugLog('pass', `[${runId}] Reflection authored ${callbacksWritten} callback-link(s) (cap ${MAX_CALLBACKS_PER_PASS}, from ${recentMoments.length} recent moment(s))`, { runId });
         }
 
         // Contradiction verdicts run BEFORE #REEVAL, and the order matters: the
@@ -1462,7 +1667,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         // more decisive verdict wins.
         if (conflictPairs.length && !(parsed.conflicts || []).length) {
             addDebugLog('info', `[${runId}] Contradiction scan offered ${conflictPairs.length} pair(s) but the reply carried no #CONFLICT section${settings?.reflectionPrompt ? ' — a CUSTOM reflection prompt is active and most likely predates that section' : ''}`, {
-                subsystem: 'reflection', event: 'conflict.scan', reason: 'NO_CONFLICT_SECTION',
+                runId, subsystem: 'reflection', event: 'conflict.scan', reason: 'NO_CONFLICT_SECTION',
                 data: { offered: conflictPairs.length, customPrompt: !!settings?.reflectionPrompt },
             });
         }
@@ -1487,7 +1692,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
             if (!pair) continue; // an id the system never offered
             if (conflictSeen.has(v.id)) {
                 addDebugLog('info', `[${runId}] Conflict verdict [${v.id}] repeated — keeping the first, ignoring "${v.verdict}"`, {
-                    subsystem: 'reflection', event: 'conflict.resolved', reason: 'DUPLICATE_VERDICT',
+                    runId, subsystem: 'reflection', event: 'conflict.resolved', reason: 'DUPLICATE_VERDICT',
                     data: { id: v.id, ignoredVerdict: v.verdict },
                 });
                 continue;
@@ -1539,7 +1744,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                 conflictsResolved++;
                 settledThisPass.push(pair.pairId);
                 addDebugLog('info', `[${runId}] Conflict MERGE [${pair.id}]: [${winner.category}] ${winner.key} "${oldValue.slice(0, 60)}" → "${String(v.value).slice(0, 60)}"; cold-tiered [${loser.category}] ${loser.key}`, {
-                    subsystem: 'reflection', event: 'conflict.resolved', reason: 'CONFLICT_MERGE',
+                    runId, subsystem: 'reflection', event: 'conflict.resolved', reason: 'CONFLICT_MERGE',
                     data: {
                         category: winner.category, key: winner.key, oldValue, newValue: v.value,
                         loserCategory: loser.category, loserKey: loser.key, pairId: pair.pairId,
@@ -1560,7 +1765,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
             conflictsResolved++;
             settledThisPass.push(pair.pairId);
             addDebugLog('info', `[${runId}] Conflict ${v.verdict.toUpperCase()} [${pair.id}]: kept [${winner.category}] ${winner.key} = "${String(winner.fact.value ?? '').slice(0, 60)}"; cold-tiered [${loser.category}] ${loser.key} = "${String(loser.fact.value ?? '').slice(0, 60)}"`, {
-                subsystem: 'reflection', event: 'conflict.resolved', reason: v.verdict === 'b' ? 'CONFLICT_B' : 'CONFLICT_A',
+                runId, subsystem: 'reflection', event: 'conflict.resolved', reason: v.verdict === 'b' ? 'CONFLICT_B' : 'CONFLICT_A',
                 data: {
                     category: winner.category, key: winner.key, keptValue: String(winner.fact.value ?? ''),
                     loserCategory: loser.category, loserKey: loser.key, loserValue: String(loser.fact.value ?? ''),
@@ -1570,7 +1775,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         }
         for (const category of conflictModified) {
             try { await saveDatabase(databases[category]); }
-            catch (err) { addDebugLog('fail', `[${runId}] Conflict resolution failed to save "${category}": ${err.message || err}`); }
+            catch (err) { addDebugLog('fail', `[${runId}] Conflict resolution failed to save "${category}": ${err.message || err}`, { runId }); }
         }
         if (settledThisPass.length) {
             // Remember every settled pair, not just the "both" ones: a/b/merge
@@ -1590,7 +1795,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                 const memoDrift = contextChanged(runCtx);
                 if (memoDrift) {
                     addDebugLog('fail', `[${runId}] Settled-conflict memo NOT persisted — ${memoDrift.field} changed mid-pass (${memoDrift.from} -> ${memoDrift.to}); ${settledThisPass.length} pair(s) will simply be re-offered next pass`, {
-                        subsystem: 'reflection', event: 'conflict.resolved', reason: 'CONTEXT_CHANGED',
+                        runId, subsystem: 'reflection', event: 'conflict.resolved', reason: 'CONTEXT_CHANGED',
                         data: { field: memoDrift.field, from: memoDrift.from, to: memoDrift.to, pairs: settledThisPass.length },
                     });
                 } else if (chatMeta) {
@@ -1603,10 +1808,10 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                 }
             } catch (err) {
                 addDebugLog('fail', `[${runId}] Conflict resolution failed to persist settled pairs (non-fatal): ${err.message || err}`, {
-                    subsystem: 'reflection', event: 'conflict.resolved', reason: 'PERSIST_FAILED',
+                    runId, subsystem: 'reflection', event: 'conflict.resolved', reason: 'PERSIST_FAILED',
                 });
             }
-            addDebugLog('pass', `[${runId}] Conflict resolution: ${conflictsResolved} pair(s) resolved, ${settledThisPass.length - conflictsResolved} ruled coexisting (from ${conflictPairs.length} offered)`);
+            addDebugLog('pass', `[${runId}] Conflict resolution: ${conflictsResolved} pair(s) resolved, ${settledThisPass.length - conflictsResolved} ruled coexisting (from ${conflictPairs.length} offered)`, { runId });
         }
 
         let promoted = 0, dropped = 0;
@@ -1626,7 +1831,7 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                 reevalModified.add(cand.category);
                 dropped++;
                 addDebugLog('info', `[${runId}] Re-eval DROP→cold-tier: [${cand.category}] ${cand.key} = "${String(fact.value ?? '').slice(0, 60)}"`, {
-                    subsystem: 'reflection', event: 'fact.demoted', reason: 'REEVAL_DROP',
+                    runId, subsystem: 'reflection', event: 'fact.demoted', reason: 'REEVAL_DROP',
                     data: { category: cand.category, key: cand.key, newlyCold },
                 });
                 continue;
@@ -1682,27 +1887,27 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
                 restoreSightingStamp(findFactMatch(targetDb, cand.key), priorLastUpdated);
                 promoted++;
                 addDebugLog('info', `[${runId}] Re-eval PROMOTE: [${cand.category}] ${cand.key} → ${newCat}/${newAspect}`, {
-                    subsystem: 'db', event: 'fact.reeval_promoted', reason: 'CONFIRMED_LASTING',
+                    runId, subsystem: 'db', event: 'fact.reeval_promoted', reason: 'CONFIRMED_LASTING',
                     data: { fromCategory: cand.category, toCategory: newCat, key: cand.key, aspect: newAspect },
                 });
             }
         }
         for (const category of reevalModified) {
             try { await saveDatabase(databases[category]); }
-            catch (err) { addDebugLog('fail', `[${runId}] Re-eval failed to save "${category}": ${err.message || err}`); }
+            catch (err) { addDebugLog('fail', `[${runId}] Re-eval failed to save "${category}": ${err.message || err}`, { runId }); }
         }
         if (promoted || dropped) {
-            addDebugLog('pass', `[${runId}] Re-evaluation: promoted ${promoted}, dropped ${dropped} (from ${reevalCandidates.length} candidate(s))`);
+            addDebugLog('pass', `[${runId}] Re-evaluation: promoted ${promoted}, dropped ${dropped} (from ${reevalCandidates.length} candidate(s))`, { runId });
         }
 
         const toolWrites = toolCtx.applied.length;
         addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, callbacks=${callbacksWritten}, reeval(+${promoted}/-${dropped}), conflicts=${conflictsResolved}, toolWrites=${toolWrites}/${REFLECT_MAX_WRITES}, rounds=${rounds}, toolCalls=${toolCallCount}`, {
-            subsystem: 'reflection', event: 'reflection.done',
+            runId, subsystem: 'reflection', event: 'reflection.done',
             data: { merged: totalMerged, observations: written, callbacks: callbacksWritten, promoted, dropped, conflictsResolved, toolWrites, rounds, toolCallCount },
         });
         return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, callbacks: callbacksWritten, promoted, dropped, conflictsResolved, toolWrites, rounds, toolCallCount, tokensIn, tokensOut };
     } catch (error) {
-        addDebugLog('fail', `Reflection error (non-fatal): ${error.message || error}`);
+        addDebugLog('fail', `Reflection error (non-fatal): ${error.message || error}`, { runId });
         return { summary: '', observations: [], rounds: 0, toolCallCount: 0, tokensIn: 0, tokensOut: 0, error: error.message || String(error) };
     }
 }

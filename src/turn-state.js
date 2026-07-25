@@ -1,4 +1,4 @@
-import { addDebugLog } from './debug-log.js';
+import { addDebugLog, isTraceRecording } from './debug-log.js';
 
 import { getContext, escapeHtml, fmt, getCurrentChatId, isBranchChat } from './ui-util.js';
 
@@ -269,6 +269,7 @@ export function setMemorySheet(text, { runId = '', sourceMessageIndex = -1 } = {
         seeded: false,
     };
     memorySheetLoaded = true;
+    recordSheetHistory(memorySheet);
     saveSheetToMeta();
     renderMemorySheet();
     addDebugLog('info', `Memory sheet updated (${t.length} chars, source msg ${memorySheet.sourceMessageIndex})`, {
@@ -277,9 +278,79 @@ export function setMemorySheet(text, { runId = '', sourceMessageIndex = -1 } = {
     });
 }
 
+// --- Injected-sheet history (RAM ONLY, test-run recording) ------------------
+//
+// setMemorySheet OVERWRITES chatMetadata.bf_mem_sheet every turn and the
+// sheet.updated line above carries only a character count, so once a reply has
+// been generated there is no way left to see WHICH sheet sat above it. That is
+// exactly the question "the memory forgot Portugal" asks.
+//
+// The ring lives here rather than on the debug ring on purpose. The debug ring
+// is 2000 entries shared with every other capture, so a long recording evicts
+// the oldest sheets first — the ones a regression hunt reaches furthest back
+// for. Keeping it separate also stores each sheet ONCE instead of once per trace
+// entry that would otherwise quote it.
+//
+// Nothing here is persisted: no chatMetadata write, no attachment, and the ring
+// is dropped on chat switch (reloadSheetFromChat) so one chat's sheets can never
+// turn up in another chat's export.
+//
+// N = 50. The sizing rule is "every trace entry still on the debug ring should
+// still have its sheet". A recorded turn emits on the order of 40 trace entries
+// (three LLM calls with their prompts and replies, plus the tool reads and
+// writes), so the 2000-entry debug ring spans roughly 50 turns. Matching that
+// costs at most 50 x SHEET_HISTORY_MAX_CHARS = 600 KB of strings — a rounding
+// error next to the debug ring's own worst case, and typically far less because
+// a real sheet is a few KB.
+const SHEET_HISTORY_MAX = 50;
+// Mirrors the trace layer's per-string cap. A sheet is normally well under this;
+// the cap exists only so a runaway sheet cannot make the ring unbounded, and the
+// cut is marked in the text rather than hidden.
+const SHEET_HISTORY_MAX_CHARS = 12000;
+
+let sheetHistory = [];
+
+// Guarded on the record switch: with recording off this is one property read and
+// a return — no copy, no string work, no growth.
+function recordSheetHistory(rec) {
+    if (!isTraceRecording()) return;
+    try {
+        const text = String(rec?.text ?? '');
+        sheetHistory.push({
+            runId: String(rec?.runId ?? ''),
+            sourceMessageIndex: Number.isInteger(rec?.sourceMessageIndex) ? rec.sourceMessageIndex : -1,
+            updatedAt: String(rec?.updatedAt ?? ''),
+            chars: text.length,
+            text: text.length > SHEET_HISTORY_MAX_CHARS
+                ? text.slice(0, SHEET_HISTORY_MAX_CHARS) + `\n…[BF-TRACE TRUNCATED: kept ${SHEET_HISTORY_MAX_CHARS} of ${text.length} chars]`
+                : text,
+        });
+        if (sheetHistory.length > SHEET_HISTORY_MAX) sheetHistory.splice(0, sheetHistory.length - SHEET_HISTORY_MAX);
+    } catch {  }
+}
+
+// Oldest first, newest last — the order the sheets were injected in, which is
+// the order an export wants to read them. Fresh array of fresh entries so a
+// consumer cannot reorder or edit the ring.
+export function getSheetHistory() {
+    return sheetHistory.map(e => ({ ...e }));
+}
+
+// NOT called when the record switch goes off — that was the old behaviour, and
+// it destroyed the recording the UI had just promised was still downloadable.
+// The ring now lives until reload or chat switch (reloadSheetFromChat below),
+// which is what the switch's toast says. Kept as an exported escape hatch for a
+// caller that genuinely wants the several hundred KB of sheet text back.
+export function clearSheetHistory() {
+    sheetHistory = [];
+}
+
 export function reloadSheetFromChat() {
     memorySheet = loadSheetFromMeta();
     memorySheetLoaded = true;
+    // Chat-scoped, like every trace: entries carry no chat id, so keeping them
+    // across a switch would silently mix two stories in one export.
+    sheetHistory = [];
     renderMemorySheet();
 }
 
@@ -915,6 +986,51 @@ export function markRecoveredRefs(refs) {
     sceneStoreLoaded = true;
     saveSceneToMeta();
     return touched;
+}
+
+// The whole scene store as plain data, for the test-run export.
+//
+// The getters above each hand back one slice, and two of them lose detail the
+// export needs: getRecoveredRefs drops the TTL (composeSheet does not need it,
+// but "why did this ref keep reappearing" is exactly a TTL question), and the
+// closed-scene archive is only reachable one scene at a time. Deep-copied on the
+// way out — these are the live objects the pipeline keeps appending beats to.
+export function getSceneStoreSnapshot() {
+    const s = getSceneStore();
+    const cloneScene = (sc) => sc ? {
+        startMsg: sc.startMsg,
+        name: sc.name,
+        beats: (Array.isArray(sc.beats) ? sc.beats : []).map(b => ({ ...b })),
+        present: [...(Array.isArray(sc.present) ? sc.present : [])],
+    } : null;
+    return {
+        current: cloneScene(s.current),
+        closed: (Array.isArray(s.closed) ? s.closed : []).map(cloneScene).filter(Boolean),
+        timeline: typeof s.timeline === 'string' ? s.timeline : '',
+        needRefs: (Array.isArray(s.needRefs) ? s.needRefs : []).map(r => ({ ...r })),
+        recoveredRefs: (Array.isArray(s.recoveredRefs) ? s.recoveredRefs : []).map(r => ({ ...r })),
+        limits: { maxClosedScenes: MAX_CLOSED_SCENES, recoveredRefTtlTurns: RECOVERED_REF_TTL_TURNS, recoveredRefsMax: RECOVERED_REFS_MAX },
+    };
+}
+
+// bf_mem_reflect_runs (the reply counter reflection's cadence is keyed on) and
+// bf_mem_conflict_ok (the settled-conflict set that suppresses re-reporting) are
+// written straight into chatMetadata by agent-reflect.js and have never had a
+// reader outside it — so "why did reflection not run" and "why was this conflict
+// never raised again" are currently unanswerable from an export.
+//
+// STRICTLY READ-ONLY: returns copies, and never creates either key. Calling it
+// cannot shift reflection's cadence or its settled set.
+export function getReflectionMetaState() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return { reflectRuns: 0, settledConflicts: [] };
+        return {
+            reflectRuns: Number(md.bf_mem_reflect_runs) || 0,
+            settledConflicts: Array.isArray(md.bf_mem_conflict_ok) ? [...md.bf_mem_conflict_ok] : [],
+        };
+    } catch { return { reflectRuns: 0, settledConflicts: [] }; }
 }
 
 // Signed diff cell: negative (saved) renders green, positive (extra cost) red.

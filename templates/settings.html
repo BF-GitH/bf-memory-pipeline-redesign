@@ -291,8 +291,17 @@
                         </label>
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_debug_verbose" />
-                            <span>Verbose logging (RAM only, heavy) &mdash; captures raw prompts/replies</span>
+                            <span>Verbose logging (RAM only) &mdash; reserve channel; nothing writes at this level today</span>
                         </label>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_trace_run" />
+                            <span>Testlauf aufzeichnen &mdash; record a test run</span>
+                        </label>
+                        <small class="bf-mem-hint">
+                            While this is on, every agent call records its full system prompt, the task block it was given, the model&rsquo;s raw reply, and each tool call with its arguments <em>and</em> its result &mdash; the context a memory write was based on. This is the only thing that writes verbose entries. When off it costs nothing: nothing is captured and no text is built.
+                            <br><b>RAM only:</b> never saved to the chat file or the character card. Switching it off <em>stops</em> the capture but keeps it &mdash; what you already recorded stays visible in the log below and stays downloadable. Only a page reload or a chat switch discards it, so download the test run before you do either.
+                            <br><b>The switch itself is a saved setting</b> and survives both: it stays on across a reload and across a chat switch, so recording resumes on the next chat even though the previous chat&rsquo;s capture is gone.
+                        </small>
 
                         <!-- Filter toolbar: client-side over the in-memory ring buffer -->
                         <div class="bf-mem-debug-filters">
@@ -315,6 +324,7 @@
                                     <option value="settings">settings</option>
                                     <option value="import">import</option>
                                     <option value="cache">cache</option>
+                                    <option value="trace">Trace (test run)</option>
                                 </select>
                                 <input type="search" id="bf_mem_log_search" class="text_pole" placeholder="Search runId / text&hellip;" />
                             </div>
@@ -324,17 +334,24 @@
                             <button id="bf_mem_clear_log" class="menu_button">
                                 <i class="fa-solid fa-eraser"></i> Clear
                             </button>
-                            <button id="bf_mem_copy_log" class="menu_button">
+                            <button id="bf_mem_copy_log" class="menu_button" title="Copy the log lines you can currently see, exactly as filtered, one line each. Message text only — no payloads, so no prompts, replies or tool results even with a recording on screen.">
                                 <i class="fa-solid fa-copy"></i> Copy
                             </button>
-                            <button id="bf_mem_export_json" class="menu_button">
+                            <button id="bf_mem_export_json" class="menu_button" title="Download the ordinary debug log as JSON and copy it to the clipboard: one entry per pipeline step, with the before/after values of every memory write. NO test-run captures — no prompts, no model replies, no tool results; those are on a separate ring that only Download Test Run reads. It does still carry raw roleplay text: fact keys and values appear in the messages and in before/after. Read it before pasting it somewhere public.">
                                 <i class="fa-solid fa-file-code"></i> Export JSON
                             </button>
-                            <button id="bf_mem_copy_all" class="menu_button" title="Copy a full diagnostics bundle: settings + logs (inputs/outputs) + the whole database (facts AND their links) + scene + entities. Paste it to share for debugging.">
+                            <button id="bf_mem_copy_all" class="menu_button" title="Copy the classic diagnostics bundle to the clipboard: settings, token counts, the last generated and last inserted memory sheet, any pending review, the whole database (facts AND their links) and the ordinary log. NO test-run captures — no prompts, no model replies, no tool results; use Download Test Run for those. It does carry raw roleplay text: every fact value and note, plus the memory sheet. Read it before pasting it somewhere public.">
                                 <i class="fa-solid fa-bug"></i> Copy Diagnostics
+                            </button>
+                            <button id="bf_mem_export_testrun" class="menu_button" title="Download ONE JSON with the whole run, beginning to end: memory sheet + its history, story spine, scenes, summaries, reflection, every database and the retrieval index, health events — and, per agent run, its prompts, its raw replies, its tool calls with arguments AND results, and the memory writes that followed. Download only (too large for the clipboard).">
+                                <i class="fa-solid fa-file-arrow-down"></i> Download Test Run
                             </button>
                             <span id="bf_mem_log_count" class="bf-mem-log-count"></span>
                         </div>
+                        <small class="bf-mem-hint">
+                            <b>The test-run file contains raw roleplay text.</b> Always, whether or not recording was on: fact values and notes, the story spine (a readable plot synopsis), scene cards, the memory sheet, reflection observations, <code>health.events</code> (raw provider error bodies) and <code>lastSentPrompt</code> &mdash; the character card, the system prompt and the last N chat messages verbatim, exactly as SillyTavern sent them for the last generation, up to 2 MB. On a recording-off export <code>lastSentPrompt</code> is the single largest piece of raw chat text in the file.
+                            <br>With recording on it additionally holds the agents&rsquo; full prompts, the model&rsquo;s full replies, and every tool call&rsquo;s arguments and results. Read it before you share it.
+                        </small>
 
                         <!-- "Why not fact X?" retrieval probe -->
                         <div class="bf-mem-debug-probe">

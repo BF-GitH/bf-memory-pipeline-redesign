@@ -24,7 +24,7 @@ import {
 import { isFactVisible, buildFactLine, retrieveFacts, formatFactsForWriter, extractContextKeywords } from './fact-retrieval.js';
 import { getScenePresent } from './turn-state.js';
 import { getTurnNowContext, recencyTail } from './recency.js';
-import { addDebugLog } from './settings.js';
+import { addDebugLog, isTraceRecording, traceCapture } from './settings.js';
 import { wordTokens, keyToken } from './tokenize.js';
 import * as host from './host.js';
 
@@ -59,6 +59,65 @@ const ALL_TOOLS = [...new Set([...KNOWN_TOOLS, ...REFLECTION_TOOLS])];
 const LIST_KEYS_CAP = 80;
 
 const SEARCH_RESULT_CAP = 15;
+
+// --- Test-run trace capture -------------------------------------------------
+//
+// Every capture in this file rides traceCapture's `verbose` level, the one level
+// buildPersistSlice and buildFileEntries both drop, so none of it reaches
+// chatMetadata or the character attachment. It is RAM-only, it is inert unless
+// the user turned "record a test run" on, and it is read back by nothing —
+// the export assembler is the only consumer.
+//
+// It is therefore NOT a revival of the _superseded history copies removed in
+// v0.75. Those were persisted alongside the record and the store read them; a
+// trace exists so a TESTER can see the record a repair overwrote, and it dies
+// with the page.
+//
+// WHERE THE LINE WITH llm-call.js RUNS. The tool loop already captures, per
+// round, the raw tool-call LINE the model emitted (its arguments verbatim) and
+// the RESULT STRING this module handed back (the rendered lines the model then
+// read). Re-capturing either here would double the ring for nothing, so nothing
+// below records a rendered line or a raw args object. What the loop cannot see,
+// and what IS captured here, is:
+//   - the resolved stored RECORDS behind a rendered line — every field, not the
+//     handful buildFactLine/buildReflectRecordLine print;
+//   - the before/after images of a record a write mutated IN PLACE, which by the
+//     time the loop sees the result string is already gone;
+//   - the normalized payload actually handed to upsertFact, which is derived
+//     from the model's args, not equal to them;
+//   - the read-gate set and the write budget at the moment a call was judged. A
+//     gate refusal names the key it wanted but never what WAS unlocked, and that
+//     is the half that explains it.
+//
+// Refusals other than the two gates are deliberately NOT captured: their result
+// strings are self-describing ("is cold-tiered", "is importance 5"), and the
+// loop already has them.
+
+// Correlation for one tool call. ctx.traceCallId is the id of the enclosing LLM
+// call, put on the ctx by the agent module that owns it — agent-memory.js for
+// extraction, agent-reflect.js for reflection — and it is the SAME id llm-call.js
+// stamps onto that call's prompts, replies and tool-call lines. That is what
+// makes the export group a memtool.* before/after image with the agent3.tool.call
+// that produced it instead of into a sibling '(no call id)' bucket. It is null
+// when recording is off (the id is minted only then) and null for any future
+// caller that builds a ctx without one; a null costs grouping, never a capture.
+// runId is always passed explicitly — reflection runs outside beginRun/endRun, so
+// the automatic one is null exactly where these captures matter most.
+function traceOpts(ctx, reason) {
+    return { runId: ctx?.runId || '', callId: ctx?.traceCallId || null, reason };
+}
+
+// The two guard states a write depends on, as plain data. readKeys is a live Set
+// the pass keeps adding to, and a Set serializes as {} — spread it, or the entry
+// would be both empty and wrong.
+function gateState(ctx) {
+    return {
+        mode: ctx?.mode || 'extract',
+        unlockedKeys: (ctx?.readKeys instanceof Set) ? [...ctx.readKeys] : [],
+        writeCount: Number(ctx?.writeCount) || 0,
+        maxWrites: Number(ctx?.maxWrites) || 0,
+    };
+}
 
 // Pull every balanced {...} object out of a line, honoring quoted strings/escapes.
 function extractJsonObjects(line) {
@@ -254,6 +313,12 @@ export async function executeMemoryTool(call, ctx) {
         }
     } catch (e) {
         addDebugLog('fail', `Memory tool "${tool}" threw: ${e?.message || e}`, {
+            // Same reason the reflection outcome sites below pass it: a reflection
+            // tool that throws runs after endRun(), so without this the one entry
+            // that says WHY a repair never happened is the one that cannot be
+            // grouped with the pass. Redundant but identical for extraction, which
+            // runs inside beginRun/endRun.
+            runId: ctx?.runId || '',
             subsystem: 'agent3', event: 'memtool.error', reason: 'TOOL_THREW',
             data: { tool, error: String(e?.message || e), runId: ctx?.runId || '' },
         });
@@ -309,6 +374,29 @@ function execListKeys(args, ctx) {
         const note = String(fact.context ?? '').replace(/\s+/g, ' ').trim();
         const shown = (val || note).slice(0, 60);
         lines.push(`${fact.key} | ${aspect} | ${shown}`);
+    }
+    // list_keys is the one read tool that deliberately does NOT unlock the repair
+    // gate (see recordReadKey), and the only one whose output can be silently
+    // shortened twice — by knownBy visibility and by LIST_KEYS_CAP. Both counts
+    // and the non-unlock are captured here because a "(no visible active facts)"
+    // line and a later "has not read" refusal are otherwise unexplainable.
+    // hidden is counted INSIDE the thunk so the loop above stays untouched and
+    // the off path pays nothing for it.
+    if (isTraceRecording()) {
+        traceCapture('memtool.list_keys', () => {
+            let hidden = 0;
+            for (const f of db.facts) {
+                if (!isActiveFact(f)) continue;
+                if (!ctx?.bypassVisibility && !isFactVisible(f, names)) hidden++;
+            }
+            return {
+                category, requestedCategory: rawCategory,
+                storedTotal: db.facts.length, visibleActive: total,
+                shown: lines.length, cap: LIST_KEYS_CAP, hiddenByVisibility: hidden,
+                unlocksRepairGate: false,
+                gate: gateState(ctx),
+            };
+        }, traceOpts(ctx));
     }
     if (lines.length === 0) return `(no visible active facts in "${category}")`;
     if (total > lines.length) lines.push(`... (+${total - lines.length} more — narrow with read_facts or search)`);
@@ -380,14 +468,29 @@ function execReadFacts(args, ctx) {
     const names = currentNames();
     const nowCtx = safeNowContext();
     const lines = [];
+    // Trace buffers. Null when recording is off, and every push below is an
+    // optional call on them — `resolved?.push(expr)` short-circuits the WHOLE
+    // chain, so neither the array nor the argument expression is built.
+    const resolved = isTraceRecording() ? [] : null;
+    const misses = resolved ? [] : null;
     for (const rawKey of keys) {
 
         const key = rawKey.includes('/') ? rawKey.slice(rawKey.lastIndexOf('/') + 1).trim() : rawKey;
         const fact = db ? findFactMatch(db, key) : null;
         if (!fact || !isActiveFact(fact) || (!ctx?.bypassVisibility && !isFactVisible(fact, names))) {
+            // "(not found)" collapses three different causes into one line; the
+            // model cannot tell them apart and neither can the tool loop.
+            misses?.push({
+                requested: rawKey, key,
+                cause: !fact ? 'NO_SUCH_KEY' : (!isActiveFact(fact) ? 'INACTIVE' : 'NOT_VISIBLE_TO_WITNESSES'),
+            });
             lines.push(`${category}/${key}: (not found)`);
             continue;
         }
+        // Reference, not a copy: sanitizeTraceValue deep-copies at capture time,
+        // and the capture happens below in this same synchronous call — nothing
+        // can mutate the record in between.
+        resolved?.push(fact);
         recordReadKey(ctx, category, fact.key);
         // Reflection sees the FULL record (value AND note AND the metadata its
         // write tools can rewrite) — this call is what unlocks the repair gate.
@@ -395,6 +498,19 @@ function execReadFacts(args, ctx) {
         lines.push(ctx?.mode === 'reflect'
             ? buildReflectRecordLine(fact, category, nowCtx)
             : buildFactLine(fact, category, nowCtx) + linkedRefsTail(fact));
+    }
+    // The rendered lines are the tool loop's to capture. What it cannot get from
+    // them is the record BEHIND each line — reflection is shown five fields plus
+    // links, extraction is shown even less, and a repair is judged against what
+    // was shown. This is also the call that unlocks the gate, so the unlocked set
+    // is stamped as it stands AFTER this read.
+    if (resolved) {
+        traceCapture('memtool.read_facts', () => ({
+            category, requestedCategory: rawCategory, requestedKeys: keys,
+            renderedAs: ctx?.mode === 'reflect' ? 'full_record' : 'sheet_line',
+            records: resolved, misses,
+            gate: gateState(ctx),
+        }), traceOpts(ctx));
     }
     return lines.join('\n');
 }
@@ -419,6 +535,22 @@ async function execSearch(args, ctx) {
     // any note-bearing fact; unlocking a write from that view would license a
     // repair of a field the model never saw. Extraction is untouched.
     for (const r of visible) recordReadKey(ctx, r.category, r.fact?.key);
+    // Search unlocks the gate on facts the model never NAMED — it asked a
+    // question and got a ranked answer. So the tier/via that admitted each record
+    // is captured with it: "why was this repairable" is otherwise unanswerable,
+    // and retrieval's own admit log is keyed by nothing that ties it back to this
+    // call. The rendered output stays with the tool loop.
+    if (isTraceRecording()) {
+        traceCapture('memtool.search', () => ({
+            query, tokens: needed, contextKeywords,
+            matched: (result?.facts || []).length, visible: visible.length, cap: SEARCH_RESULT_CAP,
+            renderedAs: ctx?.mode === 'reflect' ? 'full_record' : 'writer_format',
+            records: visible.map(r => ({
+                ref: `${r.category}/${r.fact?.key || ''}`, tier: r.tier || '', via: r.via || 'keyword', fact: r.fact,
+            })),
+            gate: gateState(ctx),
+        }), traceOpts(ctx));
+    }
     if (ctx?.mode === 'reflect') {
         const nowCtx = safeNowContext();
         return visible.map(r => buildReflectRecordLine(r.fact, r.category, nowCtx)).join('\n');
@@ -452,6 +584,14 @@ function recordReadKey(ctx, category, storedKey) {
 function assertReadThisSession(ctx, category, storedKey, tool) {
     if (!(ctx.readKeys instanceof Set)) ctx.readKeys = new Set(); // fail closed
     if (ctx.readKeys.has(`${category}::${String(storedKey).toLowerCase()}`)) return '';
+    // The refusal text names the key the model wanted. Only the trace can say
+    // what WAS unlocked at that moment, which is what separates "it never read
+    // anything" from "it read a neighbouring key and mis-typed this one".
+    if (isTraceRecording()) {
+        traceCapture('memtool.gate.read_refused', () => ({
+            tool, category, key: String(storedKey), gate: gateState(ctx),
+        }), traceOpts(ctx, 'READ_GATE_REFUSED'));
+    }
     return `ERROR: ${tool} refused — this session has not read ${category}/${storedKey}. Call {"tool":"read_facts","args":{"category":"${category}","keys":["${storedKey}"]}} first, then repair it in a LATER reply.`;
 }
 
@@ -461,6 +601,14 @@ function assertWriteBudget(ctx, tool) {
     const max = Math.max(0, Math.floor(Number(ctx?.maxWrites) || 0));
     const used = Math.max(0, Math.floor(Number(ctx?.writeCount) || 0));
     if (used < max) return '';
+    // Which repairs the pass already spent the budget on is the question a
+    // budget refusal raises, and the unlocked set is the closest thing to an
+    // answer that exists at this point in the call.
+    if (isTraceRecording()) {
+        traceCapture('memtool.gate.budget_refused', () => ({
+            tool, gate: gateState(ctx),
+        }), traceOpts(ctx, 'WRITE_BUDGET_EXHAUSTED'));
+    }
     return `ERROR: ${tool} refused — reflection write budget exhausted (${max} per pass). Deliver anything further through the final #OBS/#REEVAL sections.`;
 }
 
@@ -589,8 +737,22 @@ function execAddAlias(args, ctx) {
     if (sourceIndex !== null) fact.validAt = sourceIndex;
     if (ctx.srcId) fact.srcId = ctx.srcId;
 
+    // `existing` is the SAME object upsertFact is about to merge into, so its
+    // pre-merge alias list only exists until the next statement.
+    if (isTraceRecording()) {
+        traceCapture('memtool.add_alias.before', () => ({
+            category, key, token, name, alias, payload: fact, record: existing || null,
+        }), traceOpts(ctx, existing ? 'ALIAS_MERGED' : 'ALIAS_CREATED'));
+    }
+
     upsertFact(db, fact);
     ctx.touchedCategories.add(category);
+
+    if (isTraceRecording()) {
+        traceCapture('memtool.add_alias.after', () => ({
+            category, key, record: findFactMatch(db, key) || null,
+        }), traceOpts(ctx, 'ALIAS_STORED'));
+    }
 
     // Make the link resolvable immediately (same run), before the memory index
     // is next rebuilt.
@@ -653,6 +815,18 @@ function execLinkFacts(args, ctx) {
     const toFact = resolve(toRef);
     if (!toFact) return `ERROR: link_facts found no active fact ${toRef.category}/${toRef.key} — verify the ref with list_keys/read_facts`;
 
+    // linkFactsExplicit rewrites relationships and agentLinks on BOTH records in
+    // place. Those two fields are the ones no existing log line has ever carried,
+    // and an AGENT_LINK_MAX refusal is only readable against the list that filled
+    // up — so the before image is taken even for the outcomes that refuse.
+    if (isTraceRecording()) {
+        traceCapture('memtool.link_facts.before', () => ({
+            from: `${fromRef.category}/${fromFact.key}`, to: `${toRef.category}/${toFact.key}`,
+            reason: String(args?.reason || '').trim(), agentLinkMax: AGENT_LINK_MAX,
+            fromRecord: fromFact, toRecord: toFact,
+        }), traceOpts(ctx, 'LINK_REQUESTED'));
+    }
+
     const status = linkFactsExplicit(fromFact, fromRef.category, toFact, toRef.category, args?.reason, ctx.runId || '');
     if (status === 'invalid') return 'ERROR: link_facts cannot link a fact to itself';
     if (status === 'ambiguous') return `ERROR: link_facts cannot represent this link — ${fromRef.category}/${fromFact.key} and ${toRef.category}/${toFact.key} are different facts sharing the same key, and link refs are keyed by fact key alone; rewrite one fact under a distinct key first`;
@@ -667,6 +841,12 @@ function execLinkFacts(args, ctx) {
     if (ctx.databases[toRef.category]) ctx.databases[toRef.category].updatedAt = linkStamp;
     ctx.touchedCategories.add(fromRef.category);
     ctx.touchedCategories.add(toRef.category);
+    if (isTraceRecording()) {
+        traceCapture('memtool.link_facts.after', () => ({
+            from: `${fromRef.category}/${fromFact.key}`, to: `${toRef.category}/${toFact.key}`,
+            status, fromRecord: fromFact, toRecord: toFact,
+        }), traceOpts(ctx, 'LINK_STORED'));
+    }
     addDebugLog('info', `Memory Agent link_facts: ${fromRef.category}/${fromFact.key} <-> ${toRef.category}/${toFact.key}`, {
         subsystem: 'agent3', event: 'memtool.link_facts',
         data: { from: `${fromRef.category}:${fromFact.key}`, to: `${toRef.category}:${toFact.key}`, reason: String(args?.reason || '').trim(), runId: ctx.runId || '' },
@@ -806,6 +986,20 @@ function execWriteFact(args, ctx) {
     const noteChanged = !!matched && noteProvided && note !== storedNote;
     const status = !matched ? 'NEW' : (changed ? 'UPDATED' : (noteChanged ? 'NOTE_UPDATED' : 'SKIPPED'));
 
+    // `matched` is the live stored object upsertFact is about to merge into, so
+    // this is the last moment its pre-write state exists. fact.created /
+    // fact.updated already carry the VALUE diff; what they do not carry, and what
+    // this does, is the rest of the record plus the normalized payload — the
+    // model's args ran through key resolution, knownBy defaulting, normalizeKind,
+    // clampImportance and normalizeAspect before reaching upsertFact, so the
+    // args line the tool loop captured is not what was stored.
+    if (isTraceRecording()) {
+        traceCapture('memtool.write_fact.before', () => ({
+            category, key: fact.key, status, mode: 'extract',
+            payload: fact, record: matched || null,
+        }), traceOpts(ctx, status));
+    }
+
     upsertFact(db, fact);
     // Always mark the category dirty when upsertFact ran, so an in-place edit is
     // persisted to IDB regardless of status. Set.add is idempotent.
@@ -822,6 +1016,17 @@ function execWriteFact(args, ctx) {
         ctx.touchedCategories.add(category);
 
         ctx.applied.push({ category, key: fact.key, fact: stored || fact, status });
+    }
+
+    // Taken after autoLinkFact and applyCrossKeySupersedeRules, so the record
+    // shown is the one the next turn will actually read — including the links
+    // the write just grew and any cross-key supersede fallout.
+    if (isTraceRecording()) {
+        traceCapture('memtool.write_fact.after', () => ({
+            category, key: fact.key, status, mode: 'extract',
+            record: findFactMatch(db, fact.key) || null,
+            touchedCategories: [...ctx.touchedCategories],
+        }), traceOpts(ctx, status));
     }
 
     addDebugLog('info', `Memory Agent write_fact ${status}: [${category}] ${fact.key} = "${(value || note).slice(0, 80)}"`, {
@@ -911,6 +1116,22 @@ function reflectRepairFact({ args, ctx, category, key, value, note, noteProvided
 
     const priorLastUpdated = Number(stored.lastUpdated) || 0;
 
+    // FULL BEFORE IMAGE, and the last moment it exists — upsertFact merges into
+    // `stored` in place. The `before` object above diffs six scalars because that
+    // is what the fact.repaired message line needs; everything else a repair can
+    // disturb is only ever visible here: relationships, agentLinks, callbacks,
+    // tags, involved, aliases, source/srcId/validAt provenance, lastUpdated,
+    // createdAt, cold, track/ord. `patch` rides along because it is derived from
+    // the model's args (canonicalized aspect, clamped importance, deduped
+    // knownBy, keyed on the RESOLVED key) rather than equal to them, so the args
+    // line the tool loop captured does not tell you what upsertFact received.
+    if (isTraceRecording()) {
+        traceCapture('memtool.write_fact.before', () => ({
+            category, key: stored.key, mode: 'reflect',
+            patch, record: stored, gate: gateState(ctx),
+        }), traceOpts(ctx, 'REFLECT_WRITE'));
+    }
+
     ctx.writeCount = (Number(ctx.writeCount) || 0) + 1;
     upsertFact(db, patch);
     ctx.touchedCategories.add(category);
@@ -943,9 +1164,26 @@ function reflectRepairFact({ args, ctx, category, key, value, note, noteProvided
     if (tags.length) fields.push('tags');
     if (involved.length) fields.push('with');
 
+    // Taken after restoreSightingStamp, the importance downgrade and autoLinkFact,
+    // so the record shown is the final stored state and not an intermediate one.
+    if (isTraceRecording()) {
+        traceCapture('memtool.write_fact.after', () => ({
+            category, key: stored.key, mode: 'reflect',
+            fields, loweredImportance, restoredLastUpdated: priorLastUpdated,
+            record: after, gate: gateState(ctx),
+        }), traceOpts(ctx, 'REFLECT_WRITE'));
+    }
+
     ctx.applied.push({ category, key: stored.key, fact: after, status: 'REPAIRED' });
 
     addDebugLog('info', `[${ctx.runId || ''}] Reflection repaired [${category}] ${stored.key}: "${before.value.slice(0, 80)}" → "${String(after.value ?? '').slice(0, 80)}"${fields.length ? ` (${fields.join(', ')})` : ' (no material change)'}`, {
+        // runId rides in the OPTIONS, not only in the message. Reflection runs
+        // after endRun(), so addDebugLog's automatic currentRunId is null here and
+        // this outcome would land with entry.runId === null — ungrouped in the
+        // Debug tab and unjoinable in the export to the reflect.parsed.sections
+        // capture that proposed the repair. Same reason at fact.merged and the
+        // mark_cold site below.
+        runId: ctx.runId || '',
         subsystem: 'reflection', event: 'fact.repaired', reason: loweredImportance ? 'IMPORTANCE_LOWERED' : 'REFLECT_WRITE',
         data: {
             category, key: stored.key, fields,
@@ -1059,6 +1297,22 @@ function execMergeFacts(args, ctx) {
     const loserCallbacks = Array.isArray(loser.callbacks) ? [...loser.callbacks] : [];
     const priorLastUpdated = Number(survivor.lastUpdated) || 0;
 
+    // BOTH records in full, before either is touched. A merge is the one write
+    // that destroys information on two records at once — the survivor is merged
+    // into in place and the loser is cold-tiered — and the fact.merged line
+    // carries only the two values. The loser's own accumulated material
+    // (relationships, agentLinks, callbacks, aliases, provenance) is what a
+    // "the merge ate something" report is about, and after this point the only
+    // way to read it is off the cold record itself.
+    if (isTraceRecording()) {
+        traceCapture('memtool.merge_facts.before', () => ({
+            from: `${fromRef.category}/${loser.key}`, into: `${intoRef.category}/${survivor.key}`,
+            payload, newValue: newValue || null,
+            loserRecord: loser, survivorRecord: survivor,
+            gate: gateState(ctx),
+        }), traceOpts(ctx, 'DUPLICATE_FOLDED'));
+    }
+
     ctx.writeCount = (Number(ctx.writeCount) || 0) + 1;
 
     // Upsert FIRST, cold-tier the loser second. The old order (delete, then
@@ -1098,9 +1352,21 @@ function execMergeFacts(args, ctx) {
     if (ctx.databases[intoRef.category]) ctx.databases[intoRef.category].updatedAt = stamp;
     ctx.touchedCategories.add(fromRef.category);
     ctx.touchedCategories.add(intoRef.category);
+    // Taken after the callback fold and the cold-tiering, so both sides show
+    // their settled state — including the loser, which still exists.
+    if (isTraceRecording()) {
+        traceCapture('memtool.merge_facts.after', () => ({
+            from: `${fromRef.category}/${loserKey}`, into: `${intoRef.category}/${stored.key}`,
+            loserColdTiered: stored !== loser, restoredLastUpdated: priorLastUpdated,
+            survivorRecord: stored, loserRecord: loser,
+            gate: gateState(ctx),
+        }), traceOpts(ctx, 'DUPLICATE_FOLDED'));
+    }
+
     ctx.applied.push({ category: intoRef.category, key: stored.key, fact: stored, status: 'MERGED' });
 
     addDebugLog('info', `[${ctx.runId || ''}] Reflection merged [${fromRef.category}] ${loserKey} ("${loserValue.slice(0, 60)}") into [${intoRef.category}] ${stored.key} ("${String(stored.value ?? '').slice(0, 60)}"); the duplicate is cold-tiered, not erased`, {
+        runId: ctx.runId || '',   // see the fact.repaired site — reflection has no current run
         subsystem: 'reflection', event: 'fact.merged', reason: 'DUPLICATE_FOLDED',
         data: {
             fromCategory: fromRef.category, fromKey: loserKey, fromValue: loserValue,
@@ -1152,6 +1418,18 @@ function execMarkCold(args, ctx) {
     if (budget) return budget;
 
     const reason = String(args?.reason || '').trim().slice(0, 160);
+
+    // mark_cold is the cheapest write to get wrong — one flag drops a record out
+    // of the premise floor and out of every injection — and its log line carries
+    // value only. The full record is captured before the flag goes on so the
+    // export can answer "what exactly did the pass decide was noise", including
+    // the importance, links and provenance that argued against it.
+    if (isTraceRecording()) {
+        traceCapture('memtool.mark_cold.before', () => ({
+            category, key: fact.key, markReason: reason, record: fact, gate: gateState(ctx),
+        }), traceOpts(ctx, 'REFLECT_MARK_COLD'));
+    }
+
     ctx.writeCount = (Number(ctx.writeCount) || 0) + 1;
     markFactCold(fact, category, 'REFLECT_MARK_COLD', reason || 'reflection judged it stored noise');
     // markFactCold touches fact.cold and nothing else — stamp the db like a fact
@@ -1159,7 +1437,16 @@ function execMarkCold(args, ctx) {
     if (db) db.updatedAt = Date.now();
     ctx.touchedCategories.add(category);
 
+    // markFactCold writes fact.cold and nothing else, so the after image is the
+    // same record plus the cold envelope it just grew (code, detail, stamp).
+    if (isTraceRecording()) {
+        traceCapture('memtool.mark_cold.after', () => ({
+            category, key: fact.key, record: fact, gate: gateState(ctx),
+        }), traceOpts(ctx, 'REFLECT_MARK_COLD'));
+    }
+
     addDebugLog('info', `[${ctx.runId || ''}] Reflection cold-tiered [${category}] ${fact.key} = "${String(fact.value ?? '').slice(0, 60)}"${reason ? ` — ${reason}` : ''}`, {
+        runId: ctx.runId || '',   // see the fact.repaired site — reflection has no current run
         subsystem: 'reflection', event: 'fact.repaired', reason: 'REFLECT_MARK_COLD',
         data: {
             category, key: fact.key, oldValue: String(fact.value ?? ''), newValue: String(fact.value ?? ''),

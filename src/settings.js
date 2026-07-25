@@ -7,7 +7,11 @@ import {
 import {
     addDebugLog, reloadDebugLogFromChat, flushDebugLogNow, flushOutgoingChatLog,
     renderDebugLog, clearDebugLog, getDebugLogEntries,
-    exportLogs, exportLogsJSON, copyDiagnostics,
+    exportLogs, exportLogsJSON, copyDiagnostics, downloadTestRunExport,
+    // Local binding as well as the re-export below: `export … from` creates no
+    // local name, and the debug-tab filter wiring here has to ask whether any
+    // trace entries are still on the ring.
+    getTraceEntries,
 } from './debug-log.js';
 import {
     setLastGenerated, setLastInserted, reloadFactsFromChat,
@@ -27,6 +31,10 @@ import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 export {
     beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun,
     addDebugLog,
+    // Test-run trace capture. Re-exported here because every agent module
+    // already imports addDebugLog from this file — a trace call should not need
+    // a second import statement.
+    isTraceRecording, traceCapture, newTraceCallId, getTraceEntries,
 } from './debug-log.js';
 export {
     setLastGenerated, setLastInserted,
@@ -109,6 +117,19 @@ const DEFAULT_SETTINGS = {
 
     debugVerbose: false,
 
+    // "Testlauf aufzeichnen" — record a test run. While on, the agents capture
+    // full-text context (system prompts, task blocks, raw replies, tool
+    // arguments and tool results) via traceCapture. Those captures go to their
+    // own RAM ring in debug-log.js, which no persistence path reads at all — so
+    // they never reach the chat file or the character attachment, and they never
+    // evict ordinary diagnostics. Off costs nothing: traceCapture returns before
+    // its payload thunk is ever called.
+    //
+    // This flag is PERSISTED, so recording survives a reload and a chat switch
+    // even though the captured data does not. The hint text under the checkbox
+    // says so, because it is a genuine trap.
+    debugTraceRun: false,
+
     dbProfiles: {},
     activeDbProfile: '',
 
@@ -175,6 +196,7 @@ function validateSettings(s) {
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
     if (typeof s.debugVerbose !== 'boolean')     s.debugVerbose = false;
+    if (typeof s.debugTraceRun !== 'boolean')    s.debugTraceRun = false;
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
     if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
     if (typeof s.contradictionScanEnabled !== 'boolean') s.contradictionScanEnabled = true;
@@ -2077,8 +2099,27 @@ export async function initSettings() {
         saveSettings();
     });
 
+    // The verbose LEVEL FILTER is usable whenever verbose entries can be SHOWN,
+    // and addDebugLog admits them on either switch — so gating this control on
+    // debugVerbose alone would hide every recorded trace behind a checkbox that
+    // has nothing to do with recording.
+    //
+    // The third term is what keeps a stopped recording visible. Stopping only
+    // stops new captures; the trace ring keeps what it holds until the chat
+    // switch or reload (see the record switch below). Without this check the
+    // stop handler would untick and disable verbose and the run the user just
+    // recorded would vanish from the tab while still sitting in RAM and still
+    // being downloadable — the same "stopping destroys the recording" trap in a
+    // different disguise. getTraceEntries() copies 600 references at worst and
+    // only runs on a switch change, not per render.
+    //
+    // Known and harmless: once the ring empties (chat switch, Clear, reload)
+    // nothing re-runs this, so the checkbox stays enabled and simply matches
+    // nothing. An enabled filter over an empty set beats a disabled one hiding
+    // live data.
     const syncVerboseLevelControl = () => {
-        const on = !!extensionSettings.debugVerbose;
+        const on = !!extensionSettings.debugVerbose || !!extensionSettings.debugTraceRun
+            || getTraceEntries().length > 0;
         const vbox = document.querySelector('.bf-mem-log-level[value="verbose"]');
         const wrap = document.getElementById('bf_mem_log_level_verbose_wrap');
         if (vbox) { vbox.disabled = !on; if (!on) vbox.checked = false; }
@@ -2090,15 +2131,93 @@ export async function initSettings() {
         syncVerboseLevelControl();
         renderDebugLog();
     });
+
+    // "Testlauf aufzeichnen". This one setting is the whole record switch:
+    // isTraceRecording() reads it directly, so every capture site in every agent
+    // module goes live the moment it flips, with no re-registration.
+    //
+    // Turning it OFF stops new captures AND NOTHING ELSE. It deliberately does
+    // not drop any buffer: the toast below promises the run is still
+    // downloadable after stopping, and record → stop → download is the workflow
+    // this UI teaches. Clearing the injected-sheet ring here (as this handler
+    // used to) emptied `memory.sheetHistory` in the export — the one block whose
+    // note says "every sheet injected while recording was on" — for exactly the
+    // user who followed that instruction.
+    //
+    // So both RAM buffers now have one lifetime, and it is the one the toast and
+    // the hint text state: the trace ring and the sheet ring are dropped together
+    // on a chat switch (reloadDebugLogFromChat / reloadSheetFromChat) and by a
+    // page reload. Cost of holding the sheet ring to the end of the session is
+    // capped at 50 × 12000 chars ≈ 600 KB — a rounding error next to the trace
+    // ring's own ceiling, and not worth losing the data over.
+    $('#bf_mem_trace_run').prop('checked', extensionSettings.debugTraceRun).on('change', function () {
+        const on = $(this).prop('checked');
+        extensionSettings.debugTraceRun = on;
+        saveSettings();
+        syncVerboseLevelControl();
+        addDebugLog('info', `Test-run recording ${on ? 'STARTED' : 'STOPPED'}`, {
+            subsystem: 'settings', event: 'settings.changed', actor: 'USER',
+            data: { key: 'debugTraceRun' }, before: !on, after: on,
+        });
+        if (on) {
+            // Starting a recording and then seeing nothing in the log is the
+            // obvious trap: the captures ARE landing, they are just filtered out
+            // by default. Verbose is the only level trace entries are emitted at,
+            // so ticking it here is what makes them visible at all.
+            const vbox = document.querySelector('.bf-mem-log-level[value="verbose"]');
+            if (vbox && !vbox.checked) vbox.checked = true;
+        }
+        renderDebugLog();
+        if (extensionSettings.showToast !== false && typeof toastr !== 'undefined') {
+            toastr.info(on
+                ? 'Recording a test run — RAM only, lost on reload or chat switch. Download it before you leave this chat.'
+                : 'Recording stopped. The captured run is still downloadable until you reload or switch chats.', 'BF Memory');
+        }
+    });
     syncVerboseLevelControl();
 
     $(document).on('change', '.bf-mem-log-level', () => renderDebugLog());
-    $('#bf_mem_log_subsystem').on('change', () => renderDebugLog());
-    $('#bf_mem_log_search').on('input', () => renderDebugLog());
+
+    // Trace entries are emitted at verbose level, so picking "Trace (test run)"
+    // while verbose is unticked filters the tab down to exactly nothing — two
+    // controls that have to agree, with no hint that they do. Make the dropdown
+    // say what it promises.
+    $('#bf_mem_log_subsystem').on('change', function () {
+        if (this.value === 'trace') {
+            const vbox = document.querySelector('.bf-mem-log-level[value="verbose"]');
+            if (vbox && !vbox.disabled && !vbox.checked) vbox.checked = true;
+        }
+        renderDebugLog();
+    });
+
+    // Debounced, unlike the two selects above. renderDebugLog() rebuilds the
+    // whole visible list, and with a search term set entryMatchesFilter
+    // stringifies every ORDINARY entry's `data` on every pass — trace payloads
+    // are memoised in debug-log.js because they are frozen snapshots, ordinary
+    // ones are held by reference and their callers mutate them, so they cannot
+    // be. Rendering per keystroke ran that over the whole ring once per letter.
+    // One render per pause instead; 150 ms is below the threshold where a filter
+    // box feels laggy.
+    let logSearchRenderTimer = null;
+    $('#bf_mem_log_search').on('input', () => {
+        clearTimeout(logSearchRenderTimer);
+        logSearchRenderTimer = setTimeout(() => renderDebugLog(), 150);
+    });
 
     $('#bf_mem_clear_log').on('click', () => clearDebugLog());
 
     $('#bf_mem_copy_all').on('click', () => copyDiagnostics());
+
+    // Full test-run export. Download-only and potentially multi-MB, so the
+    // button is disabled for the duration — a second click while the first is
+    // still assembling would build the whole payload twice.
+    $('#bf_mem_export_testrun').on('click', async function () {
+        const btn = this;
+        btn.disabled = true;
+        try { await downloadTestRunExport(); }
+        catch (err) { toastr.error(`Test-run export failed: ${err?.message || err}`, 'BF Memory'); }
+        finally { btn.disabled = false; }
+    });
 
     $('#bf_mem_export_json').on('click', async () => {
         const json = exportLogsJSON();
