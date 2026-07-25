@@ -1,7 +1,7 @@
 import { injectMemoryContext } from './agent-writer.js';
 import { runMemoryAgent, isConnectionFailure } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { runLookupAgent, renderLookupBlock, LOOKUP_TIMEOUT_MS, LOOKUP_TIMEOUT_STRIKES, LOOKUP_DEADLINE_GRACE_MS } from './agent-lookup.js';
+import { runLookupAgent, renderLookupBlock, lookupTimeoutMs, LOOKUP_TIMEOUT_STRIKES, LOOKUP_DEADLINE_GRACE_MS } from './agent-lookup.js';
 import { cancelInFlightLLM, callAgentLLM } from './llm-call.js';
 import { extractSentenceLine, countSentenceEnds } from './sentence-util.js';
 import { recordHealthEvent, clearHealthEvents } from './health.js';
@@ -437,12 +437,16 @@ async function appendLookupBlock(sheetText, path, genType) {
     const runId = `lookup${++lookupSeq}`;
     // Absolute, taken BEFORE the first await and handed to every stage, so the
     // budget is shared rather than restarted per stage.
-    const deadlineAt = Date.now() + LOOKUP_TIMEOUT_MS;
+    // Read ONCE here, at the top of the pass, and threaded down as an absolute
+    // deadline. Reading it again in a later stage would let a slider drag mid-
+    // generation move the budget under a race that had already been armed.
+    const budgetMs = lookupTimeoutMs();
+    const deadlineAt = Date.now() + budgetMs;
     let backstop = null;
     internalCallDepth++;
     try {
         const backstopP = new Promise((resolve) => {
-            backstop = setTimeout(() => resolve(LOOKUP_BACKSTOP), LOOKUP_TIMEOUT_MS + LOOKUP_DEADLINE_GRACE_MS);
+            backstop = setTimeout(() => resolve(LOOKUP_BACKSTOP), budgetMs + LOOKUP_DEADLINE_GRACE_MS);
         });
         const outcome = await Promise.race([runLookupPass(sheetText, path, runId, deadlineAt), backstopP]);
         if (outcome === LOOKUP_BACKSTOP) {
@@ -450,9 +454,9 @@ async function appendLookupBlock(sheetText, path, genType) {
             // leave. The per-stage deadline should have returned control 250ms
             // ago; that it did not means an await inside the pass is not raced.
             abortLookupPass('backstop');
-            addDebugLog('fail', `[${runId}] Lookup pass blew past its own ${LOOKUP_TIMEOUT_MS}ms deadline — the ${LOOKUP_TIMEOUT_MS + LOOKUP_DEADLINE_GRACE_MS}ms backstop released the generation. An await inside the pass is not covered by a per-stage race.`, {
+            addDebugLog('fail', `[${runId}] Lookup pass blew past its own ${budgetMs}ms deadline — the ${budgetMs + LOOKUP_DEADLINE_GRACE_MS}ms backstop released the generation. An await inside the pass is not covered by a per-stage race.`, {
                 subsystem: 'agent3', event: 'lookup.run', reason: 'DEADLINE_BACKSTOP',
-                data: { path, timeoutMs: LOOKUP_TIMEOUT_MS, backstopMs: LOOKUP_TIMEOUT_MS + LOOKUP_DEADLINE_GRACE_MS },
+                data: { path, timeoutMs: budgetMs, backstopMs: budgetMs + LOOKUP_DEADLINE_GRACE_MS },
             });
             return sheetText;
         }
@@ -545,16 +549,20 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
                 lookupTimeoutStrikes++;
                 if (lookupTimeoutStrikes >= LOOKUP_TIMEOUT_STRIKES) {
                     lookupOffForSession = true;
+                    // Re-read purely to name the number in the message. The races
+                    // that produced these strikes already ran against the budget
+                    // captured at the top of their own pass.
+                    const shownMs = lookupTimeoutMs();
                     const cause = res.stage === 'store'
-                        ? `the memory store did not load inside the ${LOOKUP_TIMEOUT_MS}ms budget ${lookupTimeoutStrikes}x — that is storage (attachment fetch / IndexedDB), not the lookup model`
-                        : `${lookupTimeoutStrikes} consecutive ${LOOKUP_TIMEOUT_MS}ms deadline misses. Point it at a faster connection profile (or untick it)`;
+                        ? `the memory store did not load inside the ${shownMs}ms budget ${lookupTimeoutStrikes}x — that is storage (attachment fetch / IndexedDB), not the lookup model`
+                        : `${lookupTimeoutStrikes} consecutive ${shownMs}ms deadline misses. Point it at a faster connection profile, raise the deadline slider, or untick it`;
                     addDebugLog('fail', `Lookup agent switched OFF for this session — ${cause}; switching chats or re-ticking the setting re-arms it.`, {
                         subsystem: 'agent3', event: 'lookup.disabled', reason: 'TIMEOUT_STRIKES',
-                        data: { strikes: lookupTimeoutStrikes, stage: res.stage || null, timeoutMs: LOOKUP_TIMEOUT_MS },
+                        data: { strikes: lookupTimeoutStrikes, stage: res.stage || null, timeoutMs: shownMs },
                     });
                     toastPipelineError(res.stage === 'store'
-                        ? `Lookup agent disabled for this session — the memory store missed the ${LOOKUP_TIMEOUT_MS / 1000}s load budget ${lookupTimeoutStrikes}x.`
-                        : `Lookup agent disabled for this session — it missed the ${LOOKUP_TIMEOUT_MS / 1000}s deadline ${lookupTimeoutStrikes}x. Give it a faster connection profile.`);
+                        ? `Lookup agent disabled for this session — the memory store missed the ${shownMs / 1000}s load budget ${lookupTimeoutStrikes}x.`
+                        : `Lookup agent disabled for this session — it missed the ${shownMs / 1000}s deadline ${lookupTimeoutStrikes}x. Give it a faster profile or raise the deadline.`);
                 }
                 return sheetText;
             }

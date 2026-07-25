@@ -15,7 +15,7 @@ import { callAgentLLMWithTools } from './llm-call.js';
 // other two barriers (the roster check and a switch with no write cases).
 import { executeLookupTool, stripThinkBlocks } from './memory-tools.js';
 import { extractSheetFactRefs } from './turn-state.js';
-import { addDebugLog, isTraceRecording, traceCapture, newTraceCallId } from './settings.js';
+import { addDebugLog, isTraceRecording, traceCapture, newTraceCallId, getSettings } from './settings.js';
 import * as host from './host.js';
 
 // =============================================================================
@@ -90,7 +90,26 @@ export const LOOKUP_MAX_TOOL_CALLS = 4;
 // only viable on a fast small model, which is exactly why it has its own
 // connection-profile setting. 8s is roughly two rounds of a fast hosted model
 // plus the tool work between them.
-export const LOOKUP_TIMEOUT_MS = 8000;
+export const LOOKUP_TIMEOUT_DEFAULT_MS = 8000;
+
+// The floor and ceiling the settings slider is clamped to, and why they are where
+// they are. Below ~3s no hosted model completes a round, so the pass could only
+// ever time out. Above ~30s the wait stops reading as latency and starts reading
+// as a broken client — and this is the ONE pass the user sits and waits for, so
+// the ceiling is a UX judgement, not a technical one. Everything between is the
+// user's call: a slow proxy or a local model can genuinely need 15-20s, and that
+// number cannot be guessed from here.
+export const LOOKUP_TIMEOUT_MIN_MS = 3000;
+export const LOOKUP_TIMEOUT_MAX_MS = 30000;
+
+// Read ONCE per pass by the caller and threaded down as an absolute deadline —
+// never twice inside one pass, or the budget would move under it if the user
+// dragged the slider mid-generation.
+export function lookupTimeoutMs() {
+    const raw = Number(getSettings()?.lookupTimeoutMs);
+    if (!Number.isFinite(raw)) return LOOKUP_TIMEOUT_DEFAULT_MS;
+    return Math.min(LOOKUP_TIMEOUT_MAX_MS, Math.max(LOOKUP_TIMEOUT_MIN_MS, Math.floor(raw)));
+}
 
 // Backstop margin. The caller races its ENTIRE lookup body — including awaits
 // that are not inside runLookupAgent/renderLookupBlock, such as the dynamic
@@ -253,7 +272,7 @@ function buildLookupUserPrompt({ userMessage, priorMessage, sheetRefs, databases
  * `deadlineAt` is an ABSOLUTE timestamp (Date.now() ms) and is the budget for the
  * WHOLE pass, store load included. The caller computes it before ITS first await,
  * so the number bounds the injection handler's wait rather than this function's
- * runtime. Omitted, it defaults to LOOKUP_TIMEOUT_MS from entry — correct only for
+ * runtime. Omitted, it defaults to lookupTimeoutMs() from entry — correct only for
  * a caller that has awaited nothing yet.
  *
  * Returns { refs, error, timedOut, stage, rounds, toolCalls, tokensIn, tokensOut, ms }.
@@ -274,7 +293,11 @@ export async function runLookupAgent({
 } = {}) {
     const result = { refs: [], error: null, timedOut: false, stage: null, rounds: 0, toolCalls: 0, tokensIn: 0, tokensOut: 0, ms: 0 };
     const started = Date.now();
-    const deadline = deadlineAt > 0 ? deadlineAt : started + LOOKUP_TIMEOUT_MS;
+    // The configured budget, read once. Only used when the caller passed no
+    // absolute deadline; when it did, that deadline already encodes the setting
+    // as it stood at the top of the generation.
+    const budgetMs = lookupTimeoutMs();
+    const deadline = deadlineAt > 0 ? deadlineAt : started + budgetMs;
 
     // Deadline plumbing, armed BEFORE the first await. That ordering is the whole
     // fix: the store load below used to sit in front of it, outside the race,
@@ -342,16 +365,16 @@ export async function runLookupAgent({
         // /cancel/i as OUR hang-up rather than a transport fault, and keeps it off
         // the Health tab's agent connection row. That is the honest reading — the
         // endpoint did not fail, we stopped waiting for it.
-        try { ctrl.abort(new DOMException(`BF Memory lookup cancelled — wall-clock deadline ${LOOKUP_TIMEOUT_MS}ms exceeded in the ${stage} stage`, 'AbortError')); } catch {  }
+        try { ctrl.abort(new DOMException(`BF Memory lookup cancelled — wall-clock deadline ${budgetMs}ms exceeded in the ${stage} stage`, 'AbortError')); } catch {  }
         const advice = stage === 'store'
             ? 'the memory store did not finish loading inside the budget — that is storage (attachment fetch / IndexedDB), not the lookup model'
             : 'point the Lookup Agent at a faster connection profile, or turn it off';
-        addDebugLog('fail', `Lookup agent hit the ${LOOKUP_TIMEOUT_MS}ms wall-clock deadline in the ${stage} stage — the prompt goes out WITHOUT the looked-up block (${advice})`, {
+        addDebugLog('fail', `Lookup agent hit the ${budgetMs}ms wall-clock deadline in the ${stage} stage — the prompt goes out WITHOUT the looked-up block (${advice})`, {
             runId, subsystem: 'agent3', event: 'lookup.run', reason: 'LOOKUP_TIMEOUT',
-            data: { timeoutMs: LOOKUP_TIMEOUT_MS, stage, profileId: profileId || null, ms: result.ms },
+            data: { timeoutMs: budgetMs, stage, profileId: profileId || null, ms: result.ms },
         });
         traceCapture('lookup.verdict', () => ({
-            outcome: 'TIMEOUT', stage, timeoutMs: LOOKUP_TIMEOUT_MS, ms: result.ms, refs: [],
+            outcome: 'TIMEOUT', stage, timeoutMs: budgetMs, ms: result.ms, refs: [],
         }), { runId, callId: callId || null, reason: 'LOOKUP_TIMEOUT' });
         return result;
     };
@@ -429,7 +452,7 @@ export async function runLookupAgent({
         systemPromptChars: DEFAULT_LOOKUP_PROMPT.length,
         maxRounds: LOOKUP_MAX_ROUNDS,
         maxToolCalls: LOOKUP_MAX_TOOL_CALLS,
-        timeoutMs: LOOKUP_TIMEOUT_MS,
+        timeoutMs: budgetMs,
         profileId: profileId || null,
         note: 'system prompt is fixed (no settings override); its body is llm-call.js\'s to capture',
     }), { runId, callId });
@@ -564,7 +587,7 @@ export async function renderLookupBlock({ refs = [], sheetText = '', runId = '',
     if (!Array.isArray(refs) || refs.length === 0) return out;
     let timer = null;
     try {
-        const deadline = deadlineAt > 0 ? deadlineAt : Date.now() + LOOKUP_TIMEOUT_MS;
+        const deadline = deadlineAt > 0 ? deadlineAt : Date.now() + lookupTimeoutMs();
         const deadlineP = new Promise((resolve) => {
             timer = setTimeout(() => resolve(DEADLINE), Math.max(0, deadline - Date.now()));
         });

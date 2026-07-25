@@ -30,7 +30,7 @@ import { DEFAULT_MEMORY_AGENT_PROMPT } from './agent-memory.js';
 // addDebugLog/traceCapture back out of this file, so this is a cycle — the same
 // one agent-memory.js above already forms, and safe for the same reason: nothing
 // here touches the binding while either module is still evaluating.
-import { LOOKUP_TIMEOUT_MS } from './agent-lookup.js';
+import { LOOKUP_TIMEOUT_DEFAULT_MS } from './agent-lookup.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 
 export {
@@ -96,6 +96,11 @@ const DEFAULT_SETTINGS = {
     // single call measures in tens of seconds, and this pass has an 8s deadline.
     // Empty falls back to agent3Profile, then to the main ST connection.
     lookupProfile: '',
+    // Wall-clock deadline for the lookup pass, in ms. The ONE budget the user
+    // sits and waits for, so it is theirs to set: a fast hosted model needs ~2s,
+    // a slow proxy or a local model can genuinely need 15-20s, and neither is
+    // guessable from here. Clamped to LOOKUP_TIMEOUT_MIN_MS..MAX_MS on load.
+    lookupTimeoutMs: 8000,
 
     memoryPrompt: '',
 
@@ -217,6 +222,10 @@ function validateSettings(s) {
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
     if (typeof s.lookupEnabled !== 'boolean')    s.lookupEnabled = false;
     if (typeof s.lookupProfile !== 'string')     s.lookupProfile = '';
+    // Same bounds agent-lookup.js clamps to at read time. Doing it here as well
+    // means a hand-edited settings file shows the corrected value in the slider
+    // rather than a number the pass silently ignores.
+    s.lookupTimeoutMs = Math.floor(clamp(s.lookupTimeoutMs, 3000, 30000, 8000));
     if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
     if (typeof s.contradictionScanEnabled !== 'boolean') s.contradictionScanEnabled = true;
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
@@ -1751,11 +1760,11 @@ export async function initSettings() {
     });
 
     // --- The lookup pass (agent-lookup.js) ---------------------------------
-    // The deadline is written into the hint from the constant rather than typed
-    // into the HTML, so the number the user reads is the number the code
-    // enforces — a UI that quotes a stale constant is the same defect as a
-    // comment that does.
-    $('#bf_mem_lookup_timeout_val').text(`${LOOKUP_TIMEOUT_MS / 1000}s`);
+    // The deadline label is written from the stored setting (below, with the
+    // slider) rather than typed into the HTML, so the number the user reads is
+    // the number the code enforces — a UI that quotes a stale value is the same
+    // defect as a comment that does. LOOKUP_TIMEOUT_DEFAULT_MS is the fallback
+    // for a settings object that predates the slider.
     $('#bf_mem_lookup_enabled').prop('checked', extensionSettings.lookupEnabled === true).on('change', function () {
         const before = extensionSettings.lookupEnabled === true;
         const next = $(this).prop('checked');
@@ -1772,6 +1781,30 @@ export async function initSettings() {
     $('#bf_mem_lookup_profile').val(extensionSettings.lookupProfile || '').on('change', function () {
         extensionSettings.lookupProfile = $(this).val() || '';
         addDebugLog('info', 'Lookup pass profile changed', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'lookupProfile', value: extensionSettings.lookupProfile } });
+        saveSettings();
+        import('./pipeline.js').then(({ resetLookupBreaker }) => resetLookupBreaker?.()).catch(() => {  });
+    });
+
+    // Deadline slider, in whole seconds. Raising it also re-arms the session
+    // breaker: three strikes at 8s says nothing about whether 20s would have been
+    // enough, and leaving the pass switched off after the user just widened the
+    // budget would look broken.
+    const lookupSecs = Math.round((Number(extensionSettings.lookupTimeoutMs) || LOOKUP_TIMEOUT_DEFAULT_MS) / 1000);
+    $('#bf_mem_lookup_timeout').val(lookupSecs);
+    $('#bf_mem_lookup_timeout_val').text(`${lookupSecs}s`);
+    $('#bf_mem_lookup_timeout').on('input', function () {
+        const secs = parseInt($(this).val(), 10);
+        if (!Number.isFinite(secs)) return;
+        const before = extensionSettings.lookupTimeoutMs;
+        const after = secs * 1000;
+        extensionSettings.lookupTimeoutMs = after;
+        $('#bf_mem_lookup_timeout_val').text(`${secs}s`);
+        if (before !== after) {
+            addDebugLog('info', `Lookup deadline: ${Math.round(before / 1000)}s → ${secs}s`, {
+                subsystem: 'settings', event: 'settings.changed', actor: 'USER',
+                data: { key: 'lookupTimeoutMs' }, before, after,
+            });
+        }
         saveSettings();
         import('./pipeline.js').then(({ resetLookupBreaker }) => resetLookupBreaker?.()).catch(() => {  });
     });

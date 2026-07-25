@@ -61,7 +61,12 @@
                                     <i class="fa-solid fa-arrows-rotate"></i>
                                 </button>
                             </div>
-                            <small class="bf-mem-hint">Give this one the <b>fastest small AI you have</b> — it is on the waiting path, so it gets a hard deadline of <b><span id="bf_mem_lookup_timeout_val">8s</span></b>. Miss it and your reply is sent without the looked-up block (nothing breaks, you just don't get the extra memories). Miss it three times in a row and it switches itself off for the session and says so. Your background memory model is usually far too slow for this — that is why this is a separate setting.</small>
+                            <small class="bf-mem-hint">Give this one the <b>fastest small AI you have</b> — it is on the waiting path. Miss the deadline below and your reply is sent without the looked-up block (nothing breaks, you just don't get the extra memories). Miss it three times in a row and it switches itself off for the session and says so. Your background memory model is usually far too slow for this — that is why this is a separate setting.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:10px;">
+                            <label>Deadline <span class="bf-mem-val" id="bf_mem_lookup_timeout_val">8s</span></label>
+                            <input type="range" id="bf_mem_lookup_timeout" min="3" max="30" step="1" value="8" />
+                            <small class="bf-mem-hint">How long your reply waits for this pass before being sent without it. <b>This is your own waiting time</b>, not a network setting — every second here is a second you stare at an empty screen before the story starts. <b>8s</b> suits a fast hosted model; raise it if your connection or a local model genuinely needs longer, but past ~20s chatting starts to feel broken. Changing it re-arms the pass if it had switched itself off.</small>
                         </div>
                     </div>
                 </div>
