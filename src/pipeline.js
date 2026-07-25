@@ -15,8 +15,52 @@ let groupSkipToastShown = false;
 let runRecordedInput = false; 
 
 let successfulRunsSinceReflection = 0;
-let reflectionPending = null; 
-let reflectionInFlight = false; 
+let reflectionPending = null;
+let reflectionInFlight = false;
+// Abort handle for the reflection pass that is currently running (null when
+// none is). Reflection is the longest pass in the system — up to 7 rounds
+// against a 10-minute tool-loop budget — and it now MUTATES the fact store, so
+// it must be interruptible by the same events that already void pipeline work.
+//
+// This is NOT a second cancellation mechanism. cancelInFlightLLM already aborts
+// the network leg in flight, but it then CLEARS its controller set, so the tool
+// loop would just open a fresh leg on the next round and keep writing. The
+// signal is what makes the LOOP stop: callAgentLLMWithTools re-checks it before
+// every round and between every tool call, so the abort survives across rounds
+// and lands even when it arrives while tools (not the LLM) are executing.
+let reflectionAbort = null;
+
+// --- Story evidence for the reflection pass --------------------------------
+// Reflection used to see the fact digest, the beat list and its own prior
+// recap — memory only. It could compare memory against MEMORY but never memory
+// against the STORY, so a stored value the narrative has been contradicting for
+// thirty messages was structurally invisible to it: the contradiction scan
+// needs TWO stored facts, and the extractor's overwrite-in-place rule
+// guarantees the second one never exists. Hence the raw recent messages, handed
+// over as evidence to check the digest against.
+//
+// WINDOW SIZE. Reflection fires on a CADENCE — REFLECTION_INTERVAL (12)
+// successful extraction runs, and a run settles roughly one exchange, so a pass
+// lands about every ~24 messages. A fixed 20-message window would therefore
+// leave a permanent unread gap between consecutive passes and keep missing the
+// same stretch of story forever. So the window is "everything since the
+// previous pass" (lastReflectionChatIndex), which is cheap — one integer, no
+// scan — and by construction cannot skip a stretch. It is floored at
+// REFLECT_STORY_MIN_MESSAGES so the first pass in a chat, or a pass fired
+// unusually early, still gets enough narrative to judge anything at all, and
+// capped at REFLECT_STORY_MAX_MESSAGES so a long catch-up backlog (or a chat
+// switched back into after hundreds of messages) cannot hand one pass the
+// entire history.
+const REFLECT_STORY_MIN_MESSAGES = 20;
+const REFLECT_STORY_MAX_MESSAGES = 60;
+// Message COUNT says nothing about size, and this is raw prose going straight
+// into the reflection prompt — a handful of 4 KB replies would blow the call up
+// on its own. Cap the total characters as well, dropping OLDEST-first: the
+// newest messages are the ones most likely to contradict a stored fact.
+const REFLECT_STORY_MAX_CHARS = 12000;
+// Chat index of the newest message the PREVIOUS reflection pass was given.
+// -1 = no pass yet in this chat. Chat-scoped: reset on CHAT_CHANGED.
+let lastReflectionChatIndex = -1;
 
 let memoryExtractionInFlight = false;
 
@@ -237,6 +281,28 @@ function hideWorkingIndicator() {
     if (indicator) indicator.style.display = 'none';
 }
 
+// Abort the in-flight reflection pass, if any. Idempotent, and a no-op when
+// nothing is running. Aborting is deliberately NON-FATAL: runReflection returns a
+// result object carrying .error instead of throwing. Nothing here touches
+// reflectionInFlight — only maybeRunReflection's finally clears that, so an abort
+// can never wedge the single-flight latch.
+//
+// Whether the repairs the earlier rounds already applied SURVIVE depends on WHY
+// the pass stopped, and runReflection makes that call, not this function. A plain
+// Stop persists them: the context still matches, so the drain runs. A chat or
+// character switch does not — CHAT_CHANGED may swap the whole working store out
+// from under the pass (autoSaveDbProfile), so the repairs are dropped unsaved
+// rather than risk landing on another chat's store. The `reflection.done` log
+// line records which happened and how many repairs it cost.
+function abortReflectionPass(reason) {
+    const ctrl = reflectionAbort;
+    if (!ctrl || ctrl.signal.aborted) return;
+    try { ctrl.abort(new DOMException(`Reflection aborted (${reason})`, 'AbortError')); } catch {  }
+    addDebugLog('info', `Reflection pass aborted (${reason}) — the tool loop stops at the next round/tool boundary; repairs already applied are persisted unless the chat or character also changed`, {
+        subsystem: 'reflection', event: 'reflection.abort', reason: String(reason).toUpperCase(),
+    });
+}
+
 export function cancelActiveRun(reason = 'cancel') {
     pipelineCancelled = true;
     clearInjectedGuard();
@@ -247,6 +313,9 @@ export function cancelActiveRun(reason = 'cancel') {
     if (connectionRetryTimer) { clearTimeout(connectionRetryTimer); connectionRetryTimer = null; }
 
     try { cancelInFlightLLM(reason); } catch {  }
+    // Same event, two layers: cancelInFlightLLM chops the leg that is in the
+    // air, the signal stops the loop from starting another one.
+    abortReflectionPass(reason);
     hideWorkingIndicator();
     updateStatus('idle');
     addDebugLog('info', `Active pipeline run cancelled (${reason}) — in-flight LLM calls aborted`, {
@@ -621,6 +690,34 @@ async function runMemoryExtraction() {
     };
     setWatermark(BF_MEM_IN_FLIGHT);
 
+    // Both exits below snapshot the working store into the profile this run
+    // started under. saveCurrentToActiveProfile pins the profile NAME and
+    // nothing else: it reads getAllDatabases() / getStorySpine() /
+    // getCurrentScene() LIVE and overwrites dbProfiles[name] wholesale, so after
+    // a mid-run profile switch it would write the newly loaded profile's data
+    // into capturedDbProfile and destroy that snapshot. Read live at call time
+    // rather than captured once — the switch can land anywhere in the run.
+    //
+    // Deliberately NOT folded into the character/chat guard below: that guard
+    // discards the whole result, and a profile switch does not invalidate the
+    // extracted facts the way a character switch does. The chat is still open,
+    // the facts still describe it and are already in the working store, so only
+    // the snapshot is skipped — watermark and sheet still commit. Same gate as
+    // maybeRunReflection and catchup-import.js, narrower consequence.
+    const snapshotToCapturedProfile = async () => {
+        const liveDbProfile = (getSettings() || {}).activeDbProfile;
+        if (liveDbProfile !== capturedDbProfile) {
+            addDebugLog('fail', `[${runId}] Profile snapshot skipped — database profile changed mid-extraction ("${capturedDbProfile}" -> "${liveDbProfile}"); facts are still in the working store`, {
+                subsystem: 'agent3', event: 'agent3.snapshotSkipped', reason: 'PROFILE_CHANGED',
+                data: { capturedDbProfile, liveDbProfile: liveDbProfile || null },
+            });
+            return;
+        }
+        const snapStart = Date.now();
+        await saveCurrentToActiveProfile(capturedDbProfile);
+        postStageMs.snapshotMs = Date.now() - snapStart;
+    };
+
     memoryExtractionInFlight = true;
 
     cancelledRetryArmed = false;
@@ -649,13 +746,52 @@ async function runMemoryExtraction() {
             observationDate = new Date().toISOString();
         }
 
+        // The sheet as it stands BEFORE this run writes its own (this run's
+        // setMemorySheet calls are further down, at the extraction-error branch
+        // and the success branch — both strictly after this point), i.e. the
+        // sheet that was injected above the replies this run is about to judge.
+        //
+        // That identity holds in the steady state ONLY. When the pipeline lags
+        // the chat — a slow tool loop, a coalesced retry, the whole
+        // computeCatchupLag machinery — the user can generate reply N+1 while
+        // run R_N is still in flight; R_N then commits sheet S_k, and the run
+        // for N+1 reads S_k although N+1 was generated under S_(k-1). The
+        // omission-recovery list would then be asserted about the wrong sheet.
+        // So the record's OWN identity travels with it: `priorSheet` carries the
+        // runId and the sourceMessageIndex the sheet was built for, and
+        // `newestJudgedMessageIndex` says which message this run is judging.
+        // The comparison itself belongs to the extraction agent, not here.
+        const priorSheet = getMemorySheet();
+        const newestJudged = tentativeMessages.length > 0
+            ? tentativeMessages[tentativeMessages.length - 1].index
+            : settledMessages[settledMessages.length - 1].index;
+
         memoryResult = await runMemoryAgent({
             settledMessages,
             tentativeMessages,
             characterInfo,
             userPersona,
             profileId: agent3ProfileId,
-            priorSheetText: getMemorySheet()?.text || '',
+            priorSheetText: priorSheet?.text || '',
+            // Snapshot COPY of the whole sheet record — never the live singleton
+            // getMemorySheet() returns, which setMemorySheet replaces wholesale
+            // and which nothing downstream may mutate.
+            priorSheet: priorSheet ? {
+                text: String(priorSheet.text || ''),
+                runId: String(priorSheet.runId || ''),
+                // Chat index of the newest message that existed when this sheet
+                // was composed (chat.length - 1 at that moment). -1 = unknown /
+                // seed sheet.
+                sourceMessageIndex: Number.isInteger(priorSheet.sourceMessageIndex) ? priorSheet.sourceMessageIndex : -1,
+                updatedAt: String(priorSheet.updatedAt || ''),
+                // true = the "Story just beginning" seed, never a composed sheet.
+                seeded: priorSheet.seeded === true,
+            } : null,
+            // Chat index of the NEWEST message this run is judging (the last
+            // tentative one, or the last settled one when nothing is tentative).
+            // Compare against priorSheet.sourceMessageIndex to decide whether the
+            // sheet really is the one that stood above this reply.
+            newestJudgedMessageIndex: newestJudged,
             reflection: getReflection(),
             observationDate,
             runId,
@@ -705,7 +841,9 @@ async function runMemoryExtraction() {
         const currentChatId = String(liveCtx.getCurrentChatId?.() || liveCtx.chatId || '');
         // Guard BOTH character switches and chat/branch switches (same character,
         // different chat) — either way the sheet/watermark must not be applied to
-        // the chat that is now active.
+        // the chat that is now active. A mid-run DB-profile switch is NOT checked
+        // here: it invalidates only where the snapshot lands, not the result, so
+        // snapshotToCapturedProfile gates that separately.
         if (currentCharAvatar !== capturedCharAvatar || (capturedChatId && currentChatId && currentChatId !== capturedChatId)) {
             addDebugLog('fail', `[${runId}] Character or chat changed mid-extraction (${capturedCharAvatar}/${capturedChatId} -> ${currentCharAvatar}/${currentChatId}) — withholding watermark/sheet`);
             if (typeof toastr !== 'undefined') {
@@ -735,9 +873,7 @@ async function runMemoryExtraction() {
                 setMemorySheet(memoryResult.sheetText, { runId, sourceMessageIndex: chat.length - 1 });
             }
             if (committed.length > 0) {
-                const snapStart = Date.now();
-                await saveCurrentToActiveProfile(capturedDbProfile);
-                postStageMs.snapshotMs = Date.now() - snapStart;
+                await snapshotToCapturedProfile();
             }
             setWatermark(false);
             return;
@@ -763,9 +899,7 @@ async function runMemoryExtraction() {
         setWatermark(true);
 
         if (committed.length > 0) {
-            const snapStart = Date.now();
-            await saveCurrentToActiveProfile(capturedDbProfile);
-            postStageMs.snapshotMs = Date.now() - snapStart; 
+            await snapshotToCapturedProfile();
         }
 
         await maybeAppendStorySpine(runId, agent3ProfileId, capturedChatId);
@@ -826,6 +960,77 @@ async function runMemoryExtraction() {
     }
 }
 
+// Build the raw-message evidence block for a reflection pass. Deliberately
+// reuses the extraction path's shaping (toAgentMessage) and its exclusions —
+// isGenuineMessage drops system/tool/empty rows, isTriviallyEmptyForExtraction
+// drops [OOC:] / ((meta)) / sub-15-char noise — so the two agents can never
+// disagree about what counts as story. No second message-shaping helper exists.
+//
+// Returns { messages, fromIndex, toIndex, chars, truncated, wanted }.
+// `messages` is oldest-first, the same order the extraction task block uses.
+function collectReflectionStoryMessages() {
+    const empty = { messages: [], fromIndex: -1, toIndex: -1, chars: 0, truncated: false, wanted: 0 };
+    try {
+        const ctx = SillyTavern.getContext();
+        const chat = ctx?.chat;
+        if (!Array.isArray(chat) || chat.length === 0) return empty;
+
+        // "Since the previous pass", clamped into the min/max band. The span is
+        // measured in RAW indices while the walk below counts GENUINE messages,
+        // so the clamp errs on the generous side — it can never under-cover the
+        // stretch the previous pass did not see, which is the whole point.
+        const since = lastReflectionChatIndex >= 0
+            ? (chat.length - 1 - lastReflectionChatIndex)
+            : REFLECT_STORY_MAX_MESSAGES;
+        const wanted = Math.min(REFLECT_STORY_MAX_MESSAGES, Math.max(REFLECT_STORY_MIN_MESSAGES, since));
+
+        // Walk backwards from the newest message: the window is anchored to the
+        // present, and a shortfall (a chat shorter than `wanted`) simply yields
+        // fewer rows.
+        const picked = [];
+        for (let i = chat.length - 1; i >= 0 && picked.length < wanted; i--) {
+            const m = chat[i];
+            if (!isGenuineMessage(m)) continue;
+            if (isTriviallyEmptyForExtraction(m.mes)) continue;
+            picked.push(toAgentMessage(m, i));
+        }
+        picked.reverse();
+        if (picked.length === 0) return { ...empty, wanted };
+
+        let chars = picked.reduce((n, m) => n + String(m.text || '').length, 0);
+        let truncated = false;
+        while (picked.length > 1 && chars > REFLECT_STORY_MAX_CHARS) {
+            chars -= String(picked[0].text || '').length;
+            picked.shift();
+            truncated = true;
+        }
+        // One single message over the whole budget: slice it instead of dropping
+        // it — an empty evidence block is strictly worse than a clipped one.
+        if (picked.length === 1 && chars > REFLECT_STORY_MAX_CHARS) {
+            const clipped = String(picked[0].text || '').slice(0, REFLECT_STORY_MAX_CHARS);
+            picked[0] = { ...picked[0], text: clipped };
+            chars = clipped.length;
+            truncated = true;
+        }
+
+        return {
+            messages: picked,
+            fromIndex: picked[0].index,
+            toIndex: picked[picked.length - 1].index,
+            chars,
+            truncated,
+            wanted,
+        };
+    } catch (err) {
+        // Non-fatal: reflection without story evidence is exactly the old
+        // behaviour, so degrade to an empty window rather than skipping the pass.
+        addDebugLog('fail', `Reflection story window failed (non-fatal, pass runs without evidence): ${err?.message || err}`, {
+            subsystem: 'reflection', event: 'reflection.story_window', reason: 'ERROR',
+        });
+        return empty;
+    }
+}
+
 async function maybeRunReflection() {
     const pending = reflectionPending;
     if (!pending || reflectionInFlight) return;
@@ -844,16 +1049,72 @@ async function maybeRunReflection() {
 
     reflectionPending = null;
     reflectionInFlight = true;
-    successfulRunsSinceReflection = 0; 
-    internalCallDepth++; 
+    successfulRunsSinceReflection = 0;
+    internalCallDepth++;
     const reflectStart = Date.now();
+    // Installed BEFORE the first await so a Stop or a chat switch arriving one
+    // tick later already has something to abort.
+    const abortCtrl = new AbortController();
+    reflectionAbort = abortCtrl;
+    // Chat this pass was armed against. Read twice below: to decide whether the
+    // story-window marker may be rolled back, and to gate the profile snapshot.
+    // The pass's own fact writes are guarded separately, inside agent-reflect.js.
+    const capturedChatId = String(ctx.getCurrentChatId?.() || ctx.chatId || '');
+    // Snapshotted the way runMemoryExtraction snapshots it: getSettings() hands
+    // back the LIVE object, and this pass runs long enough for the user to
+    // switch database profiles under it — more so now that it can be aborted by
+    // a chat switch, which often carries a profile switch. The post-pass
+    // snapshot must land in the profile the repairs were made against.
+    const capturedDbProfile = settings.activeDbProfile;
+    const priorReflectionIndex = lastReflectionChatIndex;
     try {
         updateStatus('running', 'Reflecting (consolidating memory)...');
+
+        // Story evidence. Collected HERE, not at arming time: arming happens at
+        // the end of an extraction run, the pass itself runs after the next
+        // settle, and the window must describe the chat as it is when the pass
+        // actually reads it.
+        const story = collectReflectionStoryMessages();
+        if (story.messages.length > 0) {
+            addDebugLog('info', `[${pending.runId}] Reflection story window: ${story.messages.length} msg(s) ${story.fromIndex}–${story.toIndex}, ${story.chars} chars${story.truncated ? ' (oldest trimmed to fit the char cap)' : ''}`, {
+                subsystem: 'reflection', event: 'reflection.story_window',
+                data: {
+                    count: story.messages.length, fromIndex: story.fromIndex, toIndex: story.toIndex,
+                    chars: story.chars, truncated: story.truncated, wanted: story.wanted,
+                    sinceIndex: lastReflectionChatIndex,
+                },
+            });
+            // Advance the marker as soon as the pass is committed to running.
+            // A pass that then FAILS still counts as "covered": re-handing the
+            // same stretch to the next pass would just repeat a failure, and the
+            // min-window floor keeps the recent story in view regardless. A pass
+            // the user ABORTS is the one exception and rolls this back below —
+            // an interruption is not a failure that would repeat.
+            lastReflectionChatIndex = story.toIndex;
+        } else {
+            addDebugLog('info', `[${pending.runId}] Reflection story window empty — pass runs against the digest alone`, {
+                subsystem: 'reflection', event: 'reflection.story_window', reason: 'NO_MESSAGES',
+            });
+        }
+
         const reflResult = await runReflection({
             runId: pending.runId,
             characterInfo: pending.characterInfo || '',
             userPersona: pending.userPersona || '',
             profileId: pending.profileId || null,
+            // Raw chat messages as EVIDENCE to check stored facts against.
+            // Shape per entry: { index, uid, role: 'USER'|'CHAR', name, text } —
+            // identical to what the extraction agent receives. Oldest-first.
+            recentMessages: story.messages,
+            // True when the oldest messages were dropped (or a single oversized
+            // message clipped) to stay under REFLECT_STORY_MAX_CHARS. The window
+            // is then NOT a complete record of the span — a fact absent from it
+            // is not evidence of anything.
+            recentMessagesTruncated: story.truncated,
+            // Stop / extension-disable / chat switch. The pass mutates the
+            // store, so it must be interruptible; the loop honours this between
+            // rounds and between tool calls, never mid-write.
+            signal: abortCtrl.signal,
         });
 
         try {
@@ -868,20 +1129,81 @@ async function maybeRunReflection() {
             }
         } catch {  }
 
-        try { await saveCurrentToActiveProfile(settings.activeDbProfile); } catch {  }
+        // Runs on the abort path too: an abort that did NOT come with a context
+        // change still leaves runReflection's per-category drain persisted, and
+        // the profile snapshot has to follow it or a later profile load rebuilds
+        // from a snapshot that predates those repairs.
+        //
+        // But ONLY while the live context still matches the one this pass ran
+        // against. saveCurrentToActiveProfile pins the profile NAME and nothing
+        // else: it reads getAllDatabases() / getStorySpine() / getCurrentScene()
+        // LIVE and overwrites dbProfiles[name] wholesale. On the chat-switch
+        // abort path CHAT_CHANGED has already invalidated the database cache, so
+        // an ungated call reloads the NEWLY loaded character's facts and writes
+        // them into the PREVIOUS character's profile, destroying that snapshot.
+        // Pinning the name made that deterministic rather than merely racy, so
+        // the gate has to travel with it. Same shape and same reason as the
+        // snapshot gate in catchup-import.js.
+        //
+        // getContext() is wrapped: a throw here would otherwise land in the outer
+        // catch and paint the Health row red for a pass that ran fine. Failing to
+        // resolve the context means failing the gate — skip, never guess.
+        let snapCtx = null;
+        try { snapCtx = SillyTavern.getContext(); } catch {  }
+        const snapChatId = String(snapCtx?.getCurrentChatId?.() || snapCtx?.chatId || '');
+        const snapAvatar = snapCtx?.characters?.[snapCtx?.characterId]?.avatar || '';
+        const snapshotContextUnchanged = !!snapCtx && snapChatId === capturedChatId
+            && snapAvatar === currentCharAvatar
+            && (getSettings() || {}).activeDbProfile === capturedDbProfile;
+        if (snapshotContextUnchanged) {
+            try { await saveCurrentToActiveProfile(capturedDbProfile); } catch {  }
+        } else {
+            // Nothing is lost that was not already abandoned: on a context change
+            // runReflection discards its repairs unsaved rather than risk another
+            // chat's store, so there is no persisted work here for the snapshot
+            // to be missing.
+            addDebugLog('fail', `[${pending.runId}] Reflection profile snapshot skipped — chat/character/profile changed mid-pass`, {
+                subsystem: 'reflection', event: 'reflection.snapshotSkipped', reason: 'CONTEXT_CHANGED',
+                data: { capturedChatId, liveChatId: snapChatId, capturedDbProfile },
+            });
+        }
         const reflectionMs = Date.now() - reflectStart;
         const reflRounds = Number(reflResult?.rounds) || 0;
         const reflToolCalls = Number(reflResult?.toolCallCount) || 0;
-        // A loop error surfaces as reflResult.error (runReflection never throws
-        // for it) — report it as a fail instead of a false green.
-        if (reflResult?.error) {
+        // An abort also surfaces as reflResult.error ("aborted before round N" /
+        // "aborted during tool execution"), but an interrupted pass is not a
+        // broken one: it must not paint the Health row red, the same rule
+        // llm-call.js applies to a user-cancelled LLM leg. No health event at
+        // all on this path — the row keeps showing the last pass that actually
+        // finished, and the abort is in the debug log.
+        const wasAborted = abortCtrl.signal.aborted;
+        if (wasAborted) {
+            // The marker was advanced when the pass committed to running, on the
+            // reasoning that a FAILED pass would only repeat its failure. An
+            // abort is not that: the user interrupted, so hand the same stretch
+            // back to the next pass. Compare-and-swap on the exact value this
+            // pass wrote AND on the chat it was armed for — CHAT_CHANGED resets
+            // the marker to -1, and a blind restore would push a dead chat's
+            // index into the live one.
+            const liveCtx = SillyTavern.getContext();
+            const liveChatId = String(liveCtx.getCurrentChatId?.() || liveCtx.chatId || '');
+            if (story.messages.length > 0 && lastReflectionChatIndex === story.toIndex && liveChatId === capturedChatId) {
+                lastReflectionChatIndex = priorReflectionIndex;
+                addDebugLog('info', `[${pending.runId}] Reflection aborted — story-window marker rolled back to ${priorReflectionIndex} so the next pass re-covers the interrupted stretch`, {
+                    subsystem: 'reflection', event: 'reflection.story_window', reason: 'ABORT_ROLLBACK',
+                    data: { restored: priorReflectionIndex, discarded: story.toIndex },
+                });
+            }
+        } else if (reflResult?.error) {
+            // A loop error surfaces as reflResult.error (runReflection never
+            // throws for it) — report it as a fail instead of a false green.
             recordHealthEvent('reflection', { status: 'fail', error: reflResult.error, rounds: reflRounds, toolCallCount: reflToolCalls });
         } else {
             recordHealthEvent('reflection', { status: 'ok', durationMs: reflectionMs, rounds: reflRounds, toolCallCount: reflToolCalls });
         }
-        addDebugLog('info', `[${pending.runId}] Reflection pass complete (${reflectionMs}ms, ${reflRounds} round(s), ${reflToolCalls} tool call(s))`, {
-            subsystem: 'reflection', event: 'reflection.run',
-            data: { agent: 'reflection', profileId: pending.profileId || null, success: !reflResult?.error, durationMs: reflectionMs, rounds: reflRounds, toolCallCount: reflToolCalls },
+        addDebugLog('info', `[${pending.runId}] Reflection pass ${wasAborted ? 'ABORTED' : 'complete'} (${reflectionMs}ms, ${reflRounds} round(s), ${reflToolCalls} tool call(s)${wasAborted ? `; ${Number(reflResult?.toolWrites) || 0} repair(s) persisted before the abort` : ''})`, {
+            subsystem: 'reflection', event: 'reflection.run', reason: wasAborted ? 'ABORTED' : undefined,
+            data: { agent: 'reflection', profileId: pending.profileId || null, success: !wasAborted && !reflResult?.error, aborted: wasAborted, durationMs: reflectionMs, rounds: reflRounds, toolCallCount: reflToolCalls },
         });
         addDebugLog('debug', `[${pending.runId}] Stage timing (reflection): reflection=${reflectionMs}ms`, {
             runId: pending.runId, subsystem: 'pipeline', event: 'pipeline.timing',
@@ -895,6 +1217,10 @@ async function maybeRunReflection() {
         });
     } finally {
         reflectionInFlight = false;
+        // Identity check, not a blind null: a pass that somehow outlived its
+        // successor must never drop the successor's abort handle and leave the
+        // live pass uninterruptible.
+        if (reflectionAbort === abortCtrl) reflectionAbort = null;
 
         internalCallDepth = Math.max(0, internalCallDepth - 1);
         updateStatus('idle');
@@ -1134,6 +1460,15 @@ export function initPipeline() {
     });
 
     eventSource.on(eventTypes.CHAT_CHANGED, async () => {
+        // FIRST, before the await below: a reflection pass already in flight is
+        // armed against the chat that just closed — its digest, its story window
+        // and its repairs all describe that chat, and it holds database objects
+        // invalidateDatabaseCache is about to orphan. Extraction gets the same
+        // protection post-hoc (the captured-vs-live chat/character comparison
+        // before the watermark+sheet commit); a reflection pass writes THROUGH
+        // TOOLS as it goes, so post-hoc discard is not available to it and it
+        // has to be stopped instead.
+        abortReflectionPass('chat_changed');
 
         const { invalidateDatabaseCache } = await import('./database.js');
         invalidateDatabaseCache();
@@ -1152,6 +1487,12 @@ export function initPipeline() {
 
         successfulRunsSinceReflection = 0;
         reflectionPending = null;
+        // Chat indices are meaningless across chats — carrying this over would
+        // size the next chat's story window against the previous chat's history.
+        // The pass aborted at the top of this handler cannot resurrect the old
+        // value: its rollback compare-and-swaps against this -1 AND against the
+        // live chat id, and both tests fail here.
+        lastReflectionChatIndex = -1;
 
         // Event-backed health rows must not carry the previous chat's results.
         clearHealthEvents();

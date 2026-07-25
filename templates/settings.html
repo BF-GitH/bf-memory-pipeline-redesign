@@ -69,6 +69,16 @@
                             <small class="bf-mem-hint">The Memory Agent staples on a few EXTRA memories connected to the scene's facts. Instead of always the top-ranked ones, it wanders the memory graph at random — restaurant → Luigi's → first date — surfacing a different connected chain each time. This sets how many to collect. <b>0</b> turns it off.</small>
                         </div>
                         <label class="checkbox_label" style="margin-top:10px;">
+                            <input type="checkbox" id="bf_mem_contradiction_scan" checked />
+                            <span>Scan for contradicting memories during Reflection</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. The Reflect pass compares near-duplicate memories and is asked to rule on each pair, checking both against the recent story — one side wins (the other is kept but deprioritized), the two are merged (the folded-in one is kept, deprioritized, never erased), or they honestly coexist. A pair ruled "coexist" stops being offered until one of the two values actually changes, and then it comes back.</small>
+                        <div class="bf-mem-field" style="margin-top:6px;">
+                            <label>Contradiction scan every <span class="bf-mem-val" id="bf_mem_contradiction_interval_val">2</span> Reflect passes</label>
+                            <input type="range" id="bf_mem_contradiction_interval" min="1" max="10" step="1" value="2" />
+                            <small class="bf-mem-hint">The scan itself is free, but the pairs cost prompt space and the Reflect model spends reads on them. <b>2</b> is the default; raise it in a long-settled chat.</small>
+                        </div>
+                        <label class="checkbox_label" style="margin-top:10px;">
                             <input type="checkbox" id="bf_mem_knownby_enforced" checked />
                             <span>Enforce who-knows-what (POV scoping)</span>
                         </label>
@@ -127,8 +137,9 @@
                         <button id="bf_mem_reset_memory_agent_prompt" class="bf-mem-reset-btn menu_button" title="Restore the built-in Memory Agent prompt">Reset to default</button>
                     </div>
                     <div class="bf-mem-section-body">
+                        <div id="bf_mem_memory_agent_prompt_stale" class="bf-mem-hint" style="display:none;padding:8px 10px;border-left:3px solid #ff9800;border-radius:4px;margin-bottom:8px;"></div>
                         <textarea id="bf_mem_memory_agent_prompt" class="bf-mem-textarea" rows="18"></textarea>
-                        <small class="bf-mem-hint">The FULL system prompt the background extraction agent runs on — it covers only the fact-extraction and NEED-selection pass; the beat and sheet-head passes use fixed built-in prompts. Leave blank or Reset to use the built-in default. This is separate from the Memory tab's "extra instructions", which are still appended on top of whatever prompt is used here.</small>
+                        <small class="bf-mem-hint">The FULL system prompt the background extraction agent runs on — it covers only the fact-extraction and NEED-selection pass; the beat and sheet-head passes use fixed built-in prompts. It picks the memories for the NEXT reply and, since the omission-recovery rules were added, also looks BACKWARD: it is shown every memory the last sheet actually carried, plus the VALUES of stored facts about whoever that reply named which the sheet did NOT carry — so a fact the storyteller hedged on or contradicted can be recognised and re-selected instead of guessed at from key names. A memory recovered that way is marked as such and stays injected for the next few turns, not just one. Leave blank or Reset to use the built-in default — a saved copy from an older version keeps running as-is and quietly loses whatever the newer default added. This is separate from the Memory tab's "extra instructions", which are still appended on top of whatever prompt is used here.</small>
                     </div>
                 </div>
 
@@ -138,8 +149,9 @@
                         <button id="bf_mem_reset_reflect_agent_prompt" class="bf-mem-reset-btn menu_button" title="Restore the built-in Reflect Agent prompt">Reset to default</button>
                     </div>
                     <div class="bf-mem-section-body">
+                        <div id="bf_mem_reflect_agent_prompt_stale" class="bf-mem-hint" style="display:none;padding:8px 10px;border-left:3px solid #ff9800;border-radius:4px;margin-bottom:8px;"></div>
                         <textarea id="bf_mem_reflect_agent_prompt" class="bf-mem-textarea" rows="18"></textarea>
-                        <small class="bf-mem-hint">The FULL system prompt for the periodic Reflect maintenance pass. Leave blank or Reset to use the built-in default.</small>
+                        <small class="bf-mem-hint">The FULL system prompt for the periodic Reflect maintenance pass. It is no longer read-only, and no longer memory-only: it is handed the RAW recent chat messages as evidence and its FIRST job is to hunt for stored memories the story contradicts. On top of the summaries and observations it writes declaratively, it can then repair one stored memory at a time (fix a value, fold a duplicate into its survivor, demote noise) and rule on contradicting pairs — every repair gated behind reading the full record first, and capped per pass. Nothing in that path deletes: every demotion keeps the memory and only deprioritizes it. The story evidence is the largest block in the pass and is re-sent each round, so a Reflect pass now costs noticeably more tokens than it used to. Leave blank or Reset to use the built-in default — a saved copy from an older version keeps running as-is and quietly loses whatever the newer default added.</small>
                     </div>
                 </div>
             </div>

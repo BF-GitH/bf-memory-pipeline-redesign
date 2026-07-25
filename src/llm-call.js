@@ -1,7 +1,36 @@
 import { addDebugLog } from './settings.js';
 
-import { parseAgentReply } from './memory-tools.js';
+import { parseAgentReply, REFLECTION_WRITE_TOOLS } from './memory-tools.js';
 import * as host from './host.js';
+
+// The ONLY tool calls executed when they ride alongside the closing block. The
+// final round gets no TOOL RESULTS message, so anything run here is run blind:
+// the model never sees the outcome and cannot correct a refusal. write_fact and
+// link_facts are admitted because extraction routinely batches its last writes
+// with #DONE and a link may target a fact written just above it; reflection's
+// merge_facts/mark_cold are NOT, and its prompt says so in as many words
+// ("merge_facts and mark_cold lines sent alongside the closing sections are
+// dropped unexecuted") — a merge or a demotion is too consequential to fire
+// with no feedback round and no chance to refuse-and-retry.
+export const FINAL_BLOCK_WRITE_TOOLS = ['write_fact', 'link_facts'];
+
+// Does this tool MUTATE the store? Used only to tell a DISCARDED WRITE apart
+// from an ignored read when classifying what was thrown away alongside the final
+// block: a dropped read costs nothing, a dropped write is work the model
+// believed it had done.
+//
+// Deliberately a function, not a module-level array: memory-tools -> settings ->
+// agent-reflect -> llm-call -> memory-tools is a real import cycle, so when
+// memory-tools happens to be the module entered first, llm-call's BODY runs
+// while memory-tools is still evaluating and REFLECTION_WRITE_TOOLS is in its
+// temporal dead zone. Spreading it at module scope would throw at load; reading
+// it inside a call cannot, because nothing calls this before the loop runs.
+// (parseAgentReply survives the same cycle only because it is a hoisted function
+// declaration.)
+function isMutatingTool(tool) {
+    return tool === 'write_fact' || tool === 'link_facts' || tool === 'add_alias'
+        || REFLECTION_WRITE_TOOLS.includes(tool);
+}
 
 const LLM_TIMEOUT_MS = 300000;          // per-attempt cap (300s). Generous on purpose: a slow reasoning model or a self-hosted bridge (e.g. Claude Code CLI on Termux) chewing a ~20k-char prompt can take several minutes. The memory agent runs in the BACKGROUND (post-reply, detached), so a long wait never blocks the chat.
 const LLM_WALLCLOCK_BUDGET_MS = 300000; // total budget (300s) across the (up to 2) attempts of a single round.
@@ -365,8 +394,9 @@ export async function callAgentLLMWithTools({
     executeTool,
     extractOnly = false,
     // Example tool-call line shown in the grace-round correction. Callers with
-    // a restricted roster (reflection is read-only) pass a tool their executor
-    // actually accepts, so a confused model is never steered into a rejection.
+    // a restricted roster (reflection accepts reads plus its three repair tools,
+    // nothing else) pass a tool their executor actually accepts, so a confused
+    // model is never steered into a rejection.
     protocolExample = null,
     signal = null,
 } = {}) {
@@ -494,10 +524,9 @@ export async function callAgentLLMWithTools({
         if (parsed.done) {
 
             if (parsed.calls.length > 0) {
-                // write_fact AND link_facts may ride alongside the final block.
                 // Emission order is preserved so a link_facts line can target a
                 // fact written just above it in the same reply.
-                const writes = parsed.calls.filter(c => c.tool === 'write_fact' || c.tool === 'link_facts');
+                const writes = parsed.calls.filter(c => FINAL_BLOCK_WRITE_TOOLS.includes(c.tool));
                 for (const call of writes) {
                     if (signal?.aborted) break;
                     out.toolCallCount++;
@@ -515,8 +544,28 @@ export async function callAgentLLMWithTools({
                         }
                     } catch (e) { addDebugLog('fail', `write_fact alongside final block threw: ${e?.message || e}`, { subsystem: 'agent3', event: 'toolloop.write_error', data: { agent, round } }); }
                 }
-                if (writes.length < parsed.calls.length) {
-                    entry.note = `${parsed.calls.length - writes.length} read tool call(s) ignored (final block present)`;
+                // Everything else on the final round is thrown away. Split the
+                // two cases: an ignored read is free, a dropped WRITE is a
+                // repair the model believed it had made and nothing downstream
+                // will ever redo it — that has to reach the log as a failure,
+                // not be filed under "reads ignored" the way it used to be.
+                const dropped = parsed.calls.filter(c => !FINAL_BLOCK_WRITE_TOOLS.includes(c.tool));
+                const droppedWrites = dropped.filter(c => isMutatingTool(c.tool));
+                if (dropped.length > 0) {
+                    const parts = [];
+                    if (droppedWrites.length) parts.push(`${droppedWrites.length} write tool call(s) DROPPED`);
+                    if (dropped.length > droppedWrites.length) parts.push(`${dropped.length - droppedWrites.length} read tool call(s) ignored`);
+                    entry.note = `${parts.join(', ')} (final block present)`;
+                }
+                if (droppedWrites.length > 0) {
+                    const names = [...new Set(droppedWrites.map(c => c.tool))].join(', ');
+                    addDebugLog('fail', `[${agent}] ${droppedWrites.length} write tool call(s) (${names}) sent alongside the final block were DROPPED unexecuted — they must be emitted in an earlier reply`, {
+                        subsystem: 'agent3', event: 'toolloop.write_dropped', reason: 'FINAL_BLOCK_WRITE_DROPPED',
+                        data: {
+                            agent, round, tools: names, count: droppedWrites.length,
+                            lines: droppedWrites.slice(0, 5).map(c => String(c.line || '').slice(0, 200)),
+                        },
+                    });
                 }
             }
             out.done = true;

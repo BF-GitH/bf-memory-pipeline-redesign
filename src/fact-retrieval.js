@@ -553,8 +553,15 @@ function collectLinkCandidates(databases, seeds, alreadyFound) {
     const candidates = [];
     const emit = (category, fact, seedId) => {
         if (!fact) return false;
-        if (!isActiveFact(fact)) return false;          
-        if (!isFactVisible(fact)) return false;          
+        if (!isActiveFact(fact)) return false;
+        if (!isFactVisible(fact)) return false;
+        // Cold rows are deliberately demoted (a #CONFLICT loser, a merge loser, a
+        // salience-overflow demotion). Every other selection path into the sheet
+        // — the premise floor, NEED, the sticky recovered set, the recovery
+        // candidates — excludes them; the link walk was the one channel that did
+        // not, so a fact reflection had just ruled wrong could still surface as a
+        // "Connected memory" under a header calling the sheet established truth.
+        if (fact.cold === true) return false;
         const id = `${category}:${fact.key}`;
         if (alreadyFound.has(id) || emitted.has(id)) return false;
         emitted.add(id);

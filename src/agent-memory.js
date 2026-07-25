@@ -9,7 +9,9 @@ import {
     summarizeKeys,
     summarizeMenuIndexed,
     groupedTaxonomyMenu,
+    deriveSubject,
 } from './database.js';
+import { tokenSet } from './tokenize.js';
 import { isFactVisible, buildFactLine, randomWalkExtras } from './fact-retrieval.js';
 import {
     getTurnNowContext, splitInjectionSections, buildPrecedencePreamble,
@@ -18,7 +20,7 @@ import {
 import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
 import { countSentenceEnds } from './sentence-util.js';
 import { executeMemoryTool, stripThinkBlocks } from './memory-tools.js';
-import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline, getLastNeedRefs, setLastNeedRefs } from './turn-state.js';
+import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline, getLastNeedRefs, setLastNeedRefs, getRecoveredRefs, tickRecoveredRefs, markRecoveredRefs } from './turn-state.js';
 import { addDebugLog } from './settings.js';
 import * as host from './host.js';
 
@@ -34,6 +36,66 @@ function currentChatIdSafe() {
 }
 
 const KEY_INVENTORY_CAP = 200;
+// A sheet carries PREMISE_FLOOR_MAX(15) + sticky recovered(<=12) + extras(<=8) +
+// NEED rows, so the old cap of 40 truncated ordinary dense turns. That matters
+// because a TRUNCATED list is exactly where "a ref MISSING from it was never
+// shown" stops being true: the model would be told, falsely, that
+// already-injected facts were fair game, recover them into NEED, grow the sheet
+// and truncate even more. 80 makes truncation rare (worst case ~80 x 30 chars =
+// 2.4 KB); when it still happens the section header says TRUNCATED and the
+// prompt downgrades absence from proof-of-omission to "unknown".
+//
+// NEED_REFS_CAP below closes the feedback loop from the other end: 15 + 12 + 8 +
+// NEED can no longer exceed this cap at all, so truncation now requires a store
+// so large the FLOOR alone overflows it. Kept as two constants because they
+// govern different things — this one bounds what the prompt can READ back out of
+// a sheet, that one bounds what a single NEED line can PUT into one.
+const INJECTED_REFS_CAP = 80;
+
+// NEED is the one UNBOUNDED axis of the sheet. The premise floor is 15, the
+// sticky recovered set is hard-capped at 12 in code (turn-state.js), extras at
+// 8 — NEED is capped only by the prompt's "ONLY refs the NEXT reply will draw
+// on", and round 2 now dangles up to CANDIDATE_FACTS_CAP attractive
+// `Category/key = value` rows in front of the agent every full turn.
+//
+// This is a RUNAWAY GUARD, not a token budget, and the number is DERIVED rather
+// than guessed: INJECTED_REFS_CAP(80) - floor(15) - sticky(12) - extras(8) = 45.
+// That is the point where an oversized NEED stops being merely expensive and
+// starts breaking a DIFFERENT feature: next turn extractPriorSheetRefs reads
+// more refs out of the sheet than the cap admits, `## Injected last turn`
+// renders [TRUNCATED], and the prompt has to downgrade "a ref MISSING from it
+// was never shown" to "absence proves NOTHING" — i.e. a sweeping NEED line
+// silently disables omission recovery. The failure shape that gets there is the
+// re-listing sweep the prompt forbids: the task block shows up to
+// KEY_INVENTORY_CAP(200) stored keys, and nothing in code stopped an agent from
+// copying them onto the line.
+//
+// It is deliberately set far above ordinary use (a dense turn is reasoned to sit
+// in the high teens / low twenties of NEED refs) so it does not shape normal
+// behaviour, and it logs whenever it bites — the run log now carries needRefs so
+// the real distribution becomes observable instead of assumed.
+const NEED_REFS_CAP = 45;
+
+// OMISSION-RECOVERY CANDIDATES — the values half of the backward-facing NEED job.
+// The rest of Call A's prompt is ref-only: summarizeKeys emits `Category/key` and
+// `## Injected last turn` emits refs, so a stored "always wants to go to
+// Portugal" is invisible unless the word happens to sit inside the key. The
+// agent was being asked to notice an omission it could not read. This block puts
+// VALUES in front of it, scoped to the subjects the tentative reply actually
+// names and excluding everything the sheet already carried — i.e. exactly the
+// set an omission can come from.
+//
+// TOKEN MATH (this prompt runs every turn and is USER-message content, so it is
+// NOT prefix-cached — only the system prompt is; see llm-call.js's cache.drift
+// logging): 24 rows x (ref ~30 chars + separator + value <=70) = 2.4 KB worst
+// case, ~1.3 KB typical, i.e. ~600 / ~330 tokens. Against a Call A prompt that
+// already carries up to 200 key-inventory lines (~5 KB), the taxonomy menu
+// (~1.5 KB) and the settled+tentative messages, that is roughly +8% typical.
+// Rendering `## Injected last turn` with values instead would cost MORE (80 rows)
+// and would still not show the omitted fact — by definition it is absent from
+// that list. This is the cheaper and the only correct place to spend it.
+const CANDIDATE_FACTS_CAP = 24;
+const CANDIDATE_VALUE_CHARS = 70;
 
 // Connection-class failure classifier, shared with pipeline.js's timeout
 // auto-retry: transport-level errors (timeout, abort, wall-clock/run budget,
@@ -77,12 +139,14 @@ HARD LIMITS: at most 8 rounds and 24 tool calls per session. LIGHT turn (small t
 
 # FINAL REPLY
 
-Write calls first (bare JSON, one per line), then on a FULL run ONE line:
+Write calls first (bare JSON, one per line), then on a FULL run ONE line, optionally followed by a RECOVERED line:
 
 NEED: Category/key, Category/key, ...
+RECOVERED: Category/key, ...
 
 End your LAST reply with a line that is exactly \`#DONE\` (nothing else on it).
-- NEED: ONLY refs the NEXT reply will draw on (VERIFIED via tools, never invented) — people present and their state, active relationships, open threads THIS scene touches. Do NOT re-list stable premise/identity facts (auto-injected); older facts can be NEEDed later; omit NEED when nothing beyond that is needed. Read tools in the final reply are ignored.
+- NEED: ONLY refs the NEXT reply will draw on (VERIFIED via tools, never invented) — people present and their state, active relationships, open threads THIS scene touches. Do NOT re-list stable premise/identity facts (auto-injected — but see OMISSION RECOVERY); older facts can be NEEDed later; omit NEED when nothing beyond that is needed. Read tools in the final reply are ignored.
+- OMISSION RECOVERY (look BACKWARD too): the TENTATIVE reply tagged \`<- OMISSION CHECK\` is the ONLY one the lists below describe. If it hedged, forgot or contradicted something that IS in the store but was NOT injected, put that ref on the RECOVERED line — it is added to NEED for you and stays injected for a few turns, so do not repeat it on NEED. \`## Injected last turn\` = what the sheet above that reply carried; \`## Store candidates\` = VALUES of nearby stored facts it does NOT cover — read that block before concluding a fumble had no fact behind it, and \`search\` the subject when neither block shows it. That list, not your judgement, decides what counts as auto-injected: a ref ON it is already covered, do NOT re-list it — EXCEPT one tagged \`(recovered)\`, which you MAY re-list while the fumble persists; a ref MISSING from it was never shown, so it is fair game however "stable" it looks. But if its header says UNCERTAIN or TRUNCATED, absence proves NOTHING — then recover only what a candidate row or a \`search\` confirms. Max 3 per turn, and only for a fumble you can POINT AT in that reply — never pre-emptively, never a re-listing sweep.
 - EXTRACT-ONLY runs (task block says so): no NEED line — writes, then \`#DONE\`.
 
 # WHAT TO STORE
@@ -134,6 +198,12 @@ export async function runMemoryAgent({
     userPersona = '',
     profileId = null,
     priorSheetText = '',
+    // Identity of the record priorSheetText came from (snapshot copy, see
+    // pipeline.js) plus the chat index of the newest message this run judges.
+    // Together they let the omission-recovery list be VERIFIED rather than
+    // assumed — see classifyPriorSheet.
+    priorSheet = null,
+    newestJudgedMessageIndex = -1,
     reflection = null,
     observationDate = '',
     runId = '',
@@ -190,14 +260,62 @@ export async function runMemoryAgent({
     // the sheet head and beats are produced by the fixed Call C / Call B
     // passes below. The settings override + extra instructions apply HERE.
     // ===================================================================
-    const extractPrompt = buildExtractionUserPrompt({
-        settledMessages, tentativeMessages, characterInfo, userPersona,
-        observationDate, extractOnly, databases, index, settings,
+    // The sticky recovered set as it stands BEFORE this run touches it — i.e. the
+    // refs that were still being force-injected into the sheet the judged reply
+    // saw. Used to tag them on the injected list (tagged refs are exempt from the
+    // prompt's do-not-re-list rule) and re-added to the sheet at the bottom.
+    let stickyRecovered = [];
+    try { stickyRecovered = getRecoveredRefs(); } catch { stickyRecovered = []; }
+
+    // Backward-facing NEED signal. Built ONCE here rather than inside the prompt
+    // builder so the branch it took can be logged: whether the prior sheet is
+    // provably the one that stood above the reply being judged decides whether
+    // the prompt may speak about it in absolute terms at all.
+    // Normalized the same way pipeline.js normalizes it before slicing the chat,
+    // so classifyPriorSheet judges the value that actually produced the (empty)
+    // tentative array rather than the raw stored one.
+    const rawHoldBack = Number(settings?.bufferHoldBack);
+    const holdBack = Number.isFinite(rawHoldBack) ? Math.min(10, Math.max(0, Math.floor(rawHoldBack))) : 4;
+
+    const injectedSection = extractOnly ? null : buildInjectedRefsSection({
+        priorSheetText, priorSheet, newestJudgedMessageIndex, tentativeMessages, stickyRecovered,
+        bufferHoldBack: holdBack,
     });
 
-    addDebugLog('info', `[${runId}] Extraction agent start: ${settledMessages.length} settled, ${tentativeMessages.length} tentative msg(s), extractOnly=${extractOnly} (user prompt ${extractPrompt.length} chars)`, {
+    const extractPrompt = buildExtractionUserPrompt({
+        settledMessages, tentativeMessages, characterInfo, userPersona,
+        observationDate, extractOnly, databases, index, settings, injectedSection,
+    });
+
+    const injectedLastTurn = injectedSection ? injectedSection.refs.length : 0;
+
+    if (injectedSection && injectedSection.status !== 'VERIFIED') {
+        // Degraded honestly rather than silently: the list is still rendered (a
+        // ref ON it is still evidence it was covered), but its header tells the
+        // agent that ABSENCE from it proves nothing, and the prompt's absolutist
+        // rule is suspended for this turn.
+        addDebugLog('info', `[${runId}] Omission-recovery list degraded to ${injectedSection.status}: ${injectedSection.why}`, {
+            subsystem: 'agent3', event: 'agent3.injected_refs', reason: injectedSection.reason,
+            data: {
+                status: injectedSection.status, why: injectedSection.why, bufferHoldBack: holdBack,
+                refs: injectedSection.refs.length, truncated: injectedSection.truncated,
+                sheetSourceMessageIndex: injectedSection.sheetSourceMessageIndex,
+                newestJudgedMessageIndex: injectedSection.newestJudgedMessageIndex,
+                sheetRunId: injectedSection.sheetRunId,
+            },
+        });
+    }
+
+    addDebugLog('info', `[${runId}] Extraction agent start: ${settledMessages.length} settled, ${tentativeMessages.length} tentative msg(s), extractOnly=${extractOnly}, injected-last-turn=${injectedLastTurn} ref(s) [${injectedSection ? injectedSection.status : 'SKIPPED'}], ${stickyRecovered.length} sticky recovered ref(s) (user prompt ${extractPrompt.length} chars)`, {
         subsystem: 'agent3', event: 'agent3.extract',
-        data: { settled: settledMessages.length, tentative: tentativeMessages.length, extractOnly, userPromptChars: extractPrompt.length, profileId: profileId || null },
+        data: {
+            settled: settledMessages.length, tentative: tentativeMessages.length, extractOnly,
+            userPromptChars: extractPrompt.length, injectedLastTurn,
+            injectedStatus: injectedSection ? injectedSection.status : 'SKIPPED',
+            injectedTruncated: injectedSection ? injectedSection.truncated : false,
+            stickyRecovered: stickyRecovered.length,
+            profileId: profileId || null,
+        },
     });
 
     const extractStart = Date.now();
@@ -284,11 +402,26 @@ export async function runMemoryAgent({
     // none" wins over older drafts). Think blocks are stripped first: a
     // reasoning model's chain-of-thought can draft "NEED:" lines it decided
     // against — the same hazard parseAgentReply strips them for.
+    // RECOVERED travels on the SAME reply as NEED — omission recoveries are a
+    // separate line so the NEED grammar stays unchanged and so the two are
+    // distinguishable: "not on last turn's sheet" describes almost every ordinary
+    // NEED pick, so only an explicit marking can identify a backward-looking
+    // recovery worth making sticky.
     let need = [];
+    let recovered = [];
     if (!loop.error) {
         for (let i = (loop.transcript || []).length - 1; i >= 0; i--) {
             const r = stripThinkBlocks(String(loop.transcript[i]?.reply || ''));
-            if (/^\s*NEED\s*:/im.test(r)) { need = parseNeedRefs(r); break; }
+            if (/^\s*(NEED|RECOVERED)\s*:/im.test(r)) {
+                need = parseRefLine(r, 'NEED');
+                recovered = parseRefLine(r, 'RECOVERED');
+                break;
+            }
+        }
+        // A recovered ref must be injected THIS turn too — the agent is told it
+        // goes onto NEED automatically, so the sheet has to honour that.
+        for (const r of recovered) {
+            if (!need.some(n => n.category.toLowerCase() === r.category.toLowerCase() && n.key.toLowerCase() === r.key.toLowerCase())) need.push(r);
         }
     } else {
         // Isolated Call A failure: fall back to the last successful selection —
@@ -400,6 +533,28 @@ export async function runMemoryAgent({
             // empty one) so an isolated Call A failure next run re-renders these
             // rows — behind the same chat-switch guard as the scene writes.
             if (!loop.error) { try { setLastNeedRefs(need); } catch {  } }
+            // Sticky recovery bookkeeping, behind the same chat-switch guard so a
+            // recovery can never be stamped into another chat's metadata. Tick
+            // FIRST (age last turn's set), then mark (this turn's recoveries get
+            // the full TTL, refreshing any that repeated). Skipped on a Call A
+            // error: nothing was judged, so nothing should age.
+            if (!loop.error) {
+                try {
+                    const expired = tickRecoveredRefs();
+                    const marked = markRecoveredRefs(recovered);
+                    stickyRecovered = getRecoveredRefs();
+                    if (marked > 0 || expired > 0) {
+                        addDebugLog('info', `[${runId}] Omission recovery: ${marked} ref(s) marked sticky, ${expired} expired, ${stickyRecovered.length} still held`, {
+                            subsystem: 'agent3', event: 'agent3.recovered_refs',
+                            data: { marked, expired, held: stickyRecovered.length, refs: stickyRecovered.map(r => `${r.category}/${r.key}`) },
+                        });
+                    }
+                } catch (e) {
+                    addDebugLog('fail', `[${runId}] Sticky recovered-ref bookkeeping failed (non-fatal): ${e?.message || e}`, {
+                        subsystem: 'agent3', event: 'agent3.recovered_refs', reason: 'ERROR',
+                    });
+                }
+            }
         } catch (e) {
             addDebugLog('fail', `[${runId}] Scene accumulator failed: ${e?.message || e}`);
         }
@@ -413,8 +568,10 @@ export async function runMemoryAgent({
         summary,
         timeline: (head && head.timeline) || getSceneTimeline(),
         need,
+        recovered: stickyRecovered,
         settings,
         databases,
+        runId,
     });
 
     addDebugLog('pass', `[${runId}] Memory Agent done: ${ctx.applied.length} write(s), ${loop.rounds} round(s), ${loop.toolCallCount} tool call(s), ${beats.length} beat(s), sheet ${result.sheetText.length} chars${result.extractionError ? ' (extraction FAILED — sheet refreshed, watermark held)' : ''}`, {
@@ -423,6 +580,11 @@ export async function runMemoryAgent({
             agent: 'memory-agent', profileId: profileId || null, success: true, extractOnly,
             applied: ctx.applied.length, rounds: loop.rounds, toolCallCount: loop.toolCallCount,
             beats: beats.length, sheetChars: result.sheetText.length,
+            // Sheet SIZE was already recorded (here and on every injection), but
+            // nothing recorded how many refs produced it — which is why
+            // NEED_REFS_CAP had to be derived rather than fitted to data. These
+            // two make the real distribution observable.
+            needRefs: need.length, stickyRefs: stickyRecovered.length,
             extractionError: result.extractionError || null, headError: headRes.error || null, beatsError: beatsRes.error || null,
             tokensIn: result.tokensIn, tokensOut: result.tokensOut,
         },
@@ -443,12 +605,18 @@ function capLines(text, max, footer) {
     return lines.slice(0, max).join('\n') + `\n... (+${lines.length - max} more — ${footer})`;
 }
 
-// Call A user prompt: store overview + tools context + the messages. NO prior
-// memory sheet, NO SUMMARY/BEAT/TIMELINE framing — the extraction agent only
-// writes facts and picks NEED; the sheet head/beats are separate fixed passes.
+// Call A user prompt: store overview + tools context + the messages, plus the
+// backward-facing pair — the flat ref list of what LAST turn's sheet actually
+// injected, and the VALUES of the stored facts it did not cover. NO sheet PROSE
+// and no SUMMARY/BEAT/TIMELINE framing — the extraction agent only writes facts
+// and picks NEED; the sheet head/beats are separate fixed passes. Those two
+// blocks are the backward half of the selection job: without the ref list the
+// agent cannot tell an omission (fact in store, never injected, reply fumbled
+// it) from a fact the reply simply chose not to use, and without the values it
+// cannot tell what the fumble should have said.
 function buildExtractionUserPrompt({
     settledMessages, tentativeMessages, characterInfo, userPersona,
-    observationDate, extractOnly, databases, index, settings,
+    observationDate, extractOnly, databases, index, settings, injectedSection,
 }) {
     const parts = [];
 
@@ -478,8 +646,40 @@ function buildExtractionUserPrompt({
         parts.push('## SETTLED messages\n(none this run — do NOT call write_fact; just pick NEED from the store and the tentative context)');
     }
 
+    // The injected-refs list describes ONE turn, but tentativeMessages carries
+    // bufferHoldBack replies (default 4, up to 10) — only the NEWEST of them was
+    // generated under the sheet that list came from. Tagging that one message is
+    // what makes "the TENTATIVE reply" unambiguous; without it an omission
+    // attributed to an older tentative reply is judged against the wrong list.
     if (Array.isArray(tentativeMessages) && tentativeMessages.length > 0) {
-        parts.push(`## TENTATIVE — do not store facts from these (NEED planning context only):\n${tentativeMessages.map(renderMessageLine).join('\n\n')}`);
+        const rendered = tentativeMessages.map(renderMessageLine);
+        rendered[rendered.length - 1] += '\n<- OMISSION CHECK (only THIS reply ran under the sheet described below)';
+        parts.push(`## TENTATIVE — do not store facts from these (NEED planning context only):\n${rendered.join('\n\n')}`);
+    }
+
+    // Backward-facing half of the NEED job — placed right after the TENTATIVE
+    // reply the agent must diff it against; adjacency is what makes the check
+    // happen. Skipped on EXTRACT-ONLY runs (no NEED line is produced, and
+    // catch-up import fires hundreds of them), which is why the caller passes
+    // null. The refs are parsed back out of the PRIOR sheet rather than read from
+    // getLastNeedRefs() on purpose: the sheet is the only record that INCLUDES
+    // the premise-floor rows and the random-walk extras, and that EXCLUDES NEEDed
+    // refs composeSheet dropped as inactive/invisible — i.e. the only record of
+    // what the storyteller actually saw. It also survives a prior-turn Call A
+    // error, which getLastNeedRefs() does not (that write is skipped on error).
+    // An empty list is stated explicitly; silence would read as "everything was
+    // injected".
+    if (injectedSection) {
+        parts.push(`${injectedSection.header}\n${injectedSection.body}`);
+        // The values block sits immediately after the ref list it complements:
+        // the list says what WAS shown, this says what the same subjects have in
+        // the store that was NOT. Omitted entirely when it would be empty.
+        const candidates = buildRecoveryCandidates({
+            tentativeMessages, databases, injectedRefs: injectedSection.refs,
+        });
+        if (candidates.length > 0) {
+            parts.push(`## Store candidates (stored facts the list above does NOT cover, about who/what the OMISSION CHECK reply names — then, with whatever room is left, who/what the tentative replies just before it name, since a hedge often withholds the subject the reply BEFORE it introduced. VALUES shown; this is evidence for spotting an omission, not a NEED list)\n${candidates.join('\n')}`);
+        }
     }
 
     const extra = String(settings?.memoryPrompt || '').trim();
@@ -497,12 +697,14 @@ function buildExtractionUserPrompt({
     }
 }
 
-// NEED refs travel on Call A's final reply as a "NEED: Category/key, ..." line.
-// Same ref grammar parseSheetBlock uses; tolerant of "none" and bullet prefixes.
-function parseNeedRefs(text) {
+// NEED refs travel on Call A's final reply as a "NEED: Category/key, ..." line,
+// omission recoveries on an identical "RECOVERED: ..." line. Same ref grammar
+// parseSheetBlock uses; tolerant of "none" and bullet prefixes.
+function parseRefLine(text, header) {
+    const re = new RegExp(`^\\s*${header}\\s*:\\s*(.*)$`, 'i');
     const need = [];
     for (const rawLine of String(text || '').split('\n')) {
-        const m = /^\s*NEED\s*:\s*(.*)$/i.exec(rawLine.trim());
+        const m = re.exec(rawLine.trim());
         if (!m) continue;
         for (const ref of m[1].split(',')) {
             const r = ref.trim().replace(/^[-*]\s*/, '');
@@ -515,6 +717,285 @@ function parseNeedRefs(text) {
         }
     }
     return need;
+}
+
+// Every fact row a sheet renders comes from buildFactLine, whose three shapes all
+// start `[knownBy] Category/key` and then diverge into `: note`, ` = value` or a
+// bare recency tail — so one anchored regex recovers the exact ref set, floor and
+// extras included, without composeSheet having to hand anything back.
+//
+// The grammar matches what the tokenizer and the category system ACTUALLY
+// produce, which is wider than ASCII on both sides:
+//   - keys come from keyToken (tokenize.js), `[^\p{L}\p{N}_]` stripped — so any
+//     Unicode letter or digit is legal. `[A-Za-z0-9_]+` used to capture
+//     'müller_job' as 'm', emitting the phantom ref People/m while the real ref
+//     went missing and got re-NEEDed every turn. German/Japanese/Russian
+//     roleplays hit this on essentially every fact.
+//   - categories come from effectiveCategories() = L1_CATEGORIES + overlay
+//     categories, and overlayCategories() applies NO character sanitization
+//     beyond a trim — 'Ship Logs' and 'Faction2' are legal, so a single-word
+//     ASCII class never matched a custom category at all.
+// The category capture is therefore lazy and unrestricted, terminated by the
+// FIRST `/` that is followed by a key and a real terminator (end, whitespace,
+// `:`, `=` or the recency `(`). Categories never contain `/`, so the first such
+// pair is always the ref; a slash later in a note or value cannot win. The
+// sheet's other bracketed lines (header, precedence preamble) end at the `]`
+// with nothing after it and so still never match. Deduped, order kept.
+const SHEET_REF_RE = /^\[[^\]]*\]\s+(.+?)\/([\p{L}\p{N}_]+)(?=$|[\s:=(])/u;
+
+function extractPriorSheetRefs(priorSheetText) {
+    const out = [];
+    const seen = new Set();
+    for (const line of String(priorSheetText || '').split('\n')) {
+        const m = SHEET_REF_RE.exec(line.trim());
+        if (!m) continue;
+        const category = m[1].trim();
+        if (!category) continue;
+        const ref = `${category}/${m[2]}`;
+        if (seen.has(ref)) continue;
+        seen.add(ref);
+        out.push(ref);
+    }
+    return out;
+}
+
+// Is the sheet priorSheetText came from PROVABLY the one that stood above the
+// reply this run is judging? The pipeline reads the sheet before it writes the
+// new one, so in the steady state it is — but the pipeline also runs BEHIND the
+// chat (coalesced retries, a multi-minute tool loop, the whole computeCatchupLag
+// machinery), and then a run can commit sheet S_k AFTER the user already
+// generated the reply under S_(k-1). Asserting the identity instead of checking
+// it inverts the whole feature: the prompt says "THAT LIST — not your judgement —
+// decides", so a fact genuinely omitted from S_(k-1) that happens to appear in
+// S_k becomes explicitly FORBIDDEN from being recovered, in exactly the lagging
+// chats the feature was built for.
+//
+// The check: a sheet can only have stood above message J if it was composed when
+// J did not yet exist, i.e. sourceMessageIndex < J. In the steady state the gap
+// is 2 (one user message + one reply since the last run). The lag case collapses
+// it to <= 0, because setMemorySheet stamps chat.length-1 AT COMMIT TIME, which
+// by then already includes the reply being judged.
+//
+// Necessary, not sufficient: a run that commits INSIDE the generation window of
+// reply J (after injection, before the reply lands) still stamps J-1 and passes.
+// Distinguishing that would need the injection timestamp, which does not travel
+// with the record. So VERIFIED means "not provably stale", and the prompt never
+// claims more than the header says.
+function classifyPriorSheet({ priorSheet, newestJudgedMessageIndex, hasTentative, bufferHoldBack = null }) {
+    if (!priorSheet || priorSheet.seeded === true) {
+        return { status: 'SEED', why: 'no composed sheet has ever existed in this chat' };
+    }
+    if (!hasTentative) {
+        // bufferHoldBack = 0 makes this PERMANENT rather than a one-run gap:
+        // pipeline.js starts its tentative scan at maxIdx + 1 = chat.length, so
+        // the array is always empty, no reply is ever tagged `<- OMISSION CHECK`
+        // and omission recovery never runs in any chat. The setting is reachable
+        // from the slider (settings.js clamps to [0,10]), and the generic wording
+        // — "this run" — reads as transient, which is how a permanently disabled
+        // feature stayed invisible. Say which it is; the caller logs `why`.
+        return bufferHoldBack === 0
+            ? {
+                status: 'NO_TARGET', reason: 'NO_TARGET_HOLDBACK_0',
+                why: 'buffer hold-back is 0, so no reply is ever held tentative — OMISSION RECOVERY IS OFF for every run in every chat until the setting is raised (1+ holds the newest reply back for checking)',
+            }
+            : { status: 'NO_TARGET', why: 'no tentative reply this run — nothing was generated under this sheet to check' };
+    }
+    const src = Number.isInteger(priorSheet.sourceMessageIndex) ? priorSheet.sourceMessageIndex : -1;
+    const judged = Number.isInteger(newestJudgedMessageIndex) ? newestJudgedMessageIndex : -1;
+    if (src < 0 || judged < 0) {
+        return { status: 'UNVERIFIABLE', why: `sheet source index ${src} / judged index ${judged} — origin unknown` };
+    }
+    if (src >= judged) {
+        return { status: 'MISMATCH', why: `sheet was committed at message #${src}, which is not before the judged reply #${judged} — the reply ran under an OLDER sheet (pipeline lag)` };
+    }
+    return { status: 'VERIFIED', why: `sheet committed at message #${src}, judged reply #${judged}` };
+}
+
+// Renders the "## Injected last turn" section: header (which states exactly how
+// much authority the list has), body, and the parsed refs for reuse by the
+// candidates block. Degradation is in the HEADER rather than in omitting the
+// section, because a ref that IS on the list remains useful evidence that it was
+// covered even when the sheet's identity is uncertain — it is only the reverse
+// direction ("missing, therefore never shown") that stops being sound.
+function buildInjectedRefsSection({ priorSheetText, priorSheet, newestJudgedMessageIndex, tentativeMessages, stickyRecovered = [], bufferHoldBack = null }) {
+    const refs = extractPriorSheetRefs(priorSheetText);
+    const hasTentative = Array.isArray(tentativeMessages) && tentativeMessages.length > 0;
+    const { status, reason, why } = classifyPriorSheet({ priorSheet, newestJudgedMessageIndex, hasTentative, bufferHoldBack });
+    const truncated = refs.length > INJECTED_REFS_CAP;
+
+    // Sticky recoveries are tagged in place: they ARE on the list (they were
+    // force-injected), but the prompt exempts a tagged ref from the do-not-
+    // re-list rule so a fumble that keeps recurring can keep its fact.
+    const sticky = new Set((Array.isArray(stickyRecovered) ? stickyRecovered : [])
+        .map(r => `${String(r?.category || '').toLowerCase()}/${String(r?.key || '').toLowerCase()}`));
+    const rendered = refs.map(ref => sticky.has(ref.toLowerCase()) ? `${ref} (recovered)` : ref);
+
+    let header;
+    switch (status) {
+        case 'SEED':
+            header = '## Injected last turn — NONE YET (no sheet had been built in this chat, so omission recovery does not apply this turn)';
+            break;
+        case 'NO_TARGET':
+            header = '## Injected last turn — NO OMISSION CHECK TARGET this run (no tentative reply ran under this sheet); listed for context only';
+            break;
+        case 'MISMATCH':
+            header = '## Injected last turn — UNCERTAIN (this sheet was rebuilt at or after the OMISSION CHECK reply, so it is NOT the sheet that stood above it; a ref MISSING below proves NOTHING)';
+            break;
+        case 'UNVERIFIABLE':
+            header = '## Injected last turn — UNCERTAIN (this sheet\'s origin could not be confirmed against the OMISSION CHECK reply; a ref MISSING below proves NOTHING)';
+            break;
+        default:
+            // FINDING A: the old header pointed at "the sheet above the reply" as
+            // if it were in this prompt. It is not — buildExtractionUserPrompt
+            // deliberately carries no sheet prose. Say so.
+            header = '## Injected last turn (every memory the sheet above the OMISSION CHECK reply carried — that sheet\'s prose is NOT in this prompt, only its fact refs)';
+            break;
+    }
+    if (truncated) header += ' [TRUNCATED]';
+
+    const body = rendered.length > 0
+        ? capLines(rendered.join('\n'), INJECTED_REFS_CAP, 'sheet was longer — the rest is UNKNOWN, not omitted')
+        : '(nothing)';
+
+    return {
+        // `reason` refines `status` for the log only — the header switch above and
+        // the prompt both key off `status`, which stays a closed set.
+        status, reason: reason || status, why, refs, truncated, header, body,
+        sheetSourceMessageIndex: Number.isInteger(priorSheet?.sourceMessageIndex) ? priorSheet.sourceMessageIndex : -1,
+        newestJudgedMessageIndex: Number.isInteger(newestJudgedMessageIndex) ? newestJudgedMessageIndex : -1,
+        sheetRunId: String(priorSheet?.runId || ''),
+    };
+}
+
+function clipText(s, max) {
+    const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+    return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+// The values block. Candidates are stored facts that (a) are about a subject the
+// tentative window actually names and (b) were NOT on the injected list —
+// which is precisely the set an omission can be drawn from. Anything the sheet
+// already carried is excluded: showing it again would only spend tokens telling
+// the agent what it can already read on the list above.
+//
+// SCOPE — two TIERS, not one haystack. The OMISSION CHECK reply (the newest
+// tentative message, the only one the injected list describes) governs: its
+// subjects fill the cap first. The older tentative replies are a FALLBACK tier
+// that only spends slots the target reply left over, because a fumble's SUBJECT
+// is frequently named a reply or two earlier — "she just shrugged when he asked
+// where she'd go" names nobody, and the reply before it named Monika. Scoping
+// strictly to the tagged reply (F10's fix, applied literally) would lose exactly
+// that case, which is the common shape of a hedge.
+//
+// A flat haystack over all tentative messages is NOT equivalent to the fallback
+// tier, which is why the previous scoping was wrong rather than merely loosely
+// described: selection is round-robin ACROSS subjects, so at bufferHoldBack = 10
+// the nine replies the injected list does not describe contribute nine replies'
+// worth of subjects, and the target reply's own facts get pushed down to one row
+// each. Tiering keeps the recall of the wide window with the ranking of the
+// narrow one.
+//
+// Subject scoping is what keeps this affordable. deriveSubject() is the same
+// grouping key the store itself uses, and tokenSet() is the same Unicode-aware
+// tokenizer the retrieval path uses — so a German/Japanese subject matches as
+// readily as an ASCII one. The speaker NAME is folded into the haystack because
+// a character's own reply usually mentions everyone EXCEPT the speaker, and the
+// speaker is the likeliest subject of a fumble about themselves.
+//
+// Selection is round-robin ACROSS subjects rather than a flat importance sort:
+// with several characters on stage a flat sort lets the best-documented one eat
+// the whole cap, and the omission is as likely to be about the quiet one. Within
+// a subject, importance then recency — the load-bearing facts first.
+function buildRecoveryCandidates({ tentativeMessages, databases, injectedRefs = [] }) {
+    try {
+        const msgs = Array.isArray(tentativeMessages) ? tentativeMessages : [];
+        if (msgs.length === 0) return [];
+        const textOf = (m) => `${String(m?.name || '')} ${String(m?.text || '')}`;
+        // The LAST tentative message is the one buildExtractionUserPrompt tags
+        // `<- OMISSION CHECK`; keep the two in step.
+        const spokenTarget = tokenSet(textOf(msgs[msgs.length - 1]), { min: 2 });
+        const spokenNearby = tokenSet(msgs.slice(0, -1).map(textOf).join(' '), { min: 2 });
+        if (spokenTarget.size === 0 && spokenNearby.size === 0) return [];
+
+        const injected = new Set((Array.isArray(injectedRefs) ? injectedRefs : []).map(r => String(r).toLowerCase()));
+        const bySubject = new Map();
+
+        for (const [rawCat, db] of Object.entries(databases || {})) {
+            if (!db || !Array.isArray(db.facts)) continue;
+            const category = mapLegacyCategory(String(rawCat || '').trim() || 'Unsorted');
+            for (const fact of db.facts) {
+                if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
+                // Cold-tiered facts are demoted on purpose — reflection or a
+                // #CONFLICT verdict put them there. Offering them as recovery
+                // candidates would hand the agent a route to re-promote them.
+                if (fact.cold === true) continue;
+                const value = String(fact.value ?? '').trim();
+                const note = (typeof fact.context === 'string') ? fact.context.trim() : '';
+                if (!value && !note) continue;
+                if (injected.has(`${category}/${fact.key}`.toLowerCase())) continue;
+                const subject = String(deriveSubject(fact) ?? '').trim();
+                if (!subject) continue;
+                // Tier 0 = named in the OMISSION CHECK reply, tier 1 = named only
+                // in an earlier tentative reply. Scan every token before settling:
+                // a target hit anywhere outranks a nearby hit.
+                let tier = -1;
+                for (const t of tokenSet(subject, { min: 2 })) {
+                    if (spokenTarget.has(t)) { tier = 0; break; }
+                    if (tier < 0 && spokenNearby.has(t)) tier = 1;
+                }
+                if (tier < 0) continue;
+                const bucket = subject.toLowerCase();
+                let entry = bySubject.get(bucket);
+                if (!entry) { entry = { tier, list: [] }; bySubject.set(bucket, entry); }
+                // deriveSubject can group two facts under one subject via
+                // different tokens; the better tier wins for the whole bucket.
+                else if (tier < entry.tier) entry.tier = tier;
+                // Value wins over note here, deliberately diverging from
+                // buildFactLine (which shows the note INSTEAD of the value): the
+                // atomic value is the thing a hedging reply failed to say, and it
+                // is what makes "Portugal" appear in this prompt at all.
+                entry.list.push({
+                    fact, category,
+                    line: value
+                        ? `${category}/${fact.key} = ${clipText(value, CANDIDATE_VALUE_CHARS)}`
+                        : `${category}/${fact.key}: ${clipText(note, CANDIDATE_VALUE_CHARS)}`,
+                });
+            }
+        }
+        if (bySubject.size === 0) return [];
+
+        for (const entry of bySubject.values()) {
+            entry.list.sort((a, b) => {
+                const impDiff = clampImportance(b.fact.importance) - clampImportance(a.fact.importance);
+                if (impDiff !== 0) return impDiff;
+                return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
+            });
+        }
+
+        // Tier 0 exhausts its round-robin before tier 1 gets a slot, so the
+        // fallback window can only ever use headroom the check reply left.
+        const out = [];
+        for (const tier of [0, 1]) {
+            const buckets = [...bySubject.values()].filter(e => e.tier === tier).map(e => e.list);
+            if (buckets.length === 0) continue;
+            for (let depth = 0; out.length < CANDIDATE_FACTS_CAP; depth++) {
+                let placedAny = false;
+                for (const list of buckets) {
+                    if (depth >= list.length) continue;
+                    out.push(list[depth].line);
+                    placedAny = true;
+                    if (out.length >= CANDIDATE_FACTS_CAP) break;
+                }
+                if (!placedAny) break;
+            }
+            if (out.length >= CANDIDATE_FACTS_CAP) break;
+        }
+        return out;
+    } catch {
+        // Evidence is an optimisation, never a precondition — a broken store
+        // shape must not cost the run its extraction.
+        return [];
+    }
 }
 
 // Prior summary fallback for a failed Call C: the previous sheet renders the
@@ -893,7 +1374,7 @@ function clampNum(v, min, max, dflt) {
     return Math.min(max, Math.max(min, n));
 }
 
-function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], settings = {}, databases = {} } = {}) {
+function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], recovered = [], settings = {}, databases = {}, runId = '' } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
 
@@ -932,20 +1413,97 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         }
     } catch {  }
 
-    for (const ref of (Array.isArray(need) ? need : [])) {
-        try {
-            const category = mapLegacyCategory(String(ref?.category || '').trim() || 'Unsorted');
-            const key = String(ref?.key || '').trim();
-            if (!key) continue;
-            const db = databases[category];
-            if (!db) continue;
-            const fact = findFactMatch(db, key);
-            if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue; 
-            const id = `${category}:${fact.key}`;
-            if (seen.has(id)) continue;
-            seen.add(id);
-            rows.push({ fact, category, tier: 'primary' });
-        } catch {  }
+    // NEED rows, then the STICKY RECOVERED rows. Recovered refs are re-added for
+    // RECOVERED_REF_TTL_TURNS turns whether or not this turn's NEED picked them
+    // up again: a ref recovered because a reply fumbled it used to survive
+    // exactly one turn, after which the prompt's "already on the injected list,
+    // do NOT re-list it" rule dropped it and the identical fumble could recur.
+    // Resolution and de-dup run through the same `seen` set as the floor, so a
+    // ref that is both costs one row.
+    //
+    // COLD is checked here alongside active/visible, and it is the check that
+    // does the work: `active === false` is a tombstone almost nothing sets, while
+    // cold-tiering is the one demotion this codebase actually performs (a
+    // #CONFLICT loser, a merge loser, a salience-overflow demotion). Without it a
+    // sticky recovered ref OUTLIVES the demotion by up to RECOVERED_REF_TTL_TURNS
+    // turns: the sheet keeps rendering the losing value under a header that calls
+    // it "established truth for this scene", directly beside the record that beat
+    // it. Same rule the premise floor above and buildRecoveryCandidates already
+    // apply.
+    //
+    // Cold refs are SKIPPED each turn, not evicted from the sticky set, because
+    // cold is reversible: uncoldFact fires when a fact is updated or re-mentioned
+    // (database.js) and coldTierOverflow reactivates one that rises back into the
+    // hot set. A ref that goes cold and hot again inside its TTL therefore
+    // resumes being injected, which is the outcome the fumble wanted. Eviction
+    // would make a transient demotion permanent, and would need a new mutator in
+    // turn-state.js; a skipped entry is inert, holds one of the twelve sticky
+    // slots and expires on its own tick.
+    let coldSkipped = 0;
+    const resolveRefs = (refs) => {
+        const out = [];
+        for (const ref of (Array.isArray(refs) ? refs : [])) {
+            try {
+                const category = mapLegacyCategory(String(ref?.category || '').trim() || 'Unsorted');
+                const key = String(ref?.key || '').trim();
+                if (!key) continue;
+                const db = databases[category];
+                if (!db) continue;
+                const fact = findFactMatch(db, key);
+                if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
+                if (fact.cold === true) { coldSkipped++; continue; }
+                const id = `${category}:${fact.key}`;
+                // Claimed in `seen` at RESOLVE time so a duplicate ref, or one the
+                // premise floor already carries, cannot consume a NEED cap slot.
+                if (seen.has(id)) continue;
+                seen.add(id);
+                out.push({ fact, category });
+            } catch {  }
+        }
+        return out;
+    };
+
+    let needRows = resolveRefs(need);
+    const stickyRows = resolveRefs(recovered);
+
+    let needDropped = 0;
+    if (needRows.length > NEED_REFS_CAP) {
+        // Degrade by dropping the LEAST load-bearing rows, never by truncating
+        // the line at an arbitrary point: rank a COPY by the comparator the
+        // premise floor uses (importance, then last sighting), keep the top
+        // NEED_REFS_CAP, and emit the survivors in the agent's ORIGINAL order so
+        // row order is untouched in every case where the cap does not bite. The
+        // sticky set is capped in turn-state.js and is never trimmed here — it is
+        // the deliberately-chosen backward-looking pick, not the sweep.
+        // A dropped row keeps its claim on `seen`, so the random-walk extras
+        // below cannot quietly re-admit a row the cap just decided to shed.
+        const keep = new Set([...needRows]
+            .sort((a, b) => {
+                const impDiff = clampImportance(b.fact.importance) - clampImportance(a.fact.importance);
+                if (impDiff !== 0) return impDiff;
+                return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
+            })
+            .slice(0, NEED_REFS_CAP));
+        needDropped = needRows.length - keep.size;
+        needRows = needRows.filter(r => keep.has(r));
+    }
+
+    for (const { fact, category } of [...needRows, ...stickyRows]) {
+        rows.push({ fact, category, tier: 'primary' });
+    }
+
+    const logTag = runId ? `[${runId}] ` : '';
+    if (coldSkipped > 0) {
+        addDebugLog('info', `${logTag}Sheet: ${coldSkipped} NEED/recovered ref(s) skipped — cold-tiered since they were selected`, {
+            subsystem: 'agent3', event: 'sheet.refs_skipped', reason: 'COLD_TIERED',
+            data: { skipped: coldSkipped },
+        });
+    }
+    if (needDropped > 0) {
+        addDebugLog('info', `${logTag}Sheet: NEED cap hit — ${needRows.length + needDropped} resolvable ref(s), kept the ${needRows.length} most load-bearing, dropped ${needDropped}`, {
+            subsystem: 'agent3', event: 'sheet.need_capped', reason: 'NEED_CAP',
+            data: { resolved: needRows.length + needDropped, kept: needRows.length, dropped: needDropped, cap: NEED_REFS_CAP },
+        });
     }
 
     const extrasMax = Math.floor(clampNum(settings?.graphExtrasCount ?? 3, 0, 8, 3));

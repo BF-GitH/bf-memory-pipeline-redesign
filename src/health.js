@@ -7,7 +7,7 @@
 import { getSettings, getMemorySheet, getStorySpine, getCurrentScene } from './settings.js';
 import { getDebugLogEntries } from './debug-log.js';
 import { getContext } from './ui-util.js';
-import { KNOWN_TOOLS as MEMORY_AGENT_TOOLS, REFLECTION_READ_TOOLS } from './memory-tools.js';
+import { KNOWN_TOOLS as MEMORY_AGENT_TOOLS, REFLECTION_TOOLS } from './memory-tools.js';
 
 // Matches BEAT_MAX_CHARS in agent-memory.js — a beat past this slipped through
 // the brevity enforcement (or predates it) and bloats every injected sheet.
@@ -22,7 +22,8 @@ const healthEvents = {};
 // agentTag is 'memory' or 'reflection'. Recorded from the tool-loop choke point
 // in llm-call.js AFTER the executor returns success, so only tool calls that
 // actually EXECUTED are counted — parse attempts, malformed calls, rejected
-// calls (reflection's read-only gate) and failed calls never show up here.
+// calls (reflection's read-before-write gate and per-pass write cap) and failed
+// calls never show up here.
 const toolUsage = {};
 
 // Bumped on every clearHealthEvents (CHAT_CHANGED). A tool loop still in
@@ -357,10 +358,15 @@ export async function buildHealthReport() {
     for (const tool of [...MEMORY_AGENT_TOOLS, ...memoryExtras]) steps.push(toolRow('memory', tool));
 
     steps.push({ id: 'tools_reflection', label: 'Reflection tools', header: true });
-    // Reflection's fixed read-only roster first (stable order), then any extras
-    // recorded under the tag that are not in the constant (future-proofing).
-    const reflectionExtras = Object.keys(toolUsage['reflection'] || {}).filter(t => !REFLECTION_READ_TOOLS.includes(t));
-    for (const tool of [...REFLECTION_READ_TOOLS, ...reflectionExtras]) steps.push(toolRow('reflection', tool));
+    // Reflection's FULL roster — reads AND repairs (REFLECTION_TOOLS, not the
+    // read subset). Rostering only the reads meant write_fact/merge_facts/
+    // mark_cold appeared solely as "extras" AFTER their first successful call,
+    // so the tab could never show "repair tools offered, never used" — which is
+    // exactly the row you look at to diagnose a reflection that reads and reads
+    // and never fixes anything. Extras after the roster (stable order) still
+    // catch anything recorded under the tag that is not in the constant.
+    const reflectionExtras = Object.keys(toolUsage['reflection'] || {}).filter(t => !REFLECTION_TOOLS.includes(t));
+    for (const tool of [...REFLECTION_TOOLS, ...reflectionExtras]) steps.push(toolRow('reflection', tool));
 
     return steps;
 }

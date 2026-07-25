@@ -568,6 +568,54 @@ function normalizeScene(raw) {
 // very long roleplay can't grow the chat file without bound.
 const MAX_CLOSED_SCENES = 50;
 
+// STICKY RECOVERED REFS. A ref the extraction agent recovers via OMISSION
+// RECOVERY (fact IS in the store, was ABSENT from the sheet the fumbled reply
+// saw) used to survive exactly ONE turn: the next turn it appeared on the
+// "## Injected last turn" list, and the prompt's "a ref ON it is already
+// covered, do NOT re-list it" rule dropped it straight back out — so the
+// identical fumble could recur immediately. A recovered ref therefore carries a
+// TTL in turns and composeSheet re-injects it until the TTL runs out.
+//
+// K = 4 turns. It mirrors bufferHoldBack's default (4): that is how many replies
+// stay TENTATIVE, i.e. how long the SAME fumbled exchange keeps being re-judged
+// by the extraction agent — so the ref stays on the sheet for the whole span in
+// which the agent can still see whether the storyteller actually used it. Four
+// turns is also ~8 messages: long enough for a hedged topic to come back up,
+// short enough that a mistaken recovery costs a handful of rows and then expires
+// on its own without anyone having to undo it.
+const RECOVERED_REF_TTL_TURNS = 4;
+// The prompt allows at most 3 recoveries per turn; enforced here too, because
+// prompt compliance is never a guarantee. TTL x per-turn is therefore a HARD
+// ceiling on the sticky set — it cannot grow without bound. The set lives in the
+// scene store, i.e. in chatMetadata, so it is chat-scoped: reloadSceneFromChat
+// swaps it out on CHAT_CHANGED and it can never leak into a different chat.
+const RECOVERED_REFS_PER_TURN = 3;
+const RECOVERED_REFS_MAX = RECOVERED_REF_TTL_TURNS * RECOVERED_REFS_PER_TURN;
+
+function normalizeRecoveredRefs(raw) {
+    const out = [];
+    const seen = new Set();
+    for (const r of (Array.isArray(raw) ? raw : [])) {
+        const category = typeof r?.category === 'string' ? r.category.trim() : '';
+        const key = typeof r?.key === 'string' ? r.key.trim() : '';
+        if (!category || !key) continue;
+        const id = `${category.toLowerCase()}/${key.toLowerCase()}`;
+        if (seen.has(id)) continue;
+        const ttl0 = Math.floor(Number(r?.ttl));
+        // A persisted entry with a junk/absent ttl is treated as its LAST turn
+        // rather than a fresh one — a corrupt record must expire, not stick.
+        const ttl = Number.isInteger(ttl0) ? Math.min(RECOVERED_REF_TTL_TURNS, Math.max(1, ttl0)) : 1;
+        seen.add(id);
+        out.push({ category, key, ttl });
+        if (out.length >= RECOVERED_REFS_MAX) break;
+    }
+    return out;
+}
+
+function emptySceneStore() {
+    return { current: null, closed: [], timeline: '', needRefs: [], recoveredRefs: [] };
+}
+
 function normalizeSceneStore(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const current = normalizeScene(raw.current);
@@ -588,8 +636,9 @@ function normalizeSceneStore(raw) {
             if (category && key) needRefs.push({ category, key });
         }
     }
-    if (!current && closed.length === 0 && !timeline && needRefs.length === 0) return null;
-    return { current: current || null, closed, timeline, needRefs };
+    const recoveredRefs = normalizeRecoveredRefs(raw.recoveredRefs);
+    if (!current && closed.length === 0 && !timeline && needRefs.length === 0 && recoveredRefs.length === 0) return null;
+    return { current: current || null, closed, timeline, needRefs, recoveredRefs };
 }
 
 function loadSceneFromMeta() {
@@ -612,10 +661,10 @@ function saveSceneToMeta() {
 
 function getSceneStore() {
     if (!sceneStoreLoaded) {
-        sceneStore = loadSceneFromMeta() || { current: null, closed: [], timeline: '', needRefs: [] };
+        sceneStore = loadSceneFromMeta() || emptySceneStore();
         sceneStoreLoaded = true;
     }
-    return (sceneStore && typeof sceneStore === 'object') ? sceneStore : { current: null, closed: [], timeline: '', needRefs: [] };
+    return (sceneStore && typeof sceneStore === 'object') ? sceneStore : emptySceneStore();
 }
 
 export function getCurrentScene() {
@@ -754,13 +803,13 @@ export function appendSceneBeats(beats) {
 }
 
 export function setSceneStore(raw) {
-    sceneStore = normalizeSceneStore(raw) || { current: null, closed: [], timeline: '', needRefs: [] };
+    sceneStore = normalizeSceneStore(raw) || emptySceneStore();
     sceneStoreLoaded = true;
     saveSceneToMeta();
 }
 
 export function reloadSceneFromChat() {
-    sceneStore = loadSceneFromMeta() || { current: null, closed: [], timeline: '', needRefs: [] };
+    sceneStore = loadSceneFromMeta() || emptySceneStore();
     sceneStoreLoaded = true;
 }
 
@@ -804,6 +853,68 @@ export function setLastNeedRefs(refs) {
     sceneStore = store;
     sceneStoreLoaded = true;
     saveSceneToMeta();
+}
+
+// The sticky recovered set as plain refs, for composeSheet and for tagging the
+// "## Injected last turn" list (a tagged ref is exempt from the prompt's
+// do-not-re-list rule while its TTL lasts). Entries with a spent TTL are already
+// gone — tickRecoveredRefs drops them.
+export function getRecoveredRefs() {
+    const refs = getSceneStore().recoveredRefs;
+    return Array.isArray(refs) ? refs.map(r => ({ category: r.category, key: r.key })) : [];
+}
+
+// One turn passed: age every entry and drop the spent ones. Called ONCE per
+// successful full extraction run, BEFORE markRecoveredRefs, so a ref the agent
+// re-recovers this turn is refreshed to the full TTL rather than aged first.
+// A failed run does not tick — a recovery must not burn a turn of its life on a
+// turn where the agent never got to judge anything.
+export function tickRecoveredRefs() {
+    const store = getSceneStore();
+    const kept = [];
+    for (const r of (Array.isArray(store.recoveredRefs) ? store.recoveredRefs : [])) {
+        const ttl = Math.floor(Number(r?.ttl)) - 1;
+        if (ttl >= 1) kept.push({ category: r.category, key: r.key, ttl });
+    }
+    const expired = (Array.isArray(store.recoveredRefs) ? store.recoveredRefs.length : 0) - kept.length;
+    store.recoveredRefs = kept;
+    sceneStore = store;
+    sceneStoreLoaded = true;
+    saveSceneToMeta();
+    return expired;
+}
+
+// Stamp this turn's recoveries with a fresh TTL. Re-recovering an already-sticky
+// ref refreshes it instead of duplicating it, so a fumble that keeps recurring
+// keeps its fact on the sheet. Returns how many entries were added or refreshed.
+export function markRecoveredRefs(refs) {
+    const store = getSceneStore();
+    const list = Array.isArray(store.recoveredRefs) ? store.recoveredRefs : [];
+    let touched = 0;
+    // The prompt's "max 3 per turn" is re-applied here: the cap on the sticky set
+    // only holds if the per-turn intake is actually bounded.
+    for (const r of (Array.isArray(refs) ? refs : []).slice(0, RECOVERED_REFS_PER_TURN)) {
+        const category = typeof r?.category === 'string' ? r.category.trim() : '';
+        const key = typeof r?.key === 'string' ? r.key.trim() : '';
+        if (!category || !key) continue;
+        const id = `${category.toLowerCase()}/${key.toLowerCase()}`;
+        const existing = list.find(e => `${e.category.toLowerCase()}/${e.key.toLowerCase()}` === id);
+        if (existing) existing.ttl = RECOVERED_REF_TTL_TURNS;
+        else list.push({ category, key, ttl: RECOVERED_REF_TTL_TURNS });
+        touched++;
+    }
+    // Hard ceiling. Evict the entries closest to expiry first — the oldest
+    // recoveries, whose fumble the storyteller has had the most turns to fix.
+    while (list.length > RECOVERED_REFS_MAX) {
+        let worst = 0;
+        for (let i = 1; i < list.length; i++) if (list[i].ttl < list[worst].ttl) worst = i;
+        list.splice(worst, 1);
+    }
+    store.recoveredRefs = list;
+    sceneStore = store;
+    sceneStoreLoaded = true;
+    saveSceneToMeta();
+    return touched;
 }
 
 // Signed diff cell: negative (saved) renders green, positive (extra cost) red.

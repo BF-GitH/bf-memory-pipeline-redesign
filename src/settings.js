@@ -77,6 +77,19 @@ const DEFAULT_SETTINGS = {
     memoryAgentPrompt: '',
     reflectionPrompt: '',
 
+    // Per prompt-override key: the fingerprint of the built-in default the user
+    // last dismissed the "your custom prompt is out of date" notice against.
+    // Storing the fingerprint rather than a boolean means the NEXT time a
+    // capability ships the notice comes back on its own.
+    dismissedPromptWarnings: {},
+
+    // Per prompt-override key: fingerprints of the built-in defaults THIS
+    // installation has actually loaded, newest first. Written by the app from
+    // the same expression the agents run, so unlike `legacyFingerprints` it
+    // cannot be computed against the wrong string. See
+    // syncPromptDefaultWitnesses.
+    knownDefaultFingerprints: {},
+
     agent2ContextMessages: 10,
 
     bufferHoldBack: 4,
@@ -86,6 +99,9 @@ const DEFAULT_SETTINGS = {
     enforceKnownBy: true,
 
     graphExtrasCount: 3,
+
+    contradictionScanEnabled: true,
+    contradictionInterval: 2,
 
     catchupBatchSize: 8,
     showToast: true,
@@ -145,6 +161,9 @@ function validateSettings(s) {
     }
     s.spineBatchSize = Math.floor(clamp(s.spineBatchSize, 4, 30, 10));
     s.graphExtrasCount = Math.floor(clamp(s.graphExtrasCount, 0, 8, 3));
+    // Read by agent-reflect.js as `Math.max(1, Number(...) || CONTRADICTION_INTERVAL_DEFAULT)`;
+    // the default here must stay equal to that constant (2) or the UI lies.
+    s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 10, 2));
     s.catchupBatchSize = Math.floor(clamp(s.catchupBatchSize, 2, 30, 8));
     if (typeof s.enabled !== 'boolean') {
 
@@ -158,9 +177,20 @@ function validateSettings(s) {
     if (typeof s.debugVerbose !== 'boolean')     s.debugVerbose = false;
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
     if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
+    if (typeof s.contradictionScanEnabled !== 'boolean') s.contradictionScanEnabled = true;
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
     if (typeof s.memoryAgentPrompt !== 'string') s.memoryAgentPrompt = '';
     if (typeof s.reflectionPrompt !== 'string')  s.reflectionPrompt = '';
+    // agent-reflect.js reads `settings.reflectionPrompt || DEFAULT_REFLECT_PROMPT`,
+    // so a whitespace-only override is TRUTHY and would ship as the entire system
+    // prompt. Today's input handler stores '' for blank; this catches whatever an
+    // older build persisted.
+    if (!s.memoryAgentPrompt.trim()) s.memoryAgentPrompt = '';
+    if (!s.reflectionPrompt.trim())  s.reflectionPrompt = '';
+    if (!s.dismissedPromptWarnings || typeof s.dismissedPromptWarnings !== 'object' || Array.isArray(s.dismissedPromptWarnings)) {
+        s.dismissedPromptWarnings = {};
+    }
+    normalizePromptDefaultWitnesses(s);
     if (typeof s.activeDbProfile !== 'string')   s.activeDbProfile = '';
     if (!s.dbProfiles || typeof s.dbProfiles !== 'object' || Array.isArray(s.dbProfiles)) {
         s.dbProfiles = {};
@@ -183,9 +213,367 @@ function validateSettings(s) {
     return s;
 }
 
+// ---------------------------------------------------------------------------
+// Stale prompt-override handling.
+//
+// memoryAgentPrompt / reflectionPrompt store a FULL COPY of an agent's system
+// prompt, and both agents PREFER the stored copy over the built-in default
+// (agent-memory.js, agent-reflect.js). A copy taken before a capability shipped
+// therefore silently disables that capability: the model is never told the tool
+// or the output section exists, so it never emits one, and nothing errors —
+// which is the worst possible failure shape. Two cases, handled differently:
+//
+//   1. The copy is byte-identical to a default WE used to ship. The user opened
+//      the box and never really customised it (older save paths persisted the
+//      default verbatim; today's `input` handler stores '' on an exact match).
+//      Silently adopt the new default — there is nothing of theirs to lose.
+//   2. The copy genuinely differs. Never touch it. The System Prompts tab shows
+//      a per-capability notice with a one-click reset instead.
+//
+// Recognition is by fingerprint, not by shipping ~90 KB of dead prompt text.
+// The length half makes a collision across this fixed list implausible.
+//
+// Recognition has TWO sources, deliberately:
+//   - `legacyFingerprints`, hand-maintained, the only way to know about builds
+//     that predate this mechanism. It is written by a human and can be wrong.
+//   - `knownDefaultFingerprints`, written by the app itself every time it
+//     loads, from `spec.getDefault()` — the same expression the agents send.
+//     A stored copy of build N's default can only exist if build N ran here, so
+//     build N recorded it. This half cannot be computed against the wrong
+//     string, which is precisely how the hand-maintained half went wrong: both
+//     defaults are COMPOSED (`` `…` + TEMPORAL_GROUNDING_RULE ``), and every
+//     memory-agent entry in the list was a hash of the bare template literal —
+//     a string no textarea has ever shown and no user has ever stored.
+// ---------------------------------------------------------------------------
+function promptFingerprint(text) {
+    const s = String(text || '');
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        // FNV-1a's 32-bit prime (16777619) as shifts — keeps every step in int32
+        h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    return s.length + ':' + h.toString(16).padStart(8, '0');
+}
+
+// Bumped whenever a stored setting needs a one-off sweep. v4 introduced the
+// prompt-override sweep; v5 exists ONLY because both default prompts changed
+// again — `migratePromptOverrides` can adopt a stored copy only if the build
+// running it recognises that copy's fingerprint, so a build that ships new
+// defaults must re-run the sweep or every v4 user who kept an unmodified copy
+// is misreported as having customised it. v6 for the same reason: the sweep's
+// recognition set changed (every memoryAgentPrompt fingerprint was corrected,
+// and `knownDefaultFingerprints` was added), so it has to run again.
+const SETTINGS_SCHEMA_VERSION = 6;
+
+// WHEN YOU CHANGE EITHER DEFAULT PROMPT, three edits, no more:
+//   1. prepend the OUTGOING default's fingerprint to `legacyFingerprints`
+//      (newest first — the list is only ever searched, the order is for humans).
+//      TAKE THE VALUE FROM THE RUNNING APP: the previous build logged it as
+//      `NEW_BUILTIN_DEFAULT` (debug log, subsystem `settings`), or evaluate
+//      `promptFingerprint(PROMPT_OVERRIDES.<key>.getDefault())` in a console.
+//      NEVER hash the prompt source by hand — both defaults are COMPOSED
+//      expressions (`` `…` + TEMPORAL_GROUNDING_RULE ``), the textarea shows and
+//      stores the COMPOSED string, and hashing the template literal alone
+//      produces a fingerprint nothing can ever match. That is exactly how all
+//      ten memoryAgentPrompt entries were wrong for two rounds.
+//   2. add a `capabilities` entry naming a short verbatim string that ONLY the
+//      new prompt contains — verify against every historical version, not just
+//      the one you replaced, or a stale copy silently reads as up to date;
+//   3. bump SETTINGS_SCHEMA_VERSION so the sweep runs again.
+// Everything else — migration, notice, reset, dismissal expiry — follows.
+//
+// Steps 1 and 3 are now survivable when you get them wrong, which is the point:
+// `syncPromptDefaultWitnesses` records each default's real fingerprint on load,
+// so a user who ran the outgoing build is migrated even if the list entry is
+// wrong or missing, and a forgotten version bump is detected and swept anyway.
+// The list still matters for builds older than that mechanism.
+const PROMPT_OVERRIDES = {
+    memoryAgentPrompt: {
+        label: 'Memory Agent prompt',
+        textareaId: 'bf_mem_memory_agent_prompt',
+        noticeId: 'bf_mem_memory_agent_prompt_stale',
+        getDefault: () => DEFAULT_MEMORY_AGENT_PROMPT,
+        // Fingerprints of the COMPOSED default (template + TEMPORAL_GROUNDING_RULE),
+        // i.e. of the exact string the textarea has always been populated with and
+        // therefore the exact string an override stores. Recomputed from
+        // `git show <sha>:src/agent-memory.js` for every commit that touched the
+        // file; the previous list hashed the bare template literal and so could
+        // never match anything. Newest first:
+        //   6146:6134fcc3  the round-1 default (never committed; recovered by
+        //                  rolling the old list's bare hash forward over the
+        //                  238-char TEMPORAL_GROUNDING_RULE, which FNV-1a permits
+        //                  because the fingerprint IS the rolling state — verified
+        //                  exact against all 21 committed versions)
+        //   5497:ba738ab6  9af88bd   10321:1f57dd75 400f91c   11798:01a9b06a 4c32f3a
+        //   10915:1df4f2c5 6414917   9309:cba0dc1a  85d4287   8685:d2d7dbc1  bb65b09
+        //   8753:6529783e  4692330   7019:2f4058a7  97400e3   6251:de16a77b  ecb9257
+        // No round-2 entry: round 2's default IS this build's default
+        // (6747:19ca94c1), so a stored copy of it is caught by `isCurrent`.
+        // The moment this prompt changes, prepend that value — the previous
+        // build's NEW_BUILTIN_DEFAULT log line hands it to you.
+        legacyFingerprints: [
+            '6146:6134fcc3', '5497:ba738ab6', '10321:1f57dd75', '11798:01a9b06a',
+            '10915:1df4f2c5', '9309:cba0dc1a', '8685:d2d7dbc1', '8753:6529783e',
+            '7019:2f4058a7', '6251:de16a77b',
+        ],
+        capabilities: [
+            {
+                marker: 'OMISSION RECOVERY',
+                name: 'Omission recovery (the backward look)',
+                detail: 'the agent is handed the list of memories the LAST sheet actually carried, but without this instruction it never reads it — so a fact the storyteller hedged on or forgot never gets re-selected, and the loop repeats forever.',
+            },
+            {
+                marker: '## Store candidates',
+                name: 'Stored-fact candidates (VALUES, not just key names)',
+                detail: 'the prompt now carries the VALUES of stored facts about whoever the checked reply names but the sheet did not carry — that block is the only place the actual wording ("always wants to go to Portugal") appears. An older copy never mentions it, so the agent goes on guessing from key names alone and misses the fumble it was supposed to catch.',
+            },
+            {
+                marker: 'RECOVERED:',
+                name: 'Sticky recovered refs (the RECOVERED line)',
+                detail: 'a recovery is now marked on its own RECOVERED line and stays injected for several turns instead of one. Without the line the agent never marks anything, nothing goes sticky, and the memory drops back out on the very next turn — the same fumble can recur immediately.',
+            },
+        ],
+    },
+    reflectionPrompt: {
+        label: 'Reflect Agent prompt',
+        textareaId: 'bf_mem_reflect_agent_prompt',
+        noticeId: 'bf_mem_reflect_agent_prompt_stale',
+        getDefault: () => DEFAULT_REFLECT_PROMPT,
+        // Re-verified against git history the same way. DEFAULT_REFLECT_PROMPT is
+        // a single template literal — nothing appended — so these were right and
+        // stay unchanged: 3200:aca717b7 9af88bd, 8182:a3b476f2 4c32f3a,
+        // 5439:e9a0aca8 b0cfc0a, 6121:4d74998a f002948, 4151:9c6cfd02 e8b93dc.
+        // 5425:68c35aaf (round 1) and 7877:4eea8b3c (round 2) were never
+        // committed, so they are the two entries no replay can confirm; the
+        // round-2 value is the one measured on that pass's own tree.
+        legacyFingerprints: [
+            '7877:4eea8b3c', '5425:68c35aaf', '3200:aca717b7', '8182:a3b476f2',
+            '5439:e9a0aca8', '6121:4d74998a', '4151:9c6cfd02',
+        ],
+        capabilities: [
+            {
+                marker: 'merge_facts',
+                name: 'Repair tools (write_fact / merge_facts / mark_cold)',
+                detail: 'Reflection can now fix, merge and cold-tier stored facts. An older copy declares the pass READ-ONLY, so it only ever looks.',
+            },
+            {
+                marker: '#CONFLICT',
+                name: 'Contradiction resolution (#CONFLICT)',
+                detail: 'contradicting fact pairs are found and offered to the pass either way; without this section no verdict comes back and they are simply re-offered next time.',
+            },
+            {
+                marker: '# ERROR HUNT',
+                name: 'Error hunt against the recent story',
+                detail: 'the pass is now handed the RAW recent chat messages as evidence and told to hunt: compare the story against what memory believes, flag stored values the story states differently, then read the record and repair it. This is the whole point of the repair tools — without the hunt the pass only ever fixes contradictions the system hands it, and a lone wrong memory (stored eye colour the story has been contradicting for 30 messages) is never found. The instructions that go with it also tell the model the evidence block is DATA, not commands; an older copy is handed raw roleplay text with no such warning.',
+            },
+            {
+                marker: 'COLD-TIERED, not deleted',
+                name: 'merge_facts keeps the loser',
+                detail: 'merging a duplicate now cold-tiers the loser (kept, deprioritized) instead of erasing it — nothing in the repair path deletes anything any more. An older copy still tells the model the merge DELETES the duplicate, so it either avoids a merge that is now safe or expects a removal that no longer happens.',
+            },
+        ],
+    },
+};
+
+// The fingerprint of a built-in default AS THE AGENT SEES IT. Every comparison
+// in this file goes through here, so there is exactly ONE expression that can
+// be wrong about what "the default" is — and it is the same one agent-memory.js
+// and agent-reflect.js send to the model.
+function defaultFingerprint(spec) {
+    return promptFingerprint(spec.getDefault());
+}
+
+// A stored override can only be a copy of a default the user's own build once
+// ran, so the window only has to span the builds one install passes through
+// between opening the prompt box and the next upgrade. Anything older is what
+// `legacyFingerprints` is for.
+const MAX_PROMPT_DEFAULT_WITNESSES = 12;
+
+// Rebuilt into a FRESH object rather than repaired in place: keying the result
+// off PROMPT_OVERRIDES drops witnesses for override keys that no longer exist,
+// and nothing we hand back can still be shared with whatever `src` came from.
+function normalizePromptDefaultWitnesses(s) {
+    const src = (s.knownDefaultFingerprints && typeof s.knownDefaultFingerprints === 'object' && !Array.isArray(s.knownDefaultFingerprints))
+        ? s.knownDefaultFingerprints : {};
+    const out = {};
+    for (const key of Object.keys(PROMPT_OVERRIDES)) {
+        const list = Array.isArray(src[key]) ? src[key] : [];
+        out[key] = [...new Set(list.filter(v => typeof v === 'string' && /^\d+:[0-9a-f]{8}$/.test(v)))]
+            .slice(0, MAX_PROMPT_DEFAULT_WITNESSES);
+    }
+    s.knownDefaultFingerprints = out;
+    return out;
+}
+
+// The self-announcing half of stale-override recognition. Runs on EVERY load,
+// before the schema-version gate, and does three things:
+//   - records this build's default fingerprint so a FUTURE build can recognise
+//     a copy of it without anyone hand-maintaining a list correctly;
+//   - prints that fingerprint, so the next person to change the prompt copies a
+//     value the runtime computed instead of hashing the source text;
+//   - returns the keys whose default is new here, which is the signal that a
+//     new default shipped — used below to run the sweep even if the schema
+//     version bump was forgotten.
+// Also flags the one shape of hand-list error that IS locally checkable: the
+// current default appearing in its own legacy list.
+function syncPromptDefaultWitnesses(s) {
+    const witnesses = normalizePromptDefaultWitnesses(s);
+    const fresh = [];
+    for (const [key, spec] of Object.entries(PROMPT_OVERRIDES)) {
+        const fp = defaultFingerprint(spec);
+        if (spec.legacyFingerprints.includes(fp)) {
+            addDebugLog('fail', `${spec.label}: the CURRENT built-in default (${fp}) is listed in its own legacyFingerprints — the list was built against the wrong string, or the prompt was never actually changed`, {
+                subsystem: 'settings', event: 'settings.migrated', actor: 'SYSTEM',
+                reason: 'LEGACY_LIST_CONTAINS_CURRENT', data: { key, fingerprint: fp },
+            });
+        }
+        if (witnesses[key].includes(fp)) continue;
+        witnesses[key] = [fp, ...witnesses[key]].slice(0, MAX_PROMPT_DEFAULT_WITNESSES);
+        fresh.push(key);
+        addDebugLog('info', `${spec.label}: built-in default is new to this install, fingerprint ${fp} — when this prompt next changes, THIS is the value to prepend to legacyFingerprints (never re-derive it from the source text)`, {
+            subsystem: 'settings', event: 'settings.migrated', actor: 'SYSTEM',
+            reason: 'NEW_BUILTIN_DEFAULT',
+            data: { key, fingerprint: fp, chars: spec.getDefault().length },
+        });
+    }
+    return fresh;
+}
+
+// Which shipped capabilities a stored override cannot possibly use. Empty for a
+// user who hand-merged the new instructions in — marker presence is the test,
+// so nobody gets nagged about work they already did.
+function missingPromptCapabilities(key) {
+    const spec = PROMPT_OVERRIDES[key];
+    const stored = String(extensionSettings?.[key] || '');
+    if (!spec || !stored.trim()) return [];
+    return spec.capabilities.filter(c => !stored.includes(c.marker));
+}
+
+// Case 1 above. Runs once per schema bump — it is idempotent (a cleared
+// override is skipped by the `!stored.trim()` guard), and it MUST re-run every
+// time a default prompt changes, because it can only recognise the defaults
+// this build knows about.
+function migratePromptOverrides(s) {
+    const witnesses = normalizePromptDefaultWitnesses(s);
+    for (const [key, spec] of Object.entries(PROMPT_OVERRIDES)) {
+        const stored = typeof s[key] === 'string' ? s[key] : '';
+        if (!stored.trim()) continue;
+        const fp = promptFingerprint(stored);
+        const isCurrent = fp === defaultFingerprint(spec);
+        // A default this install is on record as having RUN outranks the
+        // hand-maintained list: it was measured, not typed.
+        const witnessed = !isCurrent && witnesses[key].includes(fp);
+        if (!isCurrent && !witnessed && !spec.legacyFingerprints.includes(fp)) continue;
+        s[key] = '';
+        addDebugLog('info', `${spec.label}: stored override was an unmodified ${isCurrent ? 'copy of the current' : 'older built-in'} default — dropped so the built-in prompt is used again`, {
+            subsystem: 'settings', event: 'settings.migrated', actor: 'SYSTEM',
+            reason: isCurrent ? 'REDUNDANT_COPY' : (witnessed ? 'STALE_DEFAULT_WITNESSED' : 'STALE_DEFAULT'),
+            data: { key, fingerprint: fp },
+        });
+    }
+}
+
+// Shared by the section's "Reset to default" button and the stale notice's.
+function resetPromptToDefault(key, reason) {
+    const spec = PROMPT_OVERRIDES[key];
+    if (!spec) return;
+    extensionSettings[key] = '';
+    $('#' + spec.textareaId).val(spec.getDefault());
+    // A dismissal only ever suppressed a warning about the text we just threw
+    // away, so it must not outlive it.
+    if (extensionSettings.dismissedPromptWarnings) delete extensionSettings.dismissedPromptWarnings[key];
+    addDebugLog('info', `${spec.label} reset to default`, {
+        subsystem: 'settings', event: 'settings.changed', actor: 'USER', reason,
+        data: { key, isDefault: true },
+    });
+    saveSettings();
+    renderPromptStaleNotices();
+    toastr.info(`${spec.label} reset to default`, 'BF Memory');
+}
+
+// Case 2 of the migration: the override is genuinely the user's, so say what it
+// costs them and let them choose. Re-run after every edit/reset/dismiss.
+function renderPromptStaleNotices() {
+    for (const [key, spec] of Object.entries(PROMPT_OVERRIDES)) {
+        const el = document.getElementById(spec.noticeId);
+        if (!el) continue;
+
+        const missing = missingPromptCapabilities(key);
+        // Dismissal is keyed to the default it was dismissed AGAINST, so the
+        // next capability to ship raises the notice again without any bookkeeping.
+        const dismissed = extensionSettings?.dismissedPromptWarnings?.[key] === defaultFingerprint(spec);
+
+        // This runs on every keystroke in the textarea; only touch the DOM when
+        // the verdict actually changed, or the buttons get rebuilt per character.
+        const sig = (!missing.length || dismissed) ? '' : missing.map(c => c.marker).join('|');
+        if (el.dataset.staleSig === sig) continue;
+        el.dataset.staleSig = sig;
+
+        if (!sig) {
+            el.style.display = 'none';
+            el.innerHTML = '';
+            continue;
+        }
+
+        el.style.display = 'block';
+        el.innerHTML = `
+            <b>Your custom ${escapeHtml(spec.label.toLowerCase())} predates this build.</b>
+            It is missing ${missing.length === 1 ? 'an instruction' : 'instructions'} the current default carries, so ${missing.length === 1 ? 'this capability does' : 'these capabilities do'} nothing while it is active:
+            <ul style="margin:6px 0 6px 16px;padding:0;">
+                ${missing.map(c => `<li><b>${escapeHtml(c.name)}</b> — ${escapeHtml(c.detail)}</li>`).join('')}
+            </ul>
+            Your text has not been changed. Paste the missing parts in yourself (Reset, copy, re-apply your edits), or:
+            <div class="bf-mem-db-actions" style="margin-top:6px;">
+                <button id="${spec.noticeId}_reset" class="menu_button"><i class="fa-solid fa-undo"></i> Reset to new default</button>
+                <button id="${spec.noticeId}_dismiss" class="menu_button" title="Hide this until the built-in prompt changes again">Dismiss</button>
+            </div>`;
+
+        $(`#${spec.noticeId}_reset`).on('click', () => resetPromptToDefault(key, 'STALE_PROMPT_NOTICE'));
+        $(`#${spec.noticeId}_dismiss`).on('click', () => {
+            if (!extensionSettings.dismissedPromptWarnings) extensionSettings.dismissedPromptWarnings = {};
+            extensionSettings.dismissedPromptWarnings[key] = defaultFingerprint(spec);
+            addDebugLog('info', `${spec.label}: out-of-date warning dismissed (custom prompt kept, missing: ${missing.map(c => c.marker).join(', ')})`, {
+                subsystem: 'settings', event: 'settings.changed', actor: 'USER', reason: 'STALE_PROMPT_DISMISSED',
+                data: { key, missing: missing.map(c => c.marker) },
+            });
+            saveSettings();
+            renderPromptStaleNotices();
+        });
+    }
+}
+
 function migrateLegacySettings(s) {
 
-    if ((s.schemaVersion ?? 0) >= 3) return;
+    // Before the version gate, always: this is what lets a stale-override sweep
+    // arm itself. `fresh` is non-empty exactly when a built-in default changed
+    // since this profile last loaded.
+    const fresh = syncPromptDefaultWitnesses(s);
+
+    if ((s.schemaVersion ?? 0) >= SETTINGS_SCHEMA_VERSION) {
+        // The schema says the sweep is done, yet a default just changed — i.e.
+        // step 3 of the recipe above was skipped. Sweep anyway and say so,
+        // rather than leaving the user on a prompt we no longer ship.
+        if (fresh.length > 0) {
+            addDebugLog('fail', `Built-in prompt default changed without a SETTINGS_SCHEMA_VERSION bump (${fresh.join(', ')}) — running the stale-override sweep anyway`, {
+                subsystem: 'settings', event: 'settings.migrated', actor: 'SYSTEM',
+                reason: 'MISSING_SCHEMA_BUMP',
+                data: { keys: fresh, schemaVersion: s.schemaVersion ?? 0 },
+            });
+            migratePromptOverrides(s);
+        }
+        return;
+    }
+
+    // v4, v5 and v6 consist of nothing but the prompt-override sweep (v5/v6
+    // because the defaults and then the recognition set changed again, see
+    // SETTINGS_SCHEMA_VERSION); everything below this branch is the v3 body and
+    // must not run twice for someone who already reached v3.
+    if ((s.schemaVersion ?? 0) >= 3) {
+        migratePromptOverrides(s);
+        s.schemaVersion = SETTINGS_SCHEMA_VERSION;
+        return;
+    }
 
     const context = getContext();
     const legacy = context.extensionSettings?.bf_memory;
@@ -215,7 +603,9 @@ function migrateLegacySettings(s) {
         console.log(`[BFMemory] Settings migration dropped ${dropped} obsolete key(s) (schema v3)`);
     }
 
-    s.schemaVersion = 3;
+    migratePromptOverrides(s);
+
+    s.schemaVersion = SETTINGS_SCHEMA_VERSION;
 }
 
 export function updateStatus(status, message = '') {
@@ -1216,9 +1606,14 @@ export async function initSettings() {
     }
     extensionSettings = context.extensionSettings[EXTENSION_NAME];
 
+    // Object/array defaults are CLONED, never assigned: a bare assignment aliases
+    // the module literal, so the first saveDbProfile / markChatUnlinked writes
+    // into DEFAULT_SETTINGS itself and the reset paths above then restore that
+    // accumulated state instead of a clean default. validateSettings won't catch
+    // it either — a mutated object still passes its type test.
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
         if (!Object.hasOwn(extensionSettings, key)) {
-            extensionSettings[key] = value;
+            extensionSettings[key] = (value && typeof value === 'object') ? structuredClone(value) : value;
         }
     }
 
@@ -1342,6 +1737,25 @@ export async function initSettings() {
         saveSettings();
     });
 
+    $('#bf_mem_contradiction_scan').prop('checked', extensionSettings.contradictionScanEnabled !== false).on('change', function () {
+        const before = extensionSettings.contradictionScanEnabled !== false;
+        const next = $(this).prop('checked');
+        extensionSettings.contradictionScanEnabled = next;
+        addDebugLog('info', `Contradiction scan ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'contradictionScanEnabled' }, before, after: !!next });
+        saveSettings();
+    });
+
+    $('#bf_mem_contradiction_interval').val(extensionSettings.contradictionInterval);
+    $('#bf_mem_contradiction_interval_val').text(extensionSettings.contradictionInterval);
+    $('#bf_mem_contradiction_interval').on('input', function () {
+        const val = parseInt($(this).val(), 10);
+        const before = extensionSettings.contradictionInterval;
+        extensionSettings.contradictionInterval = val;
+        $('#bf_mem_contradiction_interval_val').text(val);
+        if (before !== val) addDebugLog('debug', `Contradiction scan interval: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'contradictionInterval' }, before, after: val });
+        saveSettings();
+    });
+
     $('#bf_mem_knownby_enforced').prop('checked', extensionSettings.enforceKnownBy !== false).on('change', function () {
         const before = extensionSettings.enforceKnownBy !== false;
         const next = $(this).prop('checked');
@@ -1372,29 +1786,22 @@ export async function initSettings() {
         const v = String($(this).val() || '');
         extensionSettings.memoryAgentPrompt = (!v.trim() || v === DEFAULT_MEMORY_AGENT_PROMPT) ? '' : v;
         saveSettings();
+        // Typing is exactly when a missing capability can appear or disappear.
+        renderPromptStaleNotices();
     });
 
-    $('#bf_mem_reset_memory_agent_prompt').on('click', () => {
-        $('#bf_mem_memory_agent_prompt').val(DEFAULT_MEMORY_AGENT_PROMPT);
-        extensionSettings.memoryAgentPrompt = '';
-        addDebugLog('info', 'Memory Agent prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryAgentPrompt', isDefault: true } });
-        saveSettings();
-        toastr.info('Memory Agent prompt reset to default', 'BF Memory');
-    });
+    $('#bf_mem_reset_memory_agent_prompt').on('click', () => resetPromptToDefault('memoryAgentPrompt', 'USER_RESET'));
 
     $('#bf_mem_reflect_agent_prompt').val(extensionSettings.reflectionPrompt || DEFAULT_REFLECT_PROMPT).off('input').on('input', function () {
         const v = String($(this).val() || '');
         extensionSettings.reflectionPrompt = (!v.trim() || v === DEFAULT_REFLECT_PROMPT) ? '' : v;
         saveSettings();
+        renderPromptStaleNotices();
     });
 
-    $('#bf_mem_reset_reflect_agent_prompt').on('click', () => {
-        $('#bf_mem_reflect_agent_prompt').val(DEFAULT_REFLECT_PROMPT);
-        extensionSettings.reflectionPrompt = '';
-        addDebugLog('info', 'Reflect Agent prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionPrompt', isDefault: true } });
-        saveSettings();
-        toastr.info('Reflect Agent prompt reset to default', 'BF Memory');
-    });
+    $('#bf_mem_reset_reflect_agent_prompt').on('click', () => resetPromptToDefault('reflectionPrompt', 'USER_RESET'));
+
+    renderPromptStaleNotices();
 
     refreshDbProfileDropdown();
 
