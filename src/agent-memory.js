@@ -97,6 +97,38 @@ const NEED_REFS_CAP = 45;
 const CANDIDATE_FACTS_CAP = 24;
 const CANDIDATE_VALUE_CHARS = 70;
 
+// FORCED STATE RECHECK — the caps.
+//
+// The defect this exists for: the agent MAY update a state, so when it is unsure
+// it does nothing, and nothing forces a verdict. In the analysed run a character
+// removed her chest binding in message #23, three passes noticed it in their own
+// reasoning (one wrote verbatim "she removed her binding but hasn't decided to
+// abandon it permanently, so I won't overwrite naoto_binds_chest") and none
+// wrote — so "Chest binding beneath dress shirt, too tight across ribs" kept
+// shipping under the header "CURRENT STATE — absolute truth" for 14 of 15 turns,
+// beside a Right-now line describing her bare sternum.
+//
+// STATE_RECHECK_MAX = 8 rows per turn. Sheets in that run carried 11-26 fact
+// rows, nearly all of them in the STATE section (kind collapsed to 'trait', so
+// CHRONOLOGY held 1-2). Eight covers a third of the largest observed sheet for
+// <=1.6 KB of USER prompt and eight output lines. It is deliberately NOT
+// "every row": a long mandatory checklist is answered by rubber-stamping
+// UNCHANGED, which is the same silence in a costlier format, and an uncapped
+// list grows with the store — the exact axis the scale analysis flags.
+//
+// STATE_SUPERSEDE_MAX = 3 WRITES per turn, and this is the anti-reflex guard.
+// Two newly-settled messages cannot legitimately overturn more than a handful of
+// durable states; the measured true rate is ~1 stale row in 15 turns. Three is
+// already 3x anything observed and mirrors the RECOVERED line's own "Max 3 per
+// turn". It logs when it bites, so if the number is wrong the run log says so
+// instead of the cap silently shaping behaviour.
+const STATE_RECHECK_MAX = 8;
+const STATE_SUPERSEDE_MAX = 3;
+// Rows are fed VERBATIM as the sheet rendered them (knownBy prefix and recency
+// tail included — how old a claim is, is evidence about it). The longest row in
+// the analysed run was 280 chars; the clip only bounds the pathological case.
+const STATE_RECHECK_LINE_CHARS = 200;
+
 // Connection-class failure classifier, shared with pipeline.js's timeout
 // auto-retry: transport-level errors (timeout, abort, wall-clock/run budget,
 // network/fetch) that a later retry against the same endpoint can plausibly
@@ -118,7 +150,7 @@ const TEMPORAL_GROUNDING_RULE = `
 # OBSERVATION DATE
 The task block's \`## Observation date\` = real-world time the newest message was observed. Resolve RELATIVE time ("yesterday", "two years ago") to ABSOLUTE dates against it so facts don't rot; none given → leave as-is.`;
 
-export const DEFAULT_MEMORY_AGENT_PROMPT = `You are the EXTRACTION AGENT for a roleplay between {{user}} (human) and {{char}} (AI character), running in the BACKGROUND after each reply. TWO jobs in one tool session: EXTRACT — store new LASTING facts from the SETTLED messages; SELECT — list the STORED memories the NEXT storyteller reply needs on a NEED line. Sheet, beats and timeline are separate passes. Only outputs: tool calls, a NEED line, #DONE.
+export const DEFAULT_MEMORY_AGENT_PROMPT = `You are the EXTRACTION AGENT for a roleplay between {{user}} (human) and {{char}} (AI character), running in the BACKGROUND after each reply. TWO jobs in one tool session: EXTRACT — store new LASTING facts from the SETTLED messages; SELECT — list the STORED memories the NEXT storyteller reply needs on a NEED line. Sheet, beats and timeline are separate passes. Only outputs: tool calls, a NEED line, STATE verdicts, #DONE.
 
 # TOOL PROTOCOL (plain text — no function-call API)
 
@@ -139,7 +171,7 @@ HARD LIMITS: at most 8 rounds and 24 tool calls per session. LIGHT turn (small t
 
 # FINAL REPLY
 
-Write calls first (bare JSON, one per line), then on a FULL run ONE line, optionally followed by a RECOVERED line:
+Write calls first (bare JSON, one per line), then on a FULL run ONE NEED line, optionally a RECOVERED line, then one STATE verdict per listed ref (see STATE RECHECK):
 
 NEED: Category/key, Category/key, ...
 RECOVERED: Category/key, ...
@@ -147,7 +179,16 @@ RECOVERED: Category/key, ...
 End your LAST reply with a line that is exactly \`#DONE\` (nothing else on it).
 - NEED: ONLY refs the NEXT reply will draw on (VERIFIED via tools, never invented) — people present and their state, active relationships, open threads THIS scene touches. Do NOT re-list stable premise/identity facts (auto-injected — but see OMISSION RECOVERY); older facts can be NEEDed later; omit NEED when nothing beyond that is needed. Read tools in the final reply are ignored.
 - OMISSION RECOVERY (look BACKWARD too): the TENTATIVE reply tagged \`<- OMISSION CHECK\` is the ONLY one the lists below describe. If it hedged, forgot or contradicted something that IS in the store but was NOT injected, put that ref on the RECOVERED line — it is added to NEED for you and stays injected for a few turns, so do not repeat it on NEED. \`## Injected last turn\` = what the sheet above that reply carried; \`## Store candidates\` = VALUES of nearby stored facts it does NOT cover — read that block before concluding a fumble had no fact behind it, and \`search\` the subject when neither block shows it. That list, not your judgement, decides what counts as auto-injected: a ref ON it is already covered, do NOT re-list it — EXCEPT one tagged \`(recovered)\`, which you MAY re-list while the fumble persists; a ref MISSING from it was never shown, so it is fair game however "stable" it looks. But if its header says UNCERTAIN or TRUNCATED, absence proves NOTHING — then recover only what a candidate row or a \`search\` confirms. Max 3 per turn, and only for a fumble you can POINT AT in that reply — never pre-emptively, never a re-listing sweep.
-- EXTRACT-ONLY runs (task block says so): no NEED line — writes, then \`#DONE\`.
+- EXTRACT-ONLY runs (task block says so): no NEED line, no STATE verdicts — writes, then \`#DONE\`.
+
+# STATE RECHECK
+
+\`## State lines up for recheck\` in the task block lists CURRENT STATE rows the sheet is still injecting as present-tense truth. Give EVERY listed ref one verdict:
+
+STATE: Category/key | UNCHANGED
+STATE: Category/key | SUPERSEDE | <what is true NOW — self-contained, replaces the whole row>
+
+UNCHANGED is the default. SUPERSEDE needs a SETTLED message that makes the row false — pointable evidence, never inference; a TENTATIVE reply may inform the verdict but never justifies one, and this is CHECKED: write the replacement in the SETTLED message's own words, because a SUPERSEDE sharing no content word with the SETTLED text is refused and the stale row stands. Reversible ("she may put it back on") is still SUPERSEDE: the row claims the present, so it must describe the present. Max 3 SUPERSEDE per turn; a ref not on the list is ignored.
 
 # WHAT TO STORE
 
@@ -298,9 +339,19 @@ export async function runMemoryAgent({
         bufferHoldBack: holdBack,
     });
 
+    // The FORCED STATE RECHECK's input. Built here beside injectedSection for the
+    // same reason: both are derived from the prior sheet, both are skipped on
+    // EXTRACT-ONLY runs (which emit no final reply to carry verdicts, and which
+    // catch-up import fires hundreds of), and the branch each took has to be
+    // loggable. Null whenever nothing is owed a verdict — no sheet yet, no
+    // settled messages, no live rows, or no row the settled messages touch.
+    const stateRecheck = extractOnly ? null : buildStateRecheckSection({
+        priorSheetText, settledMessages, tentativeMessages, databases,
+    });
+
     const extractPrompt = buildExtractionUserPrompt({
         settledMessages, tentativeMessages, characterInfo, userPersona,
-        observationDate, extractOnly, databases, index, settings, injectedSection,
+        observationDate, extractOnly, databases, index, settings, injectedSection, stateRecheck,
         // Trace ids only — the builder's OUTPUT is unchanged by them. The store-
         // candidates block exists nowhere but inside that function, so the
         // capture has to happen there.
@@ -353,7 +404,7 @@ export async function runMemoryAgent({
         }), { runId, callId: extractCallId, reason: injectedSection.reason });
     }
 
-    addDebugLog('info', `[${runId}] Extraction agent start: ${settledMessages.length} settled, ${tentativeMessages.length} tentative msg(s), extractOnly=${extractOnly}, injected-last-turn=${injectedLastTurn} ref(s) [${injectedSection ? injectedSection.status : 'SKIPPED'}], ${stickyRecovered.length} sticky recovered ref(s) (user prompt ${extractPrompt.length} chars)`, {
+    addDebugLog('info', `[${runId}] Extraction agent start: ${settledMessages.length} settled, ${tentativeMessages.length} tentative msg(s), extractOnly=${extractOnly}, injected-last-turn=${injectedLastTurn} ref(s) [${injectedSection ? injectedSection.status : 'SKIPPED'}], ${stickyRecovered.length} sticky recovered ref(s), state-recheck ${stateRecheck ? `${stateRecheck.entries.length} of ${stateRecheck.stateRows} row(s)` : 'none'} (user prompt ${extractPrompt.length} chars)`, {
         subsystem: 'agent3', event: 'agent3.extract',
         data: {
             settled: settledMessages.length, tentative: tentativeMessages.length, extractOnly,
@@ -361,6 +412,8 @@ export async function runMemoryAgent({
             injectedStatus: injectedSection ? injectedSection.status : 'SKIPPED',
             injectedTruncated: injectedSection ? injectedSection.truncated : false,
             stickyRecovered: stickyRecovered.length,
+            stateRecheckAsked: stateRecheck ? stateRecheck.entries.length : 0,
+            stateRecheckRows: stateRecheck ? stateRecheck.stateRows : 0,
             profileId: profileId || null,
         },
     });
@@ -426,6 +479,37 @@ export async function runMemoryAgent({
     result.tokensOut += loop.tokensOutApprox || 0;
     result.applied = ctx.applied;
     result.stageMs = { extractMs, beatsMs: null, headMs: null };
+
+    // FORCED STATE RECHECK — applied HERE, between the tool loop and the
+    // saveDatabase pass below, so a superseded record is persisted by the same
+    // pass that persists the extraction writes and is counted by result.calls
+    // and ctx.applied like any other write. Doing it beside the NEED parse
+    // further down would land after that save and silently lose the row.
+    //
+    // The transcript is scanned newest-first for the reply carrying STATE lines,
+    // separately from the NEED/RECOVERED scan below: a grace round can split
+    // them (verdicts in round N, a corrected NEED in round N+1), and each half
+    // should come from the newest reply that actually asserts it. Think blocks
+    // are stripped first for the same reason NEED strips them — a reasoning
+    // model drafts verdicts it then argues itself out of, and a drafted
+    // SUPERSEDE would otherwise become a real write.
+    if (stateRecheck && !loop.error) {
+        let verdicts = [];
+        for (let i = (loop.transcript || []).length - 1; i >= 0; i--) {
+            const r = stripThinkBlocks(String(loop.transcript[i]?.reply || ''));
+            // Same tolerance as parseStateVerdicts, or a reply whose verdicts are
+            // bulleted would be skipped over in favour of an older one.
+            if (/^\s*[-*]?\s*STATE\s*:/im.test(r)) { verdicts = parseStateVerdicts(r); break; }
+        }
+        try {
+            await applyStateVerdicts({ verdicts, stateRecheck, ctx, runId, callId: extractCallId });
+        } catch (e) {
+            addDebugLog('fail', `[${runId}] State recheck failed (non-fatal): ${e?.message || e}`, {
+                subsystem: 'agent3', event: 'agent3.state_recheck', reason: 'ERROR',
+            });
+        }
+    }
+
     result.calls = {
         extract: loop.error
             ? { status: 'fail', error: loop.error, rounds: loop.rounds, toolCalls: loop.toolCallCount }
@@ -732,7 +816,7 @@ function capLines(text, max, footer) {
 function buildExtractionUserPrompt({
     settledMessages, tentativeMessages, characterInfo, userPersona,
     observationDate, extractOnly, databases, index, settings, injectedSection,
-    runId = '', traceCallId = null,
+    stateRecheck = null, runId = '', traceCallId = null,
 }) {
     const parts = [];
 
@@ -812,12 +896,19 @@ function buildExtractionUserPrompt({
         }
     }
 
+    // The FORWARD-facing half of the same diff. `## Injected last turn` asks what
+    // the sheet FAILED to carry; this asks whether what it DID carry is still
+    // true. Placed last of the three evidence blocks, immediately before the
+    // "Work now" line, so the rows to be judged are the freshest thing in the
+    // prompt when the verdicts are written.
+    if (stateRecheck) parts.push(`${stateRecheck.header}\n${stateRecheck.body}`);
+
     const extra = String(settings?.memoryPrompt || '').trim();
     if (extra) parts.push(`## Additional instructions from the user\n${extra}`);
 
     parts.push(extractOnly
         ? 'Work now: check the store with tools where needed, write the new lasting facts, then end with the #DONE line.'
-        : 'Work now: check the store with tools where needed, write the new lasting facts, emit the NEED line, then end with #DONE.');
+        : `Work now: check the store with tools where needed, write the new lasting facts, emit the NEED line, ${stateRecheck ? 'give one STATE verdict per row listed above, ' : ''}then end with #DONE.`);
 
     try {
         const substitute = host.getSubstituteParams();
@@ -1126,6 +1217,571 @@ function buildRecoveryCandidates({ tentativeMessages, databases, injectedRefs = 
         // shape must not cost the run its extraction.
         return [];
     }
+}
+
+// ===================================================================
+// FORCED STATE RECHECK
+// ===================================================================
+//
+// WHERE THE ROWS COME FROM. `priorSheetText` — the same string the omission
+// list is parsed out of, handed in by pipeline.js from getMemorySheet(), which
+// reads chatMetadata.bf_mem_sheet. That record is written by setMemorySheet on
+// EVERY committed run and is independent of the test-run recorder. The
+// sheetHistory ring in turn-state.js is NOT usable here: recordSheetHistory
+// returns immediately unless isTraceRecording(), so with recording off it is
+// permanently empty, and it is dropped on chat switch and on reload. The
+// persisted record is the only always-available source, and it is already an
+// argument to runMemoryAgent — no other file has to be touched.
+//
+// WHICH sheet that is, stated honestly: it is the NEWEST committed sheet, not
+// necessarily the one that stood above the settled messages being judged. With
+// bufferHoldBack = 4 those differ by about two runs (the settled window trails
+// the sheet). That is the RIGHT input anyway: the job is to stop the NEXT
+// injection from carrying a false row, so the rows worth checking are the ones
+// still live and still being injected. classifyPriorSheet's VERIFIED/MISMATCH
+// distinction is therefore not consulted — it exists because omission recovery
+// reasons from ABSENCE ("missing from the list, therefore never shown"), which
+// needs the exact sheet. A recheck reasons from PRESENCE: every row below is a
+// live store record that the sheet just rendered, whichever turn it rendered on.
+
+// Parse the CURRENT STATE block out of a composed sheet. composeSheet emits the
+// header line verbatim, then one buildFactLine row per fact, then the next
+// section header — so the block ends at the first line that is not a fact row.
+// Reuses SHEET_REF_RE, i.e. exactly the grammar extractPriorSheetRefs trusts.
+function extractPriorStateLines(priorSheetText) {
+    const out = [];
+    const seen = new Set();
+    let inState = false;
+    for (const rawLine of String(priorSheetText || '').split('\n')) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (line === STATE_SECTION_HEADER) { inState = true; continue; }
+        if (!inState) continue;
+        const m = SHEET_REF_RE.exec(line);
+        // CHRONOLOGY / "Connected memories:" headers carry no `[knownBy]` prefix
+        // and so cannot match — the first non-row line closes the block.
+        if (!m) { inState = false; continue; }
+        const category = m[1].trim();
+        if (!category) { inState = false; continue; }
+        const ref = `${category}/${m[2]}`;
+        if (seen.has(ref)) continue;
+        seen.add(ref);
+        out.push({ ref, category, key: m[2], line });
+    }
+    return out;
+}
+
+// The vocabulary a SUPERSEDE is grounded against (see the gate in
+// applyStateVerdicts). tokenSet already drops everything under 4 chars, so what
+// survives is content words; this adds a crude suffix strip on top, because
+// evidence and replacement almost never inflect the same way — "the binding came
+// off" against "no longer binds her chest" shares nothing until `binding` and
+// `binds` both reduce to `bind`. Applied to BOTH sides of every comparison, so
+// it can only add matches between related words, never invent one between
+// unrelated ones. It is a heuristic, not a stemmer: one pass, no irregulars
+// ('bound' never meets 'bind'), which is why a refusal is logged with its tokens
+// rather than treated as proof of anything about the model.
+function groundingStems(text) {
+    const out = new Set();
+    for (const t of tokenSet(text)) {
+        let s = t;
+        if (s.length > 5 && s.endsWith('ing')) s = s.slice(0, -3);
+        else if (s.length > 4 && (s.endsWith('ed') || s.endsWith('es'))) s = s.slice(0, -2);
+        else if (s.length > 4 && s.endsWith('s') && !s.endsWith('ss')) s = s.slice(0, -1);
+        // Trailing -e last, so remove/removes/removed/removing all land on
+        // `remov` instead of splitting two-and-two.
+        if (s.length > 4 && s.endsWith('e')) s = s.slice(0, -1);
+        out.add(s);
+    }
+    return out;
+}
+
+// How many negators a line carries. Deliberately NOT built on tokenSet: every
+// negator in the language is shorter than its length floor, which is exactly why
+// a supersede that inverts a row used to reach the store ungated. Counting rather
+// than testing a boolean keeps "no marks" -> "no marks left" (1 -> 1, a
+// restatement) apart from "marks" -> "no marks" (0 -> 1, an inversion).
+// Matched on the raw text, so contractions survive.
+const NEGATORS = /\b(?:not|no|never|none|nothing|nobody|nowhere|neither|nor|without|nicht|kein|keine|keinen|nie)\b|n't\b/gi;
+function negationPolarity(text) {
+    const m = String(text ?? '').match(NEGATORS);
+    return m ? m.length : 0;
+}
+
+// RANKING — which rows get one of the STATE_RECHECK_MAX mandatory verdicts.
+//
+// Score = IDF-weighted token overlap between the ROW AS RENDERED and the
+// SETTLED messages. Rationale, in order of strength:
+//
+//   1. A verdict is only ANSWERABLE from evidence. The prompt forbids
+//      superseding on inference, so a row about something the new messages
+//      never mention has exactly one honest verdict, and demanding it teaches
+//      the agent to stamp UNCHANGED without reading — or, worse, to invent a
+//      change to justify the slot. Rows sharing NO token with the messages are
+//      therefore not asked about at all.
+//   2. Lexical overlap is where a contradiction actually lives. #23's row read
+//      "Chest binding … too tight across ribs" and the message read "The
+//      binding came off … Red marks scored her ribs" — 'binding' and 'ribs' are
+//      the contradiction, in plain shared words.
+//
+// IDF (1/document-frequency across the candidate rows) is what makes this work
+// on a single-protagonist roleplay: the lead's name is in nearly every row —
+// buildFactLine renders the ref, so the subject leaks in through the KEY even
+// when the prose omits it — and in nearly every message, so raw overlap ranks
+// by nothing at all. With df weighting 'naoto' at df 18 contributes 0.06 while
+// 'ribs' at df 1 contributes 1.0: the score reduces to "how many words does
+// this row share with the new messages that it does NOT share with its
+// neighbours". That same leak is why rule 1 rarely excludes anything in a solo
+// scene and the CAP is the real selector there — the score is the ranking, the
+// zero test only spares whole absent subjects.
+//
+// Honest about what this is not: df is computed over the ~20 candidate rows,
+// not over a corpus, so an ordinary English word that happens to be rare across
+// THESE rows ('something', 'just') can score as high as a distinctive one. The
+// noise is symmetric and does not systematically bury a contradiction — on the
+// #23 data the binding row still ranks 2nd of 18, on 'binding'/'ribs'/'across'/
+// 'beneath'. This is a cheap ordering heuristic, not retrieval.
+//
+// REJECTED alternatives: recency ranks the WRONG way (a row written this turn
+// was just judged against these same messages by the extractor, and is the
+// least likely to be stale); importance is uncorrelated with staleness and its
+// top band is premise identity — a name, a birthplace — which by construction
+// rarely changes; kind === 'state' is the taxonomy's own "durable but
+// changeable" label and reads as ideal, but it is DERIVED from the aspect
+// (deriveKind), so it says which aspects CAN change, never which one just did.
+// It also does not discriminate: on the pre-derivation store measured here
+// ({trait:61, state:2}) it selected almost nothing, and on a store whose aspects
+// derive to `state` it selects almost everything. Either way the settled
+// messages are the only evidence that a change actually happened, so overlap
+// with them is the ranking. Staleness survives only as the TIEBREAK: among rows
+// the messages talk about equally, prefer the one asserted longest ago and never
+// revisited, because that is where drift accumulates.
+function buildStateRecheckSection({ priorSheetText, settledMessages, tentativeMessages, databases }) {
+    try {
+        const msgs = (Array.isArray(settledMessages) ? settledMessages : [])
+            .filter(m => String(m?.text || '').trim());
+        // No settled messages = no admissible evidence, so no verdict can be
+        // owed — and none could be checked either (see the settled-evidence gate
+        // in applyStateVerdicts, which has nothing to check against here).
+        if (msgs.length === 0) return null;
+
+        const parsed = extractPriorStateLines(priorSheetText);
+        if (parsed.length === 0) return null;
+
+        // Resolve each rendered row back to the live record. A row whose fact is
+        // gone, inactive, invisible or cold-tiered will not be injected again,
+        // so no verdict is owed on it — and cold especially must not be offered,
+        // since a write would uncold it (upsertFact) and undo the demotion.
+        const entries = [];
+        for (const p of parsed) {
+            const category = mapLegacyCategory(String(p.category || '').trim() || 'Unsorted');
+            const db = (databases || {})[category];
+            if (!db) continue;
+            const fact = findFactMatch(db, p.key);
+            if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
+            if (fact.cold === true) continue;
+            // `db` rides along so a write can be re-resolved in the SAME store
+            // object afterwards (restoreEveryoneKnownBy). It is a live record —
+            // it must never reach addDebugLog or traceCapture, and the entry is
+            // only ever projected field-by-field into those.
+            entries.push({ ref: `${category}/${fact.key}`, category, db, fact, line: p.line, tokens: null, score: 0 });
+        }
+        if (entries.length === 0) return null;
+
+        const settledText = msgs.map(m => String(m?.text || '')).join('\n');
+        const msgTokens = tokenSet(settledText);
+        if (msgTokens.size === 0) return null;
+
+        const df = new Map();
+        for (const e of entries) {
+            e.tokens = tokenSet(e.line);
+            for (const t of e.tokens) df.set(t, (df.get(t) || 0) + 1);
+        }
+
+        const scored = [];
+        for (const e of entries) {
+            let score = 0;
+            for (const t of e.tokens) {
+                if (!msgTokens.has(t)) continue;
+                score += 1 / (df.get(t) || 1);
+            }
+            if (score <= 0) continue;
+            e.score = score;
+            scored.push(e);
+        }
+        if (scored.length === 0) return null;
+
+        scored.sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            // Older first. An absent validAt sorts last: unknown age is not
+            // evidence of staleness.
+            const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : Number.MAX_SAFE_INTEGER;
+            const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : Number.MAX_SAFE_INTEGER;
+            return av - bv;
+        });
+
+        const picked = scored.slice(0, STATE_RECHECK_MAX);
+        // The two vocabularies the write gate compares a SUPERSEDE against.
+        // Built here because both windows are already in hand, and deliberately
+        // AFTER the scoring: the tentative text ranks nothing and picks nothing —
+        // it can only ever cost a write, never buy one. That is the whole of its
+        // role, and it is the reason the ranking above may stay settled-only
+        // while the gate can still name WHY a refused claim was refused.
+        return {
+            settledStems: groundingStems(settledText),
+            tentativeStems: groundingStems((Array.isArray(tentativeMessages) ? tentativeMessages : [])
+                .map(m => String(m?.text || '')).join('\n')),
+            header: '## State lines up for recheck (CURRENT STATE rows the sheet is still injecting as present-tense truth, ranked by how much the SETTLED messages above talk about them — ONE STATE verdict per ref, no exceptions)',
+            body: picked.map(e => clipText(e.line, STATE_RECHECK_LINE_CHARS)).join('\n'),
+            entries: picked,
+            stateRows: parsed.length,
+            resolved: entries.length,
+            scoredAbove0: scored.length,
+        };
+    } catch {
+        // Same doctrine as buildRecoveryCandidates: this block is an
+        // improvement, never a precondition — a broken store shape must not cost
+        // the run its extraction.
+        return null;
+    }
+}
+
+// STATE verdicts travel on the same final reply as NEED/RECOVERED, one line per
+// ref, pipe-separated the way SCENE_MARKER and BEAT already are (the free-text
+// third field can contain commas, so the comma grammar parseRefLine uses cannot
+// carry it). Tolerant of bullet prefixes like the other ref parsers.
+//   STATE: Category/key | UNCHANGED
+//   STATE: Category/key | SUPERSEDE | <new text>
+// A SUPERSEDE with an empty third field is DROPPED rather than treated as a
+// verdict: it names a row as wrong without saying what is right, and the write
+// path would have nothing to store.
+//
+// Repeats are NOT collapsed here. A ref repeated in one reply keeps its FIRST
+// verdict — a trailing rubber-stamp must not quietly cancel a considered
+// supersede written above it — but that decision belongs to applyStateVerdicts,
+// which is the only place that can tell a repeat (`X UNCHANGED` twice) from a
+// CONTRADICTION (`X SUPERSEDE` then `X UNCHANGED`) and count them separately.
+// Collapsing them here made a self-contradicting reply indistinguishable from a
+// clean one in every log and trace. It is also the only layer that can see that
+// `World/x` and `Places/x` are the same row.
+//
+// The leading `[-*]?` is not decoration: eight verdicts in a row is exactly the
+// shape a model renders as a markdown list, and a dropped SUPERSEDE is
+// indistinguishable from the silence this whole feature exists to end. Bullets
+// are stripped in BOTH positions (before the header and before the ref).
+function parseStateVerdicts(text) {
+    const out = [];
+    for (const rawLine of String(text || '').split('\n')) {
+        const m = /^\s*[-*]?\s*STATE\s*:\s*(.+)$/i.exec(rawLine.trim());
+        if (!m) continue;
+        const parts = m[1].split('|');
+        const ref = parts[0].trim().replace(/^[-*]\s*/, '');
+        const slash = ref.indexOf('/');
+        if (slash <= 0) continue;
+        const category = ref.slice(0, slash).trim();
+        const key = ref.slice(slash + 1).trim();
+        if (!category || !key) continue;
+        const verdict = String(parts[1] || '').trim().toUpperCase();
+        if (/^UNCHANGED/.test(verdict)) {
+            out.push({ category, key, verdict: 'UNCHANGED', value: '' });
+            continue;
+        }
+        if (!/^SUPERSEDE/.test(verdict)) continue;
+        // Re-join: a new value may legitimately contain a pipe.
+        const value = parts.slice(2).join('|').trim();
+        if (!value) continue;
+        out.push({ category, key, verdict: 'SUPERSEDE', value });
+    }
+    return out;
+}
+
+// An EMPTY or absent stored knownBy is a VALUE, not a missing field: it means
+// "everyone knows this". isFactVisible returns true for it unconditionally and
+// buildFactLine renders it `[everyone]` — it is how world lore, public events
+// and premise rows are stored. And it cannot be SENT: execWriteFact treats
+// `known_by: []` exactly like an omitted one and substitutes getScenePresent(),
+// after which upsertFact REPLACES knownBy wholesale (it is not on the merge-
+// preserved list). So a forced supersede of a public row silently gates it on
+// whoever happened to be on stage this turn, and it stops being injected the
+// moment that cast leaves. An omitted knownBy means UNCHANGED, never "nobody".
+//
+// The write itself must keep going through executeMemoryTool — every guard lives
+// there — so the one field is repaired afterwards, in the same store object the
+// saveDatabase pass persists (upsertFact already stamped db.updatedAt and the
+// category is already in ctx.touchedCategories, so this rides along with no
+// extra save).
+//
+// Re-resolved instead of reusing the pre-write object because upsertFact
+// REPLACES db.facts[i] with a fresh object. The key equality test is not
+// ceremony: write_fact resolves generic prefixes and aliases, so a write can
+// land on a DIFFERENT record than the row we read, and that record's knownBy is
+// not ours to blank. When it cannot be re-resolved the row is left narrowed and
+// SAID SO at fail level — a silently gated lore fact is exactly the kind of
+// disappearance this pass exists to stop.
+function restoreEveryoneKnownBy(entry, runId = '') {
+    const db = entry?.db;
+    const key = entry?.fact?.key;
+    if (!db || !key) return false;
+    const after = findFactMatch(db, key);
+    if (!after || after.key !== key) {
+        addDebugLog('fail', `[${runId}] State recheck: ${entry?.ref || '?'} was stored as "known by: everyone" but could not be re-resolved after the write — it may now be gated on the scene cast`, {
+            subsystem: 'agent3', event: 'agent3.state_recheck', reason: 'KNOWNBY_UNRESTORED',
+            data: { ref: entry?.ref || '', key, resolvedKey: after ? after.key : null, runId },
+        });
+        return false;
+    }
+    if (!Array.isArray(after.knownBy) || after.knownBy.length === 0) return false;
+    const narrowedTo = after.knownBy.length;
+    // Assigned rather than deleted: [] and absent are identical to every reader
+    // (isFactVisible reads `(fact && fact.knownBy) || []`), and [] is the shape
+    // execWriteFact writes for every new fact.
+    after.knownBy = [];
+    addDebugLog('info', `[${runId}] State recheck: restored "known by: everyone" on ${entry.ref} — the write had narrowed it to ${narrowedTo} name(s)`, {
+        subsystem: 'agent3', event: 'agent3.state_recheck', reason: 'KNOWNBY_RESTORED',
+        data: { ref: entry.ref, narrowedTo, runId },
+    });
+    return true;
+}
+
+// Apply the verdicts. SUPERSEDE goes through executeMemoryTool('write_fact'),
+// i.e. the SAME path the agent's own writes take, so every guard applies:
+// key canonicalization, alias/generic prefix resolution, findFactMatch,
+// isMaterialFactWrite, upsertFact's parallel-state merge, autoLinkFact,
+// applyCrossKeySupersedeRules, the ctx.applied ledger and the trace captures.
+//
+// The payload deliberately restates four STORED fields instead of letting
+// execWriteFact default them, because the defaults are authored for a NEW fact
+// and would silently damage an existing one:
+//   - known_by: omitted, it defaults to getScenePresent(), and upsertFact
+//     REPLACES knownBy wholesale — a supersede of a secret would broadcast it to
+//     everyone currently in the room. Restating it covers only the rows that
+//     HAVE a list; the empty/absent case is the opposite failure and is repaired
+//     after the write (restoreEveryoneKnownBy).
+//   - aspect: normalizeAspect never returns empty, so an omitted aspect rewrites
+//     a good stored one to the category default (the reflect path documents the
+//     same hazard).
+//   - kind / importance: kept so a forced write cannot re-classify or (via a
+//     default) touch the record's standing. mergeSalience takes the max of the
+//     two importances, so this is belt and braces, not a behaviour change.
+//
+// value AND note both carry the verdict text. buildFactLine renders the NOTE
+// INSTEAD of the value whenever one exists, so updating only `value` would leave
+// the sheet printing the stale note — the defect would survive its own fix. The
+// prompt already demands a self-contained replacement for the whole row, which
+// is exactly what a note is required to be.
+async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', callId = null }) {
+    const stats = {
+        asked: stateRecheck.entries.length,
+        verdicts: verdicts.length,
+        unchanged: 0, superseded: 0, unanswered: 0,
+        unlisted: 0, noop: 0, capped: 0, failed: 0,
+        repeated: 0, contradicted: 0, ungrounded: 0, tentativeOnly: 0, knownByRestored: 0,
+        applied: [],
+    };
+    const order = new Map(stateRecheck.entries.map((e, i) => [e.ref.toLowerCase(), i]));
+    const byRef = new Map(stateRecheck.entries.map(e => [e.ref.toLowerCase(), e]));
+
+    const answered = new Set();
+    const firstByRef = new Map();
+    const supersedes = [];
+    for (const v of verdicts) {
+        // `World/x` and `Places/x` are the same record, and legacy categories are
+        // still all over this store — so every comparison below happens on the
+        // MAPPED ref, not the ref as written.
+        const ref = `${mapLegacyCategory(String(v.category || '').trim() || 'Unsorted')}/${v.key}`.toLowerCase();
+        // FIRST verdict per ref wins, and the rest are counted rather than
+        // dropped in silence. A repeat is a model restating itself; a
+        // CONTRADICTION (a different verb, or a second SUPERSEDE with different
+        // text) means the reply does not agree with itself, and a reply that
+        // does not agree with itself is the rewrite reflex arguing out loud. The
+        // considered verdict is the one written first, so that is the one kept,
+        // but the disagreement is now visible in the run log instead of being
+        // indistinguishable from a clean answer.
+        const prev = firstByRef.get(ref);
+        if (prev) {
+            if (prev.verdict !== v.verdict || (v.verdict === 'SUPERSEDE' && prev.value !== v.value)) stats.contradicted++;
+            else stats.repeated++;
+            continue;
+        }
+        firstByRef.set(ref, v);
+        const entry = byRef.get(ref);
+        // A verdict for a row we did not ask about is the rewrite-everything
+        // reflex in its first observable form. It is refused, not applied: the
+        // fed list is the whole authority here, exactly as `## Injected last
+        // turn` is the authority for recovery.
+        if (!entry) { stats.unlisted++; continue; }
+        answered.add(ref);
+        if (v.verdict === 'UNCHANGED') { stats.unchanged++; continue; }
+        supersedes.push({ entry, value: v.value });
+    }
+    stats.unanswered = stats.asked - answered.size;
+
+    // When more supersedes arrive than the cap allows, keep the ones the
+    // EVIDENCE ranking put first rather than the ones the model listed first —
+    // reply order is arbitrary, the fed order is scored.
+    supersedes.sort((a, b) => (order.get(a.entry.ref.toLowerCase()) ?? 0) - (order.get(b.entry.ref.toLowerCase()) ?? 0));
+
+    for (const s of supersedes) {
+        if (stats.superseded >= STATE_SUPERSEDE_MAX) { stats.capped++; continue; }
+        const fact = s.entry.fact;
+        const storedValue = String(fact.value ?? '').trim();
+        const storedNote = (typeof fact.context === 'string') ? fact.context.trim() : '';
+        // A SUPERSEDE that restates the row as it already reads is an UNCHANGED
+        // with extra steps, and it is not free: upsertFact re-stamps lastUpdated
+        // unconditionally, which feeds cold-tiering and every recency ranking in
+        // the codebase. The test is against the RENDERED row (buildFactLine
+        // shows the note INSTEAD of the value whenever one exists) because that
+        // is what "did the injected line change" means — comparing against the
+        // raw value alone let an echo of a stored one-word value through.
+        if (s.value === (storedNote || storedValue)) { stats.noop++; continue; }
+
+        // ---- THE SETTLED-EVIDENCE GATE ------------------------------------
+        //
+        // The one rule this feature cannot enforce in prose: a SUPERSEDE must be
+        // answerable from the SETTLED window. The prompt says so; this function
+        // used to take the model's word for it, and the live export shows what
+        // that costs — two rows written from TENTATIVE replies, i.e. from text a
+        // swipe can delete, leaving a store that remembers a message that never
+        // happened. Choosing WHICH rows to ask about from settled text only (the
+        // ranking above) does not close it: it decides the question, not the
+        // answer.
+        //
+        // What is checkable is WORDS. Stem the replacement, subtract the stems
+        // of the row it replaces, and what is left is the CLAIM — the part this
+        // supersede asserts that the sheet did not already say. At least one of
+        // those stems must occur in the settled messages. If none does but one
+        // occurs in the tentative window, the claim's wording demonstrably came
+        // from text that may still be swiped away: refused, TENTATIVE_ONLY. If
+        // it occurs in neither, it came from the model alone: refused,
+        // UNGROUNDED.
+        //
+        // THE HONEST LIMIT, stated once so no comment below overstates it: this
+        // proves the claim's VOCABULARY is present in the settled text, never
+        // that the settled text supports the claim. A model that re-words a
+        // tentative observation using words that also happen to occur in the
+        // settled window still passes, and no check on this side of a text-in/
+        // text-out protocol can catch that — there is no channel on which the
+        // model can be made to prove what it read. What the gate does buy is
+        // exactly the sentence the prompt has been asserting alone: the tentative
+        // window can no longer be the SOLE source of a written row.
+        //
+        // It cuts both ways on purpose. A supersede that restates settled
+        // evidence entirely in synonyms is refused too. That costs a stale row
+        // one more turn — it still scores against those same messages, so it is
+        // asked again next turn — and every refusal is logged with the tokens
+        // that failed, so the false-refusal rate is measurable rather than
+        // assumed. An unjustified write is neither.
+        //
+        // An empty `novel` set USUALLY means the replacement introduces no content
+        // word the row did not already carry, so there is no claim to ground (the
+        // no-op test above already caught the exact restatement).
+        //
+        // With one exception that used to sail straight through: NEGATION. Every
+        // negator is shorter than groundingStems' length floor, so
+        // "binding wrapped tight" -> "binding NOT wrapped tight" yields an empty
+        // `novel` set while inverting the row's meaning completely — the single
+        // most consequential verdict this feature can produce, previously written
+        // with zero settled evidence required. A polarity flip IS a claim, so when
+        // one is detected the gate demands grounding for the whole line rather
+        // than for the (empty) novel set.
+        const rowStems = groundingStems(s.entry.line);
+        const valueStems = groundingStems(s.value);
+        const novel = [...valueStems].filter(t => !rowStems.has(t));
+        const inverts = negationPolarity(s.value) !== negationPolarity(s.entry.line);
+        const claimStems = novel.length > 0 ? novel : [...valueStems];
+        if ((novel.length > 0 || inverts) && !claimStems.some(t => stateRecheck.settledStems.has(t))) {
+            const fromTentative = novel.filter(t => stateRecheck.tentativeStems.has(t));
+            stats.ungrounded++;
+            if (fromTentative.length > 0) stats.tentativeOnly++;
+            const why = fromTentative.length > 0
+                ? 'its new wording traces to a TENTATIVE reply, not to any settled message'
+                : (novel.length === 0 && inverts
+                    ? 'it INVERTS the row (a negation was added or removed) and no word of the new line appears in the settled messages'
+                    : 'nothing in its new wording appears in the settled messages');
+            addDebugLog('info', `[${runId}] State recheck: SUPERSEDE ${s.entry.ref} refused — ${why} (unmatched: ${claimStems.slice(0, 8).join(', ')})`, {
+                subsystem: 'agent3', event: 'agent3.state_recheck',
+                reason: fromTentative.length > 0 ? 'TENTATIVE_ONLY' : (novel.length === 0 && inverts ? 'UNGROUNDED_INVERSION' : 'UNGROUNDED'),
+                data: {
+                    ref: s.entry.ref, novel: novel.slice(0, 8), inverts,
+                    fromTentative: fromTentative.slice(0, 8), runId,
+                },
+                before: storedNote || storedValue, after: s.value,
+            });
+            continue;
+        }
+
+        const storedKnownBy = (Array.isArray(fact.knownBy) ? fact.knownBy : [])
+            .map(n => String(n ?? '').trim()).filter(Boolean);
+        const args = { category: s.entry.category, key: fact.key, value: s.value, note: s.value };
+        if (storedKnownBy.length > 0) args.known_by = [...storedKnownBy];
+        if (fact.aspect) args.aspect = fact.aspect;
+        if (fact.kind) args.kind = fact.kind;
+        if (fact.importance !== undefined && fact.importance !== null) args.importance = fact.importance;
+
+        let res = '';
+        try {
+            res = String(await executeMemoryTool({ tool: 'write_fact', args }, ctx) ?? '');
+        } catch (e) {
+            res = `ERROR: ${e?.message || e}`;
+        }
+        // Non-fatal, like every other write outcome in this file: log and carry
+        // on. A refused supersede leaves the stale row standing, which is the
+        // status quo ante, not a new failure.
+        if (/^ERROR/i.test(res)) {
+            stats.failed++;
+            addDebugLog('fail', `[${runId}] State recheck: SUPERSEDE ${s.entry.ref} refused by write_fact — ${res}`, {
+                subsystem: 'agent3', event: 'agent3.state_recheck', reason: 'WRITE_REFUSED',
+                data: { ref: s.entry.ref, result: res, runId },
+            });
+            continue;
+        }
+        stats.superseded++;
+        // The other half of the known_by hazard: an omitted list is what
+        // execWriteFact defaults, so a row stored as "everyone" comes back
+        // narrowed to whoever is on stage. Repaired here, on the record the
+        // write just produced, before the saveDatabase pass persists it.
+        if (storedKnownBy.length === 0 && restoreEveryoneKnownBy(s.entry, runId)) stats.knownByRestored++;
+        stats.applied.push({ ref: s.entry.ref, before: storedNote || storedValue, after: s.value, result: res });
+        addDebugLog('info', `[${runId}] State recheck: SUPERSEDED ${s.entry.ref} — "${clipText(storedNote || storedValue, 80)}" -> "${clipText(s.value, 80)}"`, {
+            subsystem: 'agent3', event: 'agent3.state_recheck', reason: 'SUPERSEDE',
+            data: { ref: s.entry.ref, result: res, runId },
+            before: storedNote || storedValue, after: s.value,
+        });
+    }
+
+    // `unanswered` is the compliance number the whole feature turns on: the
+    // prompt calls the verdict mandatory, and this is the only place that can
+    // say whether the agent actually treated it as mandatory. Logged at info on
+    // every run (not only when non-zero) so the rate is readable straight off
+    // the run log rather than reconstructable.
+    addDebugLog(stats.unanswered > 0 ? 'info' : 'pass', `[${runId}] State recheck: ${stats.asked} row(s) asked, ${stats.unchanged} UNCHANGED, ${stats.superseded} superseded, ${stats.unanswered} unanswered${stats.capped ? `, ${stats.capped} over cap` : ''}${stats.unlisted ? `, ${stats.unlisted} for unlisted refs (refused)` : ''}${stats.ungrounded ? `, ${stats.ungrounded} without settled evidence (refused${stats.tentativeOnly ? `, ${stats.tentativeOnly} tentative-only` : ''})` : ''}${stats.noop ? `, ${stats.noop} no-op` : ''}${stats.contradicted ? `, ${stats.contradicted} contradicted by a later verdict for the same ref (first kept)` : ''}${stats.repeated ? `, ${stats.repeated} repeated` : ''}${stats.knownByRestored ? `, ${stats.knownByRestored} known-by restored` : ''}${stats.failed ? `, ${stats.failed} refused by write_fact` : ''}`, {
+        subsystem: 'agent3', event: 'agent3.state_recheck',
+        data: { ...stats, applied: stats.applied.length, supersedeCap: STATE_SUPERSEDE_MAX, askCap: STATE_RECHECK_MAX, runId },
+    });
+
+    traceCapture('agent3.state.recheck', () => ({
+        ...stats,
+        header: stateRecheck.header,
+        body: stateRecheck.body,
+        // The ranking, so a missed supersede can be diagnosed as "never asked"
+        // (row scored below the cap) versus "asked and stamped UNCHANGED".
+        ranked: stateRecheck.entries.map(e => ({
+            ref: e.ref, score: Math.round(e.score * 1000) / 1000,
+            validAt: Number.isInteger(e.fact?.validAt) ? e.fact.validAt : null,
+        })),
+        stateRows: stateRecheck.stateRows,
+        resolved: stateRecheck.resolved,
+        scoredAbove0: stateRecheck.scoredAbove0,
+        // Sizes only — the stem sets are the gate's vocabulary, not evidence in
+        // themselves, and a refusal already logs the tokens that missed.
+        settledStems: stateRecheck.settledStems.size,
+        tentativeStems: stateRecheck.tentativeStems.size,
+        // Every parsed line IN REPLY ORDER, repeats included, so a contradiction
+        // can be read off the trace as the pair it was.
+        verdictsParsed: verdicts.map(v => `${v.category}/${v.key} | ${v.verdict}${v.value ? ` | ${v.value}` : ''}`),
+    }), { runId, callId });
+
+    return stats;
 }
 
 // Prior summary fallback for a failed Call C: the previous sheet renders the

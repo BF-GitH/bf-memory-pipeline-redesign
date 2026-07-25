@@ -49,6 +49,15 @@ export const REFLECTION_WRITE_TOOLS = ['write_fact', 'merge_facts', 'mark_cold']
 // Full roster the reflection executor accepts.
 export const REFLECTION_TOOLS = [...REFLECTION_READ_TOOLS, ...REFLECTION_WRITE_TOOLS];
 
+// The LOOKUP agent's roster — three read tools, and nothing else will ever be
+// added to it. That pass runs ON THE LATENCY PATH, in front of a user who is
+// waiting for a reply, against a store the extraction agent is concurrently
+// writing to; a write from there would land outside every guard the pipeline
+// has (no run id, no settled-message gate, no chat-switch commit check, no
+// watermark). list_categories is deliberately absent: it costs a round and the
+// task block already ships the key inventory.
+export const LOOKUP_TOOLS = ['list_keys', 'read_facts', 'search'];
+
 // Union of every tool name any agent may legally emit. The PARSER validates
 // against this, not against KNOWN_TOOLS: a name missing here is reported as
 // MALFORMED (which burns the grace round and aborts the loop on the second
@@ -295,9 +304,63 @@ export function parseAgentReply(text) {
     return out;
 }
 
+// The read-only executor. WRITE ACCESS IS STRUCTURALLY IMPOSSIBLE HERE, by three
+// independent barriers rather than by nobody asking:
+//
+//   1. This switch has no write case. The write executors (execWriteFact,
+//      execAddAlias, execLinkFacts, execMergeFacts, execMarkCold) are
+//      module-private and are named in exactly one place — executeMemoryTool's
+//      switch below — so there is no expression in this function that can reach
+//      one, whatever `call.tool` says.
+//   2. The roster is checked BEFORE dispatch, so an unknown or write tool comes
+//      back as a refusal string the model can read, not as a silent no-op.
+//   3. agent-lookup.js imports THIS function and never imports executeMemoryTool,
+//      so the write dispatcher is not in that module's import graph at all.
+//
+// The fourth barrier is in executeMemoryTool itself (ctx.mode === 'lookup'
+// refuses every non-read tool), which covers a future caller that hands a lookup
+// ctx to the general dispatcher.
+//
+// A refusal returns the same 'ERROR: ...' shape every other refusal does, so the
+// tool loop's telemetry and the model's own error handling need no special case.
+export async function executeLookupTool(call, ctx) {
+    const tool = String(call?.tool || '');
+    const args = call?.args || {};
+    if (!LOOKUP_TOOLS.includes(tool)) {
+        return `ERROR: "${tool || '(missing)'}" is not available to the lookup pass — it is READ-ONLY. Valid tools: ${LOOKUP_TOOLS.join(', ')}.`;
+    }
+    try {
+        switch (tool) {
+            case 'list_keys': return execListKeys(args, ctx);
+            case 'read_facts': return execReadFacts(args, ctx);
+            case 'search': return await execSearch(args, ctx);
+            // Unreachable: the roster check above already returned. Kept because
+            // a switch whose default cannot be hit still must not fall through to
+            // undefined if the roster and this switch ever drift apart.
+            default: return `ERROR: unknown tool "${tool}"`;
+        }
+    } catch (e) {
+        // Same non-fatal shape the main executor uses. This one runs while a
+        // generation is held, so it must never propagate: the loop gets a string,
+        // the model gets one round to react, and the prompt goes out either way.
+        addDebugLog('fail', `Lookup tool "${tool}" threw: ${e?.message || e}`, {
+            runId: ctx?.runId || '',
+            subsystem: 'agent3', event: 'memtool.error', reason: 'TOOL_THREW',
+            data: { tool, error: String(e?.message || e), mode: 'lookup' },
+        });
+        return `ERROR: ${tool} failed internally (${e?.message || e})`;
+    }
+}
+
 export async function executeMemoryTool(call, ctx) {
     const tool = call?.tool;
     const args = call?.args || {};
+    // Barrier 4 for the read-only lookup pass (see executeLookupTool): a ctx
+    // marked 'lookup' can never mutate the store, no matter which entry point it
+    // is handed to. One array lookup on a path that is about to do IO.
+    if (ctx?.mode === 'lookup' && !LOOKUP_TOOLS.includes(String(tool || ''))) {
+        return `ERROR: "${tool || '(missing)'}" is not available to the lookup pass — it is READ-ONLY. Valid tools: ${LOOKUP_TOOLS.join(', ')}.`;
+    }
     try {
         switch (tool) {
             case 'list_categories': return execListCategories(ctx);
@@ -854,11 +917,39 @@ function execLinkFacts(args, ctx) {
     return `OK linked ${fromRef.category}/${fromFact.key} <-> ${toRef.category}/${toFact.key}`;
 }
 
+// `scope` is not free-standing metadata — mapLegacyCategory() ROUTES on it. Its
+// legacy `world` branch reads scope:'place' as "this v0.x world row is really a
+// place" and files the record under Places; scope:'event' sends it to Events. So
+// stamping scope:'place' onto every World write, as this used to, made World a
+// write-only category: the extraction agent filed worldbuilding there, the next cold
+// load relocated all of it, and the load after that relocated whatever had been
+// written since — one idbUpdateRecord and one full attachment snapshot per cycle,
+// forever. The remap could not converge because its own writer regenerated the input.
+//
+// A World fact therefore carries NO stored scope. The scope of world lore is the
+// world; 'character', 'place' and 'event' are the three subjects a fact can be ABOUT,
+// and world lore is about none of them. Leaving the field off is not a hole:
+// deriveScope() answers 'place' for the World category, so every consumer that reads
+// a scope (the link walk, deriveSubject, collectFactNames) behaves exactly as before,
+// while normalizeScope() — which mapLegacyCategory reads RAW, not through
+// deriveScope() — returns '' and the routing branch does not fire. Result: a fact
+// written to World stays in World, and the `world` branch is a legacy branch again,
+// firing only on records that were already in the store carrying an old scope.
+//
+// '' is returned rather than the field being omitted, and that is load-bearing:
+// execWriteFact assigns `scope` unconditionally and upsertFact merges with
+// { ...existing, ...fact }, so an old World row that still carries scope:'place'
+// is healed the next time anything writes to it, instead of being relocated by the
+// legacy branch forever.
+//
+// The other categories keep their explicit scope: it is redundant with the category
+// for them, but 'status' + scope routing and deriveScope()'s Unsorted fallback both
+// still consult it, and changing that is not this fix.
 function scopeFromCategory(category) {
     switch (String(category || '').toLowerCase()) {
         case 'events': return 'event';
-        case 'places':
-        case 'world': return 'place';
+        case 'places': return 'place';
+        case 'world': return '';
         default: return 'character';
     }
 }

@@ -1,4 +1,4 @@
-import { addDebugLog } from './settings.js';
+import { addDebugLog, traceCapture } from './settings.js';
 import { wordTokens } from './tokenize.js';
 import * as host from './host.js';
 
@@ -46,6 +46,128 @@ export function clampImportance(v) {
 export function normalizeKind(v) {
     const k = String(v || '').trim().toLowerCase();
     return VALID_KINDS.has(k) ? k : DEFAULT_KIND;
+}
+
+// `kind` is load-bearing, not decoration. Two whole maintenance mechanisms select
+// on it and nothing else: REEVAL only re-examines kind === 'state', CALLBACK only
+// surfaces kind === 'moment'. In the analysed 36-message run the store came out
+// {trait:61, state:2, event:1, moment:0} — including Events/naoto_sealed_in_pod
+// filed as a trait — so both mechanisms ran against an empty candidate set and
+// fired zero times. 'trait' is the model's safe answer under uncertainty, and a
+// safe answer does not move under prompt pressure. So the kind is DERIVED from the
+// two fields the model does get right (owning category and aspect) wherever the
+// mapping is unambiguous, and the model's own answer is consulted only for the
+// aspects that could honestly go either way.
+//
+// Neither set may contain a DEFAULT_ASPECT value ('status', 'feature', 'object',
+// 'history', 'scene', 'lore', 'misc'): those are the sinks normalizeAspect() drops
+// an UNRECOGNISED aspect into, so a fact sits there because nothing could classify
+// it, not because it is a state. Deriving off a sink would mislabel the tail of the
+// store wholesale.
+//
+// THE EFFECT THAT IS NOT ABOUT REEVAL/CALLBACK, and it is the larger one: `kind` is
+// the direct index into HALF_LIFE_DAYS above, so it also sets the recency decay used
+// by salienceScore() — and salienceScore() is what coldTierOverflow() ranks on. A
+// row re-derived from 'trait' to 'state' drops from a 90-day half-life to 3 days.
+// With IMPORTANCE_WEIGHT 0.65 / RECENCY_WEIGHT 0.35, an importance-3 row last touched
+// 21 days ago falls from 0.39 + 0.35·0.5^(21/90) ≈ 0.69 to 0.39 + 0.35·0.5^(21/3) ≈ 0.39,
+// and useBonus() caps at 0.20, so no amount of use makes that back up. Cold rows are
+// excluded from the reflection digest, the premise floor and the sheet, so a wrong
+// derivation here does not merely fail to recheck a fact — it can retire it. Two things bound that: COLD_TIER_PROTECT_IMPORTANCE
+// exempts importance 5 outright, and nothing goes cold at all until a category holds
+// more than HOT_SET_SIZE demotable rows. Membership in STATE_ASPECTS is therefore a
+// claim about DECAY as much as about rechecking: put an aspect there only if a
+// three-day-old answer is genuinely suspect.
+
+// One-off felt beats — something that HAPPENED between people and left a mark.
+// This is what CALLBACK is for: a thread the storyteller can pick back up.
+const MOMENT_ASPECTS = new Set([
+    // People > Origin & Past / Fears & Wounds
+    'formative_event', 'trauma', 'first_love', 'worst_day', 'defining_loss',
+    'turning_point_past', 'coming_of_age', 'early_hardship',
+    'grief', 'emotional_wound', 'past_hurt', 'unresolved_pain', 'sore_spot', 'nightmare',
+    // Relationships > Origin / Romance / Conflict / Trust & Standing / Dynamics
+    'how_they_met', 'first_impression', 'origin_of_bond', 'turning_point', 'introduction',
+    'heartbreak', 'breakup', 'engagement', 'infidelity',
+    'betrayal', 'falling_out',
+    'reconciliation', 'forgiveness', 'disappointment',
+    'last_interaction',
+]);
+
+// Things that are true NOW and can stop being true WITHIN A SCENE OR TWO — what
+// REEVAL exists to recheck, and what a three-day half-life is an honest model of.
+// The binding case from the analysed run lives here: 'disguise' / 'state_of_dress'
+// went stale under a "CURRENT STATE — absolute truth" header for 14 of 15 turns
+// because nothing ever put those facts in front of a recheck.
+//
+// Deliberately NOT here, though every one of them is technically mutable:
+// 'career', 'vocation', 'employer', 'workplace', 'commute', 'legal_status',
+// 'mental_health'. These change on the scale of a story arc, not a scene, and they
+// are premise identity — the state-recheck ranking rationale in agent-memory.js
+// names 'career' as its example of a top-importance field that by construction does
+// not move. Filing them as 'state' would have contradicted that comment AND cut
+// their half-life to three days, which retires a character's job from the sheet
+// faster than their mood. A career change is a #CONFLICT or an explicit SUPERSEDE,
+// which both work without REEVAL candidacy.
+const STATE_ASPECTS = new Set([
+    // People > Daily Life — where they are and what they are doing right now
+    'current_location', 'current_activity', 'companions_present', 'errands',
+    // People > Health — injuries and everything that heals
+    'health', 'injuries', 'illness', 'pain', 'fatigue', 'recovery', 'convalescence',
+    'medication', 'pregnancy', 'symptom', 'sleep_quality',
+    // People > Mind — the mood that persists past the scene
+    'mood',
+    // People > Appearance Style — what is on the body right now
+    'current_clothing', 'state_of_dress', 'disguise', 'worn_items',
+    // People > Drives — the goal in play
+    'current_goal', 'short_term_goal',
+    // Places
+    'place_status', 'condition', 'damage', 'current_use', 'under_construction',
+    'contamination', 'weather', 'crowd',
+    // Things
+    'condition_of_item', 'location_of_item', 'ownership', 'charge_remaining',
+    'lost_status', 'malfunction', 'weapon_condition',
+    // Relationships
+    'status_of_relationship', 'distance',
+    // World > Calendar / Clock / Reckoning / Threats — the clock and the live crisis
+    'time_of_day', 'hour', 'date', 'season', 'elapsed_time', 'duration', 'countdown',
+    'scarcity', 'conflict_world', 'looming_danger', 'invasion', 'famine', 'plague', 'rebellion',
+]);
+
+/**
+ * Decide a fact's `kind` from what it demonstrably is, falling back to the agent.
+ * @param {object} fact          The incoming fact.
+ * @param {string} [owningCategory] Category of the db it is being written into;
+ *                               authoritative when the fact carries none.
+ * @returns {{kind: string, via: string}} `via` names the rule that decided, so the
+ *          caller can log an override without re-deriving it.
+ */
+export function deriveKind(fact, owningCategory) {
+    const category = fact?.category || owningCategory;
+
+    // A track step is a beat on a timeline by construction — deriveScope() already
+    // asserts exactly this for the same predicate.
+    if (isSequenceFact(fact)) return { kind: 'event', via: 'SEQUENCE_STEP' };
+
+    if (String(mapLegacyCategory(category, fact)).toLowerCase() === 'events') {
+        return { kind: 'event', via: 'CATEGORY_EVENTS' };
+    }
+
+    const aspect = normalizeAspect(fact?.aspect, category);
+    if (MOMENT_ASPECTS.has(aspect)) return { kind: 'moment', via: 'ASPECT_MOMENT' };
+    if (STATE_ASPECTS.has(aspect)) return { kind: 'state', via: 'ASPECT_STATE' };
+
+    const passed = passedKindOf(fact);
+    if (passed) return { kind: passed, via: 'AGENT' };
+    return { kind: DEFAULT_KIND, via: 'DEFAULT' };
+}
+
+// "Did the caller actually say a kind" — distinct from normalizeKind(), which
+// answers 'trait' for undefined just as readily as for garbage.
+function passedKindOf(fact) {
+    if (!fact || fact.kind === undefined || fact.kind === null) return '';
+    if (!String(fact.kind).trim()) return '';
+    return normalizeKind(fact.kind);
 }
 
 const TONE_MAX_LEN = 40;
@@ -999,8 +1121,17 @@ function registerNameInto(reg, name, subject) {
 }
 
 function collectFactNames(reg, fact) {
-    const sc = normalizeScope(fact?.scope);
-    if (sc && sc !== 'character') return;
+    // deriveScope(), not the raw field. The raw test read a MISSING scope as
+    // "possibly a character" and let the record through — harmless while every writer
+    // stamped a scope, but World rows carry none now (see scopeFromCategory in
+    // memory-tools.js), and a World row's subject is a key prefix like 'time' or
+    // 'village'. Those would land in the registry that resolveGenericKeyPrefix() and
+    // lookupCharacterAlias() treat as the list of known character names.
+    // deriveScope() falls back to the owning category, so Places/Events/World rows
+    // are excluded whether or not they carry the field, and everything that resolves
+    // to 'character' — including Unsorted and a fact with no category at all —
+    // still gets in exactly as before.
+    if (deriveScope(fact) !== 'character') return;
     const subject = deriveSubject(fact);
     if (!subject) return;
     registerNameInto(reg, subject, subject);
@@ -1224,7 +1355,348 @@ export function summarizeMenuIndexed(index) {
     return lines.join('\n');
 }
 
+// What makes two records under the same key the SAME KNOWLEDGE rather than two
+// independent observations. The set is exactly the fields that decide what a record
+// ASSERTS, how buildFactLine RENDERS it, and how salienceScore RANKS it:
+//
+//   value       the assertion itself (trim + lowercase, via factValuesEqual)
+//   context     the note. buildFactLine prints the note INSTEAD of the value when one
+//               is present, so two rows with different notes read differently on the
+//               sheet however well their values match. Comparing value alone deleted
+//               an importance-5 World lore record, note and all, in favour of an
+//               importance-2 Places one-liner.
+//   importance  the premise floor selects on it, COLD_TIER_PROTECT_IMPORTANCE exempts
+//               on it, and it is 65% of salience. Two rows scored differently were
+//               judged differently.
+//   aspect      compared RAW, not through deriveAspect(): an aspect resolves against
+//               the OWNING category's vocabulary, so a genuine duplicate reads
+//               'time_since' in World and 'feature' in Places and would never match
+//               itself. The stored string is the thing the writer chose.
+//   kind        selects the half-life and both maintenance candidate sets.
+//   knownBy     the visibility gate. A row visible to everyone and a row gated on
+//               four names are not interchangeable whatever they say.
+//
+// Deliberately NOT compared — tags, aliases, involved, agentLinks, relationships:
+// autoLinkFact() and upsertFact()'s merge grow those independently on each copy of a
+// duplicated pair (six of the analysed run's autolink edges landed on shadow copies
+// alone), so requiring equality there would make every real duplicate look distinct.
+// Nothing is at risk either way now that the loser is kept. lastUpdated, createdAt,
+// source, useCount and lastUsedAt are bookkeeping, re-stamped by any touch including
+// a note-only edit. `cold` and `active` are status, not content — and excluding them
+// is what lets an already-resolved pair be recognised as resolved on the next load.
+//
+// srcId is a DISCRIMINATOR and a CONFIRMATION, never the evidence. Two records that
+// both carry an srcId and disagree came from different messages, so they are
+// independent observations even when their content matches — that is the one thing
+// srcId can settle alone. Equality proves nothing on its own: srcId is written only
+// `if (ctx.srcId)` and postdates most of the legacy store this pass exists to clean,
+// so `'' === ''` held for every old record and the old predicate silently collapsed
+// to "same key, same value".
+function duplicateEvidence(a, b) {
+    const differing = [];
+    if (!factValuesEqual(a.value, b.value)) differing.push('value');
+    if (!factValuesEqual(a.context, b.context)) differing.push('context');
+    if (clampImportance(a.importance) !== clampImportance(b.importance)) differing.push('importance');
+    if (rawAspectToken(a) !== rawAspectToken(b)) differing.push('aspect');
+    if (normalizeKind(a.kind) !== normalizeKind(b.kind)) differing.push('kind');
+    if (nameSetToken(a.knownBy) !== nameSetToken(b.knownBy)) differing.push('knownBy');
+
+    const srcA = String(a.srcId || '').trim();
+    const srcB = String(b.srcId || '').trim();
+    if (srcA && srcB && srcA !== srcB) differing.push('srcId');
+
+    return {
+        duplicate: differing.length === 0,
+        confirmedBySrcId: !!srcA && srcA === srcB,
+        differing,
+    };
+}
+
+function rawAspectToken(fact) {
+    return String(fact?.aspect || '').trim().toLowerCase();
+}
+
+function nameSetToken(list) {
+    if (!Array.isArray(list)) return '';
+    return [...new Set(list.map(n => String(n ?? '').trim().toLowerCase()).filter(Boolean))].sort().join('|');
+}
+
+// mapLegacyCategory() is not only a v0.x schema shim. Its `world` + scope:'place'
+// branch reclassifies facts the CURRENT extraction agent writes every session, so it
+// keeps firing forever on a live store. That reclassification used to happen only
+// inside loadAllDatabasesFromAttachments() — a parse whose result is discarded
+// whenever IndexedDB is authoritative — so in the analysed run the same 8 keys were
+// re-remapped on every load (70 LEGACY_CATEGORY_REMAP events, 13 passes) and never
+// actually moved. Worse: the parse DID empty World in the outgoing map, the clobber
+// guard below read the emptied category as data loss and restored it from IDB, and
+// the store ended up carrying both copies permanently — 8 of 64 rows, 8 of 43
+// digest lines, 4 of 15 premise-floor slots. scopeFromCategory() in memory-tools.js
+// no longer stamps scope:'place' onto a World write, so that branch is a legacy
+// branch again and this pass has a finite input.
+//
+// This pass runs the same mapping over the AUTHORITATIVE map after load, and the
+// caller persists the result. That is what makes it converge: everything it can move
+// is moved once and written back, so the second load finds nothing to do.
+// Idempotency is the contract — report.changed must be false on the second call.
+//
+// NOTHING HERE DELETES. Every other demotion in this codebase cold-tiers instead of
+// erasing — the #REEVAL drop, mark_cold, merge_facts' loser, the #CONFLICT loser —
+// and the prompts promise that repeatedly. A migration that silently removed records
+// on the first load after an upgrade would break that promise at the worst possible
+// moment, on a store the user cannot diff. A duplicate is marked cold and stays
+// listed in the DB panel, where it can be read and un-colded.
+//
+// Nothing MOVES onto an occupied key either. findFactMatch() returns the FIRST record
+// carrying a key, so two same-key records inside one category would shadow each other
+// for every later read, write and supersede. When source and destination both hold the
+// key, both records keep their category and only the `cold` flag moves — which is also
+// what makes the resolution idempotent, since markFactCold() is a no-op the second time.
+function canonicalizeCategories(databases) {
+    const report = {
+        changed: false, moved: 0, demotedDuplicate: 0, demotedCollision: 0,
+        alreadyResolved: 0, stamped: 0, emptied: [], byPair: {}, samples: [],
+    };
+    if (!databases || typeof databases !== 'object') return report;
+
+    const sample = (op, entry) => { if (report.samples.length < 12) report.samples.push({ op, ...entry }); };
+
+    // Snapshotted before the loop: a destination db created mid-pass needs no visit
+    // of its own, and every target mapLegacyCategory() can produce is a fixpoint
+    // (the canonical L1 names map to themselves; only 'World' can move, and only
+    // out of World).
+    for (const [cat, db] of Object.entries(databases)) {
+        if (!db || !Array.isArray(db.facts) || db.facts.length === 0) continue;
+        const keep = [];
+        for (const fact of db.facts) {
+            if (!fact || typeof fact !== 'object') { keep.push(fact); continue; }
+
+            const target = mapLegacyCategory(cat, fact);
+            if (!target || target === cat) {
+                // Stamping the owning category onto the record is a GLOBAL
+                // normalization, not a repair of the eight known ghosts: the object
+                // execWriteFact() builds carries no `category` field at all, so this
+                // fires once for every agent-written fact in every store. What it
+                // changes downstream is deriveAspect(), which resolves fact.aspect
+                // against mapLegacyCategory(fact.category)'s vocabulary — undefined
+                // resolves against Unsorted, which is why the analysed store showed
+                // aspectCounts.World = {misc: 8}. Re-resolving against the category
+                // the record actually lives in is strictly better or neutral: an
+                // aspect in that vocabulary now survives, and one that is not lands
+                // on that category's DEFAULT_ASPECT, which is what it already
+                // rendered as. It is accepted as a one-time cost, and it is bounded
+                // by being counted: the first load per character rewrites the record
+                // and re-snapshots, the second finds fact.category === cat for every
+                // row and reports changed:false, so it never runs again. Per-record
+                // logging is deliberately NOT emitted here — this branch touches the
+                // whole store and would bury the moves and demotions below.
+                if (fact.category !== cat) { fact.category = cat; report.stamped++; }
+                keep.push(fact);
+                continue;
+            }
+
+            const pair = `${cat}->${target}`;
+            report.byPair[pair] = (report.byPair[pair] || 0) + 1;
+            if (!databases[target]) databases[target] = createEmptyDatabase(target);
+            const dest = databases[target];
+            const twinIdx = dest.facts.findIndex(f => f && f.key === fact.key);
+
+            if (twinIdx < 0) {
+                fact.category = target;
+                dest.facts.push(fact);
+                dest.updatedAt = Date.now();
+                report.moved++;
+                sample('MOVED', { key: fact.key, from: cat, to: target });
+                addDebugLog('info', `Category convergence: moved ${cat}/${fact.key} → ${target} (no record under that key there)`, {
+                    subsystem: 'db', event: 'fact.remapped', actor: 'SYSTEM', reason: 'LEGACY_CATEGORY_REMAP',
+                    data: { key: fact.key, from: cat, to: target, scope: normalizeScope(fact.scope) || '(none)' },
+                    before: cat, after: target,
+                });
+                continue;
+            }
+
+            const twin = dest.facts[twinIdx];
+            const ev = duplicateEvidence(fact, twin);
+
+            if (ev.duplicate) {
+                // Same key, same knowledge, two categories: the shadow copy the old
+                // load-time remap kept re-creating. The destination copy stays hot and
+                // this one is cold-tiered WHERE IT STANDS — not moved (that would put
+                // two records under one key in `dest`) and not dropped.
+                //
+                // UNLESS the destination copy is itself already cold. Demoting this one
+                // would then retire the KEY, not just a record: nothing under it would
+                // reach the sheet, the digest, the premise floor or the lookup block.
+                // Something demoted that ONE copy deliberately — the user, a #CONFLICT
+                // loser, a #REEVAL drop, coldTierOverflow — and propagating that to the
+                // last hot record is a decision nobody made. Leaving both hot is the
+                // lesser evil: a visible duplicate the next pass still resolves once
+                // either side is un-colded, rather than a fact that silently leaves play.
+                if (isColdFact(twin)) {
+                    report.alreadyResolved++;
+                    sample('DUPLICATE_KEPT_LAST_HOT', { key: fact.key, from: cat, to: target });
+                    addDebugLog('info', `Category convergence: kept ${cat}/${fact.key} hot — its twin ${target}/${twin.key} is already cold, and demoting this one would leave no hot record under the key`, {
+                        subsystem: 'db', event: 'fact.remapped', actor: 'SYSTEM', reason: 'LAST_HOT_RECORD_KEPT',
+                        data: { key: fact.key, from: cat, to: target, twinCold: true },
+                    });
+                    keep.push(fact);
+                    continue;
+                }
+                const detail = `duplicate of ${target}/${twin.key} — identical value, note, importance, aspect, kind and knownBy${ev.confirmedBySrcId ? '; same srcId confirms one extraction event' : ''}`;
+                if (markFactCold(fact, cat, 'DUPLICATE_OF_CANONICAL', detail)) {
+                    report.demotedDuplicate++;
+                    sample('DUPLICATE_DEMOTED', { key: fact.key, from: cat, to: target, bySrcId: ev.confirmedBySrcId });
+                } else {
+                    report.alreadyResolved++;
+                }
+                keep.push(fact);
+                continue;
+            }
+
+            // Same key, genuinely different content. One of the two has to stop
+            // competing for the sheet, but neither is discarded and neither moves.
+            //
+            // lastUpdated alone decided this before, and lastUpdated is re-stamped by
+            // any touch including a note-only edit — so editing a note on the weaker
+            // row was enough to delete the stronger one. Importance leads now: it is
+            // the field the agent and the user both set deliberately, and it is what
+            // the premise floor and the cold-tier protection already read. lastUpdated
+            // only breaks a tie, and a full tie demotes the SOURCE copy, so the
+            // canonical location keeps the hot row and the outcome is deterministic
+            // (which is what makes the second pass a no-op).
+            const impFact = clampImportance(fact.importance);
+            const impTwin = clampImportance(twin.importance);
+            const tsFact = Number(fact.lastUpdated) || 0;
+            const tsTwin = Number(twin.lastUpdated) || 0;
+            let sourceLoses;
+            let why;
+            if (impFact !== impTwin) {
+                sourceLoses = impFact < impTwin;
+                why = `importance ${impFact} vs ${impTwin}`;
+            } else if (tsFact !== tsTwin) {
+                sourceLoses = tsFact < tsTwin;
+                why = 'equal importance, older lastUpdated';
+            } else {
+                sourceLoses = true;
+                why = 'equal importance and lastUpdated, canonical category wins';
+            }
+
+            const loser = sourceLoses ? fact : twin;
+            const winner = sourceLoses ? twin : fact;
+            const loserCat = sourceLoses ? cat : target;
+            const winnerRef = sourceLoses ? `${target}/${twin.key}` : `${cat}/${fact.key}`;
+
+            // Same guard as the duplicate branch: if the winner is already cold, this
+            // demotion would take the key's last hot record with it. Skip it and say so
+            // — the old log line claimed the winner "stays hot" without ever checking.
+            if (isColdFact(winner)) {
+                report.alreadyResolved++;
+                sample('CLASH_KEPT_LAST_HOT', { key: fact.key, from: cat, to: target, why });
+                addDebugLog('info', `Category convergence: kept ${loserCat}/${loser.key} hot — ${winnerRef} would have won (${why}) but is already cold, and demoting this one would leave no hot record under the key`, {
+                    subsystem: 'db', event: 'fact.remapped', actor: 'SYSTEM', reason: 'LAST_HOT_RECORD_KEPT',
+                    data: { key: fact.key, from: cat, to: target, differing: ev.differing, wouldHaveKept: winnerRef, winnerCold: true },
+                });
+                keep.push(fact);
+                continue;
+            }
+
+            if (markFactCold(loser, loserCat, 'CATEGORY_CLASH_WEAKER_CLAIM', `same key as ${winnerRef}, different content (${why}, differing: ${ev.differing.join(', ')}) — kept and readable, just out of the hot set`)) {
+                report.demotedCollision++;
+                // The one branch that takes a distinct observation out of the sheet, so
+                // both values go into the normal debug log, not only into the trace.
+                addDebugLog('info', `Category convergence: ${loserCat}/${loser.key} cold-tiered, ${winnerRef} stays hot — ${why}`, {
+                    subsystem: 'db', event: 'fact.demoted', actor: 'SYSTEM', reason: 'CATEGORY_CLASH_WEAKER_CLAIM',
+                    data: {
+                        key: fact.key, from: cat, to: target, differing: ev.differing,
+                        demoted: `${loserCat}/${loser.key}`, kept: winnerRef,
+                        demotedValue: String(loser.value ?? '').slice(0, 200),
+                        demotedNote: String(loser.context ?? '').slice(0, 200),
+                    },
+                });
+                sample('CLASH_DEMOTED', {
+                    key: fact.key, from: cat, to: target, why,
+                    demoted: `${loserCat}/${loser.key}`, kept: winnerRef,
+                    incomingValue: fact.value, incumbentValue: twin.value,
+                });
+            } else {
+                report.alreadyResolved++;
+            }
+            keep.push(fact);
+        }
+
+        if (keep.length !== db.facts.length) {
+            db.facts = keep;
+            db.updatedAt = Date.now();
+            if (keep.length === 0) report.emptied.push(cat);
+        }
+    }
+
+    // An emptied category is dropped outright rather than left as an empty shell:
+    // snapshotAvatar() skips zero-fact categories, so leaving one behind would keep
+    // its stale attachment file alive past reconcileDeletedAttachments(). Only the
+    // move branch can empty a category now — a demoted record stays in its own
+    // category, which is what keeps it findable in the DB panel.
+    for (const cat of report.emptied) delete databases[cat];
+
+    report.changed = (report.moved + report.demotedDuplicate + report.demotedCollision + report.stamped) > 0;
+    return report;
+}
+
+// Persist what canonicalizeCategories() decided. Without this the pass is just the
+// old discarded parse with better bookkeeping.
+async function persistCanonicalization(avatar, databases, report) {
+    // Summary only. Every record this pass moved or demoted already emitted its own
+    // 'info' line above (and markFactCold() emitted a second one carrying the
+    // salience it was demoted at), so the normal debug log — no test-run recording,
+    // no trace — is enough to reconstruct exactly what happened to the store. The
+    // trace below adds the sampled before/after values on top of that, not instead.
+    addDebugLog('info', `Category convergence: ${report.moved} moved, ${report.demotedDuplicate} duplicate(s) cold-tiered, ${report.demotedCollision} key clash(es) cold-tiered, ${report.stamped} stamped, ${report.alreadyResolved} already resolved — nothing was deleted`, {
+        subsystem: 'db', event: 'db.converged', actor: 'SYSTEM', reason: 'LEGACY_CATEGORY_REMAP',
+        data: {
+            avatar, moved: report.moved, demotedDuplicate: report.demotedDuplicate,
+            demotedCollision: report.demotedCollision, alreadyResolved: report.alreadyResolved,
+            stamped: report.stamped, emptiedCategories: report.emptied, byPair: report.byPair,
+        },
+    });
+    traceCapture('db.converged', () => ({
+        moved: report.moved, demotedDuplicate: report.demotedDuplicate,
+        demotedCollision: report.demotedCollision, alreadyResolved: report.alreadyResolved,
+        stamped: report.stamped, emptiedCategories: report.emptied, byPair: report.byPair,
+        samples: report.samples,
+    }), { reason: 'LEGACY_CATEGORY_REMAP' });
+
+    if (!idbAvailable()) {
+        // Attachment-only mode. The in-memory map is clean for this session and the
+        // cleaned categories reach disk on their next saveDatabase() (the cache hands
+        // out these very objects), but the pass will run again on the next cold load.
+        addDebugLog('debug', 'Category convergence not persisted — attachment-only mode, will re-run on next load', {
+            subsystem: 'db', event: 'db.converged', reason: 'IDB_UNAVAILABLE', data: { avatar },
+        });
+        return;
+    }
+    try {
+        await idbUpdateRecord(avatar, (rec) => ({
+            databases,
+            updatedAt: Date.now(),
+            deletedCategories: (rec && rec.deletedCategories) || undefined,
+        }));
+        scheduleSnapshot(avatar);
+    } catch (e) {
+        // Non-fatal: this session still sees the clean map, the next load retries.
+        addDebugLog('fail', `Category convergence could not be persisted — the remap will re-run next load (${e?.message || e})`, {
+            subsystem: 'db', event: 'db.converged', reason: 'IDB_WRITE_FAILED', data: { avatar },
+        });
+    }
+}
+
 async function loadAllDatabases(avatar) {
+    const databases = await loadAllDatabasesRaw(avatar);
+    if (!avatar) return databases;
+    const report = canonicalizeCategories(databases);
+    if (report.changed) await persistCanonicalization(avatar, databases, report);
+    return databases;
+}
+
+async function loadAllDatabasesRaw(avatar) {
     if (!avatar) return {};
 
     const stripLegacyEmbeddings = (map) => {
@@ -1277,6 +1749,7 @@ async function loadAllDatabases(avatar) {
         if (attachHasData && attachStamp > idbStamp) {
 
             const mergedTombs = mergeTombstones(rec && rec.deletedCategories, attachTombs);
+            const relocatedCats = []; // shrank, but every missing key resurfaced elsewhere
             if (idbHasData) {
 
                 const categoryRecency = (sdb) => {
@@ -1287,13 +1760,27 @@ async function loadAllDatabases(avatar) {
                     }
                     return max;
                 };
-                const refusedCats = [];    
-                const adoptedDeletes = []; 
+                const refusedCats = [];
+                const adoptedDeletes = [];
+                const missingByCat = {};
                 for (const [cat, sdb] of Object.entries(idbDatabases)) {
-                    const localCount = (sdb && Array.isArray(sdb.facts)) ? sdb.facts.length : 0;
-                    if (localCount === 0) continue; 
+                    const localFacts = (sdb && Array.isArray(sdb.facts)) ? sdb.facts : [];
+                    const localCount = localFacts.length;
+                    if (localCount === 0) continue;
                     const attachCount = (attachMap[cat] && Array.isArray(attachMap[cat].facts)) ? attachMap[cat].facts.length : 0;
-                    if (attachCount >= localCount) continue; 
+                    if (attachCount >= localCount) continue;
+
+                    // A shrinking category is NOT automatically loss. The parser applies
+                    // mapLegacyCategory() as it reads, so a fact can legitimately leave
+                    // `cat` and land in another category of the SAME snapshot. Counting
+                    // rows is what kept the World→Places remap alive for 15 consecutive
+                    // runs: the guard restored the exact 8 facts the parse had just moved,
+                    // which is why refusedCategories read ["World"] every single time.
+                    // Only keys with no landing site anywhere in the snapshot are missing.
+                    const missing = unrelocatedKeys(cat, localFacts, attachMap);
+                    if (missing.length === 0) { relocatedCats.push(cat); continue; }
+
+                    missingByCat[cat] = missing.slice(0, 8);
                     const tomb = Number(attachTombs[cat]) || 0;
                     if (tomb > categoryRecency(sdb)) adoptedDeletes.push(cat);
                     else refusedCats.push(cat);
@@ -1308,6 +1795,7 @@ async function loadAllDatabases(avatar) {
                         data: {
                             attachStamp, idbStamp, avatar, decision: 'PARTIAL_ADOPT',
                             refusedCategories: refusedCats, tombstoneDeletes: adoptedDeletes,
+                            relocatedCategories: relocatedCats, missingKeys: missingByCat,
 
                             categoriesBefore: countCats(idbDatabases), factsBefore: countFacts(idbDatabases),
                             categoriesAfter: countCats(merged), factsAfter: countFacts(merged),
@@ -1327,6 +1815,7 @@ async function loadAllDatabases(avatar) {
                 subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'NEWER_SNAPSHOT',
                 data: {
                     attachStamp, idbStamp, avatar, decision: 'ADOPT_ATTACHMENT',
+                    relocatedCategories: relocatedCats,
 
                     categoriesBefore: countCats(idbDatabases), factsBefore: countFacts(idbDatabases),
                     categoriesAfter: countCats(attachMap), factsAfter: countFacts(attachMap),
@@ -1343,6 +1832,24 @@ async function loadAllDatabases(avatar) {
         disableIdb('IDB load failed mid-session'); 
         return loadAllDatabasesFromAttachments(avatar);
     }
+}
+
+// Which of `cat`'s local keys the incoming snapshot genuinely does not hold anywhere.
+// A key still in `cat`, or sitting in the category mapLegacyCategory() would send it
+// to, is accounted for. Key equality is the right test here: the parser moves the
+// fact OBJECT, so a hit in the destination IS this record, not a namesake.
+function unrelocatedKeys(cat, localFacts, attachMap) {
+    const missing = [];
+    const stillHere = new Set(((attachMap[cat] && attachMap[cat].facts) || []).map(f => f && f.key));
+    for (const f of localFacts) {
+        if (!f || typeof f !== 'object') continue;
+        if (stillHere.has(f.key)) continue;
+        const target = mapLegacyCategory(cat, f);
+        const dest = (target && target !== cat) ? attachMap[target] : null;
+        if (dest && Array.isArray(dest.facts) && dest.facts.some(x => x && x.key === f.key)) continue;
+        missing.push(f.key);
+    }
+    return missing;
 }
 
 function attachmentSnapshotStamp(avatar, parsedMap) {
@@ -1509,6 +2016,143 @@ export async function saveDatabase(db) {
     await saveDatabaseToAttachment(avatar, db);
 }
 
+// useCount / lastUsedAt are READ in two places that decide what survives:
+// salienceScore() folds useBonus(useCount) into the score, and effectiveRecencyTs()
+// takes max(lastUpdated, lastUsedAt) as the recency term. Both feed coldTierOverflow().
+// Nothing ever WROTE them — all 64 facts in the analysed run sat at 0/0, so
+// effectiveRecencyTs collapsed to lastUpdated and a fact injected on every single
+// turn cooled out of the hot set at exactly the rate of one never injected at all.
+//
+// This is that missing write side. Deliberately NOT saveDatabase(): the injection
+// path calls it once per turn with ~26 refs spread over ~5 categories, and
+// saveDatabase() would re-run cold-tiering, drop the read cache and issue a separate
+// write per category. Instead the cached fact objects are bumped in place — the map
+// getAllDatabases() returns holds the same object identities the store does — and the
+// touched categories go back in ONE IndexedDB transaction.
+//
+// `lastUpdated` is left alone on purpose: it means "the content changed", it is what
+// the sheet renders as "(~16 turns ago)", and reading a fact is not a change to it.
+/**
+ * Record that a set of facts was used (injected, retrieved, surfaced) this turn.
+ * @param {Iterable<{category: string, key: string}|string>} refs  Facts to bump.
+ *        Objects, or "Category/key" strings — the ref form the retrieval and
+ *        recovery paths already speak. Duplicates within one call count once.
+ * @param {object} [opts]
+ * @param {number} [opts.at=Date.now()]      Timestamp written to lastUsedAt.
+ * @param {string} [opts.reason='INJECTED']  Why, for the log/trace.
+ * @param {boolean} [opts.persist=true]      false = bump in memory only.
+ * @returns {Promise<{bumped:number, missed:number, categories:string[], at:number}>}
+ *          Never throws and never rejects: usage accounting must not be able to take
+ *          a turn down.
+ */
+export async function recordFactUsage(refs, opts = {}) {
+    const at = Math.max(0, Math.floor(Number(opts.at) || Date.now()));
+    const reason = opts.reason || 'INJECTED';
+    const persist = opts.persist !== false;
+    const result = { bumped: 0, missed: 0, categories: [], at };
+
+    try {
+        const list = (refs && typeof refs[Symbol.iterator] === 'function' && typeof refs !== 'string')
+            ? Array.from(refs) : [];
+        if (list.length === 0) return result;
+
+        const avatar = getCharacterAvatar();
+        if (!avatar) return result;
+
+        const databases = await getAllDatabases();
+        const seen = new Set();
+        // Deduped on the RESOLVED fact, not on the ref text: findFactMatch() also
+        // answers on a normalized key and on a reversed pair key, so two different-
+        // looking refs in one selection can be the same record. Counting that twice
+        // would inflate exactly the facts the retrieval path is loosest about.
+        const bumped = new Set();
+        const touched = new Set();
+        const missedRefs = [];
+
+        for (const raw of list) {
+            let category = '';
+            let key = '';
+            if (raw && typeof raw === 'object') {
+                category = String(raw.category || '').trim();
+                key = String(raw.key || '').trim();
+            } else {
+                const s = String(raw ?? '').trim();
+                const slash = s.indexOf('/');
+                if (slash > 0) { category = s.slice(0, slash).trim(); key = s.slice(slash + 1).trim(); }
+            }
+            if (!category || !key) {
+                result.missed++;
+                if (missedRefs.length < 8) missedRefs.push(String(raw));
+                continue;
+            }
+            const id = `${category}/${key}`;
+            if (seen.has(id)) continue; // identical ref repeated — not even worth resolving
+            seen.add(id);
+
+            const db = databases[category];
+            const fact = db ? findFactMatch(db, key) : null;
+            if (!fact) {
+                result.missed++;
+                if (missedRefs.length < 8) missedRefs.push(id);
+                continue;
+            }
+            if (bumped.has(fact)) continue; // a second ref onto a record already counted
+            bumped.add(fact);
+
+            fact.useCount = Math.max(0, Math.floor(Number(fact.useCount) || 0)) + 1;
+            fact.lastUsedAt = at;
+            result.bumped++;
+            touched.add(category);
+        }
+        result.categories = [...touched];
+
+        addDebugLog('debug', `Fact usage recorded: ${result.bumped} bumped, ${result.missed} unresolved (${reason})`, {
+            subsystem: 'db', event: 'fact.used', reason,
+            data: { bumped: result.bumped, missed: result.missed, categories: result.categories, unresolved: missedRefs },
+        });
+        traceCapture('db.factUsage', () => ({
+            reason, at, bumped: result.bumped, missed: result.missed,
+            categories: result.categories, unresolved: missedRefs,
+        }), { reason });
+
+        if (result.bumped === 0 || !persist) return result;
+
+        if (!idbAvailable()) {
+            // Attachment-only mode. The counters are live for this session and reach
+            // disk whenever one of these categories is next written for a real reason
+            // (the cache hands out these very fact objects). Not worth an upload per
+            // category per turn just to persist a counter.
+            return result;
+        }
+        try {
+            await idbUpdateRecord(avatar, (rec) => {
+                const next = (rec && rec.databases) ? rec.databases : {};
+                // Only the touched categories are replaced — everything else in the
+                // record is left exactly as another writer left it.
+                for (const cat of touched) { if (databases[cat]) next[cat] = databases[cat]; }
+                return {
+                    databases: next,
+                    updatedAt: Date.now(),
+                    deletedCategories: (rec && rec.deletedCategories) || undefined,
+                };
+            });
+            scheduleSnapshot(avatar);
+        } catch (e) {
+            // Non-fatal, and the bumps survive in memory until the next real save.
+            addDebugLog('fail', `Fact usage counters not persisted (${e?.message || e})`, {
+                subsystem: 'db', event: 'fact.used', reason: 'IDB_WRITE_FAILED',
+                data: { bumped: result.bumped, categories: result.categories },
+            });
+        }
+        return result;
+    } catch (e) {
+        addDebugLog('fail', `recordFactUsage failed (${e?.message || e})`, {
+            subsystem: 'db', event: 'fact.used', reason: 'USAGE_RECORD_FAILED',
+        });
+        return result;
+    }
+}
+
 async function saveDatabaseToAttachment(avatar, db) {
     const fileName = `${DB_PREFIX}${db.category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
     const content = JSON.stringify(db, null, 2);
@@ -1632,6 +2276,33 @@ export function upsertFact(db, fact) {
     const supersedesSignal = fact && fact.supersedes === true;
     if (fact && 'supersedes' in fact) { fact = { ...fact }; delete fact.supersedes; }
 
+    // Kind is derived here rather than trusted, and here specifically because this
+    // is the ONE funnel every writer goes through — memory agent (memory-tools.js),
+    // reflect agent (agent-reflect.js) and dedupeDatabase()'s rebuild alike. Doing
+    // it per-caller would have left whichever path was forgotten writing 'trait'
+    // forever. See deriveKind() for why the model's answer is not enough.
+    // Side effect worth stating: because mergeSalience() lets a present incoming
+    // kind win over the stored one, every existing fact is re-derived the next time
+    // anything touches it — the store heals without a separate migration.
+    if (fact && typeof fact === 'object') {
+        const passedKind = passedKindOf(fact);
+        const derived = deriveKind(fact, db?.category);
+        if (derived.kind !== passedKind) {
+            if (passedKind) {
+                addDebugLog('debug', `Kind derived: [${db?.category}] ${fact.key} — agent said "${passedKind}", stored as "${derived.kind}"`, {
+                    subsystem: 'db', event: 'fact.kind_derived', reason: derived.via,
+                    data: {
+                        category: db?.category, key: fact.key,
+                        aspect: normalizeAspect(fact.aspect, fact.category || db?.category),
+                        passed: passedKind, derived: derived.kind,
+                    },
+                    before: passedKind, after: derived.kind,
+                });
+            }
+            fact = { ...fact, kind: derived.kind };
+        }
+    }
+
     if (isSequenceFact(fact)) {
 
         let ord = Number(fact.ord);
@@ -1702,8 +2373,12 @@ export function upsertFact(db, fact) {
         }
     }
 
-    if (existingIdx < 0 && normalizeKind(fact.kind) === 'state'
-        && fact.kind !== undefined && fact.kind !== null && String(fact.kind).trim()) {
+    // Was gated on the agent having EXPLICITLY said "state"; deriveKind() above now
+    // always stamps a kind, so the gate is just the kind itself. Derived states are
+    // the point: a second key for a location/mood/goal the store already tracks is
+    // exactly the duplicate this merge exists to catch, and the agent almost never
+    // labelled those 'state' on its own.
+    if (existingIdx < 0 && normalizeKind(fact.kind) === 'state') {
         const parallelIdx = findParallelStateKey(db, fact, -1);
         if (parallelIdx >= 0) {
             existingIdx = parallelIdx;

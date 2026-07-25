@@ -237,14 +237,34 @@ const REFLECT_MAX_WRITES = 6;
 
 const MAX_FACT_SUMMARY_CHARS = 4000;
 
-// Raw-story evidence block. pipeline.js already caps the window it hands over
-// (REFLECT_STORY_MAX_CHARS, currently 12000); this is a defensive re-clamp so
-// buildReflectInput never trusts its caller, and the one place the prompt's
-// token cost is reasoned about.
+// Raw-story evidence block. pipeline.js caps the window it hands over
+// (REFLECT_STORY_MAX_CHARS); this is a defensive re-clamp so buildReflectInput
+// never trusts its caller, and the one place the prompt's token cost is reasoned
+// about. THE PRODUCER'S CAP IS THE BINDING ONE — this number can only ever trim
+// further, so raising it alone changes nothing that ships. pipeline.js's
+// REFLECT_STORY_MAX_CHARS must be moved to the same value for the size below to
+// mean anything; until it is, the window stays whatever that constant says.
+//
+// SIZE — derived from the reflection CADENCE, not picked. Reflection fires every
+// REFLECTION_INTERVAL (12) successful extraction runs and a run settles ~2
+// messages, so a pass is responsible for ~24 messages of story. The window was
+// 12000 chars, and the Naoto session measured what that buys: the pass asked for
+// 60 messages (reflection.story_window {wanted:60, count:10, chars:11453,
+// truncated:true}) and got 10 — a mean of ~1145 chars per message, so the char
+// cap bound at 42% of the interval and the message-count band never mattered.
+// 24 × 1145 ≈ 27.5k chars is full coverage; 24000 is ~21 messages, ~87%.
+//
+// The remaining 13% is not bought back by another few thousand chars, and saying
+// otherwise here would be a lie: message length is unbounded, so ANY fixed cap
+// is a coin flip on a stretch of long replies. What makes the shortfall
+// PERMANENT is on the producer's side — pipeline.js drops oldest-first and then
+// sets lastReflectionChatIndex to the newest message SHOWN, so every message the
+// cap dropped is never offered to any later pass either. That is a watermark
+// bug, not a budget one, and it is fixed there.
 //
 // TOKEN TRADE-OFF — deliberate, and the most expensive line in this file.
-// The digest is capped at MAX_FACT_SUMMARY_CHARS (4000) and the story at 12000,
-// so together they add ~16k chars ≈ 4k tokens of DATA to the user prompt, and
+// The digest is capped at MAX_FACT_SUMMARY_CHARS (4000) and the story at 24000,
+// so together they add ~28k chars ≈ 7k tokens of DATA to the user prompt, and
 // the tool loop re-sends the whole messages array every round — on a 7-round
 // pass that data is paid for up to seven times. It buys the one thing the pass
 // could not do before: FIND an error. Reflection used to see only memory, so it
@@ -258,7 +278,17 @@ const MAX_FACT_SUMMARY_CHARS = 4000;
 // DIGEST ORDERING POLICY on buildFactDigest). The story gets the larger share
 // because prose carries far less signal per character than "Category/key =
 // value" rows.
-const MAX_STORY_EVIDENCE_CHARS = 12000;
+//
+// What the 12000 → 24000 move COSTS, measured against the same session: +12000
+// chars ≈ +3k tokens per ROUND. The observed pass ran 1 round (reflInput 15076
+// tokens total), so ~+3k tokens once per ~24 messages — against ~9k tokens of
+// memory-agent input per turn, roughly +1% of the pipeline's own spend. The
+// worst case is what the number is really bounded by: a 7-round pass pays it
+// seven times, +21k tokens. That is why the cap is not raised to the ~27.5k that
+// would cover the interval outright, and why REFLECT_STORY_MAX_MESSAGES (60)
+// must keep the char cap as the real bound — 60 messages at the measured mean is
+// 68k chars ≈ 17k tokens per round, which a catch-up pass would otherwise pay.
+const MAX_STORY_EVIDENCE_CHARS = 24000;
 
 // Every evidence line is prefixed with this gutter. Roleplay prose is
 // user-authored and UNTRUSTED: a message can legitimately contain "#DONE", a
@@ -765,9 +795,13 @@ function buildReflectInput({ runId = '', traceCallId = null, databases, reevalCa
     const story = renderStoryEvidence(recentMessages);
 
     // The evidence window, on its OWN entry so it gets the whole per-entry string
-    // budget — MAX_STORY_EVIDENCE_CHARS (12000) is exactly the trace's per-string
-    // cap, so a full window arrives uncut here and would not if it shared an
-    // entry with the digest. Today only the message COUNT and the index bounds
+    // budget — sharing an entry with the digest would cut it far earlier. It no
+    // longer arrives UNCUT: the trace's per-string cap is 12000 chars and
+    // MAX_STORY_EVIDENCE_CHARS is now 24000, so a full window is truncated by the
+    // trace at its halfway point and the capture reports `chars` (the real length)
+    // alongside the clipped text. Raising the trace cap is tracked separately —
+    // every extract user prompt is already cut at 12000 of ~20k, which is the
+    // bigger auditability hole. Today only the message COUNT and the index bounds
     // reach the log, which is the one input a "reflection never notices X" report
     // most needs and the only one nothing keeps: the window is a slice of live
     // chat that shifts on every edit, swipe or delete.
@@ -813,20 +847,152 @@ function buildReflectInput({ runId = '', traceCallId = null, databases, reevalCa
     return parts.join('\n\n');
 }
 
+// SECTION MARKERS — the closed set the reply parser recognises. #DONE is in the
+// list even though nothing parses a #DONE *body*: it is the OUTPUT FORMAT's
+// terminator, so it has to be able to BOUND the section in front of it (see
+// sectionBlock). THREADS is a retired section name kept as a bound only.
+const REFLECT_SECTION_NAMES = ['STORY', 'SHELVES', 'OBS', 'CALLBACK', 'THREADS', 'REEVAL', 'CONFLICT', 'DONE'];
+
+// A marker is a section name at the START of a line, optionally wearing markdown
+// decoration. The decoration set is deliberately the same one memory-tools.js's
+// tolerant #DONE/#SHEET matcher strips — [>*_`~\s#-] — so "**#STORY**",
+// "## #STORY" and "> #STORY" are all the marker and a line that merely CONTAINS
+// "#STORY" is not. Note what is NOT in the set: '|', the STORY_GUTTER prefix. An
+// evidence line the model echoes back verbatim therefore still cannot be a
+// marker, which is the property the gutter comment above claims.
+// The optional space after '#' and the trailing ':' are the same tolerances that
+// matcher grants, so "# STORY" and "#STORY:" both land; a trailing space is eaten
+// too, so "#STORY Naoto ..." leaves the body starting immediately after m[0].
+const SECTION_MARKER_RE = new RegExp(`^[\\s>*_~\`#-]*#[ \\t]*(${REFLECT_SECTION_NAMES.join('|')})\\b[ \\t]*:?[ \\t]*`, 'i');
+
+// Reasoning wrappers, layer TWO of the defense (see parseReflectResult). Tag
+// names are matched by SHAPE rather than from a fixed vendor list, because the
+// tag differs per model and per system prompt and a list is stale the day it is
+// written. This is belt-and-braces: the ordering rule below is what actually
+// has to hold.
+const REASONING_TAG_NAMES = '(?:think|thoughts?|thinking|reason(?:ing)?|reflection|scratch(?:pad)?|analysis|antml:thinking|internal|monologue)';
+const REASONING_BLOCK_RE = new RegExp(`<\\s*(${REASONING_TAG_NAMES})\\b[^>]*>[\\s\\S]*?<\\s*/\\s*\\1\\s*>`, 'gi');
+const REASONING_CLOSE_RE = new RegExp(`<\\s*/\\s*${REASONING_TAG_NAMES}\\s*>`, 'gi');
+
+// Balanced blocks are cut out first — that is the case the Naoto reply actually
+// had, a complete <think>…</think>. The second pass covers the ORPHAN closing
+// tag: some backends emit the reasoning body and its closing tag but not the
+// opening one, and a lone "</think>" is then the only boundary in the reply, so
+// everything up to and including the LAST one is dropped.
+// The caller falls back to the unstripped text if stripping left no markers at
+// all, so a model that (wrongly) wraps its whole answer in a reasoning tag
+// degrades to the old behaviour instead of parsing to nothing.
+function stripReasoningWrappers(text) {
+    REASONING_BLOCK_RE.lastIndex = 0;
+    let out = String(text).replace(REASONING_BLOCK_RE, '');
+    REASONING_CLOSE_RE.lastIndex = 0;
+    let cutTo = -1;
+    let m;
+    while ((m = REASONING_CLOSE_RE.exec(out)) !== null) cutTo = m.index + m[0].length;
+    return cutTo >= 0 ? out.slice(cutTo) : out;
+}
+
+// Every marker in the reply, in document order, with the offsets a slice needs.
+function scanSectionMarkers(text) {
+    const marks = [];
+    let pos = 0;
+    for (const line of String(text).split('\n')) {
+        const m = SECTION_MARKER_RE.exec(line);
+        if (m) {
+            let consumed = m[0].length;
+            // "**#STORY**" — the decoration that OPENS the marker is eaten by the
+            // regex's prefix class, the run that closes it is not, and it would
+            // otherwise become the first characters of the section body. Consumed
+            // only when nothing but decoration is left on the line, so
+            // "#STORY *emphasis* text" keeps its asterisks where they belong.
+            const close = /^[*_~`#]+[ \t]*:?[ \t]*$/.exec(line.slice(consumed));
+            if (close) consumed += close[0].length;
+            marks.push({ name: m[1].toUpperCase(), start: pos, bodyStart: pos + consumed });
+        }
+        pos += line.length + 1;
+    }
+    return marks;
+}
+
+// The body of `name`: LAST occurrence, bounded by the NEXT marker of ANY name.
+// null when the reply carries no such marker at all — distinct from '' (the
+// section was emitted empty), which the callers treat differently for #STORY.
+function sectionBlock(text, marks, name) {
+    let i = -1;
+    for (let k = 0; k < marks.length; k++) if (marks[k].name === name) i = k;
+    if (i < 0) return null;
+    const end = (i + 1 < marks.length) ? marks[i + 1].start : text.length;
+    return text.slice(marks[i].bodyStart, end);
+}
+
+// PARSE FROM THE END, AND BOUND EVERY SECTION. Both properties are load-bearing;
+// neither is a tag-stripping trick, because tags are not the invariant.
+//
+// What broke: every section used to be one `text.match(/#NAME\s*([\s\S]*?)(?=…)/)`
+// — FIRST occurrence wins, terminated by a hand-maintained lookahead list of the
+// sections allowed to follow it. A reasoning model plans its own output inside
+// its thinking block, so the first "#STORY" in the reply is routinely the one in
+// the plan, not the one in the answer. Measured damage (run Mi8kbt, the only
+// reflection pass of the Naoto session): the model wrote "…so #STORY is fresh,
+// and #CALLBACK/#REEVAL/#CONFLICT are empty." inside <think>; the parser matched
+// there, ran past </think> — "#STORY" was not in its own terminator list, so its
+// real section header could not stop it — and stored 725 chars beginning
+// "is fresh, and #CALLBACK/…</think>\n\n#STORY\nNaoto Shirogane, …" as the
+// canonical story summary. That string then shipped in three head prompts and
+// came back to the next pass as "## Prior story summary (update this…)", so the
+// corruption reproduces itself for as long as the chat lives.
+//
+// The invariant that survives any model: REASONING PRECEDES THE ANSWER. Whatever
+// it is wrapped in, whatever the wrapper is called, whether the wrapper is even
+// emitted — the answer is LAST. So:
+//   1. markers are line-anchored (a "#STORY" mid-sentence is prose, not a header);
+//   2. the LAST marker of a name wins, so a rehearsed section always loses to the
+//      emitted one;
+//   3. a section ends at the NEXT marker, whatever it is — not at a per-section
+//      list of successors, and never at end-of-text while another header follows.
+//
+// (3) generalises a fix round 2 had to make by hand: #REEVAL used to run to
+// end-of-text and swallow an out-of-order #CONFLICT, so #CONFLICT was given a
+// mirror-image terminator listing every OTHER section. That was correct and it
+// was six lists to keep in sync — one of which (#STORY's) was missing the entry
+// that would have contained this bug. Bounding by "the next marker" makes
+// section ORDER irrelevant and the lists unnecessary; adding a section now means
+// adding one name to REFLECT_SECTION_NAMES.
+//
+// Layer two — stripReasoningWrappers — runs first and is deliberately NOT the
+// mechanism: it would have fixed this reply too, but only because this model
+// spelled its wrapper <think>. Rules 1-3 hold with no wrapper at all.
 function parseReflectResult(response) {
-    const out = { summary: '', shelves: [], observations: [], callbacks: [], reevals: [], conflicts: [] };
+    const out = {
+        summary: '', shelves: [], observations: [], callbacks: [], reevals: [], conflicts: [],
+        // Parse-time diagnostics for the trace. A section that silently came out
+        // of the wrong place in the reply is otherwise indistinguishable from a
+        // section the model wrote badly, and those are opposite fixes.
+        parse: { markers: [], reasoningStripped: false, repeated: [] },
+    };
     if (!response || !response.trim()) return out;
 
-    let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim()).replace(/```/g, '');
+    const unfenced = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim()).replace(/```/g, '');
 
-    // Every section terminator enumerates the sections that may follow it, so
-    // #CONFLICT had to be added to ALL of them, not only to #REEVAL's (which is
-    // the only one the documented output order strictly requires). Models
-    // reorder sections; without the extra lookaheads a misplaced #CONFLICT is
-    // swallowed into an earlier block and vanishes silently.
-    const storyMatch = text.match(/#STORY\s*([\s\S]*?)(?=\n\s*#(?:SHELVES|OBS|CALLBACK|THREADS|REEVAL|CONFLICT)\b|$)/i);
-    if (storyMatch) {
-        let s = storyMatch[1].trim();
+    const stripped = stripReasoningWrappers(unfenced);
+    let text = stripped;
+    let marks = scanSectionMarkers(stripped);
+    if (!marks.length) {
+        // Stripping ate everything the parser can read. Whatever was cut was not
+        // reasoning-before-an-answer, so trust the raw reply instead.
+        text = unfenced;
+        marks = scanSectionMarkers(unfenced);
+    } else {
+        out.parse.reasoningStripped = stripped.length !== unfenced.length;
+    }
+    out.parse.markers = marks.map(m => m.name);
+    const seenCounts = new Map();
+    for (const m of marks) seenCounts.set(m.name, (seenCounts.get(m.name) || 0) + 1);
+    out.parse.repeated = [...seenCounts].filter(([, n]) => n > 1).map(([n, c]) => `${n}×${c}`);
+
+    const storyBlock = sectionBlock(text, marks, 'STORY');
+    if (storyBlock !== null) {
+        let s = storyBlock.trim();
 
         s = s.replace(/\n?\s*\.\s*$/, '').trim();
         if (s === '.' || /^\(none\)$/i.test(s)) s = '';
@@ -834,9 +1000,9 @@ function parseReflectResult(response) {
         out.summary = s;
     }
 
-    const shelvesMatch = text.match(/#SHELVES\s*([\s\S]*?)(?=\n\s*#(?:OBS|CALLBACK|THREADS|REEVAL|CONFLICT)\b|$)/i);
-    if (shelvesMatch) {
-        const block = shelvesMatch[1].trim();
+    const shelvesBlock = sectionBlock(text, marks, 'SHELVES');
+    if (shelvesBlock !== null) {
+        const block = shelvesBlock.trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
             for (const rawLine of block.split('\n')) {
                 let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
@@ -860,9 +1026,9 @@ function parseReflectResult(response) {
         }
     }
 
-    const obsMatch = text.match(/#OBS\s*([\s\S]*?)(?=\n\s*#CALLBACK|\n\s*#REEVAL|\n\s*#CONFLICT|$)/i);
-    if (obsMatch) {
-        const block = obsMatch[1].trim();
+    const obsBlock = sectionBlock(text, marks, 'OBS');
+    if (obsBlock !== null) {
+        const block = obsBlock.trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
             for (const rawLine of block.split('\n')) {
                 let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
@@ -883,9 +1049,9 @@ function parseReflectResult(response) {
         }
     }
 
-    const cbMatch = text.match(/#CALLBACK\s*([\s\S]*?)(?=\n\s*#REEVAL|\n\s*#CONFLICT|$)/i);
-    if (cbMatch) {
-        const block = cbMatch[1].trim();
+    const cbBlock = sectionBlock(text, marks, 'CALLBACK');
+    if (cbBlock !== null) {
+        const block = cbBlock.trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
             for (const rawLine of block.split('\n')) {
                 let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
@@ -908,9 +1074,9 @@ function parseReflectResult(response) {
         }
     }
 
-    const reMatch = text.match(/#REEVAL\s*([\s\S]*?)(?=\n\s*#CONFLICT\b|$)/i);
-    if (reMatch) {
-        const block = reMatch[1].trim();
+    const reBlock = sectionBlock(text, marks, 'REEVAL');
+    if (reBlock !== null) {
+        const block = reBlock.trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
             for (const rawLine of block.split('\n')) {
                 let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
@@ -935,14 +1101,15 @@ function parseReflectResult(response) {
         }
     }
 
-    // #CONFLICT is parsed LAST and #REEVAL's terminator was narrowed to stop at
-    // it — the two sections are adjacent and #REEVAL used to run to end-of-text.
-    // #CONFLICT carries the mirror-image terminator for the same reason: a model
-    // that emits it BEFORE #REEVAL would otherwise swallow the whole #REEVAL
-    // block and parse every reeval line as a bogus 'both' verdict.
-    const confMatch = text.match(/#CONFLICT\s*([\s\S]*?)(?=\n\s*#(?:STORY|SHELVES|OBS|CALLBACK|THREADS|REEVAL)\b|$)/i);
-    if (confMatch) {
-        const block = confMatch[1].trim();
+    // #CONFLICT is still parsed last, but only because it is last in the
+    // documented output order — nothing depends on that any more. The pair of
+    // hand-written terminators that used to keep #REEVAL and #CONFLICT from
+    // eating each other (they are adjacent, and whichever came first ran to
+    // end-of-text and parsed the other's lines as bogus 'both'/'keep' verdicts)
+    // is now the general "bounded by the next marker" rule in sectionBlock.
+    const confBlock = sectionBlock(text, marks, 'CONFLICT');
+    if (confBlock !== null) {
+        const block = confBlock.trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
             for (const rawLine of block.split('\n')) {
                 let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
@@ -1474,10 +1641,22 @@ export async function runReflection({ runId = '', characterInfo = '', userPerson
         // parsed and the apply block refused it. Captured HERE rather than after
         // the compression guard because the guard REPLACES parsed.shelves —
         // this is the only point at which the reply's own proposals exist.
+        // A reply whose sections had to be recovered from BEHIND a reasoning
+        // block, or that carried the same marker twice, parsed correctly by the
+        // last-wins rule — but it is also the exact shape that used to corrupt
+        // the story summary, so it is worth a line rather than being silent.
+        if (parsed.parse.reasoningStripped || parsed.parse.repeated.length) {
+            addDebugLog('info', `[${runId}] Reflection reply carried pre-answer material: ${parsed.parse.reasoningStripped ? 'a reasoning wrapper was stripped' : 'no wrapper'}${parsed.parse.repeated.length ? `; repeated marker(s) ${parsed.parse.repeated.join(', ')} — the LAST occurrence of each was used` : ''}`, {
+                runId, subsystem: 'reflection', event: 'reflection.parse', reason: 'PRE_ANSWER_MATERIAL',
+                data: { markers: parsed.parse.markers, repeated: parsed.parse.repeated, reasoningStripped: parsed.parse.reasoningStripped },
+            });
+        }
+
         traceCapture('reflect.parsed.sections', () => ({
             replyChars: resultStr.length,
             summaryChars: parsed.summary.length,
             summary: parsed.summary,
+            parse: parsed.parse,
             shelves: parsed.shelves,
             observations: parsed.observations,
             callbacks: parsed.callbacks,

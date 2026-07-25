@@ -358,6 +358,50 @@ export function getMemorySheetText() {
     try { return String(memorySheet?.text || ''); } catch { return ''; }
 }
 
+// --- Which facts a composed sheet actually carried -------------------------
+//
+// The sheet TEXT is the only record of what the storyteller really saw: it
+// includes the premise-floor rows and the random-walk extras that no ref list
+// ever passes through, and it EXCLUDES refs composeSheet resolved away as
+// inactive/invisible/cold. getLastNeedRefs() is neither — it is the agent's
+// request, not the delivery. So "what was injected" is answered by parsing the
+// sheet back, which is the same conclusion agent-memory.js reached for its
+// "## Injected last turn" block.
+//
+// DUPLICATION, stated plainly: agent-memory.js holds a private SHEET_REF_RE and
+// extractPriorSheetRefs() with this exact grammar. This is a second copy, not a
+// reuse — the injection path lives in pipeline.js and the prompt-side helper is
+// not exported. They must be changed together; the intended cleanup is to delete
+// the private copy and import this one.
+//
+// Grammar (copied verbatim, see agent-memory.js for the full derivation): a fact
+// row is `[knownBy] Category/key` followed by end, whitespace, `:`, `=` or the
+// recency `(`. Keys come from keyToken() so any Unicode letter/digit is legal;
+// categories are user-extensible and unsanitized beyond a trim, hence the lazy
+// unrestricted category capture terminated by the first `/` that is followed by
+// a key and a real terminator. The sheet's other bracketed lines (header,
+// precedence preamble) end at the `]` and never match.
+const SHEET_FACT_REF_RE = /^\[[^\]]*\]\s+(.+?)\/([\p{L}\p{N}_]+)(?=$|[\s:=(])/u;
+
+// Returns "Category/key" strings, deduped, in sheet order. Pure — no state, no
+// context read — so a caller can hold a sheet string captured at injection time
+// and resolve it much later without the live sheet having to still be that one.
+export function extractSheetFactRefs(sheetText) {
+    const out = [];
+    const seen = new Set();
+    for (const line of String(sheetText || '').split('\n')) {
+        const m = SHEET_FACT_REF_RE.exec(line.trim());
+        if (!m) continue;
+        const category = m[1].trim();
+        if (!category) continue;
+        const ref = `${category}/${m[2]}`;
+        if (seen.has(ref)) continue;
+        seen.add(ref);
+        out.push(ref);
+    }
+    return out;
+}
+
 export function renderMemorySheet() {
     try {
         const el = document.getElementById('bf_mem_sheet_view');
@@ -1013,24 +1057,111 @@ export function getSceneStoreSnapshot() {
     };
 }
 
-// bf_mem_reflect_runs (the reply counter reflection's cadence is keyed on) and
+// bf_mem_reflect_runs (how many passes have STARTED in this chat — agent-reflect
+// bumps it mid-pass, before the pass can succeed or fail, because its real job is
+// to step the scan phase) and
 // bf_mem_conflict_ok (the settled-conflict set that suppresses re-reporting) are
 // written straight into chatMetadata by agent-reflect.js and have never had a
 // reader outside it — so "why did reflection not run" and "why was this conflict
-// never raised again" are currently unanswerable from an export.
+// never raised again" are unanswerable from an export without this.
 //
-// STRICTLY READ-ONLY: returns copies, and never creates either key. Calling it
-// cannot shift reflection's cadence or its settled set.
+// `reflectProgress` is the other half of that first question and the one that
+// actually gates a pass: successful extraction runs accumulated since the last
+// one, against pipeline.js's REFLECTION_INTERVAL. reflectRuns alone cannot
+// distinguish "no pass has been due yet" from "passes are due and never fire".
+//
+// STRICTLY READ-ONLY: returns copies, and never creates any of the keys. Calling
+// it cannot shift reflection's cadence or its settled set.
 export function getReflectionMetaState() {
     try {
         const ctx = getContext();
         const md = ctx.chatMetadata || ctx.chat_metadata;
-        if (!md) return { reflectRuns: 0, settledConflicts: [] };
+        if (!md) return { reflectRuns: 0, reflectProgress: 0, settledConflicts: [] };
         return {
             reflectRuns: Number(md.bf_mem_reflect_runs) || 0,
+            reflectProgress: Number(md[REFLECT_PROGRESS_META_KEY]) || 0,
             settledConflicts: Array.isArray(md.bf_mem_conflict_ok) ? [...md.bf_mem_conflict_ok] : [],
         };
-    } catch { return { reflectRuns: 0, settledConflicts: [] }; }
+    } catch { return { reflectRuns: 0, reflectProgress: 0, settledConflicts: [] }; }
+}
+
+// --- Reflection cadence progress (chat-scoped) -----------------------------
+//
+// How many successful extraction runs have accumulated since the last reflection
+// pass. pipeline.js arms a pass at REFLECTION_INTERVAL (12).
+//
+// This used to be a MODULE variable in pipeline.js, zeroed on CHAT_CHANGED. A
+// run of ~2 messages means 12 runs is roughly 24 messages, so any user who
+// reloads the page or switches chats more often than that never reached the
+// interval and got ZERO reflection passes — silently, forever, with nothing in
+// the log to say a pass was even due. The analysed session had eight chat
+// switches and one pass in 47 minutes only because it stayed in one chat.
+//
+// Progress belongs to the CHAT, not to the browser session: two chats each
+// accumulate their own runs, and a chat resumed tomorrow resumes where it
+// stopped. Stored in chatMetadata beside bf_mem_reflect_runs (the pass/phase
+// counter agent-reflect.js writes) and read/written LIVE from
+// getContext().chatMetadata on every call — no module cache, so the value is
+// chat-scoped by construction and no CHAT_CHANGED reset hook can forget it.
+//
+// Branch chats inherit this value, exactly as they already inherit
+// bf_mem_reflect_runs: a branch carries the parent's story and the parent's
+// facts, so it also carries how overdue that story is for an audit. No
+// ownerChatId guard here, deliberately — bf_mem_tokens has one because token
+// TOTALS would double-count, and a cadence counter is not a total.
+const REFLECT_PROGRESS_META_KEY = 'bf_mem_reflect_progress';
+
+// Not exported: the only readers are the two mutators below, and
+// getReflectionMetaState() already exposes the value for the test-run export.
+function getReflectionProgress() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return 0;
+        const n = Math.floor(Number(md[REFLECT_PROGRESS_META_KEY]));
+        return Number.isInteger(n) && n > 0 ? n : 0;
+    } catch { return 0; }
+}
+
+// Returns true when the value actually reached chatMetadata. A write that cannot
+// land is the ORIGINAL bug wearing a different hat — the counter would stall at
+// the same number and no pass would ever arm — so bumpReflectionProgress reports
+// it instead of returning a number that looks like progress. A failed RESET is
+// harmless by comparison: the count stays over the interval, so the next run
+// re-arms and the pass simply runs again.
+function writeReflectionProgress(n) {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return false;
+        md[REFLECT_PROGRESS_META_KEY] = n;
+        ctx.saveMetadata?.();
+        return true;
+    } catch { return false; }
+}
+
+// One successful extraction run. Returns the new count, or 0 when it could not
+// be persisted — 0 never arms a pass, and the stall is never silent: this logs a
+// fail every time it happens, which is exactly what the old module variable
+// never did.
+export function bumpReflectionProgress() {
+    const next = getReflectionProgress() + 1;
+    if (!writeReflectionProgress(next)) {
+        addDebugLog('fail', 'Reflection progress could not be persisted (no chat metadata) — the cadence counter is not advancing', {
+            subsystem: 'reflection', event: 'reflection.progress', reason: 'NO_METADATA',
+            data: { attempted: next },
+        });
+        return 0;
+    }
+    return next;
+}
+
+// A pass has started: the accumulated runs are spent. Called from the pass
+// itself, not from arming, so a pass that never runs (character changed, group
+// chat, extension disabled) leaves the progress standing and the next settle
+// re-arms rather than losing the interval.
+export function resetReflectionProgress() {
+    if (getReflectionProgress() === 0) return;
+    writeReflectionProgress(0);
 }
 
 // Signed diff cell: negative (saved) renders green, positive (extra cost) red.

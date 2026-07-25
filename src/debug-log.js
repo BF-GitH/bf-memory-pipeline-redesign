@@ -42,12 +42,24 @@ const TRACE_SUBSYSTEM = 'trace';
 // reload, which is what the UI text promises.
 //
 // CAP. Sized against the memory ceiling, not against the diagnostic ring: one
-// entry is capped at TRACE_MAX_ENTRY_CHARS (32000), so 600 entries is a worst
-// case of 19.2 M chars ≈ 38 MB of UTF-16 — a third of what the shared 2000-slot
-// ring could reach, and roughly 2-4 MB in practice at a typical 2-6 KB/entry.
-// At ~51 entries per recorded turn that holds about 11 full turns, which is
-// several turns of regression hunting without putting the tab at risk. Raising
-// it trades tab stability for depth, linearly.
+// entry is capped at TRACE_MAX_ENTRY_CHARS (32000) — the ENTRY budget, not any
+// per-string cap, is what bounds an entry — so 600 entries is a worst case of
+// 19.2 M chars ≈ 38 MB of UTF-16, a third of what the shared 2000-slot ring
+// could reach.
+//
+// THAT CEILING IS UNCHANGED by the per-content-type string caps further down,
+// and that is the reason those exist instead of one raised global cap: a single
+// string may now reach 30000, but the entry it lives in still may not exceed
+// 32000, so the product 600 × 32000 does not move. What moves is the REALISTIC
+// footprint, measured over the 513 captures of the reference run (15 pipeline
+// runs, character "Naoto"): 1591 → 1936 chars per entry, so a full ring goes
+// from ~0.95 M to ~1.16 M chars, ~1.9 MB → ~2.3 MB of UTF-16. The largest single
+// entry in that run goes from 12444 to 24543 chars — still 23 % under the entry
+// cap, i.e. the backstop is not what limits it.
+//
+// 513 captures over 15 recorded turns is ~34 entries/turn, so a full ring holds
+// roughly 17 turns of regression hunting. Raising this number trades tab
+// stability for depth, linearly.
 const MAX_TRACE_ENTRIES_MEM = 600;
 
 let traceLog = [];
@@ -369,7 +381,8 @@ export function addDebugLog(type, message, opts = {}) {
 // you can see that a fact was repaired but not why the agent thought so.
 //
 // All of that is far too big to keep in a chat file — a single extraction
-// prompt is multiple KB, a reflection story window is up to 12000 chars. So
+// prompt measured 19-25 KB on the reference run, a reflection story window is
+// up to 12000 chars and a reflection user prompt reached 22 KB. So
 // traces land on their OWN ring (`traceLog`, see the note at the top of this
 // file), which no persistence path reads. They are RAM-only by construction:
 // the Debug tab renders them and the export groups them, and they never reach
@@ -382,16 +395,85 @@ export function addDebugLog(type, message, opts = {}) {
 // for the thunk contract that keeps it that way.
 // ---------------------------------------------------------------------------
 
-// Per-string cap. Sized so the single biggest legitimate field — the reflection
-// story window, which agent-reflect.js already caps at 12000 chars — arrives
-// WHOLE. A trace that clips the evidence cannot answer the one question it was
-// built to answer.
-const TRACE_MAX_STRING_CHARS = 12000;
+// PER-STRING CAPS, WITH A CONTENT-TYPE DIMENSION.
+//
+// One flat number was wrong in both directions. At 12000 it was sized for the
+// reflection story window (pipeline.js REFLECT_STORY_MAX_CHARS = 12000) and
+// clipped everything larger. On the reference run that meant ALL FIFTEEN extraction user
+// prompts were cut at "12000 of 19362…24531 chars" — and since the taxonomy menu
+// alone is a fixed 12588 chars (database.js groupedTaxonomyMenu, 77 lines), the
+// cut landed INSIDE it, leaving the settled-message block, the tentative block,
+// the injected-refs list and the store candidates entirely beyond the capture.
+// The agent that writes every fact was the one stage the export could not audit,
+// while `beats` — 1220-2923 chars, a trivial call — was captured whole.
+//
+// Raising that one number to 30000 instead would hand 30000 to EVERY string in
+// EVERY payload: a fact record's free-text `note`, a rendered tool result, a
+// composed sheet. Those grow with the STORE, not with the prompt, and there are
+// far more of them (write_fact alone captures a before and an after image per
+// write). So the cap is chosen per field instead, from the event and the field
+// path — see traceStringCap.
+//
+// MODEL_IO — the exact text sent to or returned by an LLM, and nothing else in
+// those payloads. Measured: the extraction user prompt tops out at 24531 chars
+// and grows through the "Stored keys" inventory, which agent-memory.js holds at
+// KEY_INVENTORY_CAP (200) lines of ~25.5 chars; this run's 58 keys cost 1477, so
+// that block tops out ~3600 chars higher, i.e. ~28.1 k at the inventory cap.
+// 30000 covers the measured maximum plus that growth. It is NOT a guarantee: an
+// unusually long settled/tentative window can still exceed it, and then the cut
+// is visible inline and in the manifest exactly as before.
+const TRACE_STRING_CHARS_MODEL_IO = 30000;
 
-// Total string budget for ONE entry, shared by every string in its payload.
-// Roughly a system prompt plus a task block plus a reply. Without it a payload
-// with thirty string fields could reach 360 KB, and 2000 of those would be
-// three quarters of a gigabyte of ring.
+// TOOL_RESULT — what a tool handed BACK to the agent, verbatim. Measured max
+// 1564 chars, but this is the class that scales with the store: it is bounded
+// upstream only by SEARCH_RESULT_CAP (15 records) and LIST_KEYS_CAP (80 lines)
+// at ~156 chars a record, and read_facts takes a key list with no cap at all.
+// 16000 is ~100 rendered records — well past anything a tool loop has produced,
+// well short of letting one result own half an entry.
+const TRACE_STRING_CHARS_TOOL_RESULT = 16000;
+
+// Everything else keeps the old cap. Reference-run maxima, all far below it:
+// fact-record fields 259, the composed sheet 6393, the reflection story window
+// 11881 (pipeline.js REFLECT_STORY_MAX_CHARS = 12000 — the field this cap was
+// originally sized for, and it still arrives whole), the reflection digest 2356
+// (agent-reflect.js MAX_FACT_SUMMARY_CHARS = 4000), the recovery blocks 592.
+// This is the class that grows with the STORE, and the one a raised global cap
+// would have paid for.
+const TRACE_STRING_CHARS_DEFAULT = 12000;
+
+// A model-io field is identified by (event, path), not by a caller-supplied
+// option: this file owns the trace format, and touching every call site to pass
+// a content type would be a far larger change for information the event name
+// already carries. The event families are `<agent>.prompt.system`,
+// `<agent>.prompt.user` and `<agent>.reply.raw` across extract/beats/head/spine/
+// reflect; the field names are the ones those payloads actually use.
+//
+// Matched at ROOT PATH ONLY, which is deliberate: `sections[0].header` inside a
+// prompt payload is a label, not the prompt, and must not inherit 30000.
+const TRACE_MODEL_IO_EVENT_RE = /(?:^|\.)(?:prompt\.(?:system|user)|reply\.raw)$/;
+const TRACE_MODEL_IO_FIELDS = new Set(['system', 'user', 'userPrompt', 'reply']);
+const TRACE_TOOL_CALL_EVENT_RE = /(?:^|\.)tool\.call$/;
+
+function traceStringCap(event, path) {
+    const ev = String(event || '');
+    if (TRACE_MODEL_IO_FIELDS.has(path) && TRACE_MODEL_IO_EVENT_RE.test(ev)) return TRACE_STRING_CHARS_MODEL_IO;
+    if (path === 'result' && TRACE_TOOL_CALL_EVENT_RE.test(ev)) return TRACE_STRING_CHARS_TOOL_RESULT;
+    return TRACE_STRING_CHARS_DEFAULT;
+}
+
+// Total string budget for ONE entry, shared by every string in its payload —
+// and, now that the per-string cap has a content-type dimension, the only thing
+// that bounds an entry at all. Deliberately NOT raised alongside MODEL_IO: that
+// is precisely what keeps the ring's worst case at 600 × 32000 (see the CAP note
+// at the top of this file). It still backstops a many-field payload — thirty
+// 12000-char record fields would otherwise reach 360 KB — and it still bites
+// before a second model-io string in the same entry could double one.
+//
+// It leaves 2000 chars of headroom above MODEL_IO, and that is enough by
+// measurement, not by hope: across the 157 reference-run entries carrying a
+// model-io string the largest sibling charge in the same payload was 444 chars
+// (reflect.prompt.user's `sections` headers). Where it is not enough the entry
+// budget wins, and the cut is recorded as `limitedBy: 'entry-budget'`.
 const TRACE_MAX_ENTRY_CHARS = 32000;
 
 // Structural caps. Tool-call and transcript arrays are short by nature; a fact
@@ -461,15 +543,21 @@ function sanitizeTraceValue(value, path, depth, state) {
     const t = typeof value;
     if (t === 'string') {
         const total = value.length;
-        // The shared entry budget can bite before the per-field cap does, so
-        // take whichever is tighter.
-        const allowed = Math.max(0, Math.min(TRACE_MAX_STRING_CHARS, state.budget));
+        // Two independent limits, and which one fired is the first thing someone
+        // widening a cap needs to know — so take whichever is tighter and RECORD
+        // which it was. The shared entry budget can bite before the per-field cap
+        // does, and after a big field it usually does.
+        const cap = traceStringCap(state.event, path);
+        const allowed = Math.max(0, Math.min(cap, state.budget));
         if (total <= allowed) {
             state.budget -= total;
             return value;
         }
         state.budget -= allowed;
-        pushTraceNote(state, { path: path || '(root)', kind: 'string', chars: total, kept: allowed });
+        pushTraceNote(state, {
+            path: path || '(root)', kind: 'string', chars: total, kept: allowed,
+            cap, limitedBy: allowed >= cap ? 'string-cap' : 'entry-budget',
+        });
         return value.slice(0, allowed) + `\n…[BF-TRACE TRUNCATED: kept ${allowed} of ${total} chars]`;
     }
     if (t === 'number' || t === 'boolean') return value;
@@ -590,7 +678,10 @@ export function traceCapture(event, payloadFn, opts = {}) {
         return false;
     }
 
-    const state = { budget: TRACE_MAX_ENTRY_CHARS, notes: [], notesDropped: 0 };
+    // `event` rides on the state because traceStringCap needs it at every string
+    // in the walk, and threading it as a parameter would touch every recursive
+    // call for a value that never changes within one capture.
+    const state = { budget: TRACE_MAX_ENTRY_CHARS, notes: [], notesDropped: 0, event };
     let out;
     try {
         out = sanitizeTraceValue(payloadFn(), '', 0, state);
@@ -1385,15 +1476,27 @@ async function buildDiagnostics(full) {
         limit: MAX_TRACE_ENTRIES_MEM,
         unit: 'entries',
         held: traceEntries.length,
-        note: 'Separate RAM-only ring, roughly 50 captures per recorded turn. Dropped on chat switch and on reload; '
+        note: 'Separate RAM-only ring, roughly 35 captures per recorded turn. Dropped on chat switch and on reload; '
             + 'never written to chatMetadata or to the character attachment.',
     });
     truncation.push({
         what: 'trace entry payloads',
-        limit: `${TRACE_MAX_ENTRY_CHARS} chars/entry, ${TRACE_MAX_STRING_CHARS} chars/string, ${TRACE_MAX_ARRAY_ITEMS} items/array, ${TRACE_MAX_OBJECT_KEYS} keys/object, depth ${TRACE_MAX_DEPTH}`,
-        note: 'Every cut leaves a [BF-TRACE …] marker in the value and is listed in that entry\'s own `__truncated`. '
-            + `That list is itself capped at ${TRACE_MAX_NOTES} notes; an entry that hit the cap carries `
-            + '`__truncatedIncomplete` saying how many were not listed.',
+        limit: `${TRACE_MAX_ENTRY_CHARS} chars/entry, ${TRACE_MAX_ARRAY_ITEMS} items/array, ${TRACE_MAX_OBJECT_KEYS} keys/object, depth ${TRACE_MAX_DEPTH}`,
+        stringLimit: {
+            note: 'The per-string cap depends on what the string IS, so that a prompt arrives whole without every fact '
+                + 'record getting the same allowance. Each cut records the cap that applied.',
+            modelIo: TRACE_STRING_CHARS_MODEL_IO,
+            modelIoApplies: 'prompts and raw model replies: <agent>.prompt.system/.prompt.user/.reply.raw, root fields '
+                + [...TRACE_MODEL_IO_FIELDS].join('/'),
+            toolResult: TRACE_STRING_CHARS_TOOL_RESULT,
+            toolResultApplies: '<agent>.tool.call, root field `result`',
+            default: TRACE_STRING_CHARS_DEFAULT,
+            defaultApplies: 'every other string — fact records, sheets, story windows, digests',
+        },
+        note: 'Every cut leaves a [BF-TRACE …] marker in the value and is listed in that entry\'s own `__truncated`, '
+            + 'with `cap` (the per-string cap that applied) and `limitedBy` ("string-cap" or "entry-budget" — which of '
+            + `the two limits actually fired). That list is itself capped at ${TRACE_MAX_NOTES} notes; an entry that hit `
+            + 'the cap carries `__truncatedIncomplete` saying how many were not listed.',
         entriesAffected: diag.summary.trace.withTruncatedFields,
     });
     truncation.push({

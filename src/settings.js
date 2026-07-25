@@ -26,6 +26,11 @@ import {
     refreshDatabaseView, showSpiderwebPopup,
 } from './db-panel.js';
 import { DEFAULT_MEMORY_AGENT_PROMPT } from './agent-memory.js';
+// Read inside the settings-init function only. agent-lookup.js imports
+// addDebugLog/traceCapture back out of this file, so this is a cycle — the same
+// one agent-memory.js above already forms, and safe for the same reason: nothing
+// here touches the binding while either module is still evaluating.
+import { LOOKUP_TIMEOUT_MS } from './agent-lookup.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 
 export {
@@ -79,6 +84,18 @@ const DEFAULT_SETTINGS = {
     enabled: false,
 
     agent3Profile: '',
+
+    // THE LOOKUP PASS (agent-lookup.js). Default OFF, and it is the only setting
+    // in this file that defaults off for a reason other than caution: every other
+    // pass runs post-reply and detached, this one runs INSIDE the user's
+    // generation and spends real wall-clock time before the storyteller sees the
+    // prompt. Opting in is the user's call, not ours.
+    lookupEnabled: false,
+    // Its own connection profile, independent of agent3Profile. Not a nicety: the
+    // background agent may sit on a slow, cheap or self-hosted model where a
+    // single call measures in tens of seconds, and this pass has an 8s deadline.
+    // Empty falls back to agent3Profile, then to the main ST connection.
+    lookupProfile: '',
 
     memoryPrompt: '',
 
@@ -198,6 +215,8 @@ function validateSettings(s) {
     if (typeof s.debugVerbose !== 'boolean')     s.debugVerbose = false;
     if (typeof s.debugTraceRun !== 'boolean')    s.debugTraceRun = false;
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
+    if (typeof s.lookupEnabled !== 'boolean')    s.lookupEnabled = false;
+    if (typeof s.lookupProfile !== 'string')     s.lookupProfile = '';
     if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
     if (typeof s.contradictionScanEnabled !== 'boolean') s.contradictionScanEnabled = true;
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
@@ -648,26 +667,37 @@ export function updateStatus(status, message = '') {
     }
 }
 
-function reloadProfiles() {
-    const agent3Select = document.getElementById('bf_mem_agent3_profile');
-    if (!agent3Select) return;
+// Fills ONE profile <select>. Factored out of reloadProfiles when the lookup
+// pass got its own profile: the two selects differ only in their element id, in
+// which stored setting they fall back to, and in what an empty option MEANS —
+// the memory agent falls back to the main ST connection, the lookup pass falls
+// back to the memory agent's profile first (agent-lookup's caller does that
+// resolution), so labelling both "-- Use default profile --" would be wrong.
+function fillProfileSelect(elementId, settingKey, emptyLabel) {
+    const select = document.getElementById(elementId);
+    if (!select) return;
 
     const profiles = getConnectionProfiles();
     const activeProfile = getCurrentProfileId();
 
-    const currentValue = agent3Select.value;
-    agent3Select.innerHTML = '<option value="">-- Use default profile --</option>';
+    const currentValue = select.value;
+    select.innerHTML = `<option value="">${emptyLabel}</option>`;
     profiles.forEach(profile => {
         const option = document.createElement('option');
         option.value = profile.id;
         option.textContent = profile.name + (profile.id === activeProfile ? ' (current)' : '');
-        agent3Select.appendChild(option);
+        select.appendChild(option);
     });
     if (currentValue && profiles.find(p => p.id === currentValue)) {
-        agent3Select.value = currentValue;
-    } else if (extensionSettings?.agent3Profile) {
-        agent3Select.value = extensionSettings.agent3Profile;
+        select.value = currentValue;
+    } else if (extensionSettings?.[settingKey]) {
+        select.value = extensionSettings[settingKey];
     }
+}
+
+function reloadProfiles() {
+    fillProfileSelect('bf_mem_agent3_profile', 'agent3Profile', '-- Use default profile --');
+    fillProfileSelect('bf_mem_lookup_profile', 'lookupProfile', '-- Same as the Memory Agent --');
 }
 
 // Health tab: pull-based self-test. Dynamic import keeps health.js out of this
@@ -1712,9 +1742,38 @@ export async function initSettings() {
         saveSettings();
     });
 
-    $('#bf_mem_refresh_profiles').on('click', () => {
+    // Both refresh buttons rebuild BOTH selects — the profile list is one list,
+    // and a user who clicks refresh next to the lookup select is not asking for
+    // half of it.
+    $('#bf_mem_refresh_profiles, #bf_mem_refresh_profiles_lookup').on('click', () => {
         reloadProfiles();
         toastr.info('Profiles refreshed', 'BF Memory');
+    });
+
+    // --- The lookup pass (agent-lookup.js) ---------------------------------
+    // The deadline is written into the hint from the constant rather than typed
+    // into the HTML, so the number the user reads is the number the code
+    // enforces — a UI that quotes a stale constant is the same defect as a
+    // comment that does.
+    $('#bf_mem_lookup_timeout_val').text(`${LOOKUP_TIMEOUT_MS / 1000}s`);
+    $('#bf_mem_lookup_enabled').prop('checked', extensionSettings.lookupEnabled === true).on('change', function () {
+        const before = extensionSettings.lookupEnabled === true;
+        const next = $(this).prop('checked');
+        extensionSettings.lookupEnabled = next;
+        addDebugLog('info', `Lookup pass ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'lookupEnabled' }, before, after: !!next });
+        saveSettings();
+        // Re-arms the deadline-strike latch: someone who just changed this
+        // setting (or the profile below it) is asking for another try, and
+        // without this a session that switched itself off stays off until a chat
+        // switch — with no visible reason, because the toast has long gone.
+        import('./pipeline.js').then(({ resetLookupBreaker }) => resetLookupBreaker?.()).catch(() => {  });
+    });
+
+    $('#bf_mem_lookup_profile').val(extensionSettings.lookupProfile || '').on('change', function () {
+        extensionSettings.lookupProfile = $(this).val() || '';
+        addDebugLog('info', 'Lookup pass profile changed', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'lookupProfile', value: extensionSettings.lookupProfile } });
+        saveSettings();
+        import('./pipeline.js').then(({ resetLookupBreaker }) => resetLookupBreaker?.()).catch(() => {  });
     });
 
     $('#bf_mem_agent2_context').val(extensionSettings.agent2ContextMessages);
