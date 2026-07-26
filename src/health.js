@@ -7,7 +7,7 @@
 import { getSettings, getMemorySheet, getStorySpine, getCurrentScene } from './settings.js';
 import { getDebugLogEntries } from './debug-log.js';
 import { getContext } from './ui-util.js';
-import { KNOWN_TOOLS as MEMORY_AGENT_TOOLS, REFLECTION_TOOLS } from './memory-tools.js';
+import { KNOWN_TOOLS as MEMORY_AGENT_TOOLS, REFLECTION_TOOLS, LOOKUP_TOOLS } from './memory-tools.js';
 
 // Matches BEAT_MAX_CHARS in agent-memory.js — a beat past this slipped through
 // the brevity enforcement (or predates it) and bloats every injected sheet.
@@ -19,7 +19,7 @@ const RECENT_LOG_WINDOW = 50;
 const healthEvents = {};
 
 // Session-scoped per-agent tool telemetry: { [agentTag]: { [tool]: { count, lastTs } } }.
-// agentTag is 'memory' or 'reflection'. Recorded from the tool-loop choke point
+// agentTag is 'memory', 'reflection' or 'lookup'. Recorded from the tool-loop choke point
 // in llm-call.js AFTER the executor returns success, so only tool calls that
 // actually EXECUTED are counted — parse attempts, malformed calls, rejected
 // calls (reflection's read-before-write gate and per-pass write cap) and failed
@@ -346,6 +346,37 @@ export async function buildHealthReport() {
         steps.push({ id: 'reflection', label: 'Reflection', status: 'fail', detail: String(refl.error || 'reflection failed'), ts: refl.ts });
     }
 
+    // i2. Lookup agent. The ONLY pass on the latency path — the user sits and
+    // waits for it — so a broken one is the most expensive failure in the
+    // pipeline and had, until this row existed, no representation here at all.
+    // The three numbers are the ones that decide whether it earns its wait:
+    // refs delivered, tool calls made, milliseconds spent. A pass that reports
+    // 0 refs AND 0 tool calls turn after turn is not "quiet", it is not working.
+    const look = ev('lookup');
+    if (!settings?.lookupEnabled) {
+        steps.push({ id: 'lookup', label: 'Lookup agent', status: 'none', detail: 'turned off in settings (no latency spent)' });
+    } else if (!look) {
+        steps.push({ id: 'lookup', label: 'Lookup agent', status: 'none', detail: 'has not run yet (runs on each user message)' });
+    } else if (look.status === 'off') {
+        steps.push({ id: 'lookup', label: 'Lookup agent', status: 'fail', detail: String(look.detail || 'switched off for this session after repeated failures'), ts: look.ts });
+    } else if (look.status === 'ok') {
+        // "Ran but called nothing" is the warn, and the round count is what makes
+        // it honest: runLookupAgent also returns a clean result with 0 rounds when
+        // it skipped the LLM entirely (empty store), and that is not a defect.
+        const rounds = Number(look.rounds) || 0;
+        const calls = Number(look.toolCalls) || 0;
+        const idle = rounds > 0 && calls === 0;
+        steps.push({
+            id: 'lookup', label: 'Lookup agent', status: idle ? 'warn' : 'ok',
+            detail: rounds === 0
+                ? `last pass ${Number(look.durationMs) || 0}ms — no LLM call (nothing in the store to look up)`
+                : `last pass ${Number(look.durationMs) || 0}ms, ${Number(look.refs) || 0} ref(s), ${rounds} round(s), ${calls} tool call(s)${idle ? ' — answered without searching' : ''}`,
+            ts: look.ts,
+        });
+    } else {
+        steps.push({ id: 'lookup', label: 'Lookup agent', status: 'fail', detail: String(look.error || 'lookup failed'), ts: look.ts });
+    }
+
     // j. Recent errors — scan the newest debug-log entries (newest first).
     // getDebugLogEntries() returns ORDINARY entries only — trace captures live on
     // their own ring (debug-log.js). That separation is load-bearing at this
@@ -394,6 +425,16 @@ export async function buildHealthReport() {
     // catch anything recorded under the tag that is not in the constant.
     const reflectionExtras = Object.keys(toolUsage['reflection'] || {}).filter(t => !REFLECTION_TOOLS.includes(t));
     for (const tool of [...REFLECTION_TOOLS, ...reflectionExtras]) steps.push(toolRow('reflection', tool));
+
+    // The lookup roster. This section is the reason agent-lookup.js sets an
+    // agentTag at all: with the tag null, its reads were executed and never
+    // counted, so three "never used" rows that should have been screaming were
+    // simply absent. All three reading "never used" after a few user messages is
+    // the signature of a lookup that answers without searching — which is what
+    // the export showed for 26 consecutive runs.
+    steps.push({ id: 'tools_lookup', label: 'Lookup agent tools', header: true });
+    const lookupExtras = Object.keys(toolUsage['lookup'] || {}).filter(t => !LOOKUP_TOOLS.includes(t));
+    for (const tool of [...LOOKUP_TOOLS, ...lookupExtras]) steps.push(toolRow('lookup', tool));
 
     return steps;
 }

@@ -25,7 +25,16 @@ import {
 import {
     refreshDatabaseView, showSpiderwebPopup,
 } from './db-panel.js';
-import { DEFAULT_MEMORY_AGENT_PROMPT } from './agent-memory.js';
+import {
+    DEFAULT_MEMORY_AGENT_PROMPT,
+    // The premise-floor setting contract. Nothing in this file re-derives the
+    // key name, the bounds or the sentinel: a second copy of "0 means
+    // unlimited" is a second place to get it wrong, and the sheet builder is
+    // the one that has to be right.
+    PREMISE_FLOOR_SETTING_KEY, PREMISE_FLOOR_UNLIMITED, PREMISE_FLOOR_MIN,
+    PREMISE_FLOOR_SLIDER_MAX, PREMISE_FLOOR_DEFAULT,
+    resolvePremiseFloorCap, estimatePremiseFloorCost,
+} from './agent-memory.js';
 // Read inside the settings-init function only. agent-lookup.js imports
 // addDebugLog/traceCapture back out of this file, so this is a cycle — the same
 // one agent-memory.js above already forms, and safe for the same reason: nothing
@@ -120,6 +129,23 @@ const DEFAULT_SETTINGS = {
     // syncPromptDefaultWitnesses.
     knownDefaultFingerprints: {},
 
+    // How many stored memories the sheet re-injects every turn no matter what
+    // the scene asks for. 1..100, or 0 (PREMISE_FLOOR_UNLIMITED) for all of
+    // them. Declared here so the schema-v3 key sweep keeps it and the fill loop
+    // in initSettings claims it — but deliberately WITHOUT a value: the default
+    // is agent-memory.js's (PREMISE_FLOOR_DEFAULT, moved 15 -> 50 on measured
+    // coverage), and validateSettings resolves `undefined` through the very
+    // function the sheet builder uses. A number here would be a second copy of
+    // that default, free to drift.
+    //
+    // Written as a LITERAL key rather than [PREMISE_FLOOR_SETTING_KEY] on
+    // purpose: this object literal is evaluated while the module body runs, and
+    // agent-memory.js imports this file back (see the note above its import),
+    // so reading an imported const here would be a temporal-dead-zone crash the
+    // moment anything other than index.js's settings-first order loads the
+    // graph. assertPremiseFloorKey() checks the string at runtime instead.
+    premiseFloorMax: undefined,
+
     agent2ContextMessages: 10,
 
     bufferHoldBack: 4,
@@ -131,7 +157,10 @@ const DEFAULT_SETTINGS = {
     graphExtrasCount: 3,
 
     contradictionScanEnabled: true,
-    contradictionInterval: 2,
+    // 1 = scan on every Reflect pass. See validateSettings for why this is no
+    // longer 2, and migrateContradictionInterval for what happens to profiles
+    // that already stored the old default.
+    contradictionInterval: 1,
 
     catchupBatchSize: 8,
     showToast: true,
@@ -193,6 +222,22 @@ function clamp(value, lo, hi, fallback) {
     return Math.min(hi, Math.max(lo, n));
 }
 
+// The one thing the literal `premiseFloorMax:` key in DEFAULT_SETTINGS cannot
+// check for itself. If agent-memory.js ever renames the setting, the literal
+// would silently become a dead key: the fill loop would seed a name nothing
+// reads, the schema-v3 sweep would delete the real one as obsolete, and the
+// slider would look like it does nothing. Runtime, so no TDZ.
+let premiseFloorKeyChecked = false;
+function assertPremiseFloorKey() {
+    if (premiseFloorKeyChecked) return;
+    premiseFloorKeyChecked = true;
+    if (Object.hasOwn(DEFAULT_SETTINGS, PREMISE_FLOOR_SETTING_KEY)) return;
+    addDebugLog('fail', `Premise-floor setting key is "${PREMISE_FLOOR_SETTING_KEY}" but DEFAULT_SETTINGS declares ${Object.keys(DEFAULT_SETTINGS).filter(k => /premiseFloor/i.test(k)).join(', ') || 'no matching key'} — the slider writes a key nothing reads`, {
+        subsystem: 'settings', event: 'settings.changed', actor: 'SYSTEM',
+        reason: 'PREMISE_FLOOR_KEY_MISMATCH', data: { key: PREMISE_FLOOR_SETTING_KEY },
+    });
+}
+
 function validateSettings(s) {
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 10));
     s.bufferHoldBack = Math.floor(clamp(s.bufferHoldBack, 0, 10, 4));
@@ -204,9 +249,38 @@ function validateSettings(s) {
     }
     s.spineBatchSize = Math.floor(clamp(s.spineBatchSize, 4, 30, 10));
     s.graphExtrasCount = Math.floor(clamp(s.graphExtrasCount, 0, 8, 3));
-    // Read by agent-reflect.js as `Math.max(1, Number(...) || CONTRADICTION_INTERVAL_DEFAULT)`;
-    // the default here must stay equal to that constant (2) or the UI lies.
-    s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 10, 2));
+
+    // PREMISE FLOOR. Not clamped with the helper above, because the sentinel
+    // makes 0 legal while 0.5 and 250 are not — the one expression allowed to
+    // decide that is agent-memory.js's, since it is the expression the sheet
+    // builder itself resolves the setting with. Normalizing through it here
+    // means the number in the slider and the number the sheet is built to
+    // cannot disagree, and an out-of-range hand edit is CLAMPED, not discarded:
+    // a settings file saying 250 that quietly produced a 50-row sheet would be
+    // unexplainable from the UI.
+    assertPremiseFloorKey();
+    const floorSetting = resolvePremiseFloorCap(s);
+    const floorValue = floorSetting.unlimited ? PREMISE_FLOOR_UNLIMITED : floorSetting.cap;
+    if (floorSetting.source === 'clamped') {
+        addDebugLog('fail', `Premise floor ${safeStringify(floorSetting.raw)} is outside ${PREMISE_FLOOR_MIN}..${PREMISE_FLOOR_SLIDER_MAX} (0 = unlimited); clamped to ${floorValue}`, {
+            subsystem: 'settings', event: 'settings.migrated', actor: 'SYSTEM',
+            reason: 'PREMISE_FLOOR_CLAMPED', data: { key: PREMISE_FLOOR_SETTING_KEY },
+            before: floorSetting.raw, after: floorValue,
+        });
+    }
+    s[PREMISE_FLOOR_SETTING_KEY] = floorValue;
+
+    // Read by agent-reflect.js as `Math.max(1, Number(...) || CONTRADICTION_INTERVAL_DEFAULT)`.
+    // The fallback below is 1 and that module's constant is still 2 — they no
+    // longer match, and that is survivable rather than a lie only because the
+    // two are reached on different paths: this line runs on every load and
+    // always leaves a number in the key, so agent-reflect.js's own constant is
+    // only ever consulted for a settings object that never passed through here.
+    // Why 1: Reflect runs rarely to begin with, so an interval of 2 gave a
+    // measured 78-message chat exactly ONE contradiction scan in the whole run.
+    // (agent-reflect.js is not this agent's file to edit; its constant should
+    // follow.)
+    s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 10, 1));
     s.catchupBatchSize = Math.floor(clamp(s.catchupBatchSize, 2, 30, 8));
     if (typeof s.enabled !== 'boolean') {
 
@@ -314,7 +388,14 @@ function promptFingerprint(text) {
 // is misreported as having customised it. v6 for the same reason: the sweep's
 // recognition set changed (every memoryAgentPrompt fingerprint was corrected,
 // and `knownDefaultFingerprints` was added), so it has to run again.
-const SETTINGS_SCHEMA_VERSION = 6;
+//
+// v7 is the first bump that is NOT about prompts: the contradiction-scan
+// interval default dropped 2 -> 1, and a default change alone would never reach
+// anybody, because every profile that has ever loaded has the old default
+// written into it as a concrete number (validateSettings leaves no key empty).
+// It re-runs the prompt sweep as a side effect, which is harmless — that sweep
+// only drops an override byte-identical to a default we shipped.
+const SETTINGS_SCHEMA_VERSION = 7;
 
 // WHEN YOU CHANGE EITHER DEFAULT PROMPT, three edits, no more:
 //   1. prepend the OUTGOING default's fingerprint to `legacyFingerprints`
@@ -593,12 +674,32 @@ function renderPromptStaleNotices() {
     }
 }
 
+// v7. The old default of 2 is rewritten to 1, ONCE. Only the exact value 2 is
+// touched: a user who typed 3 or 7 chose it, and this must not read as the app
+// overruling them. Someone who deliberately set 2 loses that — unavoidable, the
+// stored number carries no record of who wrote it — which is why the sweep runs
+// once and says so in the log instead of enforcing 1 on every load.
+function migrateContradictionInterval(s) {
+    if (Number(s.contradictionInterval) !== 2) return;
+    s.contradictionInterval = 1;
+    addDebugLog('info', 'Contradiction scan interval 2 → 1 (the old default): at 2, Reflect runs so rarely that a measured 78-message chat got a single scan in the whole run. Set it back in the Memory tab if you meant 2.', {
+        subsystem: 'settings', event: 'settings.migrated', actor: 'SYSTEM',
+        reason: 'CONTRADICTION_INTERVAL_DEFAULT_CHANGED',
+        data: { key: 'contradictionInterval' }, before: 2, after: 1,
+    });
+}
+
 function migrateLegacySettings(s) {
 
     // Before the version gate, always: this is what lets a stale-override sweep
     // arm itself. `fresh` is non-empty exactly when a built-in default changed
     // since this profile last loaded.
     const fresh = syncPromptDefaultWitnesses(s);
+
+    // Below the gate, above every early return: the v7 sweep has to reach both
+    // the ">= 3" shortcut and the full v3 body, and running it before either
+    // keeps that from being two call sites that can fall out of step.
+    if ((s.schemaVersion ?? 0) < 7) migrateContradictionInterval(s);
 
     if ((s.schemaVersion ?? 0) >= SETTINGS_SCHEMA_VERSION) {
         // The schema says the sweep is done, yet a default just changed — i.e.
@@ -738,6 +839,99 @@ async function renderHealthTab() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PREMISE-FLOOR SLIDER — value <-> slider position, and the live cost readout.
+//
+// UNLIMITED is slider position 101, not a companion checkbox. The axis is
+// "more rows to the right" and "no limit" is its far end, so one control holds
+// one state; a checkbox would leave the slider parked on a number that no
+// longer applies and the user guessing which of the two wins. 101 is a UI
+// coordinate only — the stored value is PREMISE_FLOOR_UNLIMITED (0).
+// ---------------------------------------------------------------------------
+const PREMISE_FLOOR_SLIDER_UNLIMITED_POS = PREMISE_FLOOR_SLIDER_MAX + 1;
+
+function premiseFloorToSliderPos(value) {
+    const n = Math.trunc(Number(value));
+    if (!Number.isFinite(n)) return PREMISE_FLOOR_DEFAULT;
+    if (n === PREMISE_FLOOR_UNLIMITED) return PREMISE_FLOOR_SLIDER_UNLIMITED_POS;
+    return Math.min(PREMISE_FLOOR_SLIDER_MAX, Math.max(PREMISE_FLOOR_MIN, n));
+}
+
+function sliderPosToPremiseFloor(pos) {
+    const n = Math.trunc(Number(pos));
+    if (!Number.isFinite(n)) return PREMISE_FLOOR_DEFAULT;
+    if (n >= PREMISE_FLOOR_SLIDER_UNLIMITED_POS) return PREMISE_FLOOR_UNLIMITED;
+    return Math.min(PREMISE_FLOOR_SLIDER_MAX, Math.max(PREMISE_FLOOR_MIN, n));
+}
+
+function premiseFloorLabel(value) {
+    return Number(value) === PREMISE_FLOOR_UNLIMITED ? '∞ no limit' : String(value);
+}
+
+// Both guards matter. The debounce is because every repaint runs
+// selectPremiseFloor over the whole store TWICE (this cap and the unlimited
+// ceiling) behind an IndexedDB read, and a slider drag fires per pixel. The
+// sequence number is because those reads finish out of order — without it the
+// figure left on screen is whichever estimate happened to be slowest, i.e. some
+// cap the user dragged past.
+let premiseFloorCostSeq = 0;
+let premiseFloorCostTimer = null;
+
+function renderPremiseFloorCost(capValue = undefined, { delay = 0 } = {}) {
+    const el = document.getElementById('bf_mem_premise_floor_cost');
+    if (!el) return;
+    const seq = ++premiseFloorCostSeq;
+    clearTimeout(premiseFloorCostTimer);
+    premiseFloorCostTimer = setTimeout(async () => {
+        let est = null;
+        try {
+            est = await estimatePremiseFloorCost(capValue);
+        } catch (err) {
+            if (seq !== premiseFloorCostSeq) return;
+            el.textContent = `Could not measure this chat's memory sheet: ${err?.message || err}`;
+            return;
+        }
+        if (seq !== premiseFloorCostSeq) return;
+
+        const num = (n) => Number(n || 0).toLocaleString();
+        // `total.rows` is floor + NEED + sticky recovered, all drawn from the
+        // store and de-duplicated against each other, so rows/storeFacts is a
+        // real coverage figure — and a conservative one: bonus connected
+        // memories are not in it, and they can only add.
+        const pct = est.storeFacts > 0 ? Math.min(100, Math.round((est.total.rows / est.storeFacts) * 100)) : 0;
+        const ceilPct = est.storeFacts > 0 ? Math.min(100, Math.round((est.ceiling.rows / est.storeFacts) * 100)) : 0;
+
+        if (!est.storeFacts) {
+            el.innerHTML = 'Nothing stored for this chat yet, so there is nothing to price. Numbers appear here once the first memories are written.';
+            return;
+        }
+        // NEVER say "all N" — that sentence was the defect. storeFacts now counts
+        // every active fact including the cold ones, so rows and storeFacts are
+        // separate numbers and the gap between them is real. Always print both
+        // sides of the fraction, at every setting, so the figure cannot flatter
+        // itself by shrinking its own denominator.
+        const head = est.unlimited
+            ? `<b>No limit:</b> ${num(est.total.rows)} of your ${num(est.storeFacts)} stored memories on the sheet (${pct}%), <b>~${num(est.total.tokens)} tokens every turn</b>.`
+            : `<b>At ${num(est.cap)} rows:</b> ${num(est.total.rows)} of your ${num(est.storeFacts)} stored memories on the sheet (${pct}%), <b>~${num(est.total.tokens)} tokens every turn</b>.`;
+
+        // Anything held back for a reason the slider cannot overrule gets named.
+        // Silence here is what let the old readout show 100% while a third of the
+        // store sat cold and invisible.
+        const ex = est.excluded || {};
+        const held = [];
+        if (ex.cold > 0) held.push(`${num(ex.cold)} set aside as wrong or duplicate`);
+        if (ex.invisible > 0) held.push(`${num(ex.invisible)} not known to anyone present`);
+        const excludedNote = held.length
+            ? ` ${num(ex.total)} are held back regardless of this slider — ${held.join(', ')}; raising it will not bring them in.`
+            : '';
+
+        const tail = est.unlimited
+            ? ' Every memory this chat adds from here is added to that bill, on every turn.'
+            : ` No limit would be ${num(est.ceiling.rows)} of ${num(est.storeFacts)} (${ceilPct}%) for ~${num(est.ceiling.tokens)} tokens — and it keeps growing with the chat.`;
+        el.innerHTML = head + excludedNote + tail;
+    }, delay);
+}
+
 function setupTabs() {
     const tablist = document.querySelector('.bf-mem-tabs[role="tablist"]');
     if (!tablist) return;
@@ -760,6 +954,12 @@ function setupTabs() {
         const panel = document.getElementById(tab.getAttribute('aria-controls'));
         if (panel) panel.style.display = '';
 
+        // The floor estimate is priced against the LIVE store, which grows every
+        // turn — a figure rendered when the panel was first built is stale by
+        // the time the user comes back to look at it.
+        if (tab.getAttribute('aria-controls') === 'bf_mem_tab_memory') {
+            renderPremiseFloorCost();
+        }
         if (tab.getAttribute('aria-controls') === 'bf_mem_tab_database') {
             refreshDatabaseView();
         }
@@ -1807,6 +2007,32 @@ export async function initSettings() {
         }
         saveSettings();
         import('./pipeline.js').then(({ resetLookupBreaker }) => resetLookupBreaker?.()).catch(() => {  });
+    });
+
+    // Premise floor. The slider carries one extra position past 100 for
+    // UNLIMITED (see premiseFloorToSliderPos); the stored value is 0 there, so
+    // nothing downstream ever sees 101.
+    const floorStored = extensionSettings[PREMISE_FLOOR_SETTING_KEY];
+    $('#bf_mem_premise_floor').val(premiseFloorToSliderPos(floorStored));
+    $('#bf_mem_premise_floor_val').text(premiseFloorLabel(floorStored));
+    renderPremiseFloorCost(floorStored);
+    $('#bf_mem_premise_floor').on('input', function () {
+        const next = sliderPosToPremiseFloor($(this).val());
+        const before = extensionSettings[PREMISE_FLOOR_SETTING_KEY];
+        extensionSettings[PREMISE_FLOOR_SETTING_KEY] = next;
+        $('#bf_mem_premise_floor_val').text(premiseFloorLabel(next));
+        // Priced for the position under the user's thumb, not for the saved
+        // value: the whole point of the readout is to show the bill BEFORE
+        // letting go of the slider.
+        renderPremiseFloorCost(next, { delay: 150 });
+        if (before !== next) {
+            addDebugLog('info', `Premise floor: ${premiseFloorLabel(before)} → ${premiseFloorLabel(next)} rows per sheet`, {
+                subsystem: 'settings', event: 'settings.changed', actor: 'USER',
+                data: { key: PREMISE_FLOOR_SETTING_KEY, unlimited: next === PREMISE_FLOOR_UNLIMITED },
+                before, after: next,
+            });
+        }
+        saveSettings();
     });
 
     $('#bf_mem_agent2_context').val(extensionSettings.agent2ContextMessages);

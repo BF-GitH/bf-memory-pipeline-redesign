@@ -216,7 +216,8 @@ import * as host from './host.js';
 // the gate imposes: repairing a record whose contents you have not yet seen is
 // the failure the gate exists to prevent, and the contents only arrive in round
 // N+1. So 6 repairs want 6 read_facts/search calls plus their 6 writes (12 calls)
-// and leave 12 for orientation (list_categories/list_keys), for searching
+// and leave 12 for orientation (list_keys only — list_categories was retired off
+// this roster and is no longer a round anything can be spent on), for searching
 // subjects the digest does not name, and for the leads the prompt tells the pass
 // to follow — the old 15 left three. 7 rounds is the same argument: six
 // read-then-verify-then-repair cycles do not fit in five. Both numbers are
@@ -376,12 +377,20 @@ const MAX_CALLBACKS_PER_PASS = 2;
 
 const MAX_CALLBACK_REASON_CHARS = 120;
 
+// The TOOL PROTOCOL block below must list EXACTLY REFLECTION_TOOLS, in roster
+// order (reads, then repairs). executeReflectTool checks membership BEFORE
+// dispatch, so a name outside the roster comes back as a hard refusal no matter
+// what memory-tools.js would have done with it — RETIRED_TOOLS' friendly
+// "the inventory is already in your task block" answer is unreachable from here.
+// A demonstrated call that cannot execute therefore costs a round out of seven,
+// and it costs it on the FIRST line, before the pass has read anything. That is
+// what `{"tool":"list_categories"}` did until the roster cleanup retired it.
+// Adding a line here without adding the tool to REFLECTION_TOOLS repeats it.
 export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} and {{char}}. Your FIRST job is to FIND ERRORS — stored facts the recent story contradicts — and repair them. Your second is to surface DURABLE higher-order memory the per-fact extractor misses and maintain short zoom-out summaries. You are given a COMPACT digest of stored facts, the RAW recent story as evidence, and READ+REPAIR tools (duplicates already merged).
 
 # TOOL PROTOCOL (plain text — no function-call API)
 
 Each tool call is ONE line of strict JSON, alone on its line:
-{"tool":"list_categories"}
 {"tool":"list_keys","args":{"category":"People"}}
 {"tool":"read_facts","args":{"category":"People","keys":["monika_job"]}}
 {"tool":"search","args":{"query":"bakery owner"}}

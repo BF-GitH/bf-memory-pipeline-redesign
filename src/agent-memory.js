@@ -10,6 +10,15 @@ import {
     summarizeMenuIndexed,
     groupedTaxonomyMenu,
     deriveSubject,
+    setSheetSupplyRefs,
+    reconcileColdTier,
+    coldTierCensus,
+    PREMISE_FLOOR_SETTING_KEY,
+    PREMISE_FLOOR_UNLIMITED,
+    PREMISE_FLOOR_MIN,
+    PREMISE_FLOOR_SLIDER_MAX,
+    PREMISE_FLOOR_DEFAULT,
+    resolvePremiseFloorCap,
 } from './database.js';
 import { tokenSet } from './tokenize.js';
 import { isFactVisible, buildFactLine, randomWalkExtras } from './fact-retrieval.js';
@@ -36,36 +45,79 @@ function currentChatIdSafe() {
 }
 
 const KEY_INVENTORY_CAP = 200;
-// A sheet carries PREMISE_FLOOR_MAX(15) + sticky recovered(<=12) + extras(<=8) +
-// NEED rows, so the old cap of 40 truncated ordinary dense turns. That matters
-// because a TRUNCATED list is exactly where "a ref MISSING from it was never
-// shown" stops being true: the model would be told, falsely, that
-// already-injected facts were fair game, recover them into NEED, grow the sheet
-// and truncate even more. 80 makes truncation rare (worst case ~80 x 30 chars =
-// 2.4 KB); when it still happens the section header says TRUNCATED and the
-// prompt downgrades absence from proof-of-omission to "unknown".
+// ===========================================================================
+// PREMISE FLOOR CAP — a user setting, not a constant.
 //
-// NEED_REFS_CAP below closes the feedback loop from the other end: 15 + 12 + 8 +
-// NEED can no longer exceed this cap at all, so truncation now requires a store
-// so large the FLOOR alone overflows it. Kept as two constants because they
-// govern different things — this one bounds what the prompt can READ back out of
-// a sheet, that one bounds what a single NEED line can PUT into one.
-const INJECTED_REFS_CAP = 80;
+// The constants and the resolver MOVED to database.js and are re-exported here
+// unchanged, so settings.js and every other importer keeps its existing import.
+// They had to move because database.js's coldTierOverflow() derives the hot-set
+// budget from this cap and is synchronous on the save path — see the HOT_SET_MIN
+// block there for why a second hand-copied constant was the bug.
+//
+// Why the default is 50 and not the old 15: measured against the 33 sheets and
+// 65 facts of the v0.81.0 export, a cap of 15 puts 46% of the store on the
+// sheet on average and 29% by message 77; 50 reaches 95% / 83%. 15 was not a
+// budget, it was the reason the sheet stopped tracking the store at message 21.
+// See estimatePremiseFloorCost() for what any given cap costs at THIS store.
+export {
+    PREMISE_FLOOR_SETTING_KEY,
+    PREMISE_FLOOR_UNLIMITED,
+    PREMISE_FLOOR_MIN,
+    PREMISE_FLOOR_SLIDER_MAX,
+    PREMISE_FLOOR_DEFAULT,
+    resolvePremiseFloorCap,
+};
 
-// NEED is the one UNBOUNDED axis of the sheet. The premise floor is 15, the
-// sticky recovered set is hard-capped at 12 in code (turn-state.js), extras at
-// 8 — NEED is capped only by the prompt's "ONLY refs the NEXT reply will draw
-// on", and round 2 now dangles up to CANDIDATE_FACTS_CAP attractive
-// `Category/key = value` rows in front of the agent every full turn.
+// The other two per-sheet row sources, restated here because the injected-refs
+// cap below is DERIVED from them and a stale copy would silently re-open the
+// truncation hole: sticky recovered is RECOVERED_REFS_MAX in turn-state.js
+// (RECOVERED_REF_TTL_TURNS 4 x RECOVERED_REFS_PER_TURN 3), extras is the
+// graphExtrasCount slider's ceiling as clamped in composeSheet.
+const STICKY_REFS_MAX = 12;
+const GRAPH_EXTRAS_MAX = 8;
+
+// A sheet carries premise floor + sticky recovered(<=12) + extras(<=8) + NEED
+// rows, and the "## Injected last turn" list must be able to hold ALL of them.
+// That matters because a TRUNCATED list is exactly where "a ref MISSING from it
+// was never shown" stops being true: the model would be told, falsely, that
+// already-injected facts were fair game, recover them into NEED, grow the sheet
+// and truncate even more. When it still happens the section header says
+// TRUNCATED and the prompt downgrades absence from proof-of-omission to
+// "unknown".
 //
-// This is a RUNAWAY GUARD, not a token budget, and the number is DERIVED rather
-// than guessed: INJECTED_REFS_CAP(80) - floor(15) - sticky(12) - extras(8) = 45.
-// That is the point where an oversized NEED stops being merely expensive and
-// starts breaking a DIFFERENT feature: next turn extractPriorSheetRefs reads
-// more refs out of the sheet than the cap admits, `## Injected last turn`
-// renders [TRUNCATED], and the prompt has to downgrade "a ref MISSING from it
-// was never shown" to "absence proves NOTHING" — i.e. a sweeping NEED line
-// silently disables omission recovery. The failure shape that gets there is the
+// This used to be the constant 80, sized for a floor of 15. With the floor under
+// user control that constant becomes a trap: a floor of 100 would overflow it
+// every turn and turn omission recovery off without saying so. Derived instead,
+// and UNBOUNDED under UNLIMITED — a list that cannot be truncated is the whole
+// point, and the prompt cost of that choice is the user's, stated in the
+// settings estimate rather than silently taken back here.
+// Split so the cost readout can price a cap the user is DRAGGING TOWARDS rather
+// than the one currently stored — same formula, one definition.
+function injectedRefsCapFor(resolved) {
+    if (resolved.unlimited) return Infinity;
+    return resolved.cap + STICKY_REFS_MAX + GRAPH_EXTRAS_MAX + NEED_REFS_CAP;
+}
+function injectedRefsCap(settings) {
+    return injectedRefsCapFor(resolvePremiseFloorCap(settings));
+}
+
+// NEED is the one UNBOUNDED axis of the sheet. The premise floor is a user
+// setting, the sticky recovered set is hard-capped at 12 in code
+// (turn-state.js), extras at 8 — NEED is capped only by the prompt's "ONLY refs
+// the NEXT reply will draw on", and round 2 now dangles up to
+// CANDIDATE_FACTS_CAP attractive `Category/key = value` rows in front of the
+// agent every full turn.
+//
+// This is a RUNAWAY GUARD, not a token budget. It used to be derived FROM the
+// injected-refs cap (80 - floor 15 - sticky 12 - extras 8 = 45); now that the
+// floor is a slider the dependency runs the other way and 45 is the independent
+// number, with injectedRefsCap() sized to fit it. The guard still marks the same
+// point: where an oversized NEED stops being merely expensive and starts
+// breaking a DIFFERENT feature — next turn extractPriorSheetRefs reads more refs
+// out of the sheet than the cap admits, `## Injected last turn` renders
+// [TRUNCATED], and the prompt has to downgrade "a ref MISSING from it was never
+// shown" to "absence proves NOTHING" — i.e. a sweeping NEED line silently
+// disables omission recovery. The failure shape that gets there is the
 // re-listing sweep the prompt forbids: the task block shows up to
 // KEY_INVENTORY_CAP(200) stored keys, and nothing in code stopped an agent from
 // copying them onto the line.
@@ -384,7 +436,7 @@ export async function runMemoryAgent({
     // `(recovered)` tag that exempts them, and the header that states how much
     // authority the whole list has. Header and body are captured rather than the
     // parsed ref array because they are the bytes that shipped: the body is
-    // capped at INJECTED_REFS_CAP lines and tagged, the array is neither.
+    // capped at injectedRefsCap() lines and tagged, the array is neither.
     if (injectedSection) {
         traceCapture('agent3.recovery.injected', () => ({
             status: injectedSection.status,
@@ -742,9 +794,22 @@ export async function runMemoryAgent({
         }
     }
 
-    // composeSheet stays pure code: fed the head from Call C (summary/timeline,
-    // falling back to the prior head / persisted timeline when Call C failed),
-    // the NEED refs from Call A, and the beats via the scene store.
+    // THE COLD TIER IS RECONCILED AGAINST THE SETTING FIRST, and the order is the
+    // point. saveDatabase() re-tiers only the category it writes, so moving the
+    // premise-floor slider leaves every category this chat has not touched
+    // holding a cold set sized for the OLD number — and a cold fact is skipped by
+    // selectPremiseFloor, so those rows would stay off the sheet indefinitely
+    // while the slider claimed they were paid for. Raising the cap has to take
+    // effect on the next sheet, not on the next time that category happens to be
+    // written. Runs once per turn, right before the sheet is composed, and it is
+    // a no-op (one comparison per category) whenever the setting has not moved.
+    // Never throws; a failure leaves the previous flags standing.
+    try { await reconcileColdTier(); } catch {  }
+
+    // composeSheet makes no LLM call: it is fed the head from Call C
+    // (summary/timeline, falling back to the prior head / persisted timeline
+    // when Call C failed), the NEED refs from Call A, and the beats via the
+    // scene store. Its one outward write is setSheetSupplyRefs — see there.
     const summary = (head && head.summary) ? head.summary : extractPriorSummary(priorSheetText);
     result.sheetText = composeSheet({
         summary,
@@ -1042,7 +1107,10 @@ function buildInjectedRefsSection({ priorSheetText, priorSheet, newestJudgedMess
     const refs = extractPriorSheetRefs(priorSheetText);
     const hasTentative = Array.isArray(tentativeMessages) && tentativeMessages.length > 0;
     const { status, reason, why } = classifyPriorSheet({ priorSheet, newestJudgedMessageIndex, hasTentative, bufferHoldBack });
-    const truncated = refs.length > INJECTED_REFS_CAP;
+    // Read here rather than passed in: the cap now tracks the premise-floor
+    // setting, and this function is the only consumer.
+    const refsCap = injectedRefsCap(getSettingsSafe());
+    const truncated = refs.length > refsCap;
 
     // Sticky recoveries are tagged in place: they ARE on the list (they were
     // force-injected), but the prompt exempts a tagged ref from the do-not-
@@ -1075,7 +1143,7 @@ function buildInjectedRefsSection({ priorSheetText, priorSheet, newestJudgedMess
     if (truncated) header += ' [TRUNCATED]';
 
     const body = rendered.length > 0
-        ? capLines(rendered.join('\n'), INJECTED_REFS_CAP, 'sheet was longer — the rest is UNKNOWN, not omitted')
+        ? capLines(rendered.join('\n'), refsCap, 'sheet was longer — the rest is UNKNOWN, not omitted')
         : '(nothing)';
 
     return {
@@ -1543,6 +1611,93 @@ function restoreEveryoneKnownBy(entry, runId = '') {
     return true;
 }
 
+// A SUPERSEDE replacement is one self-contained line — that is what the prompt
+// asks for and it is the right shape for a NOTE. It is the wrong shape for a
+// VALUE: every other write in this codebase stores a short handle in `value` and
+// puts the detail in the note, and the measured export shows the cost of
+// ignoring that — the only two values longer than ten words in a 65-fact store
+// were the only two rows this function had rewritten.
+//
+// So the line is split rather than copied. Prefer a real clause boundary that
+// falls inside the budget (a full stop, then a semicolon, dash, or comma), which
+// on both real superseded rows yields a clean standalone assertion and leaves
+// the qualifications to the note. Only when no boundary fits does it cut on a
+// word boundary and mark the cut with an ellipsis — a value that ends in "…" is
+// a pointer to the note, never a claim in its own right.
+//
+// `note` is ALWAYS the full replacement text, on both sides of the length
+// boundary, and that symmetry is the point. The stored note is the text the
+// sheet prints (buildFactLine renders the note INSTEAD of the value whenever one
+// is present), so a supersede that left the old note standing would be invisible
+// on the very sheet it was written to correct — the note has to move.
+//
+// It used to move in two different ways: over 110 characters the note became the
+// replacement, at 110 or under it became '' — which execWriteFact honours as
+// "clear it" and mergeContext (database.js) then DELETES. One character decided
+// between replacing a note and destroying one. A stored note reading "Naoto's
+// apartment: 2nd floor, Inaba, shared with her grandfather" was erased outright
+// by a 108-character supersede and preserved by a 112-character one. Returning
+// the full text on both sides replaces in both cases and destroys in neither;
+// nothing is lost on the short side either, because there value === note and
+// buildFactLine prints one line regardless of which field it read.
+const SUPERSEDE_VALUE_CHARS = 110;
+function splitSupersedeText(text) {
+    const full = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!full) return { value: '', note: '' };
+    if (full.length <= SUPERSEDE_VALUE_CHARS) return { value: full, note: full };
+
+    const head = full.slice(0, SUPERSEDE_VALUE_CHARS + 1);
+    for (const re of [/[.!?](?=\s)/g, /;/g, /\s[—–-]\s/g, /,/g]) {
+        let cut = -1;
+        let m;
+        re.lastIndex = 0;
+        while ((m = re.exec(head)) !== null) cut = m.index;
+        // A boundary in the first few words is a false split ("No, she ...").
+        if (cut >= 20) return { value: full.slice(0, cut).trim(), note: full };
+    }
+    const words = head.split(' ');
+    words.pop();
+    return { value: `${words.join(' ').trim()}…`, note: full };
+}
+
+// The second half of the same defect. mergeProvenance (database.js) keeps the
+// GENESIS source and validAt on every merge — correct for an ordinary update,
+// wrong for a supersede, which is not an elaboration of the old row but its
+// replacement by a later message. Left alone, a row rewritten from message 73
+// keeps validAt 47 and recencyTail renders the fresh text as "(~15 turns ago)",
+// i.e. the sheet tells the model that this turn's correction is stale.
+//
+// Repaired after the write for the same reason restoreEveryoneKnownBy is: the
+// write itself must keep going through executeMemoryTool, and this is the same
+// live store object the saveDatabase pass persists (the category is already in
+// ctx.touchedCategories). mergeProvenance has already pushed the previous source
+// onto sourceHistory by the time this runs — it does that whenever the incoming
+// source differs — so the chain msg_47 -> msg_73 stays readable rather than
+// being overwritten.
+//
+// Re-resolved rather than reusing the pre-write object because upsertFact
+// REPLACES db.facts[i], and the key equality test guards the same hazard: a
+// write can land on a DIFFERENT record than the row we read, and that record's
+// provenance is not ours to restamp.
+function restampSupersedeProvenance(entry, ctx, runId = '') {
+    const db = entry?.db;
+    const key = entry?.fact?.key;
+    if (!db || !key) return false;
+    if (!Number.isInteger(ctx?.sourceIndex)) return false;
+    const after = findFactMatch(db, key);
+    if (!after || after.key !== key) return false;
+    const wasValidAt = after.validAt;
+    if (wasValidAt === ctx.sourceIndex && after.source === `msg_${ctx.sourceIndex}`) return false;
+    after.validAt = ctx.sourceIndex;
+    after.source = `msg_${ctx.sourceIndex}`;
+    if (ctx.srcId) after.srcId = ctx.srcId;
+    addDebugLog('debug', `[${runId}] State recheck: ${entry.ref} re-dated to message #${ctx.sourceIndex} (was ${wasValidAt ?? 'unset'}) — a supersede is dated by the message that triggered it`, {
+        subsystem: 'agent3', event: 'agent3.state_recheck', reason: 'PROVENANCE_RESTAMPED',
+        data: { ref: entry.ref, from: wasValidAt ?? null, to: ctx.sourceIndex, runId },
+    });
+    return true;
+}
+
 // Apply the verdicts. SUPERSEDE goes through executeMemoryTool('write_fact'),
 // i.e. the SAME path the agent's own writes take, so every guard applies:
 // key canonicalization, alias/generic prefix resolution, findFactMatch,
@@ -1564,18 +1719,21 @@ function restoreEveryoneKnownBy(entry, runId = '') {
 //     default) touch the record's standing. mergeSalience takes the max of the
 //     two importances, so this is belt and braces, not a behaviour change.
 //
-// value AND note both carry the verdict text. buildFactLine renders the NOTE
+// The replacement text is SPLIT across value and note (splitSupersedeText), not
+// copied into both. Both fields must be written — buildFactLine renders the NOTE
 // INSTEAD of the value whenever one exists, so updating only `value` would leave
-// the sheet printing the stale note — the defect would survive its own fix. The
-// prompt already demands a self-contained replacement for the whole row, which
-// is exactly what a note is required to be.
+// the sheet printing the stale note, and leaving the value alone would leave
+// search and the fact list answering with the claim this verdict just retired.
+// But writing the same long sentence into both is what produced the only two
+// values over ten words in the whole measured store: `value` is a short handle
+// everywhere else in this codebase and the detail belongs in the note.
 async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', callId = null }) {
     const stats = {
         asked: stateRecheck.entries.length,
         verdicts: verdicts.length,
         unchanged: 0, superseded: 0, unanswered: 0,
         unlisted: 0, noop: 0, capped: 0, failed: 0,
-        repeated: 0, contradicted: 0, ungrounded: 0, tentativeOnly: 0, knownByRestored: 0,
+        repeated: 0, contradicted: 0, ungrounded: 0, tentativeOnly: 0, knownByRestored: 0, reDated: 0,
         applied: [],
     };
     const order = new Map(stateRecheck.entries.map((e, i) => [e.ref.toLowerCase(), i]));
@@ -1712,7 +1870,8 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
 
         const storedKnownBy = (Array.isArray(fact.knownBy) ? fact.knownBy : [])
             .map(n => String(n ?? '').trim()).filter(Boolean);
-        const args = { category: s.entry.category, key: fact.key, value: s.value, note: s.value };
+        const split = splitSupersedeText(s.value);
+        const args = { category: s.entry.category, key: fact.key, value: split.value, note: split.note };
         if (storedKnownBy.length > 0) args.known_by = [...storedKnownBy];
         if (fact.aspect) args.aspect = fact.aspect;
         if (fact.kind) args.kind = fact.kind;
@@ -1741,6 +1900,7 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
         // narrowed to whoever is on stage. Repaired here, on the record the
         // write just produced, before the saveDatabase pass persists it.
         if (storedKnownBy.length === 0 && restoreEveryoneKnownBy(s.entry, runId)) stats.knownByRestored++;
+        if (restampSupersedeProvenance(s.entry, ctx, runId)) stats.reDated++;
         stats.applied.push({ ref: s.entry.ref, before: storedNote || storedValue, after: s.value, result: res });
         addDebugLog('info', `[${runId}] State recheck: SUPERSEDED ${s.entry.ref} — "${clipText(storedNote || storedValue, 80)}" -> "${clipText(s.value, 80)}"`, {
             subsystem: 'agent3', event: 'agent3.state_recheck', reason: 'SUPERSEDE',
@@ -1754,7 +1914,7 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
     // say whether the agent actually treated it as mandatory. Logged at info on
     // every run (not only when non-zero) so the rate is readable straight off
     // the run log rather than reconstructable.
-    addDebugLog(stats.unanswered > 0 ? 'info' : 'pass', `[${runId}] State recheck: ${stats.asked} row(s) asked, ${stats.unchanged} UNCHANGED, ${stats.superseded} superseded, ${stats.unanswered} unanswered${stats.capped ? `, ${stats.capped} over cap` : ''}${stats.unlisted ? `, ${stats.unlisted} for unlisted refs (refused)` : ''}${stats.ungrounded ? `, ${stats.ungrounded} without settled evidence (refused${stats.tentativeOnly ? `, ${stats.tentativeOnly} tentative-only` : ''})` : ''}${stats.noop ? `, ${stats.noop} no-op` : ''}${stats.contradicted ? `, ${stats.contradicted} contradicted by a later verdict for the same ref (first kept)` : ''}${stats.repeated ? `, ${stats.repeated} repeated` : ''}${stats.knownByRestored ? `, ${stats.knownByRestored} known-by restored` : ''}${stats.failed ? `, ${stats.failed} refused by write_fact` : ''}`, {
+    addDebugLog(stats.unanswered > 0 ? 'info' : 'pass', `[${runId}] State recheck: ${stats.asked} row(s) asked, ${stats.unchanged} UNCHANGED, ${stats.superseded} superseded, ${stats.unanswered} unanswered${stats.capped ? `, ${stats.capped} over cap` : ''}${stats.unlisted ? `, ${stats.unlisted} for unlisted refs (refused)` : ''}${stats.ungrounded ? `, ${stats.ungrounded} without settled evidence (refused${stats.tentativeOnly ? `, ${stats.tentativeOnly} tentative-only` : ''})` : ''}${stats.noop ? `, ${stats.noop} no-op` : ''}${stats.contradicted ? `, ${stats.contradicted} contradicted by a later verdict for the same ref (first kept)` : ''}${stats.repeated ? `, ${stats.repeated} repeated` : ''}${stats.knownByRestored ? `, ${stats.knownByRestored} known-by restored` : ''}${stats.reDated ? `, ${stats.reDated} re-dated to this message` : ''}${stats.failed ? `, ${stats.failed} refused by write_fact` : ''}`, {
         subsystem: 'agent3', event: 'agent3.state_recheck',
         data: { ...stats, applied: stats.applied.length, supersedeCap: STATE_SUPERSEDE_MAX, askCap: STATE_RECHECK_MAX, runId },
     });
@@ -2204,6 +2364,339 @@ function clampNum(v, min, max, dflt) {
     return Math.min(max, Math.max(min, n));
 }
 
+// ===========================================================================
+// PREMISE FLOOR — WHICH facts, given a cap.
+//
+// The defect this replaces: admit `importance >= 4 || kind === 'trait'`, sort
+// `importance DESC, lastUpdated DESC`, take the top 15. Measured on the
+// v0.81.0 export, that produced a floor of 11 Events out of 15, because at
+// equal importance the freshest row always won — 14 of the 23 importance-4
+// facts were evicted on their timestamp alone. The character's only home
+// (Places/naoto_apartment), her only human friend (People/rise_name,
+// Relationships/naoto_rise_bond), her height and her parents' photo appeared on
+// none of the 33 sheets. `lastUpdated` as a GLOBAL sort key is a recency
+// ranking wearing an importance ranking's clothes.
+//
+// Two changes, both measured (see the numbers in the settings-estimate comment
+// below):
+//
+// 1. NO ADMISSION GATE. Every hot, active, visible fact is a candidate. The old
+//    gate was a second, invisible cap: `imp >= 4 || trait` admitted 50 of 65
+//    facts, so 8 of them — every importance-3 moment and mid-importance event —
+//    could not reach the sheet at ANY cap, which would have made "unlimited"
+//    a lie. Notably it also excluded 7 of the 8 `kind === 'state'` rows, the
+//    exact rows that go stale and the only ones the state recheck can repair.
+//    Ranking, not admission, is what keeps a cap-15 sheet load-bearing.
+//
+// 2. QUOTAS instead of a global sort. Each fact lands in exactly one bucket;
+//    each bucket gets max(min, floor(cap * share)) slots, dealt ROUND-ROBIN by
+//    rank so at a small cap every bucket is represented before any bucket gets
+//    a second row. Whatever the quotas do not spend — a bucket with fewer facts
+//    than slots — falls through to a final pass over everything still unpicked,
+//    ranked by importance. The shares sum to 1.10 on purpose: over-subscribed
+//    so buckets that run dry release their slots and the cap always fills.
+//    `lastUpdated` survives only as the last tiebreak INSIDE a bucket.
+//
+// Bucket order is significant — the first matching test wins. `state` is tested
+// first, so a state in Relationships counts as a state; that is deliberate,
+// because staleness, not category, is what makes those rows urgent.
+const PREMISE_FLOOR_QUOTAS = [
+    // States are what ROTS. A stale state ships under a header that calls it
+    // "true RIGHT NOW", and the recheck can only repair a row the sheet is
+    // currently injecting — a state that falls out of the floor is unreparable
+    // for the rest of the chat. Largest share for the smallest bucket.
+    { id: 'state', min: 2, share: 0.40, test: (f) => f.kind === 'state' },
+    // Who the characters ARE. The bucket the old sort starved.
+    { id: 'identity', min: 2, share: 0.25, test: (f, cat) => f.kind === 'trait' && cat !== 'Places' && cat !== 'Relationships' && cat !== 'World' },
+    // The premise beats (cube arrival, teleport, pregnancy). Capped, not
+    // excluded: at cap 15 the old floor was 11 of these, at cap 15 the new one
+    // is 3.
+    { id: 'event', min: 2, share: 0.20, test: (f) => f.kind === 'event' || f.kind === 'moment' },
+    { id: 'relationship', min: 1, share: 0.10, test: (f, cat) => cat === 'Relationships' },
+    // min 2, above its 0.08 share, and the reason is a measured one: with min 1
+    // the single slot goes to the higher-importance Places/cube_interior and
+    // the apartment the character actually LIVES in never ships.
+    { id: 'place', min: 2, share: 0.08, test: (f, cat) => cat === 'Places' },
+    { id: 'world', min: 1, share: 0.07, test: (f, cat) => cat === 'World' },
+];
+
+function floorRank(a, b) {
+    const impDiff = clampImportance(b.fact.importance) - clampImportance(a.fact.importance);
+    if (impDiff !== 0) return impDiff;
+    return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
+}
+
+// Returns up to `cap` { fact, category } rows. `cap` may be Infinity.
+// `exclude` is the `${category}:${key}` id set the caller has already spent
+// rows on — the floor never pays twice for a row NEED already carries.
+//
+// Exported for the settings UI: this is the function estimatePremiseFloorCost
+// runs to answer "at your current store, what does this slider position cost".
+export function selectPremiseFloor({ databases = {}, cap = PREMISE_FLOOR_DEFAULT, exclude = null } = {}) {
+    const buckets = PREMISE_FLOOR_QUOTAS.map(q => ({ q, list: [], quota: 0 }));
+    const all = [];
+    for (const [rawCat, db] of Object.entries(databases || {})) {
+        if (!db || !Array.isArray(db.facts)) continue;
+        const category = mapLegacyCategory(String(rawCat || '').trim() || 'Unsorted');
+        for (const fact of db.facts) {
+            if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
+            // Reflection cold-tiered facts stay out of the floor — otherwise a
+            // demoted-but-important-looking fact rides back in every single turn.
+            if (fact.cold === true) continue;
+            if (exclude && exclude.has(`${category}:${fact.key}`)) continue;
+            const row = { fact, category };
+            all.push(row);
+            // An entry matching no bucket (an Unsorted non-trait, say) is still
+            // in `all`, so it can only be reached by the remainder pass below.
+            const b = buckets.find(x => x.q.test(fact, category));
+            if (b) b.list.push(row);
+        }
+    }
+
+    const eff = Number.isFinite(cap) ? Math.max(0, Math.trunc(cap)) : all.length;
+    if (eff <= 0 || all.length === 0) return [];
+
+    for (const b of buckets) {
+        b.list.sort(floorRank);
+        b.quota = Math.max(b.q.min, Math.floor(eff * b.q.share));
+    }
+
+    const picked = [];
+    const taken = new Set();
+    let round = 0;
+    let progress = true;
+    while (picked.length < eff && progress) {
+        progress = false;
+        for (const b of buckets) {
+            if (picked.length >= eff) break;
+            if (round >= b.quota) continue;
+            const row = b.list[round];
+            if (!row) continue;
+            picked.push(row);
+            taken.add(row);
+            progress = true;
+        }
+        round++;
+    }
+
+    if (picked.length < eff) {
+        for (const row of [...all].sort(floorRank)) {
+            if (picked.length >= eff) break;
+            if (taken.has(row)) continue;
+            picked.push(row);
+            taken.add(row);
+        }
+    }
+    return picked;
+}
+
+// ===========================================================================
+// WHAT A CAP COSTS — the number the settings UI renders under the slider.
+//
+// Measured, not modelled: every row is rendered with the SAME buildFactLine the
+// sheet uses, and the tokens are chars/4 (the convention already used by
+// estimateInjectionTokens in fact-retrieval.js). On the v0.81.0 export a
+// rendered fact line averages 208 characters — roughly 52 tokens, because the
+// line carries the note, the known-by prefix and the recency tail, not just a
+// value. Any estimate built on "~15 tokens a row" is out by 3.5x.
+//
+// The measured curve for that store (65 facts, 33 sheets, replayed):
+//   cap 15  -> 47% of the store on the sheet on average (29% by message 77)
+//   cap 22  -> 61% (40%)
+//   cap 30  -> 74% (52%)
+//   cap 50  -> 95% (83%)
+//   cap 65+ -> 100% (100%) — 65 is the whole store; unlimited is identical
+// Those numbers are for a 65-fact store, in which no category ever held more
+// than 50 demotable rows and the cold tier therefore never bound. They are NOT
+// a statement about large stores: what a cap buys at 4 000 facts is cap/4 000,
+// and only UNLIMITED reaches the whole store. See the HOT_SET_MIN block in
+// database.js for the ceiling that used to sit under all of this invisibly.
+//
+// UNLIMITED is not free and does not stop growing: the store grew 0.83 facts
+// per message, so ~415 facts at 500 messages, ~21 500 tokens of sheet per turn,
+// every turn, uncached. That is the trade this function exists to put in front
+// of the user rather than decide for them.
+//
+// THE DENOMINATOR IS THE WHOLE STORE, and that is the fix this shape carries.
+// storeFacts used to count HOT facts only, so every fact the cold tier had
+// demoted vanished from the numerator AND the denominator together — the UI
+// rendered "all 4 000 stored memories on the sheet (100%)" over a store holding
+// 6 000. A denominator that shrinks with the numerator cannot produce a wrong
+// percentage; it produces a meaningless one, which is worse. So: storeFacts is
+// every ACTIVE fact, reachable or not, and every row that cannot reach the
+// sheet is counted, by reason, in `excluded`. `excluded.cold + excluded.invisible`
+// equals `excluded.total` exactly, and `total.rows + excluded.total <= storeFacts`
+// always — the gap is what the CAP costs, which is the thing the slider is for.
+//
+// SHAPE (stable — the settings UI codes against these field names):
+//   { cap, unlimited, setting,
+//     storeFacts,      // ALL active facts. The denominator. Hot + cold.
+//     eligible,        // active AND visible AND hot — what the floor may draw from
+//     inactive,        // superseded history snapshots; context only, NOT in storeFacts
+//     excluded: {
+//        total,          // storeFacts - eligible; rows no cap can put on the sheet
+//        cold,           // demoted by the cold tier or by a conflict/merge loss
+//        invisible,      // knownBy excludes everyone currently in the scene
+//        coldReleasable, // of `cold`, how many the CURRENT setting already frees
+//     },
+//     hotSetBudget,    // demotable rows per category the setting now allows; null = no limit
+//     floor:   { rows, chars, tokens },
+//     other:   { rows, chars, tokens },   // NEED + sticky recovered
+//     total:   { rows, chars, tokens },   // what one turn's WRITER sheet costs
+//     ceiling: { rows, chars, tokens },   // the same at UNLIMITED, for the warning
+//     coverage:        { rows, of, pct },   // total.rows / storeFacts
+//     ceilingCoverage: { rows, of, pct },   // ceiling.rows / storeFacts
+//     perTurn: {  // see below — the sheet is billed three times, not once
+//        sheet: {rows,tokens}, injectedRefs: {rows,tokens,capped},
+//        lookupRefs: {rows,tokens,enabled}, tokens },
+//     tokensPerRow }
+export async function estimatePremiseFloorCost(capOverride = undefined) {
+    const settings = getSettingsSafe() || {};
+    const resolved = capOverride === undefined
+        ? resolvePremiseFloorCap(settings)
+        : resolvePremiseFloorCap({ [PREMISE_FLOOR_SETTING_KEY]: capOverride });
+
+    let databases = {};
+    try { databases = await getAllDatabases(); } catch { databases = {}; }
+    let nowCtx = null;
+    try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
+
+    const chars = (list) => list.reduce((n, r) => n + buildFactLine(r.fact, r.category, nowCtx).length + 1, 0);
+    const cost = (list) => {
+        const c = chars(list);
+        return { rows: list.length, chars: c, tokens: Math.ceil(c / 4) };
+    };
+
+    // The other row sources as they stand RIGHT NOW, so the estimate is this
+    // chat's sheet and not a generic one. They are resolved first and excluded
+    // from the floor for the same reason composeSheet does it: the floor does
+    // not pay twice for a row NEED already carries.
+    const other = [];
+    const exclude = new Set();
+    const addRef = (ref) => {
+        try {
+            const category = mapLegacyCategory(String(ref?.category || '').trim() || 'Unsorted');
+            const key = String(ref?.key || '').trim();
+            if (!key) return;
+            const db = databases[category];
+            if (!db) return;
+            const fact = findFactMatch(db, key);
+            if (!fact || !isActiveFact(fact) || !isFactVisible(fact) || fact.cold === true) return;
+            const id = `${category}:${fact.key}`;
+            if (exclude.has(id)) return;
+            exclude.add(id);
+            other.push({ fact, category });
+        } catch {  }
+    };
+    try { for (const r of getLastNeedRefs()) addRef(r); } catch {  }
+    try { for (const r of getRecoveredRefs()) addRef(r); } catch {  }
+
+    const floor = selectPremiseFloor({ databases, cap: resolved.cap, exclude });
+    const ceilingFloor = resolved.unlimited ? floor : selectPremiseFloor({ databases, cap: Infinity, exclude });
+
+    // THE CENSUS. Counted in one pass so the four numbers cannot disagree:
+    // storeFacts is every active fact, and each active fact lands in exactly one
+    // of eligible / excludedCold / excludedInvisible. Cold is tested FIRST so a
+    // row that is both is counted once, as cold — cold is the condition the
+    // slider governs, invisibility is a property of the current scene.
+    let storeFacts = 0;
+    let inactive = 0;
+    let eligible = 0;
+    let excludedCold = 0;
+    let excludedInvisible = 0;
+    for (const db of Object.values(databases || {})) {
+        if (!db || !Array.isArray(db.facts)) continue;
+        for (const f of db.facts) {
+            if (!f) continue;
+            if (!isActiveFact(f)) { inactive++; continue; }
+            storeFacts++;
+            if (f.cold === true) excludedCold++;
+            else if (!isFactVisible(f)) excludedInvisible++;
+            else eligible++;
+        }
+    }
+    // coldReleasable answers the one question the raw cold count leaves open:
+    // "is this number the setting talking, or is it just stale?" It is the rows
+    // the CURRENT budget already frees and that reconcileColdTier() will hand
+    // back on the next turn — normally 0, because the memory run reconciles
+    // before it composes, and non-zero only in the window between a slider
+    // change and the next turn.
+    let census = { cold: excludedCold, coldReleasable: 0, budget: Infinity };
+    try { census = coldTierCensus(databases); } catch {  }
+
+    const f = cost(floor);
+    const o = cost(other);
+    const c = cost([...ceilingFloor, ...other]);
+    const total = { rows: f.rows + o.rows, chars: f.chars + o.chars, tokens: Math.ceil((f.chars + o.chars) / 4) };
+    const pctOf = (rows) => (storeFacts > 0 ? Math.min(100, Math.round((rows / storeFacts) * 100)) : 0);
+
+    // ===================================================================
+    // THE SAME REF SET IS BILLED THREE TIMES PER TURN, not once.
+    //
+    // `total` above is the WRITER sheet — full rendered fact lines, prepended to
+    // the newest user message. But the same rows are echoed twice more as bare
+    // `Category/key` refs: into the extraction prompt's "## Injected last turn"
+    // block (capped at injectedRefsCap, which tracks this very slider), and into
+    // the lookup prompt's "## Already on the sheet" block, which has NO cap at
+    // all and sits on the latency path behind an 8 s deadline. A readout that
+    // priced only the first understated a turn by the other two.
+    //
+    // Ref lines are measured, not assumed: `Category/key` off the same rows,
+    // chars/4, the same convention as everything else here. The extras are not
+    // in `total.rows` (they are a walk, not a selection) so both echoes are
+    // understated by at most GRAPH_EXTRAS_MAX rows — stated here rather than
+    // guessed at, and it can only be an underestimate.
+    const refChars = [...floor, ...other].reduce((n, r) => n + `${r.category}/${r.fact.key}`.length + 1, 0);
+    const refCap = injectedRefsCapFor(resolved);
+    const injectedRefRows = Math.min(total.rows, refCap);
+    const injectedRefChars = total.rows > 0 ? Math.round(refChars * (injectedRefRows / total.rows)) : 0;
+    const lookupEnabled = settings?.lookupEnabled === true;
+    const perTurn = {
+        sheet: { rows: total.rows, tokens: total.tokens },
+        injectedRefs: {
+            rows: injectedRefRows,
+            tokens: Math.ceil(injectedRefChars / 4),
+            capped: total.rows > refCap,
+        },
+        lookupRefs: {
+            rows: lookupEnabled ? total.rows : 0,
+            tokens: lookupEnabled ? Math.ceil(refChars / 4) : 0,
+            enabled: lookupEnabled,
+            // agent-lookup.js writes this block with no cap and no [TRUNCATED]
+            // marker, unlike every other list in that prompt.
+            uncapped: true,
+        },
+        tokens: 0,
+    };
+    perTurn.tokens = perTurn.sheet.tokens + perTurn.injectedRefs.tokens + perTurn.lookupRefs.tokens;
+
+    return {
+        cap: resolved.unlimited ? null : resolved.cap,
+        unlimited: resolved.unlimited,
+        setting: resolved,
+        storeFacts,
+        eligible,
+        inactive,
+        excluded: {
+            total: excludedCold + excludedInvisible,
+            cold: excludedCold,
+            invisible: excludedInvisible,
+            coldReleasable: census.coldReleasable,
+        },
+        hotSetBudget: Number.isFinite(census.budget) ? census.budget : null,
+        floor: f,
+        other: o,
+        total,
+        ceiling: c,
+        coverage: { rows: total.rows, of: storeFacts, pct: pctOf(total.rows) },
+        ceilingCoverage: { rows: c.rows, of: storeFacts, pct: pctOf(c.rows) },
+        perTurn,
+        // Averaged over what the floor actually selected, so it reflects THIS
+        // store's rows rather than a global constant. 0 when nothing is picked.
+        tokensPerRow: total.rows > 0 ? Math.round(total.tokens / total.rows) : 0,
+    };
+}
+
 function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], recovered = [], settings = {}, databases = {}, runId = '' } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
@@ -2211,45 +2704,22 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     const rows = [];
     const seen = new Set();
 
-    // PREMISE FLOOR: always inject the load-bearing premise/identity facts, even if
-    // this turn's fresh NEED pick omits them. This is a FLOOR (a guaranteed minimum),
-    // not a ceiling — it never evicts or caps anything the NEED loop adds below.
-    const PREMISE_FLOOR_MAX = 15;
-    try {
-        const floorCandidates = [];
-        for (const [rawCat, db] of Object.entries(databases || {})) {
-            if (!db || !Array.isArray(db.facts)) continue;
-            const category = mapLegacyCategory(String(rawCat || '').trim() || 'Unsorted');
-            for (const fact of db.facts) {
-                if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
-                // Reflection cold-tiered facts stay out of the floor — otherwise a
-                // demoted-but-important-looking fact rides back in every single turn.
-                if (fact.cold === true) continue;
-                const loadBearing = clampImportance(fact.importance) >= 4 || fact.kind === 'trait';
-                if (!loadBearing) continue;
-                floorCandidates.push({ fact, category });
-            }
-        }
-        floorCandidates.sort((a, b) => {
-            const impDiff = clampImportance(b.fact.importance) - clampImportance(a.fact.importance);
-            if (impDiff !== 0) return impDiff;
-            return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
-        });
-        for (const { fact, category } of floorCandidates.slice(0, PREMISE_FLOOR_MAX)) {
-            const id = `${category}:${fact.key}`;
-            if (seen.has(id)) continue;
-            seen.add(id);
-            rows.push({ fact, category, tier: 'primary' });
-        }
-    } catch {  }
-
     // NEED rows, then the STICKY RECOVERED rows. Recovered refs are re-added for
     // RECOVERED_REF_TTL_TURNS turns whether or not this turn's NEED picked them
     // up again: a ref recovered because a reply fumbled it used to survive
     // exactly one turn, after which the prompt's "already on the injected list,
     // do NOT re-list it" rule dropped it and the identical fumble could recur.
-    // Resolution and de-dup run through the same `seen` set as the floor, so a
-    // ref that is both costs one row.
+    //
+    // These now resolve BEFORE the premise floor, which is a behaviour change:
+    // the floor used to run first and claim `seen`, so every ref NEED and the
+    // floor agreed on burned a floor slot and the cap bought fewer distinct rows
+    // than it promised. Selecting the floor against what NEED already carries
+    // makes the cap mean exactly what the slider says — N floor rows — and on
+    // the measured export it is worth +2 points of store coverage at cap 15, +3
+    // at 22, +4 at 30, +2 at 50 and nothing at all once the cap exceeds the
+    // store. The FLOOR GUARANTEE is unchanged and is a union, not an order:
+    // a top-ranked premise fact is on the sheet either because NEED asked for it
+    // or because the floor added it.
     //
     // COLD is checked here alongside active/visible, and it is the check that
     // does the work: `active === false` is a tombstone almost nothing sets, while
@@ -2258,7 +2728,7 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     // sticky recovered ref OUTLIVES the demotion by up to RECOVERED_REF_TTL_TURNS
     // turns: the sheet keeps rendering the losing value under a header that calls
     // it "established truth for this scene", directly beside the record that beat
-    // it. Same rule the premise floor above and buildRecoveryCandidates already
+    // it. Same rule the premise floor below and buildRecoveryCandidates already
     // apply.
     //
     // Cold refs are SKIPPED each turn, not evicted from the sticky set, because
@@ -2283,8 +2753,9 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
                 if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
                 if (fact.cold === true) { coldSkipped++; continue; }
                 const id = `${category}:${fact.key}`;
-                // Claimed in `seen` at RESOLVE time so a duplicate ref, or one the
-                // premise floor already carries, cannot consume a NEED cap slot.
+                // Claimed in `seen` at RESOLVE time so a duplicate ref cannot
+                // consume a NEED cap slot, and so the premise floor below can
+                // select against what these rows already cover.
                 if (seen.has(id)) continue;
                 seen.add(id);
                 out.push({ fact, category });
@@ -2305,8 +2776,9 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         // row order is untouched in every case where the cap does not bite. The
         // sticky set is capped in turn-state.js and is never trimmed here — it is
         // the deliberately-chosen backward-looking pick, not the sweep.
-        // A dropped row keeps its claim on `seen`, so the random-walk extras
-        // below cannot quietly re-admit a row the cap just decided to shed.
+        // A dropped row keeps its claim on `seen`, so neither the premise floor
+        // nor the random-walk extras below can quietly re-admit a row the cap
+        // just decided to shed.
         const keep = new Set([...needRows]
             .sort((a, b) => {
                 const impDiff = clampImportance(b.fact.importance) - clampImportance(a.fact.importance);
@@ -2322,7 +2794,42 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         rows.push({ fact, category, tier: 'primary' });
     }
 
+    // PREMISE FLOOR: always inject the load-bearing premise/identity facts, even
+    // if this turn's fresh NEED pick omits them. This is a FLOOR (a guaranteed
+    // minimum), not a ceiling — it never evicts or caps anything NEED added
+    // above. Unshifted rather than pushed so the floor still renders first
+    // within its section, which is the row order every prior sheet had.
+    const floorCap = resolvePremiseFloorCap(settings);
+    let floorRowCount = 0;
+    // Kept for the supply/demand publication below — these are the rows nothing
+    // asked for.
+    const floorSupply = [];
+    try {
+        const floor = selectPremiseFloor({ databases, cap: floorCap.cap, exclude: seen });
+        const floorRows = [];
+        for (const { fact, category } of floor) {
+            const id = `${category}:${fact.key}`;
+            if (seen.has(id)) continue;
+            seen.add(id);
+            floorRows.push({ fact, category, tier: 'primary' });
+            floorSupply.push({ fact, category });
+        }
+        rows.unshift(...floorRows);
+        floorRowCount = floorRows.length;
+    } catch {  }
+
     const logTag = runId ? `[${runId}] ` : '';
+    // The floor is now user-controlled, so its size has to be readable off the
+    // run log — a coverage complaint is otherwise indistinguishable from a
+    // slider set to 3.
+    addDebugLog('debug', `${logTag}Sheet: premise floor ${floorRowCount} row(s) at cap ${floorCap.unlimited ? 'UNLIMITED' : floorCap.cap}${floorCap.source === 'clamped' ? ` (clamped from ${floorCap.raw})` : ''}, ${needRows.length} NEED + ${stickyRows.length} sticky already carried`, {
+        subsystem: 'agent3', event: 'sheet.premise_floor',
+        data: {
+            rows: floorRowCount, cap: floorCap.unlimited ? null : floorCap.cap,
+            unlimited: floorCap.unlimited, source: floorCap.source,
+            need: needRows.length, sticky: stickyRows.length,
+        },
+    });
     if (coldSkipped > 0) {
         addDebugLog('info', `${logTag}Sheet: ${coldSkipped} NEED/recovered ref(s) skipped — cold-tiered since they were selected`, {
             subsystem: 'agent3', event: 'sheet.refs_skipped', reason: 'COLD_TIERED',
@@ -2343,6 +2850,20 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
             extras = randomWalkExtras(databases, rows, seen, extrasMax);
         } catch { extras = []; }
     }
+
+    // SUPPLY vs DEMAND, published for recordFactUsage (database.js). This is the
+    // last point at which the distinction still exists: downstream, the usage
+    // flush parses refs back out of the rendered sheet text and every row looks
+    // alike. The floor rows and the connected-memory extras are supply — nothing
+    // about THIS turn asked for them, they are on the sheet because the slider
+    // and the walk put them there — so crediting them as usage would stamp
+    // lastUsedAt on the entire hot set every turn and flatten the recency term
+    // out of salienceScore. NEED and the sticky recovered rows are demand and
+    // are deliberately absent from this set. See the DEMAND vs SUPPLY block in
+    // database.js for the full failure shape.
+    try {
+        setSheetSupplyRefs([...floorSupply, ...extras].map(r => ({ category: r.category, key: r.fact.key })));
+    } catch {  }
 
     const { state, chrono } = splitInjectionSections(rows);
 

@@ -75,6 +75,14 @@
                     <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context &amp; budget</div>
                     <div class="bf-mem-section-body">
                         <div class="bf-mem-field">
+                            <label>Memories always on the sheet <span class="bf-mem-val" id="bf_mem_premise_floor_val">50</span></label>
+                            <!-- Slider positions 1..100 are row counts; position 101 is the
+                                 UNLIMITED sentinel and stores 0. See src/settings.js. -->
+                            <input type="range" id="bf_mem_premise_floor" min="1" max="101" step="1" value="50" />
+                            <div id="bf_mem_premise_floor_cost" class="bf-mem-hint" style="margin-top:4px;padding:6px 8px;border-left:3px solid #ff9800;border-radius:4px;">Measuring this chat&rsquo;s memory sheet&hellip;</div>
+                            <small class="bf-mem-hint">How many stored memories are re-injected every turn regardless of what the scene asks for &mdash; the floor under what the storyteller can know. <b>More rows means it forgets less, and every row is paid on every single turn</b>, uncached. Growth is the catch: a chat keeps adding memories (about 0.8 per message in the measured test chat), so <b>no limit</b> means the sheet grows with the store forever &mdash; roughly 415 memories and ~21 000 tokens per turn by message 500. <b>50</b> is the default: at that size the test chat kept 95% of its store on the sheet, where the old 15 kept 46% and only 29% by the end. The far right of the slider is <b>no limit</b>. Bonus connected memories (below) come on top and are not in the figures above.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:10px;">
                             <label>Writer history limit <span class="bf-mem-val" id="bf_mem_agent2_context_val">10</span></label>
                             <input type="range" id="bf_mem_agent2_context" min="0" max="50" step="1" value="10" />
                             <small class="bf-mem-hint">How many recent messages your main AI sees while writing. <b>0 = off</b> (it sees the whole chat, the normal way). With a number set, older history is trimmed and the memory sheet stands in for it — cheaper and more focused. Trimming only kicks in once the first memory sheet exists.</small>
@@ -100,9 +108,9 @@
                         </label>
                         <small class="bf-mem-hint">On by default. The Reflect pass compares near-duplicate memories and is asked to rule on each pair, checking both against the recent story — one side wins (the other is kept but deprioritized), the two are merged (the folded-in one is kept, deprioritized, never erased), or they honestly coexist. A pair ruled "coexist" stops being offered until one of the two values actually changes, and then it comes back.</small>
                         <div class="bf-mem-field" style="margin-top:6px;">
-                            <label>Contradiction scan every <span class="bf-mem-val" id="bf_mem_contradiction_interval_val">2</span> Reflect passes</label>
-                            <input type="range" id="bf_mem_contradiction_interval" min="1" max="10" step="1" value="2" />
-                            <small class="bf-mem-hint">The scan itself is free, but the pairs cost prompt space and the Reflect model spends reads on them. <b>2</b> is the default; raise it in a long-settled chat.</small>
+                            <label>Contradiction scan every <span class="bf-mem-val" id="bf_mem_contradiction_interval_val">1</span> Reflect pass(es)</label>
+                            <input type="range" id="bf_mem_contradiction_interval" min="1" max="10" step="1" value="1" />
+                            <small class="bf-mem-hint">The scan itself is free, but the pairs cost prompt space and the Reflect model spends reads on them. <b>1</b> &mdash; every pass &mdash; is the default now: Reflect only runs every so often to begin with, so at <b>2</b> a measured 78-message chat got exactly <b>one</b> scan in the entire run and its duplicate memories were never ruled on. Raise it only in a long-settled chat where nothing contradicts any more.</small>
                         </div>
                         <label class="checkbox_label" style="margin-top:10px;">
                             <input type="checkbox" id="bf_mem_knownby_enforced" checked />

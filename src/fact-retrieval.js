@@ -1,4 +1,4 @@
-import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getTrackSteps, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sameCharacter } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFactsIndexed, getCharacterNameWords, getTrackSteps, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sameCharacter } from './database.js';
 import { getScenePresent } from './turn-state.js';
 import { addDebugLog, getSettings } from './settings.js';
 import { recencyTail, getTurnNowContext } from './recency.js';
@@ -282,7 +282,44 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     return { facts: visibleResults, formatted, stats };
 }
 
-const FUZZY_THRESHOLD = 0.4;
+// Layer B runs LAST — after exact-key resolution and after indexed keyword
+// search — and it compares single words by trigram overlap, a spelling metric
+// with no idea what a word means. Left ungoverned it stops being a fallback and
+// becomes a noise wall. It was one in the v0.81.0 run: the extraction agent asked
+// "felix powers abilities matter reality manipulation" and then "felix creates
+// matter shape controls gravity" one call apart and got the SAME 12 rows in the
+// SAME order, every one of them via:'fuzzy'.
+//
+// Measured cause, against that store: all 12 were admitted on the single word
+// "felix" — the user persona — at similarity 1.00, and not one of the ten CONTENT
+// words across both queries reached even 0.41 against any stored token. The
+// queries were therefore identical to this layer, and it answered accordingly.
+// Three properties fix that, and each one is load-bearing on its own:
+//
+//  1. CHARACTER NAMES ARE NOT EVIDENCE. getCharacterNameWords() is the same
+//     exclusion searchFactsIndexed() has always applied; this layer skipping it
+//     was the whole defect above.
+//  2. SCORED, NOT FIRST-COME. The old loop broke out of both loops at the first
+//     token over threshold and pushed in store-iteration order, so every hit
+//     recorded the same 1.00 and the output order was the order facts happened to
+//     be written in. A fact now scores on how many DISTINCT query words it answers
+//     first and summed similarity second, so a row that covers two words of the
+//     query outranks one that covers a single word.
+//  3. CAPPED FAR BELOW SEARCH_RESULT_CAP. Fifteen rows of guesswork crowd exact
+//     and keyword hits out of the same reply. FUZZY_RESULT_CAP is 5.
+//
+// The threshold is 0.5 because that is where this metric separates on real data,
+// not because 0.5 is a round number. Inflections — the thing a fuzzy layer exists
+// to catch — score 0.50-0.58 (powers~power 0.50, pregnant~pregnancy 0.50,
+// creates~create 0.55, manipulation~manipulating 0.56, controls~control 0.58,
+// bindings~binding 0.58). The false friends it has to reject score 0.31-0.45
+// (felix~felicia 0.33, shape~shame 0.40, reality~really 0.42, abilities~ability
+// 0.43, matter~master 0.45). The old 0.4 sat UNDER every false friend in that
+// list. 0.5 clears all of them and costs one true positive (abilities~ability),
+// which the keyword layer catches anyway whenever the store spells it either way.
+const FUZZY_THRESHOLD = 0.5;
+
+const FUZZY_RESULT_CAP = 5;
 
 function trigramSimilarity(a, b) {
     const grams = (s) => {
@@ -348,14 +385,25 @@ function fuzzyFallback(databases, neededInfo, results, seenIds) {
     const primaries = results.filter(r => r.tier === 'primary');
     const primaryTokenSets = primaries.map(r => {
         const text = `${r.fact.key} ${r.fact.value} ${(r.fact.tags || []).join(' ')} ${(r.fact.aliases || []).join(' ')}`;
-        return tokenSet(text, { min: 1 }); 
+        return tokenSet(text, { min: 1 });
     });
 
-    let admitted = 0;
+    // Property 1 (see FUZZY_THRESHOLD above). Guarded because getCtx() throws when
+    // no context is mounted, and a missing name list must cost precision, not the
+    // whole layer.
+    let nameWords = new Set();
+    try { nameWords = getCharacterNameWords(); } catch { nameWords = new Set(); }
+
+    // One pooled word list instead of a per-entry pass. Entries are still judged
+    // individually for the "a primary already covers this" skip — that test is
+    // about the entry as a phrase — but scoring has to see every surviving word at
+    // once, or coverage cannot be counted.
+    const queryWords = new Set();
+    let nameWordsDropped = 0;
     for (const raw of (neededInfo || [])) {
         const entry = String(raw || '').trim();
         if (!entry) continue;
-        if (entry.indexOf('/') >= 0) continue; 
+        if (entry.indexOf('/') >= 0) continue;
         const entryLower = entry.toLowerCase();
 
         const words = wordTokens(entryLower);
@@ -368,34 +416,83 @@ function fuzzyFallback(databases, neededInfo, results, seenIds) {
         });
         if (covered) continue;
 
-        const entryWords = words.length > 0 ? words : [entryLower];
-        for (const [category, db] of Object.entries(databases)) {
-            for (const fact of (db.facts || [])) {
-                if (!isActiveFact(fact)) continue; 
-                const id = `${category}:${fact.key}`;
-                if (seenIds.has(id)) continue; 
-                const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
-                const tokens = wordTokens(factText, { min: 3 }); 
-                let best = 0;
-                for (const ew of entryWords) {
-                    for (const tok of tokens) {
-                        const sim = trigramSimilarity(ew, tok);
-                        if (sim > best) best = sim;
-                        if (best >= FUZZY_THRESHOLD) break;
-                    }
-                    if (best >= FUZZY_THRESHOLD) break;
-                }
-                if (best >= FUZZY_THRESHOLD) {
-                    results.push({ fact, category, tier: 'secondary', via: 'fuzzy', fuzzyScore: Number(best.toFixed(2)) });
-                    seenIds.add(id);
-                    admitted++;
-                }
-            }
+        for (const w of (words.length > 0 ? words : [entryLower])) {
+            if (nameWords.has(w)) { nameWordsDropped++; continue; }
+            queryWords.add(w);
         }
     }
-    if (admitted > 0) {
-        addDebugLog('info', `Fuzzy fallback (Layer B): admitted ${admitted} secondary fact(s) at threshold ${FUZZY_THRESHOLD}`);
+    if (queryWords.size === 0) return;
+
+    const scored = [];
+    for (const [category, db] of Object.entries(databases)) {
+        for (const fact of (db.facts || [])) {
+            if (!isActiveFact(fact)) continue;
+            const id = `${category}:${fact.key}`;
+            if (seenIds.has(id)) continue;
+            // `context` is in this text and NOT in searchFactsIndexed's, on purpose.
+            // execWriteFact routes the model's `note` into fact.context, and
+            // buildFactLine renders the context INSTEAD of the value when one is
+            // present — so context is the text the model reads back off the sheet.
+            // In the analysed store 59 of 65 facts carry one, averaging 155 chars
+            // against 36 for the value: four fifths of the stored prose. The
+            // measured miss is exact: "felix creates matter shape controls gravity"
+            // finds nothing on key+value, while the fact that answers it
+            // (People/felix_reality_manipulation, value "God-tier reality warping")
+            // spells matter, shape, gravity and control out in its context. Widening
+            // the INDEXED layer the same way would change what reaches the sheet on
+            // every turn; widening it here is bounded by FUZZY_RESULT_CAP and by the
+            // coverage ranking, which is what makes it safe to do in this layer only.
+            const factText = `${fact.key} ${fact.value} ${fact.context || ''} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
+            const tokens = wordTokens(factText, { min: 3 });
+            let hits = 0, sum = 0, best = 0;
+            for (const qw of queryWords) {
+                // No early break at the threshold any more: the per-word maximum IS
+                // the score now, and stopping at "good enough" is what made every
+                // admitted row report the same number. Only an exact token match
+                // can end the scan early, because nothing beats 1.
+                let wordBest = 0;
+                for (const tok of tokens) {
+                    const sim = trigramSimilarity(qw, tok);
+                    if (sim > wordBest) wordBest = sim;
+                    if (wordBest >= 1) break;
+                }
+                if (wordBest >= FUZZY_THRESHOLD) { hits++; sum += wordBest; }
+                if (wordBest > best) best = wordBest;
+            }
+            if (hits > 0) scored.push({ fact, category, hits, sum, best });
+        }
     }
+    if (scored.length === 0) return;
+
+    // Coverage, then total similarity, then salience. Salience only ever decides
+    // between rows the query itself cannot tell apart, and it is the same ranking
+    // every other admission path in this file uses, so the cap never falls on the
+    // arbitrary side of a tie.
+    const now = Date.now();
+    scored.sort((a, b) => (b.hits - a.hits)
+        || (b.sum - a.sum)
+        || (retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now)));
+
+    const admitted = scored.slice(0, FUZZY_RESULT_CAP);
+    for (const s of admitted) {
+        results.push({
+            fact: s.fact, category: s.category, tier: 'secondary', via: 'fuzzy',
+            fuzzyScore: Number(s.best.toFixed(2)), fuzzyWords: s.hits,
+        });
+        seenIds.add(`${s.category}:${s.fact.key}`);
+    }
+    addDebugLog('info', `Fuzzy fallback (Layer B): ${scored.length} fact(s) over threshold ${FUZZY_THRESHOLD}, admitted top ${admitted.length}/${FUZZY_RESULT_CAP} ranked by query-word coverage`, {
+        subsystem: 'retrieval', event: 'retrieval.fuzzy',
+        data: {
+            queryWords: [...queryWords], nameWordsDropped,
+            threshold: FUZZY_THRESHOLD, cap: FUZZY_RESULT_CAP,
+            candidates: scored.length, admitted: admitted.length,
+            top: admitted.map(s => ({
+                ref: `${s.category}/${s.fact.key}`, words: s.hits,
+                score: Number(s.sum.toFixed(2)), best: Number(s.best.toFixed(2)),
+            })),
+        },
+    });
 }
 
 function resolveExactKeys(databases, requests) {

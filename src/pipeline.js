@@ -1,7 +1,7 @@
 import { injectMemoryContext } from './agent-writer.js';
 import { runMemoryAgent, isConnectionFailure } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { runLookupAgent, renderLookupBlock, lookupTimeoutMs, LOOKUP_TIMEOUT_STRIKES, LOOKUP_DEADLINE_GRACE_MS } from './agent-lookup.js';
+import { runLookupAgent, renderLookupBlock, lookupTimeoutMs, LOOKUP_TIMEOUT_STRIKES, LOOKUP_ERROR_STRIKES, LOOKUP_PROTOCOL_STRIKES, LOOKUP_DEADLINE_GRACE_MS } from './agent-lookup.js';
 import { cancelInFlightLLM, callAgentLLM } from './llm-call.js';
 import { extractSentenceLine, countSentenceEnds } from './sentence-util.js';
 import { recordHealthEvent, clearHealthEvents } from './health.js';
@@ -299,6 +299,22 @@ let lookupAbort = null;
 // message; bounded per turn is not the same as bounded overall. Reset by a chat
 // switch and by toggling the setting (resetLookupBreaker).
 let lookupTimeoutStrikes = 0;
+// The second counter, on hard errors, sharing the ONE latch above. A dead
+// connection profile answers fast and answers wrong: `API request failed` comes
+// back with timedOut:false, so it never touched the counter above and the pass
+// re-armed itself indefinitely (measured: 8 consecutive failures, 26 runs, 0
+// refs, 147.9s of the user's waiting time). Counters rather than one because
+// the causes need different thresholds and different advice.
+//
+// NARROWED: this one now counts CONNECTION failures only ('transport' / 'store' /
+// 'budget'), not every non-abort error. It used to catch protocol failures too,
+// and the deferral in llm-call.js made those reachable — see lookupProtocolStrikes.
+let lookupErrorStrikes = 0;
+// The third counter: the model answered and would not follow the protocol. Split
+// out of lookupErrorStrikes because the toast it produced named the connection
+// profile, and for this class the profile is provably innocent — we read the
+// endpoint's replies. See LOOKUP_PROTOCOL_STRIKES in agent-lookup.js.
+let lookupProtocolStrikes = 0;
 let lookupOffForSession = false;
 // The last ref set, keyed by the exact message it was found for. A swipe or a
 // regenerate re-enters this handler with the SAME user message; re-running the
@@ -342,8 +358,27 @@ const LOOKUP_BACKSTOP = { __lookup: 'backstop' };
 // have it try again without reloading.
 export function resetLookupBreaker() {
     lookupTimeoutStrikes = 0;
+    lookupErrorStrikes = 0;
+    lookupProtocolStrikes = 0;
     lookupOffForSession = false;
     lastLookup = null;
+}
+
+// Arms the session latch and says which of the three counters tripped it. One
+// helper for all of them so the log line, the toast and the Health row can never
+// disagree about the cause — the whole point of splitting the counters is that
+// "too slow", "cannot connect" and "will not follow the format" need different
+// fixes from the user, and a wrong attribution sends them to fix the wrong thing.
+const LOOKUP_TRIP_REASON = { timeout: 'TIMEOUT_STRIKES', error: 'ERROR_STRIKES', protocol: 'PROTOCOL_STRIKES' };
+const LOOKUP_TRIP_NOUN = { timeout: 'deadline miss(es)', error: 'connection failure(s)', protocol: 'protocol failure(s)' };
+function disableLookupForSession({ trippedBy, strikes, cause, toast }) {
+    lookupOffForSession = true;
+    addDebugLog('fail', `Lookup agent switched OFF for this session — tripped by ${trippedBy} strikes (${strikes}): ${cause}; switching chats or re-ticking the setting re-arms it.`, {
+        subsystem: 'agent3', event: 'lookup.disabled', reason: LOOKUP_TRIP_REASON[trippedBy] || 'ERROR_STRIKES',
+        data: { trippedBy, strikes, timeoutStrikes: lookupTimeoutStrikes, errorStrikes: lookupErrorStrikes, protocolStrikes: lookupProtocolStrikes },
+    });
+    recordHealthEvent('lookup', { status: 'off', detail: `switched off for this session — ${strikes} consecutive ${LOOKUP_TRIP_NOUN[trippedBy] || 'failure(s)'}` });
+    toastPipelineError(toast);
 }
 
 function abortLookupPass(reason) {
@@ -547,30 +582,112 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
                 // differs, so the stage is carried into the message rather than
                 // blaming a profile that may be innocent.
                 lookupTimeoutStrikes++;
+                // Re-read purely to name the number in the message. The races
+                // that produced these strikes already ran against the budget
+                // captured at the top of their own pass.
+                const shownMs = lookupTimeoutMs();
+                recordHealthEvent('lookup', { status: 'fail', error: `deadline miss (${shownMs}ms, ${res.stage || 'model'} stage) — strike ${lookupTimeoutStrikes}/${LOOKUP_TIMEOUT_STRIKES}`, durationMs: res.ms || 0 });
                 if (lookupTimeoutStrikes >= LOOKUP_TIMEOUT_STRIKES) {
-                    lookupOffForSession = true;
-                    // Re-read purely to name the number in the message. The races
-                    // that produced these strikes already ran against the budget
-                    // captured at the top of their own pass.
-                    const shownMs = lookupTimeoutMs();
-                    const cause = res.stage === 'store'
-                        ? `the memory store did not load inside the ${shownMs}ms budget ${lookupTimeoutStrikes}x — that is storage (attachment fetch / IndexedDB), not the lookup model`
-                        : `${lookupTimeoutStrikes} consecutive ${shownMs}ms deadline misses. Point it at a faster connection profile, raise the deadline slider, or untick it`;
-                    addDebugLog('fail', `Lookup agent switched OFF for this session — ${cause}; switching chats or re-ticking the setting re-arms it.`, {
-                        subsystem: 'agent3', event: 'lookup.disabled', reason: 'TIMEOUT_STRIKES',
-                        data: { strikes: lookupTimeoutStrikes, stage: res.stage || null, timeoutMs: shownMs },
+                    disableLookupForSession({
+                        trippedBy: 'timeout',
+                        strikes: lookupTimeoutStrikes,
+                        cause: res.stage === 'store'
+                            ? `the memory store did not load inside the ${shownMs}ms budget ${lookupTimeoutStrikes}x — that is storage (attachment fetch / IndexedDB), not the lookup model`
+                            : `${lookupTimeoutStrikes} consecutive ${shownMs}ms deadline misses. Point it at a faster connection profile, raise the deadline slider, or untick it`,
+                        toast: res.stage === 'store'
+                            ? `Lookup agent disabled for this session — the memory store missed the ${shownMs / 1000}s load budget ${lookupTimeoutStrikes}x.`
+                            : `Lookup agent disabled for this session — it missed the ${shownMs / 1000}s deadline ${lookupTimeoutStrikes}x. Give it a faster profile or raise the deadline.`,
                     });
-                    toastPipelineError(res.stage === 'store'
-                        ? `Lookup agent disabled for this session — the memory store missed the ${shownMs / 1000}s load budget ${lookupTimeoutStrikes}x.`
-                        : `Lookup agent disabled for this session — it missed the ${shownMs / 1000}s deadline ${lookupTimeoutStrikes}x. Give it a faster profile or raise the deadline.`);
                 }
                 return sheetText;
             }
-            // Only a completed pass clears the streak: an error is not evidence
-            // the model is fast enough, but it is not a deadline miss either, so
-            // it neither clears nor arms the latch.
-            if (!res.error) lookupTimeoutStrikes = 0;
-            if (res.error) return sheetText;
+
+            // A HARD ERROR: the pass finished inside its deadline and produced
+            // nothing usable. Errors used to clear nothing and arm nothing, which is
+            // how eight `API request failed` in a row cost the user eight full waits
+            // and left the pass armed for a ninth.
+            //
+            // TWO CLASSES, and they are not interchangeable — they need different
+            // thresholds, and their advice is not merely different but mutually
+            // contradictory ("your connection is broken" vs "your connection is
+            // fine"). `res.errorKind` is set by the tool loop, so this branch never
+            // has to guess the class from the message text — which is written for
+            // humans and will be reworded:
+            //
+            //   CONNECTION (anything not listed below — 'transport', 'store',
+            //     'internal') — the endpoint, the bridge or storage failed us. The
+            //     old toast's advice ("check its connection profile") is correct
+            //     here and only here. This is also the fallback for an unrecognised
+            //     kind, which keeps the pre-split behaviour as the default.
+            //     ('budget' cannot reach this pass: the tool loop's own budget is
+            //     600s and the lookup deadline is at most 30s, so the race in
+            //     agent-lookup.js always wins and reports timedOut instead.)
+            //
+            //   PROTOCOL ('protocol') — the model replied, inside the deadline, and
+            //     would not produce a #DONE block. This became reachable when a read
+            //     next to #DONE started buying another round instead of being
+            //     dropped: round 1 searches and closes, the block is deferred, round
+            //     2 chatters, the loop ends with `no #DONE block produced`. Before
+            //     that change the same reply ended the pass SUCCESSFULLY with zero
+            //     refs, so this is a new failure where there used to be a (useless)
+            //     success — and charging it to the connection profile would switch
+            //     the pass off over a model's formatting habit and point the user at
+            //     a URL that was never wrong. A reasoning model that writes #DONE
+            //     inside <think> hits this on every single turn.
+            //
+            // 'aborted' is exempt and always has been the odd one out: a chat switch
+            // or a user cancel is US stopping, not the endpoint failing. It clears
+            // no streak either — nothing about it says the setup works.
+            if (res.error) {
+                if (res.error === 'aborted' || res.errorKind === 'aborted') {
+                    return sheetText;
+                }
+                if (res.errorKind === 'protocol') {
+                    lookupProtocolStrikes++;
+                    // A protocol failure is PROOF the transport works — we read the
+                    // model's replies to know it broke the contract, and it did so
+                    // inside the deadline. So it clears the two counters that accuse
+                    // the connection of being broken or slow, rather than feeding
+                    // either of them.
+                    lookupTimeoutStrikes = 0;
+                    lookupErrorStrikes = 0;
+                    recordHealthEvent('lookup', { status: 'fail', error: `protocol: ${res.error} — strike ${lookupProtocolStrikes}/${LOOKUP_PROTOCOL_STRIKES} (the connection answered; the model did not follow the format)`, durationMs: res.ms || 0 });
+                    addDebugLog('info', `[${runId}] Lookup protocol failure (${res.error}) — strike ${lookupProtocolStrikes}/${LOOKUP_PROTOCOL_STRIKES}. The connection profile answered inside the deadline, so this counts against the MODEL, not the transport.`, {
+                        subsystem: 'agent3', event: 'lookup.run', reason: 'PROTOCOL_FAILURE',
+                        data: { error: res.error, strikes: lookupProtocolStrikes, rounds: res.rounds, toolCalls: res.toolCalls, ms: res.ms || 0 },
+                    });
+                    if (lookupProtocolStrikes >= LOOKUP_PROTOCOL_STRIKES) {
+                        disableLookupForSession({
+                            trippedBy: 'protocol',
+                            strikes: lookupProtocolStrikes,
+                            cause: `${lookupProtocolStrikes} consecutive protocol failures, last one: ${String(res.error).slice(0, 200)}. The connection is FINE — it answered every time, inside the deadline. This model will not end its reply with the required closing block (reasoning models often bury it inside <think>). Point the Lookup Agent at a different model, not at a different URL`,
+                            toast: `Lookup agent disabled for this session — its model failed the reply format ${lookupProtocolStrikes} times in a row. The connection works; try a different model for this pass.`,
+                        });
+                    }
+                    return sheetText;
+                }
+                lookupErrorStrikes++;
+                recordHealthEvent('lookup', { status: 'fail', error: `${res.error} — strike ${lookupErrorStrikes}/${LOOKUP_ERROR_STRIKES}`, durationMs: res.ms || 0 });
+                if (lookupErrorStrikes >= LOOKUP_ERROR_STRIKES) {
+                    disableLookupForSession({
+                        trippedBy: 'error',
+                        strikes: lookupErrorStrikes,
+                        cause: `${lookupErrorStrikes} consecutive failures, last one: ${String(res.error).slice(0, 200)}. These are not timeouts and not format errors — the pass came back fast and unusable, which points at the connection profile itself (URL, key, bridge) rather than at its speed`,
+                        toast: `Lookup agent disabled for this session — ${lookupErrorStrikes} calls in a row failed (${String(res.error).slice(0, 80)}). Check its connection profile.`,
+                    });
+                }
+                return sheetText;
+            }
+            // Only a completed pass clears ALL THREE: one working call is evidence
+            // against slow, against broken and against unusable formatting alike.
+            lookupTimeoutStrikes = 0;
+            lookupErrorStrikes = 0;
+            lookupProtocolStrikes = 0;
+            recordHealthEvent('lookup', {
+                status: 'ok', refs: res.refs.length, rounds: res.rounds,
+                toolCalls: res.toolCalls, durationMs: res.ms,
+                profileId: settings.lookupProfile || settings.agent3Profile || null,
+            });
 
             refs = res.refs;
             lastLookup = { chatId, avatar, message, refs };

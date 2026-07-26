@@ -4,7 +4,113 @@ import * as host from './host.js';
 
 const DB_PREFIX = 'bf_memory_db_';
 
-const HOT_SET_SIZE = 50;
+// ===========================================================================
+// PREMISE FLOOR CAP — a user setting, not a constant.
+//
+// This lives HERE rather than in agent-memory.js (where it was, and from where
+// it is still re-exported so every existing importer keeps working) for one
+// reason: coldTierOverflow() below has to know it. It is a synchronous function
+// on the save path, so a dynamic import is not available to it, and a
+// hand-copied second constant is exactly the stale-copy trap this file's other
+// derived caps are written to avoid.
+//
+// SETTINGS CONTRACT (the settings UI binds to these exports; nothing else reads
+// the raw key):
+//   settings.premiseFloorMax
+//     1 .. 100  -> that many premise-floor rows per sheet
+//     0         -> PREMISE_FLOOR_UNLIMITED: every eligible fact, no cap at all
+//     absent / not a number -> PREMISE_FLOOR_DEFAULT
+export const PREMISE_FLOOR_SETTING_KEY = 'premiseFloorMax';
+export const PREMISE_FLOOR_UNLIMITED = 0;
+export const PREMISE_FLOOR_MIN = 1;
+export const PREMISE_FLOOR_SLIDER_MAX = 100;
+export const PREMISE_FLOOR_DEFAULT = 50;
+
+// Resolves the setting to a usable cap. `cap` is Infinity when unlimited, so
+// every consumer can do arithmetic with it without special-casing the sentinel;
+// `unlimited` is there for callers that must render or log the distinction.
+//
+// TYPE CHECK BEFORE COERCION, and it is load-bearing. `Number()` answers 0 for
+// `false`, for `''` and for `[]` — and 0 is the UNLIMITED sentinel, i.e. the
+// single most expensive position this setting has. A corrupt or hand-edited
+// settings entry must not resolve to "put the entire store on every prompt".
+// Only a number, or a string that is entirely a number, is a value here;
+// everything else is "not set" and takes the default.
+//
+// ±Infinity, by contrast, IS a number and the intent behind it is legible
+// ("as many as possible" / "as few as possible"), so it CLAMPS like any other
+// out-of-range number rather than falling back to the default. That
+// distinction matters because only the clamp path reports source 'clamped',
+// which is what settings.js logs a warning on — a silent default would leave
+// the user's file saying one thing and the extension doing another.
+export function resolvePremiseFloorCap(settings) {
+    const raw = settings?.[PREMISE_FLOOR_SETTING_KEY];
+    const numeric = typeof raw === 'number'
+        || (typeof raw === 'string' && raw.trim() !== '' && !Number.isNaN(Number(raw)));
+    const n = numeric ? Number(raw) : NaN;
+    if (!numeric || Number.isNaN(n)) {
+        return { cap: PREMISE_FLOOR_DEFAULT, unlimited: false, raw, source: 'default' };
+    }
+    const t = Math.trunc(n);
+    if (t === PREMISE_FLOOR_UNLIMITED) {
+        return { cap: Infinity, unlimited: true, raw, source: 'setting' };
+    }
+    // Math.trunc(Infinity) is Infinity, which Math.min/Math.max clamp correctly.
+    const cap = Math.min(PREMISE_FLOOR_SLIDER_MAX, Math.max(PREMISE_FLOOR_MIN, t));
+    return { cap, unlimited: false, raw, source: cap === t ? 'setting' : 'clamped' };
+}
+
+// ===========================================================================
+// THE HOT-SET BUDGET — how many demotable rows a category may keep before
+// coldTierOverflow() demotes the tail.
+//
+// This used to be the flat constant 50, and that constant was a SECOND, HIDDEN
+// CAP sitting underneath the premise-floor slider. Cold facts are skipped by
+// selectPremiseFloor(), by composeSheet()'s ref resolution and by the
+// reflection digest, so 50 demotable rows per category x 7 categories was a
+// hard ceiling of ~350 sheet-eligible rows no matter where the slider stood —
+// including UNLIMITED, where "unlimited" was therefore false. Above ~350 facts
+// the user's stated coverage goal was unreachable by construction, and the cost
+// readout could not see it either.
+//
+// WHAT COLD-TIERING IS ACTUALLY FOR decides the fix. It does two jobs:
+//   (a) it is a VERDICT — a #CONFLICT loser, a merge loser, a reflection
+//       demotion. markFactCold() is that path and it is untouched here.
+//   (b) it is a BUDGET — "this category's tail is crowding the sheet".
+// Job (b) is now the slider's job, explicitly, with a number in front of the
+// user. Two budgets for one thing, where the lower one is invisible and wins,
+// is the defect. So the budget follows the setting:
+//
+//   finite cap C -> max(HOT_SET_MIN, C) demotable rows per category. The cap is
+//       a GLOBAL row budget, so even a sheet drawn entirely from one category
+//       cannot want more than C rows from it — at C the cold tier can never be
+//       the binding constraint, and HOT_SET_MIN keeps the historical 50 for
+//       every cap below it.
+//   UNLIMITED -> Infinity, i.e. the overflow demotion does not fire at all.
+//
+// WHAT THAT TRADES. Under UNLIMITED nothing automatically bounds the working
+// set any more; `cold` narrows to meaning (a) only, and the store's whole
+// low-salience tail stays on every sheet. That is the token bill the user
+// accepted, and estimatePremiseFloorCost() is what states it. The cost that is
+// NOT tokens: salience stops being coarsely pre-sorted for the retrieval
+// ranking, which now has to discriminate on the raw score — which is exactly
+// why the lastUsedAt ratchet below had to be fixed in the same pass. Selection
+// cost is not part of the trade: selectPremiseFloor is 6 ms over 4 000 facts.
+//
+// REVERSIBILITY IS FREE and needs no new field. Raising the cap (or switching
+// to UNLIMITED) makes `demotable.length <= budget` true again, and that branch
+// already un-colds every demoted row in the category. Lowering it re-demotes on
+// the next write. reconcileColdTier() below is what applies a slider change to
+// categories that are not otherwise written.
+const HOT_SET_MIN = 50;
+
+function hotSetBudget() {
+    let settings = null;
+    try { settings = host.getExtensionSettings(); } catch { settings = null; }
+    const { cap, unlimited } = resolvePremiseFloorCap(settings);
+    if (unlimited) return Infinity;
+    return Math.max(HOT_SET_MIN, cap);
+}
 
 const COLD_TIER_PROTECT_IMPORTANCE = 5;
 
@@ -75,7 +181,8 @@ export function normalizeKind(v) {
 // excluded from the reflection digest, the premise floor and the sheet, so a wrong
 // derivation here does not merely fail to recheck a fact — it can retire it. Two things bound that: COLD_TIER_PROTECT_IMPORTANCE
 // exempts importance 5 outright, and nothing goes cold at all until a category holds
-// more than HOT_SET_SIZE demotable rows. Membership in STATE_ASPECTS is therefore a
+// more demotable rows than hotSetBudget() allows — which under UNLIMITED is never.
+// Membership in STATE_ASPECTS is therefore a
 // claim about DECAY as much as about rechecking: put an aspect there only if a
 // three-day-old answer is genuinely suspect.
 
@@ -644,9 +751,17 @@ export function isColdFact(fact) {
     return !!(fact && fact.cold === true);
 }
 
+// Cold because the budget said so, and therefore releasable by the budget. A cold
+// row with no coldVia predates the field and is read as a verdict — see the block
+// above markFactCold for why that is the safe default rather than the lenient one.
+function isBudgetCold(fact) {
+    return !!fact && fact.cold === true && fact.coldVia === COLD_VIA_BUDGET;
+}
+
 function uncoldFact(fact, category, reason = 'COLD_REACTIVATED', detail = '') {
     if (!fact || fact.cold !== true) return false;
     delete fact.cold;
+    delete fact.coldVia;
     addDebugLog('info', `Fact resurfaced (un-cold): [${category}] ${fact.key}${detail ? ` — ${detail}` : ''}`, {
         subsystem: 'db', event: 'fact.resurfaced', reason,
         data: { category, key: fact.key, salienceScore: Number(salienceScore(fact, Date.now()).toFixed(3)) },
@@ -654,9 +769,34 @@ function uncoldFact(fact, category, reason = 'COLD_REACTIVATED', detail = '') {
     return true;
 }
 
-export function markFactCold(fact, category, reason = 'DEMOTED_LOW_VALUE', detail = '') {
+// WHY a fact is cold, not just THAT it is. Two callers demote for two completely
+// different reasons and only one of them may ever be undone automatically:
+//
+//   VERDICT — a #CONFLICT loser, a merge loser, a #REEVAL drop, an explicit
+//             mark_cold, a canonicalisation shadow copy. Someone JUDGED this row
+//             wrong or redundant. Nothing may resurface it except an explicit
+//             un-cold or a fresh write; the hot-set budget has no standing to
+//             overrule a verdict.
+//   BUDGET  — coldTierOverflow trimmed the tail because the category exceeded the
+//             hot-set budget. That is bookkeeping, and raising the budget must
+//             give those rows back.
+//
+// Without this field the budget branch un-colds everything it finds, so every
+// verdict in the system had a lifetime of one turn: the refuted value came back
+// under "established truth", and the canonicalisation shadow copies returned as
+// duplicate sheet rows because composeSheet dedupes on `category:key`, which a
+// cross-category twin does not collide on.
+//
+// A cold fact from before this field existed carries no coldVia. Those read as
+// VERDICT — the conservative direction: a row that stays cold one release too
+// long is a missing line, a resurfaced verdict is a wrong line sold as truth.
+export const COLD_VIA_VERDICT = 'VERDICT';
+export const COLD_VIA_BUDGET = 'BUDGET';
+
+export function markFactCold(fact, category, reason = 'DEMOTED_LOW_VALUE', detail = '', via = COLD_VIA_VERDICT) {
     if (!fact || fact.cold === true) return false;
     fact.cold = true;
+    fact.coldVia = via;
     addDebugLog('info', `Fact cold-tiered (kept, deprioritized): [${category}] ${fact.key}${detail ? ` — ${detail}` : ''}`, {
         subsystem: 'db', event: 'fact.demoted', reason,
         data: { category, key: fact.key, salienceScore: Number(salienceScore(fact, Date.now()).toFixed(3)) },
@@ -1381,8 +1521,8 @@ export function summarizeMenuIndexed(index) {
 // duplicated pair (six of the analysed run's autolink edges landed on shadow copies
 // alone), so requiring equality there would make every real duplicate look distinct.
 // Nothing is at risk either way now that the loser is kept. lastUpdated, createdAt,
-// source, useCount and lastUsedAt are bookkeeping, re-stamped by any touch including
-// a note-only edit. `cold` and `active` are status, not content — and excluding them
+// source, useCount/lastUsedAt and seenCount/lastSeenAt are bookkeeping, re-stamped by
+// any touch including a note-only edit. `cold` and `active` are status, not content — and excluding them
 // is what lets an already-resolved pair be recognised as resolved on the next load.
 //
 // srcId is a DISCRIMINATOR and a CONFIRMATION, never the evidence. Two records that
@@ -1483,12 +1623,24 @@ function canonicalizeCategories(databases) {
                 // the record actually lives in is strictly better or neutral: an
                 // aspect in that vocabulary now survives, and one that is not lands
                 // on that category's DEFAULT_ASPECT, which is what it already
-                // rendered as. It is accepted as a one-time cost, and it is bounded
-                // by being counted: the first load per character rewrites the record
-                // and re-snapshots, the second finds fact.category === cat for every
-                // row and reports changed:false, so it never runs again. Per-record
-                // logging is deliberately NOT emitted here — this branch touches the
-                // whole store and would bury the moves and demotions below.
+                // rendered as.
+                //
+                // THE ONE-TIME CLAIM THIS COMMENT USED TO MAKE WAS FALSE, and is now
+                // true for a different reason. It said the first load per character
+                // rewrites the record and the second finds fact.category === cat for
+                // every row, so it never runs again. That only ever held for a store
+                // that had stopped growing: every agent write arrived with no
+                // `category` field, so each load stamped the facts written since the
+                // last one, set report.changed and paid another full-store IDB
+                // rewrite plus a snapshot — measured as stamped = 1,3,1,3,2,3,1,2
+                // over eight consecutive loads of the analysed run, never 0. The
+                // producers stamp it now (execWriteFact / execAddAlias in
+                // memory-tools.js) and upsertFact() stamps it for any producer that
+                // does not, so what reaches this branch is legacy records only and it
+                // really does converge to 0 — which is what makes it a migration
+                // rather than a per-write cost. Per-record logging is deliberately
+                // NOT emitted here — this branch touches the whole store and would
+                // bury the moves and demotions below.
                 if (fact.category !== cat) { fact.category = cat; report.stamped++; }
                 keep.push(fact);
                 continue;
@@ -1940,48 +2092,161 @@ async function loadAllDatabasesFromAttachments(avatar, meta) {
     return databases;
 }
 
-function coldTierOverflow(db) {
-    if (!db || !Array.isArray(db.facts)) return;
-    const now = Date.now();
-
-    const demotable = [];
+// The rows this category may demote at all. Importance 5, sequence rows and
+// open threads are exempt outright, so they are neither counted against the
+// budget nor eligible to go cold.
+function demotableFacts(db) {
+    const out = [];
+    if (!db || !Array.isArray(db.facts)) return out;
     for (const f of db.facts) {
         if (!f || typeof f !== 'object') continue;
-        if (!isActiveFact(f)) continue;                                  
-        if (isSequenceFact(f)) continue;                                 
-        if (f.thread === 'open') continue;                               
-        if (clampImportance(f.importance) >= COLD_TIER_PROTECT_IMPORTANCE) continue; 
-        demotable.push(f);
+        if (!isActiveFact(f)) continue;
+        if (isSequenceFact(f)) continue;
+        if (f.thread === 'open') continue;
+        if (clampImportance(f.importance) >= COLD_TIER_PROTECT_IMPORTANCE) continue;
+        out.push(f);
     }
+    return out;
+}
 
-    if (demotable.length <= HOT_SET_SIZE) {
+// Returns the number of currently-cold rows this category would RELEASE under
+// `budget` — i.e. how far the stored cold flags lag the setting in force. Pure:
+// it is what the cost readout reports as `excluded.coldReleasable`, and it must
+// not mutate anything on a path the settings UI calls per slider pixel.
+function coldReleasableCount(db, budget) {
+    const demotable = demotableFacts(db);
+    const coldNow = demotable.filter(f => f.cold === true).length;
+    if (coldNow === 0) return 0;
+    if (demotable.length <= budget) return coldNow;
+    const stayCold = demotable.length - budget;
+    return Math.max(0, coldNow - stayCold);
+}
 
+// Returns true when anything changed, so callers can persist selectively.
+function coldTierOverflow(db) {
+    if (!db || !Array.isArray(db.facts)) return false;
+    const now = Date.now();
+    const budget = hotSetBudget();
+
+    const demotable = demotableFacts(db);
+
+    // Infinity lands here too, and that is the whole UNLIMITED story: the branch
+    // that un-colds becomes unconditional, so switching the slider to "no limit"
+    // RELEASES every overflow demotion instead of merely halting new ones. A
+    // ceiling that only stopped growing would still have been a ceiling.
+    //
+    // isBudgetCold is what keeps that from also releasing every VERDICT. This pass
+    // now runs once per turn across EVERY category (reconcileColdTier), so an
+    // unguarded release would give a #CONFLICT loser, a merge loser, a #REEVAL
+    // drop and every canonicalisation shadow copy a lifetime of exactly one turn.
+    if (demotable.length <= budget) {
+        let released = 0;
         for (const f of demotable) {
-            if (f.cold === true) uncoldFact(f, db.category, 'COLD_REACTIVATED', 'hot-set no longer over budget');
+            if (isBudgetCold(f) && uncoldFact(f, db.category, 'COLD_REACTIVATED', 'hot-set no longer over budget')) released++;
         }
-        return;
+        return released > 0;
     }
 
     const ranked = demotable.slice().sort((a, b) => salienceScore(b, now) - salienceScore(a, now));
-    const keepHot = ranked.slice(0, HOT_SET_SIZE);
-    const goCold = ranked.slice(HOT_SET_SIZE);
+    const keepHot = ranked.slice(0, budget);
+    const goCold = ranked.slice(budget);
 
+    let changed = false;
     for (const f of keepHot) {
-        if (f.cold === true) uncoldFact(f, db.category, 'COLD_REACTIVATED', 'rose back into hot set');
+        // Same rule: rising back up the salience ranking earns a BUDGET row its
+        // place back, and earns a judged row nothing.
+        if (isBudgetCold(f) && uncoldFact(f, db.category, 'COLD_REACTIVATED', 'rose back into hot set')) changed = true;
     }
 
     for (const f of goCold) {
-        if (f.cold === true) continue; 
+        if (f.cold === true) continue;
         f.cold = true;
+        f.coldVia = COLD_VIA_BUDGET;
+        changed = true;
         addDebugLog('info', `Fact cold-tiered (kept, deprioritized): [${db.category}] ${f.key} (score ${salienceScore(f, now).toFixed(2)}, imp ${clampImportance(f.importance)}, ${normalizeKind(f.kind)})`, {
             subsystem: 'db', event: 'fact.demoted', reason: 'COLD_TIERED_LOW_SALIENCE',
             data: {
                 category: db.category, key: f.key,
                 salienceScore: Number(salienceScore(f, now).toFixed(3)),
-                hotSetSize: HOT_SET_SIZE,
+                hotSetBudget: budget,
             },
         });
     }
+    return changed;
+}
+
+/**
+ * Apply the CURRENT hot-set budget to every category at once.
+ *
+ * saveDatabase() cold-tiers only the category it is writing, which is correct
+ * for a data change but not for a SETTING change: move the premise-floor slider
+ * and a category nothing writes keeps a cold set sized for the old number
+ * indefinitely — so the cost readout would keep reporting rows as unreachable
+ * that the new setting has already paid for. This is the reconciler for that
+ * case. Call it after a slider commit, and once per turn before the sheet is
+ * composed.
+ *
+ * Never throws: a failure here leaves the previous flags standing, which is the
+ * status quo, not a new failure.
+ * @param {object} [opts]
+ * @param {boolean} [opts.persist=true] false = reconcile the cached objects only.
+ * @returns {Promise<{categories:string[], budget:number}>}
+ */
+export async function reconcileColdTier({ persist = true } = {}) {
+    const out = { categories: [], budget: hotSetBudget() };
+    try {
+        const avatar = getCharacterAvatar();
+        if (!avatar) return out;
+        const databases = await getAllDatabases();
+        const touched = [];
+        for (const [category, db] of Object.entries(databases || {})) {
+            if (coldTierOverflow(db)) touched.push(category);
+        }
+        out.categories = touched;
+        if (touched.length === 0) return out;
+
+        addDebugLog('info', `Cold tier reconciled against the premise-floor setting — ${touched.length} categor${touched.length === 1 ? 'y' : 'ies'} changed (budget ${Number.isFinite(out.budget) ? out.budget : 'UNLIMITED'})`, {
+            subsystem: 'db', event: 'fact.demoted', reason: 'COLD_TIER_RECONCILED',
+            data: { categories: touched, budget: Number.isFinite(out.budget) ? out.budget : null },
+        });
+
+        if (!persist || !idbAvailable()) return out;
+        await idbUpdateRecord(avatar, (rec) => {
+            const next = (rec && rec.databases) ? rec.databases : {};
+            for (const cat of touched) { if (databases[cat]) next[cat] = databases[cat]; }
+            return {
+                databases: next,
+                updatedAt: Date.now(),
+                deletedCategories: (rec && rec.deletedCategories) || undefined,
+            };
+        });
+        scheduleSnapshot(avatar);
+        return out;
+    } catch (e) {
+        addDebugLog('fail', `Cold-tier reconciliation failed (non-fatal): ${e?.message || e}`, {
+            subsystem: 'db', event: 'fact.demoted', reason: 'COLD_TIER_RECONCILE_FAILED',
+        });
+        return out;
+    }
+}
+
+/**
+ * Per-category exclusion counts for the premise-floor cost readout.
+ * Pure — no writes, safe to call per slider repaint.
+ * @returns {{cold:number, coldReleasable:number, budget:number}}
+ */
+export function coldTierCensus(databases) {
+    const budget = hotSetBudget();
+    let cold = 0;
+    let coldReleasable = 0;
+    for (const db of Object.values(databases || {})) {
+        if (!db || !Array.isArray(db.facts)) continue;
+        for (const f of db.facts) {
+            if (f && isActiveFact(f) && f.cold === true) cold++;
+        }
+        coldReleasable += coldReleasableCount(db, budget);
+    }
+    return { cold, coldReleasable, budget };
 }
 
 export async function saveDatabase(db) {
@@ -2016,6 +2281,9 @@ export async function saveDatabase(db) {
     await saveDatabaseToAttachment(avatar, db);
 }
 
+// ===========================================================================
+// DEMAND vs SUPPLY — why one injected sheet produces two different writes.
+//
 // useCount / lastUsedAt are READ in two places that decide what survives:
 // salienceScore() folds useBonus(useCount) into the score, and effectiveRecencyTs()
 // takes max(lastUpdated, lastUsedAt) as the recency term. Both feed coldTierOverflow().
@@ -2030,26 +2298,118 @@ export async function saveDatabase(db) {
 // getAllDatabases() returns holds the same object identities the store does — and the
 // touched categories go back in ONE IndexedDB transaction.
 //
+// THE RATCHET THIS SPLIT EXISTS FOR. Crediting every injected row as USE was
+// sound while the premise floor was 15 rows out of 65. It stops being sound the
+// moment the floor is large: then nearly every hot fact is on every sheet, so
+// every hot fact gets lastUsedAt = now every turn, ageDays goes to ~0 for all of
+// them, and RECENCY_WEIGHT * recency becomes a CONSTANT. useBonus saturates at
+// USE_BONUS_CAP for everyone for the same reason. salienceScore degenerates to
+// importance — and salienceScore is precisely the ranking coldTierOverflow uses
+// to decide who gets demoted, so the demotion becomes a bare importance cut with
+// no usage evidence in it. Worse, it is one-directional: a fact that once fell
+// out of the hot set is no longer injected, so it is no longer refreshed, while
+// every fact still inside is refreshed every single turn. It can never climb
+// back. That is the same disappearance the floor slider was raised to fix, one
+// layer down.
+//
+// SO: does a fact "count as used" when it rode in on the FLOOR? No. It was not
+// selected for this turn — it is furniture; it is on the sheet because the
+// setting says so, not because anything about this turn wanted it. Counting it
+// measures the slider, not the fact. Same for the random-walk extras, which are
+// a serendipity injection nobody asked for. What DOES count is demand: the
+// agent's NEED picks, the sticky recovered refs (recovered precisely because a
+// reply fumbled them), and anything the lookup pass appended to the sheet.
+//
+//   DEMAND -> useCount++, lastUsedAt = at   (feeds recency and the use bonus)
+//   SUPPLY -> seenCount++, lastSeenAt = at  (feeds NOTHING in salienceScore)
+//
+// `seenCount` is recorded rather than discarded because it is the denominator
+// the hit-rate question needs ("of the turns this fact was available, how often
+// was it reached for") and because a row with a large seenCount and a zero
+// useCount is a concrete, readable answer to "why did this get demoted".
+// Nothing scores on it today; adding it to salienceScore would be a second
+// ranking change in the same pass.
+//
+// PRE-EXISTING COUNTERS are left alone. Stores written before this split carry
+// useCount values inflated by blanket crediting; useBonus is log1p-shaped and
+// capped at 0.20, so the inflation compresses to near-nothing and washes out as
+// real demand accrues. Not worth a migration.
+//
 // `lastUpdated` is left alone on purpose: it means "the content changed", it is what
 // the sheet renders as "(~16 turns ago)", and reading a fact is not a change to it.
+
+// The supply half of the sheet that is currently injected, published by
+// composeSheet (agent-memory.js) as it builds it — the only place that still
+// knows which rows came from the floor and which the agent asked for, since the
+// flush downstream sees nothing but ref text parsed back out of the rendered
+// sheet.
+//
+// ORDERING IS SAFE, not assumed: the flush runs at MESSAGE_RECEIVED and the
+// next composeSheet runs after it, in the same continuation
+// (flushInjectedFactUsage -> runMemoryExtraction in pipeline.js), so the record
+// standing at flush time always describes the sheet that was just injected.
+// Stamped with chat + character anyway and ignored on a mismatch, because a
+// switch between the two would otherwise apply one chat's provenance to
+// another's facts.
+//
+// UNSET means unknown, and unknown is credited as DEMAND — i.e. exactly the old
+// behaviour. That is the state after a page reload, for the one turn before the
+// first sheet is composed, and it is the safe direction: over-crediting one turn
+// blurs the ranking slightly, whereas under-crediting would silently discard a
+// real NEED hit.
+let sheetSupplyRefs = null; // { ids: Set<string>, avatar, chatId }
+
 /**
- * Record that a set of facts was used (injected, retrieved, surfaced) this turn.
+ * Publish which of the sheet's rows were SUPPLY (premise floor + connected
+ * memories) rather than demand. Called by composeSheet; nothing else should.
+ * @param {Iterable<{category:string,key:string}>} rows
+ */
+export function setSheetSupplyRefs(rows) {
+    try {
+        const ids = new Set();
+        for (const r of (rows || [])) {
+            const category = String(r?.category || '').trim();
+            const key = String(r?.key || '').trim();
+            if (category && key) ids.add(`${category}/${key}`.toLowerCase());
+        }
+        sheetSupplyRefs = {
+            ids,
+            avatar: getCharacterAvatar() || '',
+            chatId: getCurrentChatIdSafe(),
+        };
+    } catch {
+        sheetSupplyRefs = null;
+    }
+}
+
+function supplyRefIds(avatar) {
+    const rec = sheetSupplyRefs;
+    if (!rec) return null;
+    if (rec.avatar && avatar && rec.avatar !== avatar) return null;
+    const live = getCurrentChatIdSafe();
+    if (rec.chatId && live && rec.chatId !== live) return null;
+    return rec.ids;
+}
+
+/**
+ * Record that a set of facts was injected this turn, split into demand and supply.
  * @param {Iterable<{category: string, key: string}|string>} refs  Facts to bump.
  *        Objects, or "Category/key" strings — the ref form the retrieval and
  *        recovery paths already speak. Duplicates within one call count once.
  * @param {object} [opts]
- * @param {number} [opts.at=Date.now()]      Timestamp written to lastUsedAt.
+ * @param {number} [opts.at=Date.now()]      Timestamp written to lastUsedAt/lastSeenAt.
  * @param {string} [opts.reason='INJECTED']  Why, for the log/trace.
  * @param {boolean} [opts.persist=true]      false = bump in memory only.
- * @returns {Promise<{bumped:number, missed:number, categories:string[], at:number}>}
- *          Never throws and never rejects: usage accounting must not be able to take
- *          a turn down.
+ * @returns {Promise<{bumped:number, seen:number, missed:number, categories:string[], at:number}>}
+ *          `bumped` counts DEMAND rows (the ones that moved salience); `seen`
+ *          counts supply rows. Never throws and never rejects: usage accounting
+ *          must not be able to take a turn down.
  */
 export async function recordFactUsage(refs, opts = {}) {
     const at = Math.max(0, Math.floor(Number(opts.at) || Date.now()));
     const reason = opts.reason || 'INJECTED';
     const persist = opts.persist !== false;
-    const result = { bumped: 0, missed: 0, categories: [], at };
+    const result = { bumped: 0, seen: 0, missed: 0, categories: [], at };
 
     try {
         const list = (refs && typeof refs[Symbol.iterator] === 'function' && typeof refs !== 'string')
@@ -2068,6 +2428,9 @@ export async function recordFactUsage(refs, opts = {}) {
         const bumped = new Set();
         const touched = new Set();
         const missedRefs = [];
+        // null = no provenance for this sheet, so every row is credited as
+        // demand (the pre-split behaviour). See the block comment above.
+        const supply = supplyRefIds(avatar);
 
         for (const raw of list) {
             let category = '';
@@ -2099,23 +2462,43 @@ export async function recordFactUsage(refs, opts = {}) {
             if (bumped.has(fact)) continue; // a second ref onto a record already counted
             bumped.add(fact);
 
-            fact.useCount = Math.max(0, Math.floor(Number(fact.useCount) || 0)) + 1;
-            fact.lastUsedAt = at;
-            result.bumped++;
+            // Matched on the ref as RENDERED, not on the resolved record:
+            // composeSheet publishes the same `${category}/${fact.key}` string
+            // buildFactLine printed and extractSheetFactRefs read back, so the
+            // two sides are the same text by construction. Resolving first and
+            // matching on the record would reintroduce findFactMatch's fuzzy
+            // key mapping in the one place it must not apply.
+            if (supply && supply.has(id.toLowerCase())) {
+                fact.seenCount = Math.max(0, Math.floor(Number(fact.seenCount) || 0)) + 1;
+                fact.lastSeenAt = at;
+                result.seen++;
+            } else {
+                fact.useCount = Math.max(0, Math.floor(Number(fact.useCount) || 0)) + 1;
+                fact.lastUsedAt = at;
+                result.bumped++;
+            }
             touched.add(category);
         }
         result.categories = [...touched];
 
-        addDebugLog('debug', `Fact usage recorded: ${result.bumped} bumped, ${result.missed} unresolved (${reason})`, {
+        addDebugLog('debug', `Fact usage recorded: ${result.bumped} used (demand), ${result.seen} seen (floor/extras, salience unchanged), ${result.missed} unresolved (${reason})`, {
             subsystem: 'db', event: 'fact.used', reason,
-            data: { bumped: result.bumped, missed: result.missed, categories: result.categories, unresolved: missedRefs },
+            data: {
+                bumped: result.bumped, seen: result.seen, missed: result.missed,
+                provenance: supply ? 'known' : 'unknown-all-demand',
+                categories: result.categories, unresolved: missedRefs,
+            },
         });
         traceCapture('db.factUsage', () => ({
-            reason, at, bumped: result.bumped, missed: result.missed,
+            reason, at, bumped: result.bumped, seen: result.seen, missed: result.missed,
+            provenance: supply ? 'known' : 'unknown-all-demand',
             categories: result.categories, unresolved: missedRefs,
         }), { reason });
 
-        if (result.bumped === 0 || !persist) return result;
+        // `seen` counts too: seenCount/lastSeenAt are stored fields, and losing
+        // them on a turn that happened to produce no demand hit would make the
+        // denominator of the hit rate depend on whether the numerator was zero.
+        if ((result.bumped === 0 && result.seen === 0) || !persist) return result;
 
         if (!idbAvailable()) {
             // Attachment-only mode. The counters are live for this session and reach
@@ -2288,19 +2671,43 @@ export function upsertFact(db, fact) {
         const passedKind = passedKindOf(fact);
         const derived = deriveKind(fact, db?.category);
         if (derived.kind !== passedKind) {
-            if (passedKind) {
-                addDebugLog('debug', `Kind derived: [${db?.category}] ${fact.key} — agent said "${passedKind}", stored as "${derived.kind}"`, {
-                    subsystem: 'db', event: 'fact.kind_derived', reason: derived.via,
-                    data: {
-                        category: db?.category, key: fact.key,
-                        aspect: normalizeAspect(fact.aspect, fact.category || db?.category),
-                        passed: passedKind, derived: derived.kind,
-                    },
-                    before: passedKind, after: derived.kind,
-                });
-            }
+            // The old line said `agent said "<passedKind>"` unconditionally, and the
+            // `if (passedKind)` guard meant it only ever printed when the field was
+            // populated — which, until execWriteFact stopped fabricating it, was
+            // always, so every one of these lines reported the extension's own
+            // DEFAULT_KIND back as the model's word. Now that "said nothing" reaches
+            // here as an empty passedKind, that case is stated as what it is instead
+            // of being dropped: the derivation is the only reason the record has a
+            // kind at all, and a silent log made that indistinguishable from an
+            // override the model lost.
+            addDebugLog('debug', passedKind
+                ? `Kind derived: [${db?.category}] ${fact.key} — agent said "${passedKind}", stored as "${derived.kind}"`
+                : `Kind derived: [${db?.category}] ${fact.key} — agent named no kind, stored as "${derived.kind}"`, {
+                subsystem: 'db', event: 'fact.kind_derived', reason: derived.via,
+                data: {
+                    category: db?.category, key: fact.key,
+                    aspect: normalizeAspect(fact.aspect, fact.category || db?.category),
+                    passed: passedKind || null, derived: derived.kind,
+                    agentNamedKind: !!passedKind,
+                },
+                before: passedKind || '(none)', after: derived.kind,
+            });
             fact = { ...fact, kind: derived.kind };
         }
+    }
+
+    // Same funnel argument as the kind derivation above, for the same reason: the
+    // producers stamp `category` themselves now, but a producer that forgets one
+    // (or a future one that never knew) costs a full-store rewrite plus a snapshot
+    // on EVERY subsequent load, because canonicalizeCategories() stamps whatever it
+    // finds unstamped and reports changed. Doing it here as well makes convergence
+    // a property of the write path rather than a promise each writer has to keep.
+    // db.category is authoritative — it is the category the record is being stored
+    // in by definition, and it is exactly what canonicalizeCategories() would have
+    // written. A record that belongs somewhere else is still MOVED by that pass;
+    // this only settles the field for records already in the right place.
+    if (fact && typeof fact === 'object' && db?.category && fact.category !== db.category) {
+        fact = { ...fact, category: db.category };
     }
 
     if (isSequenceFact(fact)) {
@@ -2695,6 +3102,11 @@ function normalizeSalienceFields(fact) {
 
     out.useCount = Math.max(0, Math.floor(Number(fact?.useCount) || 0));
     out.lastUsedAt = Math.max(0, Math.floor(Number(fact?.lastUsedAt) || 0));
+    // Carried alongside, and deliberately NOT folded into the two above: seen
+    // means "the floor put it on the sheet", used means "something asked for
+    // it". Merging them back together is the ratchet this pair exists to break.
+    out.seenCount = Math.max(0, Math.floor(Number(fact?.seenCount) || 0));
+    out.lastSeenAt = Math.max(0, Math.floor(Number(fact?.lastSeenAt) || 0));
 
     const tone = normalizeTone(fact?.tone);
     if (tone) out.tone = tone;
@@ -2720,6 +3132,14 @@ function mergeSalience(existing, incoming) {
     const exUsedAt = Math.max(0, Math.floor(Number(existing?.lastUsedAt) || 0));
     const incUsedAt = Math.max(0, Math.floor(Number(incoming?.lastUsedAt) || 0));
     out.lastUsedAt = Math.max(exUsedAt, incUsedAt);
+    // Same max-of-both rule as the pair above: a merge must not lose exposure
+    // history, or a merged row looks like it was never offered.
+    out.seenCount = Math.max(
+        Math.max(0, Math.floor(Number(existing?.seenCount) || 0)),
+        Math.max(0, Math.floor(Number(incoming?.seenCount) || 0)));
+    out.lastSeenAt = Math.max(
+        Math.max(0, Math.floor(Number(existing?.lastSeenAt) || 0)),
+        Math.max(0, Math.floor(Number(incoming?.lastSeenAt) || 0)));
 
     const incTone = normalizeTone(incoming?.tone);
     const exTone = normalizeTone(existing?.tone);
@@ -3023,7 +3443,12 @@ export function removeFact(db, key) {
     return db;
 }
 
-function getCharacterNameWords() {
+// Exported because the fuzzy fallback in fact-retrieval.js has to apply the SAME
+// exclusion searchFactsIndexed applies below: in a two-hander's store every fact
+// mentions the character or the user, so those words match nearly everything and
+// rank nothing. A layer that dropped them from indexed search but kept them for
+// trigram search ranked the whole store by the one word that cannot discriminate.
+export function getCharacterNameWords() {
     const names = new Set();
     try {
         const context = getContext();

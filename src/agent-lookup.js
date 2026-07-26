@@ -127,6 +127,43 @@ export const LOOKUP_DEADLINE_GRACE_MS = 250;
 // bounded per turn is not the same as bounded overall.
 export const LOOKUP_TIMEOUT_STRIKES = 3;
 
+// The SECOND strike counter, on hard errors rather than deadline misses, sharing
+// the same session latch. A deadline miss is not the only way this pass can cost
+// latency forever: measured on the analysed session, EIGHT consecutive
+// `API request failed` results (a dead profile — wrong URL, expired key, bridge
+// down) never touched the timeout counter, because they came back fast and with
+// `timedOut: false`. The pass kept re-arming itself for 26 runs. An error is
+// weaker evidence than a timeout — a single transport blip is not a broken
+// setup — so the threshold is higher, but the outcome has to be the same: stop
+// paying for a pass that cannot work.
+//
+// 'aborted' is excluded at the call site (pipeline.js): a chat switch or a user
+// cancel says nothing about the profile.
+export const LOOKUP_ERROR_STRIKES = 5;
+
+// The THIRD counter, and the reason the second one had to get narrower. Since a
+// read arriving next to #DONE buys another round instead of being dropped
+// (readsForceAnotherRound in llm-call.js), this pass has a failure mode it did
+// not have before: round 1 searches and says #DONE, the block is deferred, and
+// round 2 fails to restate it — chatter, a grace round, loop end, `no #DONE block
+// produced`. Before the deferral that same reply ENDED the pass successfully, with
+// zero refs; now it ends it with an error.
+//
+// That error is not a connection failure and must not be counted as one. The
+// endpoint answered, twice, inside the deadline — a run that reaches this class is
+// positive evidence the profile works, which is why it CLEARS the other two
+// counters instead of feeding them. Attributing it to the profile is how a
+// reasoning model that writes #DONE inside <think> got the user a toast telling
+// them to check a URL that was never wrong.
+//
+// It still needs a latch of its own: a model that cannot hold this contract will
+// fail it on every message, and dead latency forever is the exact thing the other
+// two latches exist to stop. The threshold is the highest of the three because the
+// evidence is the weakest — one badly formatted reply is ordinary, which is why
+// the grace round exists at all — and the ADVICE is different from both: not the
+// profile's plumbing, not the deadline, but the model behind it.
+export const LOOKUP_PROTOCOL_STRIKES = 8;
+
 // Refs the agent may deliver. This block is stapled onto a sheet that already
 // carries 11-26 fact rows; its value is precision, not volume. Six is generous
 // for "what this one message needs that the sheet is missing" — the honest
@@ -142,6 +179,53 @@ const LOOKUP_REFS_CAP = 6;
 // background time; when it truncates the header says so and points at list_keys,
 // which is one of the three tools this pass has.
 const LOOKUP_KEY_INVENTORY_CAP = 120;
+
+// `## Already on the sheet` cap. This list used to be written out in full, which
+// was safe only while the sheet itself was small: the premise floor was a fixed 15
+// rows, so the sheet could not exceed 15 + 45 NEED + 12 sticky + 8 connected = 80
+// refs. The floor is now a user slider up to 100 and past that UNLIMITED, so "in
+// full" means an unbounded list — thousands of lines, hundreds of KB — inside a
+// prompt this pass has LOOKUP_TIMEOUT_DEFAULT_MS to complete while the user waits.
+// The pass would then miss its deadline every turn, take three strikes, switch
+// itself off, and blame the connection profile for a slider two settings above it.
+// Nothing else in this file is allowed to scale with a setting, and neither is
+// this.
+//
+// THE NUMBER. 120 is not a guess: the DEFAULT floor of 50 tops the sheet out at
+// 50 + 45 + 12 + 8 = 115 refs, so at stock settings this cap never bites at all
+// and the list stays exactly as complete as it was. It only truncates for a user
+// who has raised the slider — and it matches LOOKUP_KEY_INVENTORY_CAP, which
+// bounds the other list in this same prompt, so the two together are a few KB.
+//
+// THE TENSION, and how it is resolved. The list exists so the pass does not spend
+// one of its six slots re-finding a row the storyteller is already getting.
+// Truncating it means the pass MIGHT re-find something; omitting it means it
+// always might. Three things make the truncated list the right trade:
+//
+//   1. Truncation is not a correctness failure. renderLookupBlock re-derives the
+//      sheet ref set from the FULL sheetText and drops any ref it already carries
+//      (ALREADY_ON_SHEET). A re-find therefore costs one wasted slot, never a
+//      duplicated row in the prompt. The absent-list case has the same ceiling but
+//      pays it on every turn instead of only above the default.
+//   2. The truncation is announced. The header says the list is partial, so
+//      absence from it stops meaning absence from the sheet — the same contract
+//      `## Stored keys` already states when its inventory truncates.
+//   3. WHICH refs are dropped is chosen, not incidental. composeSheet unshifts the
+//      premise floor ahead of NEED and sticky, so within each sheet section the
+//      standing background rows come FIRST and the rows selected against THIS
+//      turn's message come last, with the connected-memories extras last of all.
+//      A head-only cut would drop precisely the rows a targeted search is most
+//      likely to land on. So both ends are kept and the middle is dropped: the
+//      middle is premise-floor background, which a search aimed at the new message
+//      collides with least.
+//
+// The tail reserve is sized from the caps composeSheet applies to its non-floor
+// rows — NEED 45 + sticky 12 + connected 8 = 65 — so the tail slice can never be
+// too small to cover them. It is hardcoded rather than imported because this
+// module must not pull agent-memory.js into its graph (see parseRefsLine below for
+// the same rule); if those caps move, this becomes conservative, never wrong.
+const LOOKUP_SHEET_REFS_CAP = 120;
+const LOOKUP_SHEET_REFS_TAIL = 65;
 
 // Input clips. The user message is the whole point and is clipped only against
 // the pathological paste; the preceding character reply is context for resolving
@@ -237,6 +321,25 @@ function capLines(text, max, footer) {
     return { text: lines.slice(0, max).join('\n') + `\n... (+${lines.length - max} more — ${footer})`, truncated: true };
 }
 
+// Both ends of the sheet ref list, with the dropped middle named on its own line.
+// Returns the refs to print plus how many were left out; the CALLER still counts
+// the full set in the header, so the number the model is told is the real one.
+function capSheetRefs(refs) {
+    const all = Array.isArray(refs) ? refs : [];
+    if (all.length <= LOOKUP_SHEET_REFS_CAP) return { lines: all, omitted: 0 };
+    const tail = Math.min(LOOKUP_SHEET_REFS_TAIL, LOOKUP_SHEET_REFS_CAP);
+    const head = LOOKUP_SHEET_REFS_CAP - tail;
+    const omitted = all.length - LOOKUP_SHEET_REFS_CAP;
+    return {
+        lines: [
+            ...all.slice(0, head),
+            `... (+${omitted} more sheet memories not listed — mostly standing background rows)`,
+            ...all.slice(all.length - tail),
+        ],
+        omitted,
+    };
+}
+
 function buildLookupUserPrompt({ userMessage, priorMessage, sheetRefs, databases }) {
     const parts = [];
 
@@ -248,7 +351,19 @@ function buildLookupUserPrompt({ userMessage, priorMessage, sheetRefs, databases
 
     // What the storyteller is getting regardless. Refs only, not the sheet prose:
     // the job is a set difference, and the prose cannot participate in one.
-    parts.push(`## Already on the sheet (${sheetRefs.length} memor${sheetRefs.length === 1 ? 'y' : 'ies'} the storyteller receives anyway — do NOT list these)\n${sheetRefs.length ? sheetRefs.join('\n') : '(nothing — the sheet is carrying no stored memories at all this turn)'}`);
+    //
+    // Capped — see LOOKUP_SHEET_REFS_CAP for the size, the choice of which refs go,
+    // and why a truncated list beats an unbounded one here. The count in the header
+    // is the FULL sheet size even when the body is cut, and the truncation note
+    // withdraws the inference the untruncated header invites: absence from a partial
+    // list proves nothing, so "do NOT list these" softens to "listing one is a
+    // wasted slot". It cannot become a duplicate row — renderLookupBlock re-checks
+    // every returned ref against the whole sheet.
+    const sheetList = capSheetRefs(sheetRefs);
+    const sheetTrunc = sheetList.omitted > 0
+        ? ` — PARTIAL LIST: ${sheetList.omitted} of them are not shown, so a memory MISSING from this list may still be on the sheet; if you are unsure, prefer a ref you know it lacks (listing one it already has is not an error, just a wasted slot)`
+        : ' — do NOT list these';
+    parts.push(`## Already on the sheet (${sheetRefs.length} memor${sheetRefs.length === 1 ? 'y' : 'ies'} the storyteller receives anyway${sheetTrunc})\n${sheetRefs.length ? sheetList.lines.join('\n') : '(nothing — the sheet is carrying no stored memories at all this turn)'}`);
 
     try {
         const inv = capLines(summarizeKeys(databases), LOOKUP_KEY_INVENTORY_CAP, 'list_keys shows a category in full');
@@ -275,9 +390,12 @@ function buildLookupUserPrompt({ userMessage, priorMessage, sheetRefs, databases
  * runtime. Omitted, it defaults to lookupTimeoutMs() from entry — correct only for
  * a caller that has awaited nothing yet.
  *
- * Returns { refs, error, timedOut, stage, rounds, toolCalls, tokensIn, tokensOut, ms }.
+ * Returns { refs, error, errorKind, timedOut, stage, rounds, toolCalls, tokensIn,
+ * tokensOut, ms }.
  * `stage` names what the deadline or the abort caught ('store' | 'model'), null
- * otherwise.
+ * otherwise. `errorKind` classifies `error` so the caller's breaker can tell a
+ * broken connection from a model that will not follow the protocol — those need
+ * different thresholds and opposite advice.
  * `refs` is what the agent SAID (parsed, deduped); resolving it against the store
  * and against the sheet is renderLookupBlock's job, so a cached ref set can be
  * re-resolved later against a sheet that has since changed.
@@ -291,7 +409,12 @@ export async function runLookupAgent({
     runId = '',
     deadlineAt = 0,
 } = {}) {
-    const result = { refs: [], error: null, timedOut: false, stage: null, rounds: 0, toolCalls: 0, tokensIn: 0, tokensOut: 0, ms: 0 };
+    // `errorKind` classifies `error` for the caller's breaker, which must not have
+    // to read prose to tell a dead endpoint from a model that will not emit #DONE.
+    // Values are llm-call.js's ('transport' | 'protocol' | 'budget' | 'aborted' |
+    // 'internal') plus 'store' for a failure that never reached the model at all.
+    // Null whenever `error` is null.
+    const result = { refs: [], error: null, errorKind: null, timedOut: false, stage: null, rounds: 0, toolCalls: 0, tokensIn: 0, tokensOut: 0, ms: 0 };
     const started = Date.now();
     // The configured budget, read once. Only used when the caller passed no
     // absolute deadline; when it did, that deadline already encodes the setting
@@ -346,6 +469,7 @@ export async function runLookupAgent({
         // because nothing about it says anything was too slow.
         releaseDeadline();
         result.error = 'aborted';
+        result.errorKind = 'aborted';
         result.stage = stage;
         result.ms = Date.now() - started;
         addDebugLog('info', `Lookup agent aborted after ${result.ms}ms (${stage} stage) — the prompt goes out without the looked-up block`, {
@@ -397,6 +521,9 @@ export async function runLookupAgent({
     if (!loaded.ok) {
         releaseDeadline();
         result.error = `memory store unavailable: ${loaded.err?.message || loaded.err}`;
+        // Storage, not the connection profile — the model was never called. The
+        // caller must not offer "check the connection profile" for this one.
+        result.errorKind = 'store';
         result.stage = 'store';
         result.ms = Date.now() - started;
         addDebugLog('fail', `Lookup agent aborted — ${result.error}`, {
@@ -435,6 +562,15 @@ export async function runLookupAgent({
 
     const sheetRefs = extractSheetFactRefs(sheetText);
     const userPrompt = buildLookupUserPrompt({ userMessage, priorMessage, sheetRefs, databases });
+    // Say it out loud when the sheet has outgrown the list. Without this line a
+    // user who raised the premise-floor slider has no way to connect "the lookup
+    // started repeating rows I already had" to the setting that caused it.
+    if (sheetRefs.length > LOOKUP_SHEET_REFS_CAP) {
+        addDebugLog('info', `Lookup prompt: sheet carries ${sheetRefs.length} memories, listing ${LOOKUP_SHEET_REFS_CAP} of them (both ends kept, ${sheetRefs.length - LOOKUP_SHEET_REFS_CAP} middle rows omitted) — the pass may re-find one of the omitted rows, which renderLookupBlock then drops as ALREADY_ON_SHEET`, {
+            runId, subsystem: 'agent3', event: 'lookup.prompt', reason: 'SHEET_REFS_TRUNCATED',
+            data: { sheetRefs: sheetRefs.length, shown: LOOKUP_SHEET_REFS_CAP, omitted: sheetRefs.length - LOOKUP_SHEET_REFS_CAP, tailReserved: LOOKUP_SHEET_REFS_TAIL },
+        });
+    }
     const callId = isTraceRecording() ? newTraceCallId('lookup') : null;
 
     // The prompt as this pass built it. llm-call.js captures prompt BODIES for
@@ -447,7 +583,12 @@ export async function runLookupAgent({
         userMessageChars: String(userMessage || '').length,
         userMessage: clip(userMessage, LOOKUP_MESSAGE_CHARS),
         priorMessageChars: String(priorMessage || '').length,
+        // The FULL set, which is what renderLookupBlock will exclude against — the
+        // prompt shows at most LOOKUP_SHEET_REFS_CAP of them, so both numbers are
+        // carried and a trace reader can see the gap rather than infer it.
         sheetRefs,
+        sheetRefsShown: Math.min(sheetRefs.length, LOOKUP_SHEET_REFS_CAP),
+        sheetRefsCap: LOOKUP_SHEET_REFS_CAP,
         userPromptChars: userPrompt.length,
         systemPromptChars: DEFAULT_LOOKUP_PROMPT.length,
         maxRounds: LOOKUP_MAX_ROUNDS,
@@ -472,13 +613,29 @@ export async function runLookupAgent({
             userPrompt,
             profileId,
             agent: 'lookup-agent',
-            // Health-tab tool telemetry is keyed on the two agents health.js knows
-            // ('memory' | 'reflection'); null disables recording rather than
-            // filing this pass's reads under another agent's row.
-            agentTag: null,
+            // Health-tab tool telemetry tag. It used to be null, on the theory
+            // that recording under an unknown tag would file these reads under
+            // another agent's row — which recordToolUse does not do: it keys a
+            // plain map on the tag and has no roster check at all. The only
+            // effect of null was that this pass recorded NOTHING, so the Health
+            // tab showed no lookup section and no failures while the pass had
+            // been failing every turn for 26 minutes. health.js now carries a
+            // 'lookup' section over LOOKUP_TOOLS.
+            agentTag: 'lookup',
             maxRounds: LOOKUP_MAX_ROUNDS,
             maxToolCalls: LOOKUP_MAX_TOOL_CALLS,
             executeTool: (call) => executeLookupTool(call, ctx),
+            // THE fix that lets this pass search at all. Extraction and reflection
+            // drop tool calls that ride alongside the closing block; for a
+            // READ-ONLY agent that drops every call it can ever make, and its own
+            // prompt invites the batching ("Several call lines in one reply are
+            // fine", DEFAULT_LOOKUP_PROMPT above). With this set, a read next to
+            // #DONE invalidates the block and buys round 2 instead of vanishing.
+            // Scoped to this caller: extraction's final-block writes are untouched.
+            // With LOOKUP_MAX_ROUNDS = 2 this can only ever fire on round 1; on
+            // the last round the block stands and the reads drop as before, since
+            // there is no round left to restate the verdict in.
+            readsForceAnotherRound: true,
             // The loop's "carried no sheet content" guard is for the sheet-emitting
             // agent only; this pass closes with #DONE like extraction does.
             extractOnly: true,
@@ -490,7 +647,11 @@ export async function runLookupAgent({
             signal: ctrl.signal,
             runId,
             traceCallId: callId,
-        }).catch((e) => ({ error: String(e?.message || e), rounds: 0, toolCallCount: 0, transcript: [] }));
+        }).catch((e) => ({
+            // A throw out of the loop itself is plumbing, not protocol — the model
+            // never got as far as answering badly. 'transport' is the honest class.
+            error: String(e?.message || e), errorKind: 'transport', rounds: 0, toolCallCount: 0, transcript: [],
+        }));
 
         loop = await Promise.race([loopPromise, deadlineP, abortedP]);
     } catch (e) {
@@ -498,6 +659,7 @@ export async function runLookupAgent({
         // covers it anyway — this is the belt for anything the plumbing itself
         // throws, so the injection handler can never see an exception from here.
         result.error = String(e?.message || e);
+        result.errorKind = 'internal';
     }
 
     if (loop === ABORTED && !result.error) return finishAborted('model');
@@ -509,7 +671,12 @@ export async function runLookupAgent({
         result.toolCalls = loop.toolCallCount || 0;
         result.tokensIn = loop.tokensInApprox || 0;
         result.tokensOut = loop.tokensOutApprox || 0;
-        if (loop.error) result.error = loop.error;
+        if (loop.error) {
+            result.error = loop.error;
+            // The loop classifies its own failures; 'transport' only as the
+            // fallback for a shape that predates the field.
+            result.errorKind = loop.errorKind || 'transport';
+        }
 
         // Newest-first for the reply that actually carries a REFS line: a grace
         // round can split the answer, and a reasoning model drafts ref lists
@@ -541,6 +708,7 @@ export async function runLookupAgent({
             refs: result.refs.map(r => `${r.category}/${r.key}`),
             rounds: result.rounds, toolCallCount: result.toolCalls, durationMs: result.ms,
             tokensIn: result.tokensIn, tokensOut: result.tokensOut, error: result.error || null,
+            errorKind: result.errorKind || null,
         },
     });
 
@@ -550,6 +718,7 @@ export async function runLookupAgent({
     traceCapture('lookup.verdict', () => ({
         outcome: result.error ? 'ERROR' : (result.refs.length ? 'REFS' : 'NONE'),
         error: result.error || null,
+        errorKind: result.errorKind || null,
         ms: result.ms,
         refs: result.refs.map(r => `${r.category}/${r.key}`),
         rounds: (loop?.transcript || []).map(t => ({

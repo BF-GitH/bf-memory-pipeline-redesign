@@ -12,6 +12,27 @@ import * as host from './host.js';
 // ("merge_facts and mark_cold lines sent alongside the closing sections are
 // dropped unexecuted") — a merge or a demotion is too consequential to fire
 // with no feedback round and no chance to refuse-and-retry.
+//
+// This list governs the DEFAULT path only, and the deferral path deliberately
+// does NOT inherit it — stated here because the difference is easy to read as an
+// oversight. A caller that passes readsForceAnotherRound (the lookup agent, and
+// only it) does not reach this filter while a round remains: a read next to the
+// closing block invalidates the block, and then EVERY call in that reply —
+// including a merge_facts or a mark_cold that rode along — runs through the
+// ordinary round path, unfiltered by this list.
+//
+// That is correct rather than a hole, because the exclusion above is justified by
+// ONE thing only: no feedback round. A deferral creates exactly that round — the
+// results go back to the model and it can refuse-and-retry — so the reason to
+// withhold merge_facts and mark_cold is gone with it.
+//
+// What the deferral path must therefore NOT be used for is a caller whose PROMPT
+// promises the drop (agent-reflect.js says "merge_facts and mark_cold lines sent
+// alongside the closing sections are dropped unexecuted"). Today no such caller
+// sets the flag and the one that does is read-only by construction, so the
+// combination is unreachable; the tripwire at the deferral site logs it at fail
+// level if a future caller ever makes it reachable, rather than letting a prompt
+// quietly start lying.
 export const FINAL_BLOCK_WRITE_TOOLS = ['write_fact', 'link_facts'];
 
 // Does this tool MUTATE the store? Used only to tell a DISCARDED WRITE apart
@@ -519,6 +540,13 @@ export async function callAgentLLMWithTools({
     // nothing else) pass a tool their executor actually accepts, so a confused
     // model is never steered into a rejection.
     protocolExample = null,
+    // LOOKUP PATH ONLY (agent-lookup.js passes true; nothing else does). When a
+    // reply carries the closing block AND a non-mutating tool call, the read wins
+    // and the block is discarded: the call is executed like any ordinary round,
+    // its output is fed back, and the model must restate its verdict next round.
+    // Default false keeps extraction and reflection byte-for-byte on the old
+    // behaviour (FINAL_BLOCK_WRITE_TOOLS below).
+    readsForceAnotherRound = false,
     signal = null,
     // Test-run trace correlation, both plain strings, both optional.
     // runId MUST be passed explicitly: it is populated automatically only inside
@@ -536,12 +564,31 @@ export async function callAgentLLMWithTools({
         rounds: 0,
         toolCallCount: 0,
         error: null,
+        // WHAT KIND of failure `error` is, as a token rather than as prose. Callers
+        // that act on a failure — the lookup breaker in pipeline.js is the only one
+        // today — must not have to regex the message to tell "the endpoint is dead"
+        // from "the model would not follow the format", because those two need
+        // opposite advice and the message text is written for humans and changes.
+        //
+        //   'transport' — the call itself failed or came back empty. Evidence about
+        //                 the CONNECTION (URL, key, bridge, model availability).
+        //   'protocol'  — the model answered, inside budget, and did not follow the
+        //                 tool/closing-block contract. Evidence about the MODEL's
+        //                 formatting, and positive evidence that the connection works.
+        //   'budget'    — the total-run budget ran out between rounds. Speed.
+        //   'aborted'   — WE stopped (chat switch, user cancel). Evidence about nothing.
+        //   'internal'  — this function was called wrong.
+        //
+        // Stays null when `error` is null. Additive: every existing caller reads
+        // `error` and ignores this.
+        errorKind: null,
         tokensInApprox: 0,
         tokensOutApprox: 0,
         transcript: [],
     };
     if (typeof executeTool !== 'function') {
         out.error = 'callAgentLLMWithTools requires an executeTool function';
+        out.errorKind = 'internal';
         return out;
     }
     // Telemetry epoch captured at loop start: recordToolUse drops calls whose
@@ -572,11 +619,13 @@ export async function callAgentLLMWithTools({
     for (let round = 1; round <= maxRounds; round++) {
         if (signal?.aborted) {
             out.error = 'aborted before round ' + round;
+            out.errorKind = 'aborted';
             break;
         }
         // Total-run budget (between rounds only — never chops an in-flight round).
         if (round > 1 && Date.now() - loopStart >= TOOL_LOOP_BUDGET_MS) {
             out.error = `run budget exhausted after ${Math.round((Date.now() - loopStart) / 1000)}s (${round - 1} round(s) completed, budget ${TOOL_LOOP_BUDGET_MS / 1000}s)`;
+            out.errorKind = 'budget';
             addDebugLog('fail', `[${agent}] Tool-loop total run budget exhausted: ${out.error}`, {
                 subsystem: 'agent3', event: 'toolloop.budget', reason: 'RUN_BUDGET',
                 data: { agent, rounds: round - 1, toolCallCount: out.toolCallCount, budgetMs: TOOL_LOOP_BUDGET_MS },
@@ -598,6 +647,11 @@ export async function callAgentLLMWithTools({
             out.error = /timed out|wall-clock|budget|abort/i.test(raw)
                 ? `timed out — no response from the memory-agent connection after ${Math.round(LLM_WALLCLOCK_BUDGET_MS / 1000)}s (check the connection profile / bridge)`
                 : (raw || `LLM call failed on round ${round}`);
+            // 'transport' even for the timeout wording: a call that never returned
+            // is evidence about the endpoint/bridge, not about formatting. The
+            // lookup pass never gets here on ITS deadline — that one is a race in
+            // agent-lookup.js and reports timedOut instead.
+            out.errorKind = 'transport';
             out.transcript.push({ round, reply: '', toolCalls: [], malformed: 0, note: out.error });
             break;
         }
@@ -606,6 +660,9 @@ export async function callAgentLLMWithTools({
         if (!reply || !reply.trim()) {
 
             out.error = `empty LLM reply on round ${round}`;
+            // An empty body is a transport/endpoint symptom, not a formatting one:
+            // there is no reply to have formatted badly.
+            out.errorKind = 'transport';
             out.transcript.push({ round, reply: '', toolCalls: [], malformed: 0, note: 'empty reply' });
             break;
         }
@@ -662,6 +719,7 @@ export async function callAgentLLMWithTools({
             });
             if (graceUsed) {
                 out.error = `malformed protocol reply (second offense): ${detail}`;
+                out.errorKind = 'protocol';
                 entry.note = 'malformed — second offense';
                 break;
             }
@@ -689,11 +747,29 @@ export async function callAgentLLMWithTools({
 
         if (parsed.calls.length > 0 && out.toolCallCount + parsed.calls.length > maxToolCalls) {
             out.error = `tool-call cap exceeded (${out.toolCallCount} + ${parsed.calls.length} > ${maxToolCalls})`;
+            out.errorKind = 'protocol';
             entry.note = 'tool-call cap overrun';
             break;
         }
 
-        if (parsed.done) {
+        // A READ that arrived in the same reply as the closing block. For
+        // extraction and reflection dropping it costs nothing: their product is
+        // the block, and the read was at most a confirmation they chose to skip.
+        // For the LOOKUP agent it is the whole pass — that agent is read-only, so
+        // EVERY call it can make is a read, and its prompt tells it batching is
+        // fine. Measured with the drop in place: 26 lookup runs, 0 executed tool
+        // calls, 0 refs. So here the read wins and the block loses; the model gets
+        // TOOL RESULTS and has to restate its verdict with them in hand.
+        //
+        // `round < maxRounds` is the guard that keeps this from destroying the
+        // answer: on the last round there is no round left to restate it in, so
+        // the block stands and the reads drop as they always did.
+        const deferredFinalBlock = parsed.done
+            && readsForceAnotherRound
+            && round < maxRounds
+            && parsed.calls.some(c => !isMutatingTool(c.tool));
+
+        if (parsed.done && !deferredFinalBlock) {
 
             if (parsed.calls.length > 0) {
                 // Emission order is preserved so a link_facts line can target a
@@ -776,9 +852,35 @@ export async function callAgentLLMWithTools({
             if (!extractOnly && (out.sheet === null || out.sheet === '')) {
 
                 out.error = `final block on round ${round} carried no sheet content`;
+                out.errorKind = 'protocol';
                 out.sheet = null;
             }
             break;
+        }
+
+        if (deferredFinalBlock) {
+            const readTools = [...new Set(parsed.calls.filter(c => !isMutatingTool(c.tool)).map(c => c.tool))];
+            entry.note = `${finalToken} deferred — ${parsed.calls.length} tool call(s) in the same reply were executed instead (${readTools.join(', ')})`;
+            addDebugLog('info', `[${agent}] ${finalToken} arrived alongside ${parsed.calls.length} tool call(s) (${readTools.join(', ')}) — the calls RAN and the block was discarded; round ${round + 1} must restate it`, {
+                subsystem: 'agent3', event: 'toolloop.final_deferred', reason: 'FINAL_BLOCK_DEFERRED',
+                data: { agent, round, maxRounds, tools: readTools, calls: parsed.calls.length },
+            });
+            // TRIPWIRE for the FINAL_BLOCK_WRITE_TOOLS relationship documented at
+            // that constant. Only ONE read is needed to defer, so a mixed reply
+            // (read + merge_facts) drags the write onto the ordinary path where
+            // this list does not apply. Unreachable today — the only caller that
+            // sets readsForceAnotherRound is read-only in its executor — so this
+            // fires only if someone widens the flag, which is exactly when a prompt
+            // that promises the drop would start lying. Logged, not blocked: the
+            // deferral gives the write its feedback round, so executing it is the
+            // defensible behaviour; what must not happen is it being silent.
+            const rideAlongWrites = [...new Set(parsed.calls.filter(c => isMutatingTool(c.tool)).map(c => c.tool))];
+            if (rideAlongWrites.length > 0) {
+                addDebugLog('fail', `[${agent}] deferral is executing ${rideAlongWrites.length} MUTATING tool(s) (${rideAlongWrites.join(', ')}) that the FINAL_BLOCK_WRITE_TOOLS whitelist would have dropped on the normal path — readsForceAnotherRound bypasses that filter by design, but this agent's prompt may promise otherwise`, {
+                    subsystem: 'agent3', event: 'toolloop.final_deferred', reason: 'DEFERRED_WRITE_BYPASS',
+                    data: { agent, round, tools: rideAlongWrites, whitelist: FINAL_BLOCK_WRITE_TOOLS },
+                });
+            }
         }
 
         const resultParts = [];
@@ -821,6 +923,7 @@ export async function callAgentLLMWithTools({
         }
         if (signal?.aborted) {
             out.error = `aborted during tool execution on round ${round}`;
+            out.errorKind = 'aborted';
             break;
         }
         addDebugLog('debug', `Memory Agent round ${round}: executed ${parsed.calls.length} tool call(s) (${out.toolCallCount}/${maxToolCalls} total)`, {
@@ -831,21 +934,35 @@ export async function callAgentLLMWithTools({
         if (round === maxRounds) {
 
             out.error = `max rounds (${maxRounds}) reached without a ${finalToken} block`;
+            out.errorKind = 'protocol';
             entry.note = 'round cap without final block';
             break;
         }
         messages.push({ role: 'assistant', content: reply });
-        messages.push({ role: 'user', content: `TOOL RESULTS:\n${resultParts.join('\n\n')}` });
+        // On a deferral the model believes it already finished. Saying so is the
+        // difference between it restating the verdict and it sitting silent on a
+        // round it thinks is over — and naming the round left tells it not to
+        // spend this one on more tools.
+        const deferNote = deferredFinalBlock
+            ? `\n\nNOTE: your ${finalToken} block was NOT accepted — you sent tool calls in the same reply, so these results arrived after it. This is round ${round + 1} of ${maxRounds}${round + 1 >= maxRounds ? ', the last one' : ''}: give your final answer ending in ${finalToken}, and call no further tools.`
+            : '';
+        messages.push({ role: 'user', content: `TOOL RESULTS:\n${resultParts.join('\n\n')}${deferNote}` });
     }
 
     if (!out.error && !out.done) {
 
         out.error = out.rounds === 0 ? 'no rounds executed' : `no ${finalToken} block produced`;
+        // THE fall-through class, and the one the lookup deferral made reachable:
+        // rounds ran, replies came back, no closing block survived. That is the
+        // model failing the contract, never the connection failing — the connection
+        // demonstrably worked, we read its answers. 'no rounds executed' cannot be
+        // reached with maxRounds >= 1 and is filed as internal.
+        out.errorKind = out.rounds === 0 ? 'internal' : 'protocol';
     }
     if (out.error) {
         addDebugLog('fail', `Memory Agent tool loop failed: ${out.error}`, {
             subsystem: 'agent3', event: 'toolloop.failed', reason: 'LOOP_ERROR',
-            data: { agent, rounds: out.rounds, toolCallCount: out.toolCallCount, error: out.error },
+            data: { agent, rounds: out.rounds, toolCallCount: out.toolCallCount, error: out.error, errorKind: out.errorKind },
         });
     } else {
         addDebugLog('pass', `Memory Agent tool loop done: ${out.rounds} round(s), ${out.toolCallCount} tool call(s)${out.sheet ? `, sheet ${out.sheet.length} chars` : ''}`, {

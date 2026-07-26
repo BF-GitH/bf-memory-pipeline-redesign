@@ -30,14 +30,37 @@ import * as host from './host.js';
 
 // Exported so the Health tab can list the memory agent's tool roster without
 // hardcoding it — this constant is the single source of truth for valid tools.
-export const KNOWN_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'write_fact', 'search', 'add_alias', 'link_facts'];
+//
+// list_categories was REMOVED from this roster (and from the reflection one) after
+// 78 measured messages in which neither agent called it once. That is not model
+// laziness: the tool cannot return anything the caller has not already read. Its
+// entire output is one `<Category> — N active fact(s)` line per entry of the fixed
+// L1_CATEGORIES list, while every extraction task block already opens with
+// `## Memory database overview` — `Populated drawers (aspect(count))` from
+// summarizeMenuIndexed plus `Stored keys` from summarizeKeys (agent-memory.js:887-893,
+// unconditional, with its own fallbacks). Those are the same category names carried
+// at per-aspect and per-key resolution: strictly more than list_categories returns.
+// So the tool costs one of a budget of 8 rounds to learn nothing, and it costs its
+// protocol line in every prompt on every turn. For reflection it is worse still —
+// like list_keys it deliberately does not unlock the read gate, so it cannot even
+// license the repair the pass exists to make.
+export const KNOWN_TOOLS = ['list_keys', 'read_facts', 'write_fact', 'search', 'add_alias', 'link_facts'];
 
 // Read subset of the reflection roster. Kept as its own export only because
 // REFLECTION_TOOLS is composed from it below; the read-key bookkeeping does NOT
 // consult it (recordReadKey is called directly from execReadFacts/execSearch,
 // because "unlocks a repair" is a property of what a tool RENDERS, not of it
 // being read-only — list_keys is read-only and deliberately does not unlock).
-export const REFLECTION_READ_TOOLS = ['list_categories', 'list_keys', 'read_facts', 'search'];
+//
+// list_keys is KEPT on both rosters, unlike list_categories, and the difference is
+// KEY_INVENTORY_CAP. `Stored keys` is capped at 200 lines and the cap's own
+// overflow text is the string 'use list_keys' (agent-memory.js:889) — so the task
+// block stops being a substitute for this tool at exactly the store size where the
+// tail it hides is the part worth reading. The measured run held 65 facts, which is
+// the only reason the two looked equally redundant. Its output is also richer than
+// the block's (`key | aspect | first 60 chars`, per category, versus a flat ref
+// list), and it is a member of LOOKUP_TOOLS, whose roster is deliberately untouched.
+export const REFLECTION_READ_TOOLS = ['list_keys', 'read_facts', 'search'];
 
 // Reflection's REPAIR tools. They exist only to fix records that are already
 // stored — creation stays with the extractor (and, for patterns, with the
@@ -58,12 +81,25 @@ export const REFLECTION_TOOLS = [...REFLECTION_READ_TOOLS, ...REFLECTION_WRITE_T
 // task block already ships the key inventory.
 export const LOOKUP_TOOLS = ['list_keys', 'read_facts', 'search'];
 
+// Names that are no longer on ANY agent's roster but must still PARSE. Dropping a
+// retired name straight out of ALL_TOOLS would turn it into a MALFORMED reply,
+// which burns the grace round and aborts the loop on the second offense — a
+// disproportionate punishment for a model that is doing exactly what the protocol
+// block in front of it still shows. Both prompts still carry the
+// `{"tool":"list_categories"}` example line (agent-memory.js:214,
+// agent-reflect.js:384); those two lines are the other half of this change and they
+// live in files this change does not own. Until they go, a model that copies the
+// example gets a one-line answer telling it where the inventory already is. After
+// they go, this entry can be deleted and the name will fall through to MALFORMED
+// like any other invention — which is the correct end state, not this one.
+const RETIRED_TOOLS = ['list_categories'];
+
 // Union of every tool name any agent may legally emit. The PARSER validates
 // against this, not against KNOWN_TOOLS: a name missing here is reported as
 // MALFORMED (which burns the grace round and aborts the loop on the second
 // offense) instead of coming back as an ordinary refusal the model can read
 // and correct.
-const ALL_TOOLS = [...new Set([...KNOWN_TOOLS, ...REFLECTION_TOOLS])];
+const ALL_TOOLS = [...new Set([...KNOWN_TOOLS, ...REFLECTION_TOOLS, ...RETIRED_TOOLS])];
 
 const LIST_KEYS_CAP = 80;
 
@@ -401,19 +437,21 @@ function safeNowContext() {
     try { return getTurnNowContext(); } catch { return null; }
 }
 
+// Retired (see RETIRED_TOOLS). It no longer returns the inventory, because
+// returning it is what made the call worth a round: the caller had already been
+// handed the same names at higher resolution before it was allowed to speak. This
+// answers in one line instead, names the block the answer is in, and points at the
+// tool that DOES render records — so a round spent here still ends with the model
+// knowing what to do next. Reflection never reaches this: list_categories is off
+// REFLECTION_TOOLS, so agent-reflect.js's roster check refuses it first.
 function execListCategories(ctx) {
-    const databases = ctx?.databases || {};
     const cats = effectiveCategories();
-    const lines = [];
-    const countActive = (db) => (db?.facts || []).reduce((n, f) => n + (isActiveFact(f) ? 1 : 0), 0);
-    for (const cat of cats) {
-        lines.push(`${cat} — ${countActive(databases[cat])} active fact(s)`);
-    }
-
-    for (const [cat, db] of Object.entries(databases)) {
-        if (!cats.includes(cat)) lines.push(`${cat} — ${countActive(db)} active fact(s) (legacy)`);
-    }
-    return lines.join('\n');
+    const extra = Object.keys(ctx?.databases || {}).filter(c => !cats.includes(c));
+    addDebugLog('debug', 'list_categories is retired — answered with a pointer to the task block', {
+        subsystem: 'agent3', event: 'memtool.retired', reason: 'LIST_CATEGORIES_RETIRED',
+        data: { runId: ctx?.runId || '', legacyCategories: extra },
+    });
+    return `NOTE: list_categories is retired — it only ever listed the fixed categories (${cats.join(', ')})${extra.length ? ` plus legacy ${extra.join(', ')}` : ''}, and your task block already shows those under "## Memory database overview" with per-aspect counts (Populated drawers) and the stored keys themselves. Use list_keys for one category's keys, or read_facts/search for the records.`;
 }
 
 function execListKeys(args, ctx) {
@@ -791,7 +829,11 @@ function execAddAlias(args, ctx) {
         relationships: { primary: [], secondary: [], tertiary: [] },
         source: sourceIndex !== null ? `msg_${sourceIndex}` : `agent_${ctx.runId || 'run'}`,
         importance: 4,
+        // Asserted by the TOOL, not passed through from the model: an alias record
+        // is a trait by construction. That distinction is the point of the omission
+        // in execWriteFact — this one really is somebody saying "trait".
         kind: 'trait',
+        category,
         aspect: 'aliases',
         subject: token,
         scope: 'character',
@@ -1026,7 +1068,20 @@ function execWriteFact(args, ctx) {
         knownBy = [...new Set(knownBy)];
     }
 
-    const kind = normalizeKind(args?.kind);
+    // NOT normalizeKind(args?.kind) unconditionally. normalizeKind answers 'trait'
+    // for undefined exactly as readily as for garbage, so a call that named no kind
+    // — which is EVERY extraction call, since the write_fact contract in the
+    // extraction prompt does not list `kind` at all — reached upsertFact already
+    // stamped 'trait'. deriveKind()'s AGENT branch exists to consult the model on
+    // the aspects that could honestly go either way, and passedKindOf() exists to
+    // tell "the caller said trait" from "the caller said nothing"; with the field
+    // pre-filled, passedKindOf() could never see the second case from this path, so
+    // that branch was unreachable (0 of 21 kind derivations in the measured run
+    // reported via:'AGENT') and every "agent said trait" line in the debug log was
+    // the extension quoting its own default back at itself. reflectRepairFact
+    // already gates on kindProvided the same way; this is the extraction half.
+    // upsertFact still stamps a kind on every record — omitting the field changes
+    // which RULE gets the credit, never whether the stored fact has one.
     const importance = clampImportance(args?.importance);
     const rawAspect = String(args?.aspect || '').trim();
     const aspect = normalizeAspect(canonicalizeLeafSurface(rawAspect) || rawAspect, category);
@@ -1046,11 +1101,27 @@ function execWriteFact(args, ctx) {
         relationships: { primary: [], secondary: [], tertiary: [] },
         source: sourceIndex !== null ? `msg_${sourceIndex}` : `agent_${ctx.runId || 'run'}`,
         importance,
-        kind,
+        // The category the record is being filed under, written WITH the record.
+        // canonicalizeCategories() stamps this field on load and calls the stamp a
+        // one-time migration; that was only ever true of a store that had stopped
+        // growing, because this object used to carry no `category` at all. Every
+        // agent write therefore arrived unstamped, the next load stamped it, set
+        // report.changed, and paid a full-store IndexedDB rewrite plus a snapshot —
+        // measured as stamped = 1,3,1,3,2,3,1,2 across eight consecutive loads,
+        // never 0. Writing it here is the producer-side fix: the pass finds nothing
+        // to stamp on a store nothing has been written to since, so `changed` is
+        // false and the rewrite does not happen. It also makes deriveAspect()
+        // resolve against the owning category's vocabulary from the first moment
+        // the fact exists rather than from the next load (before, an unstamped
+        // record resolved against Unsorted — the cause of aspectCounts.World being
+        // {misc: 8} in the analysed store).
+        category,
         aspect,
         subject: subjectFromKey(key),
         scope: scopeFromCategory(category),
     };
+    // Only when the model actually named one — see the normalizeKind note above.
+    if (kindProvided) fact.kind = normalizeKind(args.kind);
     if (note) fact.context = note;
     else if (noteProvided) fact.context = ''; // explicit empty note = clear it (mergeContext honors '')
     if (involved.length) fact.involved = involved;

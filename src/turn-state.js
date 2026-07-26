@@ -285,27 +285,52 @@ export function setMemorySheet(text, { runId = '', sourceMessageIndex = -1 } = {
 // been generated there is no way left to see WHICH sheet sat above it. That is
 // exactly the question "the memory forgot Portugal" asks.
 //
-// The ring lives here rather than on the debug ring on purpose. The debug ring
-// is 2000 entries shared with every other capture, so a long recording evicts
-// the oldest sheets first — the ones a regression hunt reaches furthest back
-// for. Keeping it separate also stores each sheet ONCE instead of once per trace
+// The ring lives here rather than on either log ring on purpose. Both are shared
+// with every other capture of a recorded turn, so a long recording evicts the
+// oldest sheets first — the ones a regression hunt reaches furthest back for.
+// Keeping it separate also stores each sheet ONCE instead of once per trace
 // entry that would otherwise quote it.
 //
 // Nothing here is persisted: no chatMetadata write, no attachment, and the ring
 // is dropped on chat switch (reloadSheetFromChat) so one chat's sheets can never
 // turn up in another chat's export.
 //
-// N = 50. The sizing rule is "every trace entry still on the debug ring should
-// still have its sheet". A recorded turn emits on the order of 40 trace entries
-// (three LLM calls with their prompts and replies, plus the tool reads and
-// writes), so the 2000-entry debug ring spans roughly 50 turns. Matching that
-// costs at most 50 x SHEET_HISTORY_MAX_CHARS = 600 KB of strings — a rounding
-// error next to the debug ring's own worst case, and typically far less because
-// a real sheet is a few KB.
+// N = 50. The sizing rule is "every trace entry still on the trace ring should
+// still have its sheet". BOTH halves of that rule have moved since it was
+// written and neither move has been acted on:
+//
+//   - Trace captures no longer share the 2000-entry debug ring. They have their
+//     own (debug-log.js MAX_TRACE_ENTRIES_MEM = 600) at ~34 captures per
+//     recorded turn, so the ring a sheet has to outlive spans ~17 turns, not
+//     ~50. Thirty of these 50 slots hold sheets whose trace entries are already
+//     gone.
+//   - 50 x SHEET_HISTORY_MAX_CHARS is still 600 KB of strings and still a
+//     rounding error next to the trace ring's own worst case (600 x 32000 =
+//     19.2 M chars). What is no longer true is "typically far less": see the cap
+//     below, the ring now runs AT its ceiling on every recorded turn.
 const SHEET_HISTORY_MAX = 50;
-// Mirrors the trace layer's per-string cap. A sheet is normally well under this;
-// the cap exists only so a runaway sheet cannot make the ring unbounded, and the
-// cut is marked in the text rather than hidden.
+// UNDERSIZED FOR THE SHEET THIS EXTENSION NOW BUILDS — read before trusting a
+// recorded sheet.
+//
+// This mirrors the trace layer's DEFAULT per-string cap (debug-log.js
+// TRACE_STRING_CHARS_DEFAULT), which is the tier for fact records and digests,
+// and it was sized when the composed sheet measured 6393 chars against a 65-fact
+// store and a premise floor of 15. The floor is now a slider defaulting to 50,
+// so composeSheet renders up to 50 floor rows + 45 NEED + 12 sticky + 8 extras =
+// 115 buildFactLine rows on top of the story/scene/timeline/precedence preamble.
+// At the SHIPPED DEFAULT that is 12-20 KB, i.e. at or over this cap; under
+// UNLIMITED it is hundreds of KB. The cap is therefore no longer a runaway
+// guard that never fires — it fires on essentially every recorded turn.
+//
+// What that costs, precisely: composeSheet appends the fact sections LAST
+// (STATE, then chrono, then `Connected memories:`), so the cut lands inside the
+// rows and takes the random-walk extras with it. The recorded sheet answers
+// "which memories did the storyteller see" only for the head of the list.
+//
+// Nothing here is silent — the cut is marked in the text with its own kept/total
+// counts, and the export's truncation manifest names this cap. Raising it is a
+// TWO-FILE change: debug-log.js hardcodes both this number and SHEET_HISTORY_MAX
+// in that manifest, so changing one without the other makes the manifest lie.
 const SHEET_HISTORY_MAX_CHARS = 12000;
 
 let sheetHistory = [];
