@@ -78,9 +78,24 @@ export function buildFactLine(fact, category, nowCtx = null) {
 
     const recency = nowCtx ? recencyTail(fact, nowCtx) : '';
 
-    if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${recency}`;
-    if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${recency}`;
+    // RESOLVED lifecycle (set by the state recheck's RESOLVED verdict): the row
+    // stays rendered — the model still needs the background — but its text is
+    // prefixed so no surface (sheet, retrieval, recheck feed) can present it as
+    // the current situation anymore. `resolvedNote` is the settled-message
+    // evidence, appended so the sheet says WHY the row is closed. Facts without
+    // a `status` field render exactly as before.
+    const isResolved = fact.status === 'resolved';
+    const resolvedTag = isResolved
+        ? `resolved (msg ${Number.isInteger(fact.resolvedAt) ? fact.resolvedAt : '?'}): `
+        : '';
+    const resolvedTail = (isResolved && typeof fact.resolvedNote === 'string' && fact.resolvedNote.trim())
+        ? ` — ${fact.resolvedNote.trim()}`
+        : '';
 
+    if (note) return `${prefix} ${category}/${fact.key}: ${resolvedTag}${note}${tone ? ` (${tone})` : ''}${resolvedTail}${recency}`;
+    if (hasValue) return `${prefix} ${category}/${fact.key} = ${resolvedTag}${fact.value}${resolvedTail}${recency}`;
+
+    if (isResolved) return `${prefix} ${category}/${fact.key}: ${resolvedTag.replace(/:\s*$/, '')}${resolvedTail}${recency}`;
     return `${prefix} ${category}/${fact.key}${recency}`;
 }
 

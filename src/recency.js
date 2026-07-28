@@ -60,6 +60,14 @@ export function splitInjectionSections(results) {
 }
 
 export const STATE_SECTION_HEADER = 'CURRENT STATE — what is true RIGHT NOW; absolute truth, overrides CHRONOLOGY and anything older in the chat:';
+// RESOLVED lifecycle: a fact whose tension the story has worked through stays on
+// the sheet — the model still needs it as background — but it must stop shipping
+// under the "true RIGHT NOW" header, which is what kept the measured run
+// re-litigating settled conflicts every turn. Rendered as its own subsection
+// directly below CURRENT STATE; deliberately NOT matching the fact-row grammar,
+// so extractPriorStateLines closes the state block before these rows and no
+// recheck verdict is ever owed on an already-resolved fact.
+export const RESOLVED_SECTION_HEADER = 'RESOLVED (settled earlier — still true as background; do NOT re-open or re-litigate unprompted):';
 export const CHRONO_SECTION_HEADER = 'CHRONOLOGY — past events and background, oldest first; context only, do NOT replay as happening now:';
 
 export function buildPrecedencePreamble(nowCtx) {

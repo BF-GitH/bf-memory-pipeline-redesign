@@ -24,7 +24,7 @@ import { tokenSet } from './tokenize.js';
 import { isFactVisible, buildFactLine, randomWalkExtras } from './fact-retrieval.js';
 import {
     getTurnNowContext, splitInjectionSections, buildPrecedencePreamble,
-    STATE_SECTION_HEADER, CHRONO_SECTION_HEADER,
+    STATE_SECTION_HEADER, RESOLVED_SECTION_HEADER, CHRONO_SECTION_HEADER,
 } from './recency.js';
 import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
 import { countSentenceEnds } from './sentence-util.js';
@@ -176,6 +176,29 @@ const CANDIDATE_VALUE_CHARS = 70;
 // instead of the cap silently shaping behaviour.
 const STATE_RECHECK_MAX = 8;
 const STATE_SUPERSEDE_MAX = 3;
+// RESOLVED — the third verdict, and the lifecycle SUPERSEDE cannot express. In
+// the analysed run reflection-written trait rows (People/chloe_distrusts_kindness)
+// shipped as "true RIGHT NOW" long after the narrative had worked the conflict
+// through: SUPERSEDE was the wrong tool (there is no replacement value — the
+// trait was not falsified, its tension was settled) so the run logged 0
+// SUPERSEDEs and the model re-litigated the same conflict endlessly. RESOLVED
+// keeps the fact stored and injected (the model still needs it as background)
+// but moves it out of CURRENT STATE. Same anti-reflex cap as SUPERSEDE: mass-
+// resolving the checklist would be silence in a new costume.
+const STATE_RESOLVE_MAX = 3;
+// The recheck ranking's tiebreak sorts rows WITHOUT validAt last ("unknown age
+// is not evidence of staleness") — correct for dated rows, but reflection-
+// written traits have no validAt at all, and in a solo scene scores cluster
+// (the subject leaks into every row via the key, so many rows share exactly one
+// token with the messages and tie). A validAt-less trait therefore lost every
+// tie and could sit below the 8-row cap for the whole chat: never asked, never
+// resolvable. This quota guarantees the best-scoring validAt-less rows up to
+// this many of the STATE_RECHECK_MAX slots — only when they scored at all, so
+// the "no shared token, no question" rule still holds.
+const STATE_RECHECK_NOVALIDAT_MIN = 2;
+// resolvedNote is evidence, not prose storage — clipped like the recheck feed
+// lines are, so a rambling verdict cannot grow the sheet row unboundedly.
+const RESOLVED_NOTE_CHARS = 160;
 // Rows are fed VERBATIM as the sheet rendered them (knownBy prefix and recency
 // tail included — how old a claim is, is evidence about it). The longest row in
 // the analysed run was 280 chars; the clip only bounds the pathological case.
@@ -239,8 +262,9 @@ End your LAST reply with a line that is exactly \`#DONE\` (nothing else on it).
 
 STATE: Category/key | UNCHANGED
 STATE: Category/key | SUPERSEDE | <what is true NOW — self-contained, replaces the whole row>
+STATE: Category/key | RESOLVED | <where the story settled it, in the SETTLED message's own words>
 
-UNCHANGED is the default. SUPERSEDE needs a SETTLED message that makes the row false — pointable evidence, never inference; a TENTATIVE reply may inform the verdict but never justifies one, and this is CHECKED: write the replacement in the SETTLED message's own words, because a SUPERSEDE sharing no content word with the SETTLED text is refused and the stale row stands. Reversible ("she may put it back on") is still SUPERSEDE: the row claims the present, so it must describe the present. Max 3 SUPERSEDE per turn; a ref not on the list is ignored.
+UNCHANGED is the default. SUPERSEDE needs a SETTLED message that makes the row false — pointable evidence, never inference; a TENTATIVE reply may inform the verdict but never justifies one, and this is CHECKED: write the replacement in the SETTLED message's own words, because a SUPERSEDE sharing no content word with the SETTLED text is refused and the stale row stands. Reversible ("she may put it back on") is still SUPERSEDE: the row claims the present, so it must describe the present. RESOLVED is for a row whose tension the story has WORKED THROUGH — the conflict was confronted, answered or laid to rest on-screen, so the row is true background but no longer the live situation; the fact is KEPT (not replaced — no new value needed, lower bar than SUPERSEDE) and stops being presented as present-tense truth. Still needs pointable SETTLED evidence: the third field quotes the settling moment. Max 3 SUPERSEDE and 3 RESOLVED per turn; a ref not on the list is ignored.
 
 # WHAT TO STORE
 
@@ -1448,6 +1472,11 @@ function buildStateRecheckSection({ priorSheetText, settledMessages, tentativeMe
             const fact = findFactMatch(db, p.key);
             if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
             if (fact.cold === true) continue;
+            // Already-resolved facts owe no verdict: they render in the RESOLVED
+            // subsection now, not as present-tense truth, so the only verdicts
+            // left for them would be noise. (Also guards the one-turn window in
+            // which the prior sheet predates the resolution.)
+            if (fact.status === 'resolved') continue;
             // `db` rides along so a write can be re-resolved in the SAME store
             // object afterwards (restoreEveryoneKnownBy). It is a live record —
             // it must never reach addDebugLog or traceCapture, and the entry is
@@ -1485,10 +1514,41 @@ function buildStateRecheckSection({ priorSheetText, settledMessages, tentativeMe
             // evidence of staleness.
             const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : Number.MAX_SAFE_INTEGER;
             const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : Number.MAX_SAFE_INTEGER;
+            if (av === bv && av === Number.MAX_SAFE_INTEGER) {
+                // Both undated (typically reflection-written traits): lastUpdated
+                // is the only age signal left — longest-untouched first, the same
+                // "drift accumulates where nothing revisits" rationale as above.
+                return (Number(a.fact.lastUpdated) || 0) - (Number(b.fact.lastUpdated) || 0);
+            }
             return av - bv;
         });
 
         const picked = scored.slice(0, STATE_RECHECK_MAX);
+        // THE validAt-LESS QUOTA (see STATE_RECHECK_NOVALIDAT_MIN). Undated rows
+        // lose every score tie by construction, and in the analysed run they were
+        // therefore NEVER asked — the exact rows (reflection traits) that kept
+        // shipping as "true RIGHT NOW" after the story had moved on. When the cap
+        // bites and the pick carries fewer undated rows than the quota, the
+        // best-scoring undated rows below the cut replace dated rows from the
+        // TAIL of the pick — the top-scored questions are untouched, and a row
+        // only enters this way if it scored at all (the zero test above stands).
+        if (scored.length > picked.length) {
+            const undated = (e) => !Number.isInteger(e.fact?.validAt);
+            let have = picked.filter(undated).length;
+            const wanted = Math.min(STATE_RECHECK_NOVALIDAT_MIN, scored.filter(undated).length);
+            if (have < wanted) {
+                // Best-scoring first, truncated to what the quota still needs;
+                // consumed from the END while walking the pick from its tail, so
+                // the best promoted row lands in the earliest replaced slot —
+                // fed order is also the supersede-cap priority, so it matters.
+                const promotions = scored.slice(picked.length).filter(undated).slice(0, wanted - have);
+                for (let i = picked.length - 1; i >= 0 && promotions.length > 0; i--) {
+                    if (undated(picked[i])) continue;
+                    picked[i] = promotions.pop();
+                    have++;
+                }
+            }
+        }
         // The two vocabularies the write gate compares a SUPERSEDE against.
         // Built here because both windows are already in hand, and deliberately
         // AFTER the scoring: the tentative text ranks nothing and picks nothing —
@@ -1554,11 +1614,14 @@ function parseStateVerdicts(text) {
             out.push({ category, key, verdict: 'UNCHANGED', value: '' });
             continue;
         }
-        if (!/^SUPERSEDE/.test(verdict)) continue;
+        if (!/^SUPERSEDE/.test(verdict) && !/^RESOLVED/.test(verdict)) continue;
         // Re-join: a new value may legitimately contain a pipe.
         const value = parts.slice(2).join('|').trim();
+        // Same doctrine for both verdicts: SUPERSEDE without a replacement names
+        // a row as wrong without saying what is right; RESOLVED without evidence
+        // closes a row without saying what closed it. Both are DROPPED.
         if (!value) continue;
-        out.push({ category, key, verdict: 'SUPERSEDE', value });
+        out.push({ category, key, verdict: /^RESOLVED/.test(verdict) ? 'RESOLVED' : 'SUPERSEDE', value });
     }
     return out;
 }
@@ -1731,7 +1794,7 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
     const stats = {
         asked: stateRecheck.entries.length,
         verdicts: verdicts.length,
-        unchanged: 0, superseded: 0, unanswered: 0,
+        unchanged: 0, superseded: 0, resolved: 0, unanswered: 0,
         unlisted: 0, noop: 0, capped: 0, failed: 0,
         repeated: 0, contradicted: 0, ungrounded: 0, tentativeOnly: 0, knownByRestored: 0, reDated: 0,
         applied: [],
@@ -1742,6 +1805,7 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
     const answered = new Set();
     const firstByRef = new Map();
     const supersedes = [];
+    const resolves = [];
     for (const v of verdicts) {
         // `World/x` and `Places/x` are the same record, and legacy categories are
         // still all over this store — so every comparison below happens on the
@@ -1770,6 +1834,7 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
         if (!entry) { stats.unlisted++; continue; }
         answered.add(ref);
         if (v.verdict === 'UNCHANGED') { stats.unchanged++; continue; }
+        if (v.verdict === 'RESOLVED') { resolves.push({ entry, value: v.value }); continue; }
         supersedes.push({ entry, value: v.value });
     }
     stats.unanswered = stats.asked - answered.size;
@@ -1778,6 +1843,7 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
     // EVIDENCE ranking put first rather than the ones the model listed first —
     // reply order is arbitrary, the fed order is scored.
     supersedes.sort((a, b) => (order.get(a.entry.ref.toLowerCase()) ?? 0) - (order.get(b.entry.ref.toLowerCase()) ?? 0));
+    resolves.sort((a, b) => (order.get(a.entry.ref.toLowerCase()) ?? 0) - (order.get(b.entry.ref.toLowerCase()) ?? 0));
 
     for (const s of supersedes) {
         if (stats.superseded >= STATE_SUPERSEDE_MAX) { stats.capped++; continue; }
@@ -1909,12 +1975,64 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
         });
     }
 
+    // RESOLVED — the lifecycle stamp, deliberately NOT a write_fact. The design
+    // decision this encodes: a resolved fact STAYS in the store and STAYS on the
+    // sheet (the model still needs the background — deleting or superseding it
+    // is what re-opens old conflicts as "new" information), it just stops being
+    // sold as the current situation. So value/note are untouched; only the
+    // lifecycle fields are stamped, on the SAME live record composeSheet reads
+    // (entry.fact IS db.facts[i] here — no upsert replaced it), and persistence
+    // rides the same ctx.touchedCategories -> saveDatabase pass every supersede
+    // and post-write repair above already relies on.
+    //
+    // The evidence gate is the SUPERSEDE gate's lower bar, by design: no
+    // novel-claim subtraction and no replacement value (a resolution asserts
+    // nothing new about the present), but the quoted settling moment must share
+    // at least one content stem with the SETTLED window — otherwise its wording
+    // came from tentative text or from the model alone, and a verdict that can
+    // retire a row from CURRENT STATE must not be free.
+    for (const s of resolves) {
+        if (stats.resolved >= STATE_RESOLVE_MAX) { stats.capped++; continue; }
+        const fact = s.entry.fact;
+        if (fact.status === 'resolved') { stats.noop++; continue; }
+        const evidenceStems = [...groundingStems(s.value)];
+        if (evidenceStems.length > 0 && !evidenceStems.some(t => stateRecheck.settledStems.has(t))) {
+            const fromTentative = evidenceStems.filter(t => stateRecheck.tentativeStems.has(t));
+            stats.ungrounded++;
+            if (fromTentative.length > 0) stats.tentativeOnly++;
+            addDebugLog('info', `[${runId}] State recheck: RESOLVED ${s.entry.ref} refused — ${fromTentative.length > 0 ? 'its evidence traces to a TENTATIVE reply, not to any settled message' : 'nothing in its evidence appears in the settled messages'} (unmatched: ${evidenceStems.slice(0, 8).join(', ')})`, {
+                subsystem: 'agent3', event: 'agent3.state_recheck',
+                reason: fromTentative.length > 0 ? 'RESOLVED_TENTATIVE_ONLY' : 'RESOLVED_UNGROUNDED',
+                data: { ref: s.entry.ref, evidence: evidenceStems.slice(0, 8), runId },
+                before: String(fact.context || fact.value || ''), after: s.value,
+            });
+            continue;
+        }
+        const before = (typeof fact.context === 'string' && fact.context.trim()) || String(fact.value ?? '').trim();
+        fact.status = 'resolved';
+        if (Number.isInteger(ctx?.sourceIndex)) fact.resolvedAt = ctx.sourceIndex;
+        fact.resolvedNote = clipText(s.value, RESOLVED_NOTE_CHARS);
+        // lastUpdated moves — a resolution IS a revisit, and recency rankings
+        // (cold tier, floor tiebreaks) should see the row as freshly judged.
+        fact.lastUpdated = Date.now();
+        if (s.entry.db) s.entry.db.updatedAt = Date.now();
+        if (!(ctx.touchedCategories instanceof Set)) ctx.touchedCategories = new Set();
+        ctx.touchedCategories.add(s.entry.category);
+        stats.resolved++;
+        stats.applied.push({ ref: s.entry.ref, before, after: `resolved (msg ${fact.resolvedAt ?? '?'}): ${s.value}`, result: 'RESOLVED' });
+        addDebugLog('info', `[${runId}] State recheck: RESOLVED ${s.entry.ref} — kept as background, no longer presented as current state ("${clipText(s.value, 80)}")`, {
+            subsystem: 'agent3', event: 'fact.resolved', reason: 'STATE_RECHECK',
+            data: { ref: s.entry.ref, resolvedAt: Number.isInteger(fact.resolvedAt) ? fact.resolvedAt : null, runId },
+            before, after: s.value,
+        });
+    }
+
     // `unanswered` is the compliance number the whole feature turns on: the
     // prompt calls the verdict mandatory, and this is the only place that can
     // say whether the agent actually treated it as mandatory. Logged at info on
     // every run (not only when non-zero) so the rate is readable straight off
     // the run log rather than reconstructable.
-    addDebugLog(stats.unanswered > 0 ? 'info' : 'pass', `[${runId}] State recheck: ${stats.asked} row(s) asked, ${stats.unchanged} UNCHANGED, ${stats.superseded} superseded, ${stats.unanswered} unanswered${stats.capped ? `, ${stats.capped} over cap` : ''}${stats.unlisted ? `, ${stats.unlisted} for unlisted refs (refused)` : ''}${stats.ungrounded ? `, ${stats.ungrounded} without settled evidence (refused${stats.tentativeOnly ? `, ${stats.tentativeOnly} tentative-only` : ''})` : ''}${stats.noop ? `, ${stats.noop} no-op` : ''}${stats.contradicted ? `, ${stats.contradicted} contradicted by a later verdict for the same ref (first kept)` : ''}${stats.repeated ? `, ${stats.repeated} repeated` : ''}${stats.knownByRestored ? `, ${stats.knownByRestored} known-by restored` : ''}${stats.reDated ? `, ${stats.reDated} re-dated to this message` : ''}${stats.failed ? `, ${stats.failed} refused by write_fact` : ''}`, {
+    addDebugLog(stats.unanswered > 0 ? 'info' : 'pass', `[${runId}] State recheck: ${stats.asked} row(s) asked, ${stats.unchanged} UNCHANGED, ${stats.superseded} superseded, ${stats.resolved} resolved, ${stats.unanswered} unanswered${stats.capped ? `, ${stats.capped} over cap` : ''}${stats.unlisted ? `, ${stats.unlisted} for unlisted refs (refused)` : ''}${stats.ungrounded ? `, ${stats.ungrounded} without settled evidence (refused${stats.tentativeOnly ? `, ${stats.tentativeOnly} tentative-only` : ''})` : ''}${stats.noop ? `, ${stats.noop} no-op` : ''}${stats.contradicted ? `, ${stats.contradicted} contradicted by a later verdict for the same ref (first kept)` : ''}${stats.repeated ? `, ${stats.repeated} repeated` : ''}${stats.knownByRestored ? `, ${stats.knownByRestored} known-by restored` : ''}${stats.reDated ? `, ${stats.reDated} re-dated to this message` : ''}${stats.failed ? `, ${stats.failed} refused by write_fact` : ''}`, {
         subsystem: 'agent3', event: 'agent3.state_recheck',
         data: { ...stats, applied: stats.applied.length, supersedeCap: STATE_SUPERSEDE_MAX, askCap: STATE_RECHECK_MAX, runId },
     });
@@ -2405,7 +2523,13 @@ const PREMISE_FLOOR_QUOTAS = [
     // "true RIGHT NOW", and the recheck can only repair a row the sheet is
     // currently injecting — a state that falls out of the floor is unreparable
     // for the rest of the chat. Largest share for the smallest bucket.
-    { id: 'state', min: 2, share: 0.40, test: (f) => f.kind === 'state' },
+    // status === 'resolved' rows are OUT of this bucket: its 40% share exists
+    // because live states rot under the "true RIGHT NOW" header, and a resolved
+    // row no longer ships under that header — letting it hold a state slot
+    // would spend the urgency budget on rows that are already past tense. They
+    // stay floor-ELIGIBLE (remainder pass, deprioritized in floorRank), because
+    // the design is "keep the background in context", never "drop it".
+    { id: 'state', min: 2, share: 0.40, test: (f) => f.kind === 'state' && f.status !== 'resolved' },
     // Who the characters ARE. The bucket the old sort starved.
     { id: 'identity', min: 2, share: 0.25, test: (f, cat) => f.kind === 'trait' && cat !== 'Places' && cat !== 'Relationships' && cat !== 'World' },
     // The premise beats (cube arrival, teleport, pregnancy). Capped, not
@@ -2421,6 +2545,12 @@ const PREMISE_FLOOR_QUOTAS = [
 ];
 
 function floorRank(a, b) {
+    // Resolved rows rank below live rows of ANY importance: they are settled
+    // background, and at a tight cap a live row is always the better spend. They
+    // remain selectable (buckets they still match, and the remainder pass), so
+    // the background never becomes unreachable — it just never evicts the present.
+    const resolvedDiff = (a.fact?.status === 'resolved' ? 1 : 0) - (b.fact?.status === 'resolved' ? 1 : 0);
+    if (resolvedDiff !== 0) return resolvedDiff;
     const impDiff = clampImportance(b.fact.importance) - clampImportance(a.fact.importance);
     if (impDiff !== 0) return impDiff;
     return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
@@ -2913,10 +3043,30 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     } catch {  }
     lines.push(buildPrecedencePreamble(nowCtx));
 
-    const renderSection = (header, sectionRows) => {
+    // RESOLVED lifecycle: rows the state recheck stamped `status: 'resolved'`
+    // leave CURRENT STATE — that header sells them as "true RIGHT NOW", which is
+    // what kept the measured run re-litigating settled conflicts every turn —
+    // and render in their own subsection directly below. They are NOT dropped:
+    // the model still needs the background, it just must not treat it as live.
+    // Facts without a status field split exactly as before.
+    const liveState = state.filter(r => r?.fact?.status !== 'resolved');
+    const resolvedState = state.filter(r => r?.fact?.status === 'resolved');
+
+    // KEY DEDUPE across sections: any ref already rendered under CURRENT STATE
+    // (incl. the RESOLVED subsection) is suppressed in CHRONOLOGY / extras.
+    // Exact category/key match only — no semantic guessing. Today `seen`
+    // already makes cross-section duplicates of one record impossible, so this
+    // is a guard on the rendering layer itself: whatever feeds a section later,
+    // one sheet never asserts the same key twice.
+    const renderedRefs = new Set();
+    let dedupSuppressed = 0;
+    const renderSection = (header, sectionRows, dedupe = false) => {
         const admitted = [];
         for (const r of sectionRows) {
-            admitted.push(buildFactLine(r.fact, r.category, nowCtx)); 
+            const refId = `${r.category}/${r.fact.key}`;
+            if (dedupe && renderedRefs.has(refId)) { dedupSuppressed++; continue; }
+            renderedRefs.add(refId);
+            admitted.push(buildFactLine(r.fact, r.category, nowCtx));
         }
         if (admitted.length > 0) {
             lines.push(header);
@@ -2925,9 +3075,16 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         return admitted.length;
     };
 
-    renderSection(STATE_SECTION_HEADER, state);
-    renderSection(CHRONO_SECTION_HEADER, chrono);
-    renderSection('Connected memories:', extras);
+    renderSection(STATE_SECTION_HEADER, liveState);
+    renderSection(RESOLVED_SECTION_HEADER, resolvedState);
+    renderSection(CHRONO_SECTION_HEADER, chrono, true);
+    renderSection('Connected memories:', extras, true);
+
+    if (dedupSuppressed > 0) {
+        addDebugLog('debug', `${logTag}Sheet: ${dedupSuppressed} row(s) suppressed — same category/key already rendered in CURRENT STATE/RESOLVED`, {
+            subsystem: 'agent3', event: 'sheet.dedupe', data: { suppressed: dedupSuppressed },
+        });
+    }
 
     return lines.join('\n');
 }
