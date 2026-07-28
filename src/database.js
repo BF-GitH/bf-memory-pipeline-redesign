@@ -1902,6 +1902,16 @@ async function loadAllDatabasesRaw(avatar) {
 
             const mergedTombs = mergeTombstones(rec && rec.deletedCategories, attachTombs);
             const relocatedCats = []; // shrank, but every missing key resurfaced elsewhere
+            // Value guard FIRST, key guard second: the clobber guard below can only
+            // see keys the snapshot LOST, so before any adoption path runs, every
+            // key held on both sides keeps whichever copy has the newer per-fact
+            // lastUpdated. attachMap is replaced, not mutated — the guard's
+            // unrelocatedKeys() checks key presence only, which the value merge
+            // never changes.
+            const valueGuard = idbHasData
+                ? mergeNewerLocalFacts(attachMap, idbDatabases)
+                : { map: attachMap, keptByCat: {}, keptCount: 0 };
+            const attachAdopt = valueGuard.map;
             if (idbHasData) {
 
                 const categoryRecency = (sdb) => {
@@ -1939,7 +1949,7 @@ async function loadAllDatabasesRaw(avatar) {
                 }
                 if (refusedCats.length > 0) {
 
-                    const merged = { ...attachMap };
+                    const merged = { ...attachAdopt };
                     for (const cat of refusedCats) merged[cat] = idbDatabases[cat];
                     await idbPutDatabases(avatar, merged, attachStamp, mergedTombs);
                     addDebugLog('info', 'Rehydrate partially refused: kept local categories the snapshot would SHRINK (clobber guard)', {
@@ -1948,6 +1958,7 @@ async function loadAllDatabasesRaw(avatar) {
                             attachStamp, idbStamp, avatar, decision: 'PARTIAL_ADOPT',
                             refusedCategories: refusedCats, tombstoneDeletes: adoptedDeletes,
                             relocatedCategories: relocatedCats, missingKeys: missingByCat,
+                            valueGuardKept: valueGuard.keptCount, valueGuardKeys: valueGuard.keptByCat,
 
                             categoriesBefore: countCats(idbDatabases), factsBefore: countFacts(idbDatabases),
                             categoriesAfter: countCats(merged), factsAfter: countFacts(merged),
@@ -1962,18 +1973,19 @@ async function loadAllDatabasesRaw(avatar) {
                     });
                 }
             }
-            await idbPutDatabases(avatar, attachMap, attachStamp, mergedTombs);
+            await idbPutDatabases(avatar, attachAdopt, attachStamp, mergedTombs);
             addDebugLog('info', 'Rehydrated IndexedDB from newer attachment snapshot', {
                 subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'NEWER_SNAPSHOT',
                 data: {
                     attachStamp, idbStamp, avatar, decision: 'ADOPT_ATTACHMENT',
                     relocatedCategories: relocatedCats,
+                    valueGuardKept: valueGuard.keptCount, valueGuardKeys: valueGuard.keptByCat,
 
                     categoriesBefore: countCats(idbDatabases), factsBefore: countFacts(idbDatabases),
-                    categoriesAfter: countCats(attachMap), factsAfter: countFacts(attachMap),
+                    categoriesAfter: countCats(attachAdopt), factsAfter: countFacts(attachAdopt),
                 },
             });
-            return attachMap;
+            return attachAdopt;
         }
 
         if (idbHasData) return stripLegacyEmbeddings(rec.databases);
@@ -2002,6 +2014,55 @@ function unrelocatedKeys(cat, localFacts, attachMap) {
         missing.push(f.key);
     }
     return missing;
+}
+
+// Value-level companion to the clobber guard above. That guard catches keys the
+// snapshot LOST; it is blind to a key that exists on both sides where the
+// snapshot holds an OLDER value. attachmentSnapshotStamp() dates the attachment,
+// not its content, so a snapshot serialized moments before an agent save but
+// stamped after it adopts cleanly and silently rolls the value back — observed
+// in the v0.81.0 test run, where a reflection update to a Relationships fact was
+// reverted three seconds after it was written and the rollback persisted for the
+// rest of the session. Per-fact `lastUpdated` is the only content-derived clock
+// available, so on a key collision the newer side wins; a tie keeps the
+// snapshot's copy (the pre-existing behaviour). Keys on one side only are left
+// exactly as the key-level guard decides — this merge never adds or removes a
+// key, so unrelocatedKeys() sees the same key sets either way.
+function mergeNewerLocalFacts(attachMap, idbDatabases) {
+    const keptByCat = {};
+    let keptCount = 0;
+    let merged = attachMap;
+    for (const [cat, sdb] of Object.entries(idbDatabases || {})) {
+        const localFacts = (sdb && Array.isArray(sdb.facts)) ? sdb.facts : [];
+        if (localFacts.length === 0) continue;
+        const adb = merged[cat];
+        const attachFacts = (adb && Array.isArray(adb.facts)) ? adb.facts : null;
+        if (!attachFacts || attachFacts.length === 0) continue;
+        let indexByKey = null;
+        for (const lf of localFacts) {
+            if (!lf || typeof lf !== 'object' || !lf.key) continue;
+            if (indexByKey === null) {
+                indexByKey = new Map();
+                attachFacts.forEach((af, i) => { if (af && af.key) indexByKey.set(af.key, i); });
+            }
+            const idx = indexByKey.get(lf.key);
+            if (idx === undefined) continue;
+            if ((Number(lf.lastUpdated) || 0) <= (Number(attachFacts[idx]?.lastUpdated) || 0)) continue;
+            // Copy-on-first-win so callers holding attachMap never see a mutation.
+            if (merged === attachMap) merged = { ...attachMap };
+            if (merged[cat] === adb) merged[cat] = { ...adb, facts: adb.facts.slice() };
+            merged[cat].facts[idx] = lf;
+            (keptByCat[cat] = keptByCat[cat] || []).push(lf.key);
+            keptCount++;
+        }
+    }
+    if (keptCount > 0) {
+        addDebugLog('info', `Rehydrate value guard: kept ${keptCount} newer local fact value(s) a same-key snapshot row would have rolled back`, {
+            subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'VALUE_GUARD',
+            data: { keptByCat },
+        });
+    }
+    return { map: merged, keptByCat, keptCount };
 }
 
 function attachmentSnapshotStamp(avatar, parsedMap) {
