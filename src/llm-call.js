@@ -33,7 +33,12 @@ import * as host from './host.js';
 // combination is unreachable; the tripwire at the deferral site logs it at fail
 // level if a future caller ever makes it reachable, rather than letting a prompt
 // quietly start lying.
-export const FINAL_BLOCK_WRITE_TOOLS = ['write_fact', 'link_facts'];
+// add_alias earns its slot the same way link_facts does: additive, idempotent,
+// and touching no stored value — there is nothing a feedback round could veto.
+// Measured cost of leaving it out (v0.81.0 test run): the only add_alias of the
+// whole session rode alongside the final block and was dropped, and no later
+// round ever re-issued it.
+export const FINAL_BLOCK_WRITE_TOOLS = ['write_fact', 'link_facts', 'add_alias'];
 
 // Does this tool MUTATE the store? Used only to tell a DISCARDED WRITE apart
 // from an ignored read when classifying what was thrown away alongside the final
@@ -547,6 +552,16 @@ export async function callAgentLLMWithTools({
     // Default false keeps extraction and reflection byte-for-byte on the old
     // behaviour (FINAL_BLOCK_WRITE_TOOLS below).
     readsForceAnotherRound = false,
+    // LOOKUP PATH ONLY (agent-lookup.js passes true; nothing else does). A final
+    // verdict delivered with ZERO tool calls executed across the whole run gets
+    // ONE correction round demanding an actual search before the verdict stands.
+    // Protocol-legal but unverified: measured on the v0.81.0 test run, ~93% of
+    // lookup passes answered "REFS: none" without a single search — the pass ran
+    // its latency budget every turn and looked at nothing. Second idle verdict
+    // after the correction is accepted as-is: a model that searched and STILL
+    // says none is the honest outcome this option exists to force, and a model
+    // that refuses to search twice should not cost a third round every turn.
+    requireToolCallBeforeDone = false,
     signal = null,
     // Test-run trace correlation, both plain strings, both optional.
     // runId MUST be passed explicitly: it is populated automatically only inside
@@ -614,6 +629,7 @@ export async function callAgentLLMWithTools({
         { role: 'user', content: String(userPrompt || '') },
     ];
     let graceUsed = false;
+    let idleGraceUsed = false;
     const loopStart = Date.now();
 
     for (let round = 1; round <= maxRounds; round++) {
@@ -750,6 +766,32 @@ export async function callAgentLLMWithTools({
             out.errorKind = 'protocol';
             entry.note = 'tool-call cap overrun';
             break;
+        }
+
+        // The idle-verdict correction (requireToolCallBeforeDone above). Fires
+        // at most once per run, only when the reply closes with the final token,
+        // carries no tool call, and no tool has run in any earlier round either.
+        // `round < maxRounds` for the same reason the deferral below guards on
+        // it: with no round left to restate the verdict in, the correction could
+        // only destroy the answer, so the idle verdict stands.
+        if (requireToolCallBeforeDone && parsed.done && !idleGraceUsed
+            && out.toolCallCount === 0 && parsed.calls.length === 0
+            && round < maxRounds) {
+            idleGraceUsed = true;
+            entry.note = 'idle verdict — search demanded';
+            addDebugLog('info', `[${agent}] Verdict with zero tool calls executed — correction round issued demanding at least one search`, {
+                subsystem: 'agent3', event: 'toolloop.idlefinal', reason: 'SEARCH_REQUIRED',
+                data: { agent, round },
+            });
+            const idleCorrection = 'Your reply delivered a verdict without executing a single tool call this run. Do not judge from the prompt alone: emit at least one {"tool":"search",...} (or read_facts / list_keys) line NOW — batching several in one reply is fine. You will get their TOOL RESULTS back, then restate your final answer with the results in hand. If they genuinely add nothing, your original verdict remains a valid final answer.';
+            messages.push({ role: 'assistant', content: reply });
+            messages.push({ role: 'user', content: idleCorrection });
+            if (isTraceRecording()) {
+                traceCapture(`${traceNs(agent)}.prompt.correction`, () => ({
+                    agent, round, detail: 'idle final: verdict with zero executed tool calls', correction: idleCorrection,
+                }), { runId, callId: traceCallId, round });
+            }
+            continue;
         }
 
         // A READ that arrived in the same reply as the closing block. For

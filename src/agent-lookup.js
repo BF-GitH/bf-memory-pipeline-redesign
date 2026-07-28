@@ -52,11 +52,16 @@ import * as host from './host.js';
 // they are far tighter than the extraction agent's 8 rounds / 24 tool calls.
 //
 // 2 rounds is the minimum that can do the job at all: round 1 searches, round 2
-// answers with what the results showed. A third round buys a second search on a
-// miss, and a second search is worth less than the second of latency it costs.
+// answers with what the results showed. The third round exists for exactly one
+// caller: the idle-verdict correction (requireToolCallBeforeDone below). When
+// round 1 delivers a verdict with zero searches, the correction consumes a
+// round — and a 2-round budget would leave the demanded search to run BLIND on
+// the final round, its results never fed back. A ceiling, not a target: a pass
+// that searches in round 1 still closes in round 2, so the third round costs
+// latency only on turns that were previously answering with nothing.
 // 4 tool calls fit "search the two or three things this message names" with one
 // call to spare for a read_facts confirmation.
-export const LOOKUP_MAX_ROUNDS = 2;
+export const LOOKUP_MAX_ROUNDS = 3;
 export const LOOKUP_MAX_TOOL_CALLS = 4;
 
 // WALL-CLOCK DEADLINE for the WHOLE pass. Non-negotiable: when it bites the
@@ -259,7 +264,9 @@ Each tool call is ONE line of strict JSON, alone on its line:
 
 The system replies with one "TOOL RESULTS:" message; then you finish. Several call lines in one reply are fine; no markdown fences, no multi-line JSON.
 
-HARD LIMITS: 2 rounds, 4 tool calls. THE USER IS WAITING — this runs while the reply is held. Round 1: every search you want, all at once. Round 2: the final reply. There is no round 3, and a slow answer is a wasted one.
+HARD LIMITS: 3 rounds, 4 tool calls. THE USER IS WAITING — this runs while the reply is held. Round 1: every search you want, all at once. Round 2: the final reply. A slow answer is a wasted one.
+
+SEARCH BEFORE YOU JUDGE: you MUST execute at least one tool call (search / read_facts / list_keys) before delivering your verdict. The store holds things the sheet does not carry — "the sheet looks complete" is a guess until a search says so. A verdict with zero tool calls will be sent back to you with a demand to search first.
 
 # HOW TO SEARCH
 
@@ -275,7 +282,7 @@ REFS: none
 - VERIFIED refs only — a ref you saw in a tool result this session. Never invented, never reconstructed from a key that merely looks likely.
 - ONLY what THIS message needs: what it asks about, names, calls back to, doubts or contradicts. Not "related", not "good to have".
 - \`## Already on the sheet\` is going to the storyteller anyway. Listing one of those changes nothing and wastes a slot.
-- Max 6. Fewer is better. \`REFS: none\` is a correct and COMMON answer — small talk, an emote or a reply that only continues the current beat needs nothing, and you may answer it in round 1 without calling any tool.
+- Max 6. Fewer is better. \`REFS: none\` is a correct and COMMON answer — small talk, an emote or a reply that only continues the current beat often needs nothing — but only AFTER at least one search came back empty or already-covered. Never as a round-1 guess.
 - No prose, no reasons, no other lines.`;
 
 // --- Ref parsing ------------------------------------------------------------
@@ -632,10 +639,16 @@ export async function runLookupAgent({
             // fine", DEFAULT_LOOKUP_PROMPT above). With this set, a read next to
             // #DONE invalidates the block and buys round 2 instead of vanishing.
             // Scoped to this caller: extraction's final-block writes are untouched.
-            // With LOOKUP_MAX_ROUNDS = 2 this can only ever fire on round 1; on
-            // the last round the block stands and the reads drop as before, since
-            // there is no round left to restate the verdict in.
+            // Guarded by `round < maxRounds` inside the loop; on the last round
+            // the block stands and the reads drop as before, since there is no
+            // round left to restate the verdict in.
             readsForceAnotherRound: true,
+            // The other half of the "search before you judge" contract the
+            // prompt now states: a verdict with zero executed tool calls gets
+            // one correction round demanding a search. LOOKUP_MAX_ROUNDS is 3
+            // precisely so this correction never pushes the demanded search
+            // into a blind final round (see the budget comment at the top).
+            requireToolCallBeforeDone: true,
             // The loop's "carried no sheet content" guard is for the sheet-emitting
             // agent only; this pass closes with #DONE like extraction does.
             extractOnly: true,
