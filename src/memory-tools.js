@@ -218,6 +218,40 @@ function repairJsonLine(line) {
     return out;
 }
 
+// Best-effort repair for the second most common model JSON mistake, and the one
+// the quote repair above cannot touch: the line is valid up to its last
+// character and simply stops one closer short, e.g.
+// {"tool":"write_fact","args":{...,"kind":"event"}  — args closed, root never did.
+// Measured on the Lightning export this was EVERY protocol failure in the run:
+// 5 grace rounds, ~2.5 minutes of extra latency each, and in all 15 broken lines
+// the only defect was a missing final '}'. The link_facts lines emitted in the
+// same replies, which end in '}}', parsed fine every time.
+//
+// Only a line that ends OUTSIDE a string is repaired. A line cut mid-string is a
+// truncated VALUE, and inventing its terminator would store half a note as if it
+// were whole — that case is left to fail, exactly as before. As with
+// repairJsonLine, the caller re-parses and discards the result if it is still
+// invalid, so a wrong guess cannot be worse than the original parse failure.
+function closeUnbalancedJsonLine(line) {
+    const stack = [];
+    let inStr = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (inStr) {
+            if (ch === '\\') { i++; continue; }
+            if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === '{' || ch === '[') stack.push(ch);
+        else if (ch === '}' || ch === ']') stack.pop();
+    }
+    if (inStr || stack.length === 0) return line;
+    let out = line;
+    for (let i = stack.length - 1; i >= 0; i--) out += stack[i] === '{' ? '}' : ']';
+    return out;
+}
+
 // Strip reasoning-model chain-of-thought so it never reaches a strict line
 // parser. Reasoning models emit <think>...</think> (or <thinking>...</thinking>)
 // whose free-form prose can contain stray '{', "#SHEET", or "NEED:" lookalikes
@@ -256,21 +290,33 @@ export function parseAgentReply(text) {
 
     const lines = cleaned.split('\n');
 
+    // Second chances, cheapest and most conservative first. Each is tried on the
+    // ORIGINAL line, then the two are composed, so a line with both defects is
+    // still recovered without letting either repair mask the other's failure.
+    const REPAIRS = [
+        { how: 'unescaped inner quotes', fix: repairJsonLine },
+        { how: 'unterminated object/array', fix: closeUnbalancedJsonLine },
+        { how: 'unescaped inner quotes + unterminated object/array', fix: (s) => closeUnbalancedJsonLine(repairJsonLine(s)) },
+    ];
+
     const tryTool = (jsonStr, strict) => {
         let obj;
         try { obj = JSON.parse(jsonStr); }
         catch (e) {
-            // Second chance: escape unescaped quotes inside string values and
-            // re-parse, so one sloppy write_fact value doesn't burn the grace
-            // round (or abort the whole run on a second offense).
-            try { obj = JSON.parse(repairJsonLine(jsonStr)); }
-            catch {
+            // Repair and re-parse, so one sloppy write_fact line doesn't burn the
+            // grace round (or abort the whole run on a second offense).
+            let how = '';
+            for (const r of REPAIRS) {
+                try { obj = JSON.parse(r.fix(jsonStr)); how = r.how; break; }
+                catch {  }
+            }
+            if (!how) {
                 if (strict) out.malformed.push({ line: jsonStr, error: `invalid JSON (${e.message || e}) — a tool call must be ONE line of strict JSON` });
                 return;
             }
-            addDebugLog('info', 'Repaired malformed JSON tool-call line (unescaped inner quotes)', {
+            addDebugLog('info', `Repaired malformed JSON tool-call line (${how})`, {
                 subsystem: 'agent3', event: 'toolloop.json_repaired', reason: 'JSON_REPAIRED',
-                data: { line: jsonStr.slice(0, 200) },
+                data: { how, line: jsonStr.slice(0, 200) },
             });
         }
         if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
