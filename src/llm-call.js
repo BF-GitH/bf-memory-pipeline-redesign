@@ -59,15 +59,27 @@ function isMutatingTool(tool) {
 }
 
 const LLM_TIMEOUT_MS = 300000;          // per-attempt cap (300s). Generous on purpose: a slow reasoning model or a self-hosted bridge (e.g. Claude Code CLI on Termux) chewing a ~20k-char prompt can take several minutes. The memory agent runs in the BACKGROUND (post-reply, detached), so a long wait never blocks the chat.
-const LLM_WALLCLOCK_BUDGET_MS = 300000; // total budget (300s) across the (up to 2) attempts of a single round.
-// Total tool-loop budget across ALL rounds of one run (10 min). Deliberately
+// Total budget across the (up to 2) attempts of a single round. MUST stay larger
+// than LLM_TIMEOUT_MS, and that is not a style point: both were 300000, so a
+// first attempt that ran to its own timeout consumed the ENTIRE round budget and
+// the deadline check below killed attempt 2 before it was ever made. The retry
+// existed in the code and could never once fire — measured on the Lightning
+// export as `LLM wall-clock budget exhausted before attempt 2` immediately after
+// a 300s timeout, losing that turn's extraction outright. Derived from the
+// per-attempt cap rather than hand-written so the two cannot drift back into
+// equality; the +30s covers the parse/dispatch overhead between attempts.
+const LLM_WALLCLOCK_BUDGET_MS = LLM_TIMEOUT_MS * 2 + 30000;
+// Total tool-loop budget across ALL rounds of one run (15 min). Deliberately
 // looser than the per-round budgets above: a slow-but-progressing extraction
 // (e.g. 6 rounds x 70s ≈ 7 min) must never die mid-run while every individual
 // round is fine. Checked BETWEEN rounds only — an in-flight round is never
 // chopped, the loop just refuses to start another one past the budget, and
 // exhaustion is logged distinctly (toolloop.budget) so it can't be mistaken
-// for a single-round timeout.
-const TOOL_LOOP_BUDGET_MS = 600000;
+// for a single-round timeout. Raised from 600000 alongside the round budget
+// above and for the same reason: one round that spends its full retry allowance
+// (630s) would have exhausted the whole run's budget, so restoring the retry
+// without this would have traded a dead retry for a truncated run.
+const TOOL_LOOP_BUDGET_MS = 900000;
 
 const lastSystemHashByAgent = new Map();   
 let lastPersonaName = undefined;            
