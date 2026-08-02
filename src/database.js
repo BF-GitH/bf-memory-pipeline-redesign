@@ -754,7 +754,11 @@ export function isColdFact(fact) {
 // Cold because the budget said so, and therefore releasable by the budget. A cold
 // row with no coldVia predates the field and is read as a verdict — see the block
 // above markFactCold for why that is the safe default rather than the lenient one.
-function isBudgetCold(fact) {
+//
+// Exported because the sheet's NEED/recovered resolver has the same question to
+// ask: a ref the extraction agent explicitly asked for must not be dropped over
+// bookkeeping, only over a judgement. See resolveRefs in agent-memory.js.
+export function isBudgetCold(fact) {
     return !!fact && fact.cold === true && fact.coldVia === COLD_VIA_BUDGET;
 }
 

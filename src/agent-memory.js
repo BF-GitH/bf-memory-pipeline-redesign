@@ -5,6 +5,7 @@ import {
     findFactMatch,
     mapLegacyCategory,
     isActiveFact,
+    isBudgetCold,
     clampImportance,
     summarizeKeys,
     summarizeMenuIndexed,
@@ -2869,6 +2870,18 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     // would make a transient demotion permanent, and would need a new mutator in
     // turn-state.js; a skipped entry is inert, holds one of the twelve sticky
     // slots and expires on its own tick.
+    //
+    // But only a VERDICT skips. The paragraph above argues from the #CONFLICT
+    // loser — a row someone judged wrong — and that argument does not reach a
+    // BUDGET demotion, which says nothing about the row except that its category
+    // held more than the hot-set budget and it ranked below the line. Treating
+    // the two alike made the sheet drop refs the extraction agent had just asked
+    // for BY NAME: 8 occurrences and 15 refs on the Lightning export, including
+    // Felix's suit and his position at the altar dropped in the middle of the
+    // wedding scene, seconds after being written. NEED is demand and it is
+    // explicit; the budget is bookkeeping over supply. Demand outranks
+    // bookkeeping — that is the same split coldTierOverflow already draws when it
+    // releases BUDGET rows and never releases VERDICT rows.
     let coldSkipped = 0;
     const resolveRefs = (refs) => {
         const out = [];
@@ -2881,7 +2894,7 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
                 if (!db) continue;
                 const fact = findFactMatch(db, key);
                 if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
-                if (fact.cold === true) { coldSkipped++; continue; }
+                if (fact.cold === true && !isBudgetCold(fact)) { coldSkipped++; continue; }
                 const id = `${category}:${fact.key}`;
                 // Claimed in `seen` at RESOLVE time so a duplicate ref cannot
                 // consume a NEED cap slot, and so the premise floor below can
@@ -2961,7 +2974,7 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         },
     });
     if (coldSkipped > 0) {
-        addDebugLog('info', `${logTag}Sheet: ${coldSkipped} NEED/recovered ref(s) skipped — cold-tiered since they were selected`, {
+        addDebugLog('info', `${logTag}Sheet: ${coldSkipped} NEED/recovered ref(s) skipped — judged (conflict/merge/mark_cold) since they were selected; budget demotions no longer skip`, {
             subsystem: 'agent3', event: 'sheet.refs_skipped', reason: 'COLD_TIERED',
             data: { skipped: coldSkipped },
         });
