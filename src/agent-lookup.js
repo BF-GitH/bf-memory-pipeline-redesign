@@ -14,7 +14,7 @@ import { callAgentLLMWithTools } from './llm-call.js';
 // can reach a write path at all. See memory-tools.js's executeLookupTool for the
 // other two barriers (the roster check and a switch with no write cases).
 import { executeLookupTool, stripThinkBlocks } from './memory-tools.js';
-import { extractSheetFactRefs } from './turn-state.js';
+import { extractSheetFactRefs, getClosedScenes, findClosedSceneById } from './turn-state.js';
 import { addDebugLog, isTraceRecording, traceCapture, newTraceCallId, getSettings } from './settings.js';
 import * as host from './host.js';
 
@@ -247,6 +247,15 @@ const LOOKUP_PRIOR_MESSAGE_CHARS = 600;
 // the usage counters credit them like any other injected row.
 export const LOOKUP_BLOCK_HEADER = 'Looked up for the message below (a memory search against what {{user}} just wrote; not part of the standing sheet above):';
 
+// Header of the OPTIONAL second block: one closed scene card the user's message
+// calls back to. Worded as past background because the card's beats are written
+// in the same present-tense shape as the sheet's live "Scene:" card, and a
+// storyteller that mistook them for the current scene would replay them.
+export const LOOKUP_SCENE_HEADER = 'Earlier scene recalled for the message below (past events, oldest first; background only — do NOT replay as happening now):';
+// Same idea as composeSheet's MAX_SCENE_BEATS_SHOWN: the LAST beats of the card,
+// with the dropped head counted on its own line.
+const LOOKUP_SCENE_BEATS_CAP = 12;
+
 // FIXED prompt, like DEFAULT_BEATS_PROMPT and DEFAULT_HEAD_PROMPT and unlike the
 // extraction/reflection prompts: it is not exposed as a settings override. The
 // override machinery stores a full COPY of a prompt and prefers it forever
@@ -261,29 +270,35 @@ Each tool call is ONE line of strict JSON, alone on its line:
 {"tool":"search","args":{"query":"stolen bike case"}}
 {"tool":"read_facts","args":{"category":"People","keys":["monika_promise_lake"]}}
 {"tool":"list_keys","args":{"category":"Places"}}
+{"tool":"search_scenes","args":{"query":"roof storm"}}
 
 The system replies with one "TOOL RESULTS:" message; then you finish. Several call lines in one reply are fine; no markdown fences, no multi-line JSON.
 
 HARD LIMITS: 3 rounds, 4 tool calls. THE USER IS WAITING — this runs while the reply is held. Round 1: every search you want, all at once. Round 2: the final reply. A slow answer is a wasted one.
 
-SEARCH BEFORE YOU JUDGE: you MUST execute at least one tool call (search / read_facts / list_keys) before delivering your verdict. The store holds things the sheet does not carry — "the sheet looks complete" is a guess until a search says so. A verdict with zero tool calls will be sent back to you with a demand to search first.
+SEARCH BEFORE YOU JUDGE: you MUST execute at least one tool call (search / read_facts / list_keys / search_scenes) before delivering your verdict. The store holds things the sheet does not carry — "the sheet looks complete" is a guess until a search says so. A verdict with zero tool calls will be sent back to you with a demand to search first.
 
 # HOW TO SEARCH
 
 Search for the THING, not the sentence: "did you ever find the bike?" → \`search\` "bike". A name, an object, a place, a promise, an old event, a callback ("like you said before", "that night at the lab") — those are what you are for, because the recent chat window may no longer reach back that far. \`list_keys\` when you need to see what a category even holds. \`read_facts\` to confirm a key you saw named somewhere.
 
+\`search_scenes\` is for callbacks to EARLIER SCENES — "that night on the roof", "remember when we…", "like last time at the lab". It searches the closed scene cards (scene name + beats) and answers with one line per scene, each carrying an id like \`s42\`. Only useful when the message reaches back to a past scene; the CURRENT scene is already on the sheet.
+
 # FINAL REPLY
 
-Nothing but ONE line, then \`#DONE\` on its own line:
+Nothing but ONE line (plus the optional SCENE line), then \`#DONE\` on its own line:
 
 REFS: Category/key, Category/key
 REFS: none
+SCENE: s42
+
+- \`SCENE:\` is optional and carries at most ONE id you saw in a \`search_scenes\` result. Emit it only when {{user}}'s message calls back to THAT earlier scene and it is not the scene currently playing; otherwise omit the line entirely (no \`SCENE: none\`).
 
 - VERIFIED refs only — a ref you saw in a tool result this session. Never invented, never reconstructed from a key that merely looks likely.
 - ONLY what THIS message needs: what it asks about, names, calls back to, doubts or contradicts. Not "related", not "good to have".
 - \`## Already on the sheet\` is going to the storyteller anyway. Listing one of those changes nothing and wastes a slot.
 - Max 6. Fewer is better. \`REFS: none\` is a correct and COMMON answer — small talk, an emote or a reply that only continues the current beat often needs nothing — but only AFTER at least one search came back empty or already-covered. Never as a round-1 guess.
-- No prose, no reasons, no other lines.`;
+- No prose, no reasons, no other lines. \`search_scenes\` counts as a tool call like the other three.`;
 
 // --- Ref parsing ------------------------------------------------------------
 //
@@ -309,6 +324,19 @@ function parseRefsLine(text) {
         }
     }
     return out;
+}
+
+// The optional `SCENE: s42` line. First well-formed id wins; `none` and prose
+// parse to null. Resolution against the archive is renderLookupBlock's job, for
+// the same reason refs are resolved there and not here (swipe reuse).
+function parseSceneLine(text) {
+    for (const rawLine of String(text || '').split('\n')) {
+        const m = /^\s*[-*]?\s*SCENE\s*:\s*(.*)$/i.exec(rawLine.trim());
+        if (!m) continue;
+        const id = /(?:^|[\s,`"'])([sb]\d+)(?=$|[\s,`"'.)])/i.exec(m[1]);
+        if (id) return id[1].toLowerCase();
+    }
+    return null;
 }
 
 // Race sentinels. Distinct objects rather than null/undefined so "the loop
@@ -377,7 +405,7 @@ function buildLookupUserPrompt({ userMessage, priorMessage, sheetRefs, databases
         parts.push(`## Stored keys${inv.truncated ? ' [TRUNCATED — the store is larger than this list; use list_keys before concluding something is not stored]' : ''}\n${inv.text || '(store is empty)'}`);
     } catch { parts.push('## Stored keys\n(unavailable)'); }
 
-    parts.push('Work now: search for what the NEW message needs, then reply with ONE REFS line and #DONE.');
+    parts.push('Work now: search for what the NEW message needs, then reply with ONE REFS line (plus a SCENE line only if the message calls back to an earlier scene) and #DONE.');
 
     try {
         return host.getSubstituteParams()(parts.join('\n\n'));
@@ -397,8 +425,10 @@ function buildLookupUserPrompt({ userMessage, priorMessage, sheetRefs, databases
  * runtime. Omitted, it defaults to lookupTimeoutMs() from entry — correct only for
  * a caller that has awaited nothing yet.
  *
- * Returns { refs, error, errorKind, timedOut, stage, rounds, toolCalls, tokensIn,
- * tokensOut, ms }.
+ * Returns { refs, sceneId, error, errorKind, timedOut, stage, rounds, toolCalls,
+ * tokensIn, tokensOut, ms }.
+ * `sceneId` is the closed-scene id the agent's optional SCENE: line named (or
+ * null) — like `refs`, what it SAID, resolved later by renderLookupBlock.
  * `stage` names what the deadline or the abort caught ('store' | 'model'), null
  * otherwise. `errorKind` classifies `error` so the caller's breaker can tell a
  * broken connection from a model that will not follow the protocol — those need
@@ -421,7 +451,7 @@ export async function runLookupAgent({
     // Values are llm-call.js's ('transport' | 'protocol' | 'budget' | 'aborted' |
     // 'internal') plus 'store' for a failure that never reached the model at all.
     // Null whenever `error` is null.
-    const result = { refs: [], error: null, errorKind: null, timedOut: false, stage: null, rounds: 0, toolCalls: 0, tokensIn: 0, tokensOut: 0, ms: 0 };
+    const result = { refs: [], sceneId: null, error: null, errorKind: null, timedOut: false, stage: null, rounds: 0, toolCalls: 0, tokensIn: 0, tokensOut: 0, ms: 0 };
     const started = Date.now();
     // The configured budget, read once. Only used when the caller passed no
     // absolute deadline; when it did, that deadline already encodes the setting
@@ -549,7 +579,8 @@ export async function runLookupAgent({
     // cold rows outright, so the only reachable answer is `REFS: none` — bought
     // with a full prompt build and an LLM round-trip on the latency path. Counted
     // rather than trusted from a flag because `databases` is already in hand and
-    // the walk stops at the first hit.
+    // the walk stops at the first hit. A closed-scene archive is the other thing
+    // this pass can return (search_scenes / SCENE:), so the skip needs BOTH empty.
     let hasLookupable = false;
     for (const db of Object.values(databases)) {
         for (const fact of (db?.facts || [])) {
@@ -557,10 +588,12 @@ export async function runLookupAgent({
         }
         if (hasLookupable) break;
     }
-    if (!hasLookupable) {
+    let closedScenes = 0;
+    try { closedScenes = getClosedScenes().length; } catch { closedScenes = 0; }
+    if (!hasLookupable && closedScenes === 0) {
         releaseDeadline();
         result.ms = Date.now() - started;
-        addDebugLog('debug', `Lookup skipped — the store holds no row this pass could return (no LLM call, ${result.ms}ms)`, {
+        addDebugLog('debug', `Lookup skipped — the store holds no row and the archive no closed scene this pass could return (no LLM call, ${result.ms}ms)`, {
             runId, subsystem: 'agent3', event: 'lookup.skip', reason: 'STORE_EMPTY',
             data: { categories: Object.keys(databases).length, ms: result.ms },
         });
@@ -697,7 +730,14 @@ export async function runLookupAgent({
         // agent-memory.js strips think blocks for before parsing NEED.
         for (let i = (loop.transcript || []).length - 1; i >= 0; i--) {
             const r = stripThinkBlocks(String(loop.transcript[i]?.reply || ''));
-            if (/^\s*[-*]?\s*REFS\s*:/im.test(r)) { result.refs = parseRefsLine(r); break; }
+            if (/^\s*[-*]?\s*REFS\s*:/im.test(r)) {
+                result.refs = parseRefsLine(r);
+                // SCENE: is read from the SAME reply as the verdict, never from an
+                // older round: an id the model named in a draft and then left out
+                // of its final answer was dropped on purpose.
+                result.sceneId = parseSceneLine(r);
+                break;
+            }
         }
     }
 
@@ -714,11 +754,12 @@ export async function runLookupAgent({
     result.ms = Date.now() - started;
 
     const level = result.error ? 'fail' : 'info';
-    addDebugLog(level, `Lookup agent: ${result.refs.length} ref(s) in ${result.ms}ms, ${result.rounds} round(s), ${result.toolCalls} tool call(s)${result.error ? ` — ERROR: ${result.error}` : ''}`, {
+    addDebugLog(level, `Lookup agent: ${result.refs.length} ref(s)${result.sceneId ? ` + scene ${result.sceneId}` : ''} in ${result.ms}ms, ${result.rounds} round(s), ${result.toolCalls} tool call(s)${result.error ? ` — ERROR: ${result.error}` : ''}`, {
         runId, subsystem: 'agent3', event: 'lookup.run', reason: result.error ? 'ERROR' : 'OK',
         data: {
             agent: 'lookup-agent', profileId: profileId || null, success: !result.error,
             refs: result.refs.map(r => `${r.category}/${r.key}`),
+            sceneId: result.sceneId,
             rounds: result.rounds, toolCallCount: result.toolCalls, durationMs: result.ms,
             tokensIn: result.tokensIn, tokensOut: result.tokensOut, error: result.error || null,
             errorKind: result.errorKind || null,
@@ -729,11 +770,12 @@ export async function runLookupAgent({
     // that answers "did this pass earn its latency": what it was asked, what it
     // called, what it came back with, and how long the user waited for it.
     traceCapture('lookup.verdict', () => ({
-        outcome: result.error ? 'ERROR' : (result.refs.length ? 'REFS' : 'NONE'),
+        outcome: result.error ? 'ERROR' : (result.refs.length ? 'REFS' : (result.sceneId ? 'SCENE' : 'NONE')),
         error: result.error || null,
         errorKind: result.errorKind || null,
         ms: result.ms,
         refs: result.refs.map(r => `${r.category}/${r.key}`),
+        sceneId: result.sceneId,
         rounds: (loop?.transcript || []).map(t => ({
             round: t.round,
             toolCalls: t.toolCalls,
@@ -761,27 +803,72 @@ export async function runLookupAgent({
  * is the FIRST — runLookupAgent never runs there (the refs are reused), and any
  * save since has invalidated the cache, so the cold load lands here instead.
  *
- * Never throws. Returns { block, rendered, dropped } with block === '' when
- * nothing survives, which is the common case.
+ * `sceneId` is the optional closed-scene id from the SCENE: line. It resolves
+ * against the scene archive in chatMetadata (synchronous, no store load), and
+ * renders as a SECOND block after the facts block — or alone when no fact row
+ * survives. Its beat lines are prefixed "- " so extractSheetFactRefs, whose row
+ * grammar starts at `[`, can never read one as a fact row.
+ *
+ * Never throws. Returns { block, rendered, dropped, scene } with block === ''
+ * when nothing survives, which is the common case; `scene` is
+ * { id, name, beats } for the rendered card, else null.
  */
-export async function renderLookupBlock({ refs = [], sheetText = '', runId = '', deadlineAt = 0 } = {}) {
-    const out = { block: '', rendered: [], dropped: [] };
-    if (!Array.isArray(refs) || refs.length === 0) return out;
+export async function renderLookupBlock({ refs = [], sceneId = null, sheetText = '', runId = '', deadlineAt = 0 } = {}) {
+    const out = { block: '', rendered: [], dropped: [], scene: null };
+    const askedRefs = Array.isArray(refs) ? refs : [];
+    const askedScene = sceneId ? String(sceneId).trim().toLowerCase() : '';
+    if (askedRefs.length === 0 && !askedScene) return out;
     let timer = null;
     try {
+        // The scene card first: it needs no store, so a slow store below must not
+        // cost the one part of the answer that was already in hand.
+        let sceneBlock = '';
+        if (askedScene) {
+            const sc = findClosedSceneById(askedScene);
+            if (!sc) {
+                out.dropped.push({ ref: askedScene, why: 'SCENE_NOT_FOUND' });
+                addDebugLog('debug', `Lookup scene dropped — "${askedScene}" resolves to no closed scene (archive trimmed, chat switched, or an invented id)`, {
+                    runId, subsystem: 'agent3', event: 'lookup.block', reason: 'SCENE_NOT_FOUND',
+                    data: { sceneId: askedScene },
+                });
+            } else {
+                const beatsArr = (Array.isArray(sc.beats) ? sc.beats : []).map(b => String(b?.sentence || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+                const name = String(sc.name || '').trim() || '(unnamed scene)';
+                const from = Number.isInteger(sc.startMsg) && sc.startMsg >= 0 ? ` (from #${sc.startMsg})` : '';
+                let header = LOOKUP_SCENE_HEADER;
+                try { header = host.getSubstituteParams()(header); } catch {  }
+                const lines = [header, `Scene: ${name}${from}`];
+                if (beatsArr.length > LOOKUP_SCENE_BEATS_CAP) lines.push(`…(${beatsArr.length - LOOKUP_SCENE_BEATS_CAP} earlier beats)`);
+                const shown = beatsArr.slice(-LOOKUP_SCENE_BEATS_CAP);
+                for (const s of shown) lines.push(`- ${s}`);
+                sceneBlock = lines.join('\n');
+                out.scene = { id: askedScene, name, beats: shown };
+            }
+        }
+
         const deadline = deadlineAt > 0 ? deadlineAt : Date.now() + lookupTimeoutMs();
         const deadlineP = new Promise((resolve) => {
             timer = setTimeout(() => resolve(DEADLINE), Math.max(0, deadline - Date.now()));
         });
         // No rejection handler on the load: a genuine store error should unwind to
         // the catch below and be reported as ERROR, which is a different thing
-        // from the store being slow.
-        const loaded = await Promise.race([getAllDatabases().then(db => ({ db })), deadlineP]);
+        // from the store being slow. Skipped entirely when only a scene was asked.
+        const loaded = askedRefs.length > 0
+            ? await Promise.race([getAllDatabases().then(db => ({ db })), deadlineP])
+            : { db: {} };
         if (loaded === DEADLINE) {
-            addDebugLog('fail', `Lookup block skipped — the memory store did not load inside the pass deadline; the prompt goes out without the looked-up rows`, {
+            addDebugLog('fail', `Lookup block skipped — the memory store did not load inside the pass deadline; the prompt goes out without the looked-up rows${sceneBlock ? ' (the recalled scene still goes out — it needs no store)' : ''}`, {
                 runId, subsystem: 'agent3', event: 'lookup.block', reason: 'STORE_TIMEOUT',
-                data: { asked: refs.length },
+                data: { asked: askedRefs.length, sceneId: askedScene || null },
             });
+            out.block = sceneBlock;
+            // The scene card still went out, so the trace must say so — a prompt
+            // carrying a recalled scene with no lookup.block entry would read as
+            // an unexplained injection in a recorded run.
+            traceCapture('lookup.block', () => ({
+                asked: askedRefs.map(r => `${r.category}/${r.key}`), askedScene: askedScene || null, scene: out.scene,
+                rendered: [], dropped: out.dropped, storeTimeout: true, chars: out.block.length, block: out.block,
+            }), { runId });
             return out;
         }
         const databases = loaded.db || {};
@@ -795,7 +882,7 @@ export async function renderLookupBlock({ refs = [], sheetText = '', runId = '',
 
         const lines = [];
         const seen = new Set();
-        for (const ref of refs) {
+        for (const ref of askedRefs) {
             const category = mapLegacyCategory(String(ref?.category || '').trim() || 'Unsorted');
             const key = String(ref?.key || '').trim();
             const asked = `${ref?.category || ''}/${ref?.key || ''}`;
@@ -828,12 +915,17 @@ export async function renderLookupBlock({ refs = [], sheetText = '', runId = '',
             try { header = host.getSubstituteParams()(header); } catch {  }
             out.block = [header, ...lines].join('\n');
         }
+        // Facts first, scene second; either may stand alone.
+        if (sceneBlock) out.block = out.block ? `${out.block}\n${sceneBlock}` : sceneBlock;
 
         traceCapture('lookup.block', () => ({
-            asked: refs.map(r => `${r.category}/${r.key}`),
+            asked: askedRefs.map(r => `${r.category}/${r.key}`),
+            askedScene: askedScene || null,
+            scene: out.scene,
             rendered: out.rendered,
             dropped: out.dropped,
             cap: LOOKUP_REFS_CAP,
+            sceneBeatsCap: LOOKUP_SCENE_BEATS_CAP,
             chars: out.block.length,
             block: out.block,
         }), { runId });

@@ -321,8 +321,8 @@ let lookupOffForSession = false;
 // pass would spend the latency twice for an answer that cannot differ. Refs are
 // cached, not the rendered block — the sheet may have been recomposed since, and
 // the "already on the sheet" exclusion has to be redone against the sheet that is
-// actually going out.
-let lastLookup = null; // { chatId, avatar, message, refs }
+// actually going out. The recalled scene id rides along for the same reason.
+let lastLookup = null; // { chatId, avatar, message, refs, sceneId }
 let lookupSeq = 0;
 
 // The type ST passed to Generate() for the generation currently being built, or
@@ -549,11 +549,13 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
         } catch {  }
 
         let refs;
+        let sceneId = null;
         if (lastLookup && lastLookup.chatId === chatId && lastLookup.avatar === avatar && lastLookup.message === message) {
             refs = lastLookup.refs;
-            addDebugLog('debug', `[${runId}] Lookup reused — same user message as the last pass (${refs.length} ref(s), no LLM call, no wait)`, {
+            sceneId = lastLookup.sceneId || null;
+            addDebugLog('debug', `[${runId}] Lookup reused — same user message as the last pass (${refs.length} ref(s)${sceneId ? ` + scene ${sceneId}` : ''}, no LLM call, no wait)`, {
                 subsystem: 'agent3', event: 'lookup.skip', reason: 'REUSED_SAME_MESSAGE',
-                data: { path, refs: refs.map(r => `${r.category}/${r.key}`) },
+                data: { path, refs: refs.map(r => `${r.category}/${r.key}`), sceneId },
             });
         } else {
             lookupAbort = new AbortController();
@@ -684,16 +686,17 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
             lookupErrorStrikes = 0;
             lookupProtocolStrikes = 0;
             recordHealthEvent('lookup', {
-                status: 'ok', refs: res.refs.length, rounds: res.rounds,
+                status: 'ok', refs: res.refs.length, sceneId: res.sceneId || null, rounds: res.rounds,
                 toolCalls: res.toolCalls, durationMs: res.ms,
                 profileId: settings.lookupProfile || settings.agent3Profile || null,
             });
 
             refs = res.refs;
-            lastLookup = { chatId, avatar, message, refs };
+            sceneId = res.sceneId || null;
+            lastLookup = { chatId, avatar, message, refs, sceneId };
         }
 
-        if (!refs.length) return sheetText;
+        if (!refs.length && !sceneId) return sheetText;
 
         // The awaits above are seconds long. A chat or character switch inside
         // that window means these refs describe another store entirely — and this
@@ -711,7 +714,7 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
         // Same deadline again, not a fresh one: on the REUSED path above no agent
         // ran, so this is the pass's first store touch — and any save since the
         // last lookup has invalidated the cache, which makes it the cold load.
-        const { block } = await renderLookupBlock({ refs, sheetText, runId, deadlineAt });
+        const { block } = await renderLookupBlock({ refs, sceneId, sheetText, runId, deadlineAt });
         if (!block) return sheetText;
         // Appended, never prepended: the standing sheet keeps its exact shape and
         // its header stays the first line of the injection. With no sheet yet

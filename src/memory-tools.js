@@ -22,7 +22,7 @@ import {
     registerCharacterAlias,
 } from './database.js';
 import { isFactVisible, buildFactLine, retrieveFacts, formatFactsForWriter, extractContextKeywords } from './fact-retrieval.js';
-import { getScenePresent } from './turn-state.js';
+import { getScenePresent, getClosedScenes, closedSceneId } from './turn-state.js';
 import { getTurnNowContext, recencyTail } from './recency.js';
 import { addDebugLog, isTraceRecording, traceCapture } from './settings.js';
 import { wordTokens, keyToken } from './tokenize.js';
@@ -72,14 +72,19 @@ export const REFLECTION_WRITE_TOOLS = ['write_fact', 'merge_facts', 'mark_cold']
 // Full roster the reflection executor accepts.
 export const REFLECTION_TOOLS = [...REFLECTION_READ_TOOLS, ...REFLECTION_WRITE_TOOLS];
 
-// The LOOKUP agent's roster — three read tools, and nothing else will ever be
-// added to it. That pass runs ON THE LATENCY PATH, in front of a user who is
+// The LOOKUP agent's roster — read tools only, and no write will ever be added
+// to it. That pass runs ON THE LATENCY PATH, in front of a user who is
 // waiting for a reply, against a store the extraction agent is concurrently
 // writing to; a write from there would land outside every guard the pipeline
 // has (no run id, no settled-message gate, no chat-switch commit check, no
 // watermark). list_categories is deliberately absent: it costs a round and the
 // task block already ships the key inventory.
-export const LOOKUP_TOOLS = ['list_keys', 'read_facts', 'search'];
+//
+// search_scenes is lookup-ONLY: it reads the closed-scene archive in
+// chatMetadata (turn-state.js), which the extraction agent already owns at full
+// resolution and reflection never repairs — so it is neither in KNOWN_TOOLS nor
+// in REFLECTION_TOOLS, and executeMemoryTool refuses it as unknown.
+export const LOOKUP_TOOLS = ['list_keys', 'read_facts', 'search', 'search_scenes'];
 
 // Names that are no longer on ANY agent's roster but must still PARSE. Dropping a
 // retired name straight out of ALL_TOOLS would turn it into a MALFORMED reply,
@@ -99,11 +104,18 @@ const RETIRED_TOOLS = ['list_categories'];
 // MALFORMED (which burns the grace round and aborts the loop on the second
 // offense) instead of coming back as an ordinary refusal the model can read
 // and correct.
-const ALL_TOOLS = [...new Set([...KNOWN_TOOLS, ...REFLECTION_TOOLS, ...RETIRED_TOOLS])];
+// LOOKUP_TOOLS is in the union for search_scenes: without it the parser would
+// flag the lookup agent's own documented tool as MALFORMED.
+const ALL_TOOLS = [...new Set([...KNOWN_TOOLS, ...REFLECTION_TOOLS, ...LOOKUP_TOOLS, ...RETIRED_TOOLS])];
 
 const LIST_KEYS_CAP = 80;
 
 const SEARCH_RESULT_CAP = 15;
+
+// search_scenes: at most this many closed scenes per call, and this much of a
+// beat sentence per rendered line. The agent only needs enough to pick an id.
+const SCENE_SEARCH_CAP = 3;
+const SCENE_BEAT_CLIP = 160;
 
 // --- Test-run trace capture -------------------------------------------------
 //
@@ -416,6 +428,7 @@ export async function executeLookupTool(call, ctx) {
             case 'list_keys': return execListKeys(args, ctx);
             case 'read_facts': return execReadFacts(args, ctx);
             case 'search': return await execSearch(args, ctx);
+            case 'search_scenes': return execSearchScenes(args, ctx);
             // Unreachable: the roster check above already returned. Kept because
             // a switch whose default cannot be hit still must not fall through to
             // undefined if the roster and this switch ever drift apart.
@@ -703,6 +716,55 @@ async function execSearch(args, ctx) {
         return visible.map(r => buildReflectRecordLine(r.fact, r.category, nowCtx)).join('\n');
     }
     return formatFactsForWriter(visible);
+}
+
+// Lookup-only (see LOOKUP_TOOLS). Searches the CLOSED scene cards — name plus
+// beat sentences — so a callback to an earlier scene ("that night on the roof")
+// can be answered even when no fact was ever written about it. Plain token
+// containment over the lowercased card, no retrieval tiers: the archive holds at
+// most MAX_CLOSED_SCENES cards and lives in chatMetadata, so this is synchronous
+// and costs nothing on the latency path. Newest scene wins a tie, because a
+// callback usually reaches for the nearer of two similar scenes. Each hit is one
+// line carrying the id the SCENE: verdict must echo (closedSceneId).
+function execSearchScenes(args, ctx) {
+    const query = String(args?.query || '').trim();
+    if (!query) return 'ERROR: search_scenes requires args.query';
+    const needed = wordTokens(query, { min: 3 });
+    if (needed.length === 0) needed.push(query.toLowerCase());
+    const closed = getClosedScenes();
+    const hits = [];
+    closed.forEach((sc, index) => {
+        if (!sc || typeof sc !== 'object') return;
+        const beats = Array.isArray(sc.beats) ? sc.beats : [];
+        const hay = [String(sc.name || ''), ...beats.map(b => String(b?.sentence || ''))].join('\n').toLowerCase();
+        let score = 0;
+        for (const tok of needed) if (hay.includes(tok)) score++;
+        // A card without an id cannot be echoed back in a SCENE: line, so
+        // showing it would only invite an invented id.
+        if (score > 0 && closedSceneId(sc)) hits.push({ sc, index, score, beats });
+    });
+    hits.sort((a, b) => (b.score - a.score) || (b.index - a.index));
+    const shown = hits.slice(0, SCENE_SEARCH_CAP);
+    if (isTraceRecording()) {
+        traceCapture('memtool.search_scenes', () => ({
+            query, tokens: needed, closedScenes: closed.length, matched: hits.length, cap: SCENE_SEARCH_CAP,
+            scenes: shown.map(h => ({ id: closedSceneId(h.sc), name: h.sc.name || '', startMsg: h.sc.startMsg, beats: h.beats.length, score: h.score })),
+        }), traceOpts(ctx));
+    }
+    if (shown.length === 0) return '(no matching earlier scene)';
+    const clipBeat = (b) => {
+        const s = String(b?.sentence || '').replace(/\s+/g, ' ').trim();
+        return s.length > SCENE_BEAT_CLIP ? `${s.slice(0, SCENE_BEAT_CLIP - 1)}…` : s;
+    };
+    return shown.map(({ sc, beats }) => {
+        const id = closedSceneId(sc);
+        const name = String(sc.name || '').trim() || '(unnamed scene)';
+        const from = Number.isInteger(sc.startMsg) && sc.startMsg >= 0 ? `from #${sc.startMsg}, ` : '';
+        let span = '(no beats)';
+        if (beats.length === 1) span = clipBeat(beats[0]);
+        else if (beats.length > 1) span = `${clipBeat(beats[0])} … ${clipBeat(beats[beats.length - 1])}`;
+        return `SCENE ${id} "${name}" (${from}${beats.length} beat${beats.length === 1 ? '' : 's'}): ${span}`;
+    }).join('\n');
 }
 
 // --- Reflection repair-mode guardrails -------------------------------------

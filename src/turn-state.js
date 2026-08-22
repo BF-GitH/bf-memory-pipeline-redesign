@@ -816,6 +816,34 @@ export function getClosedScenes() {
     return Array.isArray(closed) ? closed : [];
 }
 
+// Stable id the lookup agent can hand back for a closed scene: "s<startMsg>"
+// when the card knows where it started (startScene refuses to reopen a closed
+// start index, so it is unique within the archive), else "b<msgIndex>" of the
+// card's first indexed beat. Both are CONTENT ids, never positions: the id is
+// cached in pipeline.js's lastLookup across swipes, and an archive trim
+// (MAX_CLOSED_SCENES splice at the head) between the pass and the swipe would
+// make a positional id silently resolve to a different scene. A card with
+// neither a start index nor an indexed beat gets no id and is not recallable.
+export function closedSceneId(scene) {
+    const s = Number.isInteger(scene?.startMsg) ? scene.startMsg : -1;
+    if (s >= 0) return `s${s}`;
+    const beats = Array.isArray(scene?.beats) ? scene.beats : [];
+    const first = beats.find(b => Number.isInteger(b?.msgIndex) && b.msgIndex >= 0);
+    return first ? `b${first.msgIndex}` : null;
+}
+
+export function findClosedSceneById(id) {
+    const m = /^([sb])(\d+)$/i.exec(String(id || '').trim());
+    if (!m) return null;
+    const closed = getClosedScenes();
+    const n = Number(m[2]);
+    // Resolution is defined as the inverse of closedSceneId, so an id can only
+    // ever name the card that would have minted it — two start-less cards
+    // sharing a beat index cannot be confused.
+    const want = `${m[1].toLowerCase()}${n}`;
+    return closed.find(c => c && closedSceneId(c) === want) || null;
+}
+
 // A new marker fired: close the current card (if it holds anything) and open a
 // fresh one starting at startMsg with the given name.
 export function startScene({ startMsg = -1, name = '' } = {}) {

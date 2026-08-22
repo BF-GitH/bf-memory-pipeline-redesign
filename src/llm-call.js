@@ -795,7 +795,7 @@ export async function callAgentLLMWithTools({
                 subsystem: 'agent3', event: 'toolloop.idlefinal', reason: 'SEARCH_REQUIRED',
                 data: { agent, round },
             });
-            const idleCorrection = 'Your reply delivered a verdict without executing a single tool call this run. Do not judge from the prompt alone: emit at least one {"tool":"search",...} (or read_facts / list_keys) line NOW — batching several in one reply is fine. You will get their TOOL RESULTS back, then restate your final answer with the results in hand. If they genuinely add nothing, your original verdict remains a valid final answer.';
+            const idleCorrection = 'Your reply delivered a verdict without executing a single tool call this run. Do not judge from the prompt alone: emit at least one {"tool":"search",...} (or read_facts / list_keys / search_scenes) line NOW — batching several in one reply is fine. You will get their TOOL RESULTS back, then restate your final answer with the results in hand. If they genuinely add nothing, your original verdict remains a valid final answer.';
             messages.push({ role: 'assistant', content: reply });
             messages.push({ role: 'user', content: idleCorrection });
             if (isTraceRecording()) {

@@ -2140,7 +2140,7 @@ async function runBeatsCall({ settledMessages = [], profileId = null, runId = ''
 // head — never the whole store.
 function buildHeadUserPrompt({
     settledMessages, tentativeMessages, characterInfo, userPersona,
-    priorSheetText, reflection, observationDate,
+    priorSheetText, reflection, observationDate, withheldNewestReply = false,
 }) {
     const parts = [];
     parts.push('## Task\nWrite the memory-sheet head (SUMMARY, optional SCENE_MARKER, TIMELINE, PRESENT) for the upcoming storyteller reply. Output only those lines.');
@@ -2188,8 +2188,19 @@ function buildHeadUserPrompt({
         // The recent settled tail carries the scene's current state (last ~8).
         parts.push(`## Recent settled messages\n${settledMessages.slice(-8).map(renderMessageLine).join('\n\n')}`);
     }
+    // The caller (runHeadCall) has already withheld the newest storyteller
+    // reply: that reply can still be swiped, and a swipe does NOT trigger a new
+    // memory run, so a head written from swipe #1 would be injected as settled
+    // truth into every later swipe. Only older tentative messages and the
+    // newest user message reach Call C; the section is omitted when empty.
+    // The note is stated only when a reply WAS withheld: telling the model a
+    // reply is missing when none was dropped makes it hedge against a reply
+    // that does not exist.
+    const withheldNote = withheldNewestReply ? ' — the newest storyteller reply is withheld because it can still be swiped; frame the next beat without it' : '';
     if (Array.isArray(tentativeMessages) && tentativeMessages.length > 0) {
-        parts.push(`## Tentative messages (may still change; use for framing the next beat)\n${tentativeMessages.map(renderMessageLine).join('\n\n')}`);
+        parts.push(`## Tentative messages (may still change; use for framing the next beat${withheldNote})\n${tentativeMessages.map(renderMessageLine).join('\n\n')}`);
+    } else if (withheldNewestReply) {
+        parts.push('## Tentative messages\n(none shown — the newest storyteller reply is withheld because it can still be swiped; frame the next beat from the settled messages)');
     }
 
     parts.push('Write the head now: SUMMARY, then SCENE_MARKER only if a new scene begins, then TIMELINE and PRESENT. Nothing else.');
@@ -2208,9 +2219,29 @@ async function runHeadCall({
 } = {}) {
     const out = { parsed: null, tokensIn: 0, tokensOut: 0, error: null, durationMs: 0 };
     const start = Date.now();
+
+    // Swipe re-injection guard: the tentative tail ends with the assistant reply
+    // that was JUST generated (pipeline runs post-reply). If the user swipes it,
+    // no new run fires (no newly settled messages), so whatever Call C wrote
+    // from that reply ("Right now:", TIMELINE, PRESENT) would be injected as
+    // established truth into every alternative swipe — invented details from
+    // swipe #1 then get reproduced on every later swipe. Drop that one message
+    // here (not in pipeline.js) so Call A / Call B keep their inputs unchanged.
+    // `role` comes from toAgentMessage ('USER' | 'CHAR'); anything not USER is
+    // the storyteller, matching renderMessageLine's own convention.
+    const tentativeList = Array.isArray(tentativeMessages) ? tentativeMessages : [];
+    const newestTentative = tentativeList[tentativeList.length - 1];
+    const withheldNewestReply = Boolean(newestTentative) && newestTentative.role !== 'USER';
+    const headTentative = withheldNewestReply ? tentativeList.slice(0, -1) : tentativeList;
+    if (withheldNewestReply) {
+        addDebugLog('debug', `[${runId}] Head call: withheld newest storyteller reply (msg #${newestTentative.index}) — it can still be swiped, so it must not shape the head`, {
+            subsystem: 'agent3', event: 'agent3.head', data: { withheldIndex: newestTentative.index, tentativeSeen: headTentative.length },
+        });
+    }
+
     const userPrompt = buildHeadUserPrompt({
-        settledMessages, tentativeMessages, characterInfo, userPersona,
-        priorSheetText, reflection, observationDate,
+        settledMessages, tentativeMessages: headTentative, characterInfo, userPersona,
+        priorSheetText, reflection, observationDate, withheldNewestReply,
     });
     out.tokensIn = Math.ceil((DEFAULT_HEAD_PROMPT.length + userPrompt.length) / 4);
 
@@ -2228,7 +2259,8 @@ async function runHeadCall({
         systemChars: DEFAULT_HEAD_PROMPT.length,
         userPromptChars: userPrompt.length,
         settled: (Array.isArray(settledMessages) ? settledMessages : []).length,
-        tentative: (Array.isArray(tentativeMessages) ? tentativeMessages : []).length,
+        tentative: headTentative.length,
+        withheldNewestReply,
     }), { runId, callId: headCallId, note: 'prompt TEXT rides the llm-call layer under this callId' });
     let reply = '';
     try {
