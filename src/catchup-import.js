@@ -1,6 +1,6 @@
 import {
     getSettings, addDebugLog, setLastGenerated, setLastInserted,
-    saveCurrentToActiveProfile, isTriviallyEmptyForExtraction, getPendingRun,
+    saveCurrentToActiveProfile, isTriviallyEmptyForExtraction,
     getMemorySheet, setMemorySheet, getReflection,
 } from './settings.js';
 
@@ -61,7 +61,6 @@ export async function runCatchupImport({ batchSize, onProgress, shouldCancel } =
     const context = ctx();
     if (!context) return refuse('NO_CONTEXT', 'SillyTavern context unavailable.');
     if (context.groupId || context.selected_group) return refuse('GROUP_CHAT', 'Catch-up import does not support group chats.'); 
-    if (getPendingRun()) return refuse('GENERATION_IN_FLIGHT', 'A reply is still generating/settling — wait for the turn to finish, then retry.');
     const chat = context.chat || [];
     if (chat.length === 0) return refuse('EMPTY_CHAT', 'No messages in the current chat.');
 

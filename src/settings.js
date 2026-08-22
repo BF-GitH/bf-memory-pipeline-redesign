@@ -43,7 +43,7 @@ import { LOOKUP_TIMEOUT_DEFAULT_MS } from './agent-lookup.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 
 export {
-    beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun,
+    beginRun, endRun,
     addDebugLog,
     // Test-run trace capture. Re-exported here because every agent module
     // already imports addDebugLog from this file — a trace call should not need

@@ -104,8 +104,6 @@ let _logBufferChatId = '';
 
 const MAX_DEBUG_ENTRIES_FILE = 4000;
 
-let pendingRun = null;
-
 export function beginRun(runId) {
     currentRunId = runId || null;
     return currentRunId;
@@ -113,20 +111,6 @@ export function beginRun(runId) {
 
 export function endRun() {
     currentRunId = null;
-}
-
-export function setPendingRun(info) {
-    pendingRun = info && info.runId ? { ...info } : null;
-}
-
-export function getPendingRun() {
-    return pendingRun;
-}
-
-export function consumePendingRun() {
-    const p = pendingRun;
-    pendingRun = null;
-    return p;
 }
 
 export function flushDebugLogNow() {

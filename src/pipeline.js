@@ -5,7 +5,7 @@ import { runLookupAgent, renderLookupBlock, lookupTimeoutMs, LOOKUP_TIMEOUT_STRI
 import { cancelInFlightLLM, callAgentLLM } from './llm-call.js';
 import { extractSentenceLine, countSentenceEnds } from './sentence-util.js';
 import { recordHealthEvent, clearHealthEvents } from './health.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getReflection, getMemorySheet, setMemorySheet, getStorySpine, appendStorySpineBatch, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, isTriviallyEmptyForExtraction } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getReflection, getMemorySheet, setMemorySheet, getStorySpine, appendStorySpineBatch, beginRun, endRun, isTriviallyEmptyForExtraction } from './settings.js';
 // Straight from the module that owns them: settings.js re-exports the older
 // turn-state surface this file already used, but not these.
 import { bumpReflectionProgress, resetReflectionProgress, extractSheetFactRefs } from './turn-state.js';
@@ -1267,8 +1267,7 @@ async function runMemoryExtraction() {
     const capturedChatId = String(ctx0.getCurrentChatId?.() || ctx0.chatId || '');
     const startTime = Date.now();
 
-    const pending = getPendingRun();
-    const runId = pending?.runId || `M${startTime.toString(36).slice(-5)}`;
+    const runId = `M${startTime.toString(36).slice(-5)}`;
     beginRun(runId);
 
     const postStageMs = { agent3Ms: null, snapshotMs: null };
@@ -2146,8 +2145,6 @@ export function initPipeline() {
             } catch (err) {
                 addDebugLog('fail', `Settle extraction failed (non-fatal): ${err.message || err}`);
                 toastPipelineError(`Memory update failed: ${err.message || err}`);
-            } finally {
-                consumePendingRun();
             }
         })();
     });
@@ -2219,7 +2216,6 @@ export function initPipeline() {
         // Event-backed health rows must not carry the previous chat's results.
         clearHealthEvents();
 
-        setPendingRun(null);
         endRun();
         hideWorkingIndicator();
         updateStatus('idle');
