@@ -299,7 +299,7 @@ function validateSettings(s) {
     // Same bounds agent-lookup.js clamps to at read time. Doing it here as well
     // means a hand-edited settings file shows the corrected value in the slider
     // rather than a number the pass silently ignores.
-    s.lookupTimeoutMs = Math.floor(clamp(s.lookupTimeoutMs, 3000, 30000, 8000));
+    s.lookupTimeoutMs = Math.floor(clamp(s.lookupTimeoutMs, 3000, 45000, 8000));
     if (typeof s.enforceKnownBy !== 'boolean') s.enforceKnownBy = true;
     if (typeof s.contradictionScanEnabled !== 'boolean') s.contradictionScanEnabled = true;
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';

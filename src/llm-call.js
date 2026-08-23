@@ -1087,7 +1087,17 @@ export async function callAgentLLMWithTools({
                 : 'you sent tool calls in the same reply, so these results arrived after it';
             deferNote = `\n\nNOTE: your ${finalToken} block was NOT accepted — ${reason}. ${lastRoundNote}: give your final answer ending in ${finalToken}, and call no further tools.`;
         }
-        messages.push({ role: 'user', content: `TOOL RESULTS:\n${resultParts.join('\n\n')}${capNote}${deferNote}` });
+        // The round that comes next is the last one: say so even when nothing was
+        // deferred. The model otherwise learns the cap only from its own system
+        // prompt, and on the 0.83.0 long runs the lookup agent — told "3 rounds"
+        // — searched again in round 2 on 7 of 66 passes and needed round 3 to
+        // close. Its cap is now 2, so a second searching round would end the pass
+        // as "max rounds reached without a block" with the refs it found thrown
+        // away; one line here keeps that from depending on prompt obedience.
+        const lastRoundPlain = (!deferNote && round + 1 >= maxRounds)
+            ? `\n\nNOTE: ${lastRoundNote} — give your final answer ending in ${finalToken}. Tool calls sent now cannot be answered any more.`
+            : '';
+        messages.push({ role: 'user', content: `TOOL RESULTS:\n${resultParts.join('\n\n')}${capNote}${deferNote}${lastRoundPlain}` });
     }
 
     if (!out.error && !out.done) {

@@ -52,13 +52,20 @@ import * as host from './host.js';
 // they are far tighter than the extraction agent's 8 rounds / 24 tool calls.
 //
 // 2 rounds is the minimum that can do the job at all: round 1 searches, round 2
-// answers with what the results showed. The third round exists for exactly one
-// caller: the idle-verdict correction (requireToolCallBeforeDone below). When
-// round 1 delivers a verdict with zero searches, the correction consumes a
-// round — and a 2-round budget would leave the demanded search to run BLIND on
-// the final round, its results never fed back. A ceiling, not a target: a pass
-// that searches in round 1 still closes in round 2, so the third round costs
-// latency only on turns that were previously answering with nothing.
+// answers with what the results showed — and it is also the ceiling now. The
+// third round used to exist for exactly one caller, the idle-verdict correction
+// (requireToolCallBeforeDone below): a zero-search verdict in round 1 was sent
+// back for a search, and a 2-round budget would have left that search to run
+// BLIND on the final round. Measured on the two 0.83.0 long runs (Opus 5, 24 s
+// cadence, 66 successful passes each): the idle correction fired 0x — the model
+// searches in round 1 on its own — and the round the third slot actually got
+// used for was a SECOND searching round (3/66 and 7/66 passes), which closed at
+// ~23 s mean against ~14 s for a two-round pass. On the path the user waits on
+// that is the most expensive way to earn a ref, and the prompt now says so
+// ("there is no round 3"); the tool loop tells the model the same thing on the
+// last round's TOOL RESULTS (llm-call.js). The correction still fires (round 1
+// < maxRounds), but its demanded search lands on the last round and the pass
+// closes on the verdict it has — an accepted trade for a path that never ran.
 // 8 tool calls: the prompt asks for "every search you want, all at once" in
 // round 1, and a capable model takes that literally — measured on the 0.83.0
 // long run as batches of 8 (a search plus a search_scenes per subject), which
@@ -66,7 +73,7 @@ import * as host from './host.js';
 // The loop now executes what fits and drops the rest (llm-call.js), so the cap
 // is a ceiling on latency again rather than a trap; 8 covers the measured
 // batches without inviting a sweep of the store.
-export const LOOKUP_MAX_ROUNDS = 3;
+export const LOOKUP_MAX_ROUNDS = 2;
 export const LOOKUP_MAX_TOOL_CALLS = 8;
 
 // WALL-CLOCK DEADLINE for the WHOLE pass. Non-negotiable: when it bites the
@@ -104,13 +111,20 @@ export const LOOKUP_TIMEOUT_DEFAULT_MS = 8000;
 
 // The floor and ceiling the settings slider is clamped to, and why they are where
 // they are. Below ~3s no hosted model completes a round, so the pass could only
-// ever time out. Above ~30s the wait stops reading as latency and starts reading
-// as a broken client — and this is the ONE pass the user sits and waits for, so
-// the ceiling is a UX judgement, not a technical one. Everything between is the
-// user's call: a slow proxy or a local model can genuinely need 15-20s, and that
-// number cannot be guessed from here.
+// ever time out. The ceiling is a UX judgement, not a technical one — this is
+// the ONE pass the user sits and waits for — and it was 30s until the 0.83.0
+// long runs measured a large hosted model (Opus 5) against it: 3 of 69 passes
+// that reached the model missed 30s outright, the successful ones took 15.1 s
+// mean / 22.5 s p90 / 28.8 s max, 9 of 66 ran past 20 s. 30s left no headroom
+// for exactly the profile the harness runs, and a miss there is three strikes
+// from switching the pass off for the session. 45s is the point past which the
+// wait stops reading as latency and starts reading as a broken client.
+// Everything between is the user's call: a slow proxy or a local model can
+// genuinely need 15-20s, and that number cannot be guessed from here.
+// settings.js clamps the stored value to the same bounds, and
+// templates/settings.html's slider carries them.
 export const LOOKUP_TIMEOUT_MIN_MS = 3000;
-export const LOOKUP_TIMEOUT_MAX_MS = 30000;
+export const LOOKUP_TIMEOUT_MAX_MS = 45000;
 
 // Read ONCE per pass by the caller and threaded down as an absolute deadline —
 // never twice inside one pass, or the budget would move under it if the user
@@ -279,7 +293,7 @@ Each tool call is ONE line of strict JSON, alone on its line:
 
 The system replies with one "TOOL RESULTS:" message; then you finish. Several call lines in one reply are fine; no markdown fences, no multi-line JSON.
 
-HARD LIMITS: 3 rounds, 8 tool calls. THE USER IS WAITING — this runs while the reply is held. Round 1: every search you want, all at once. Round 2: the final reply. A slow answer is a wasted one. Stop after your tool-call lines — never write TOOL RESULTS or a user turn yourself.
+HARD LIMITS: 2 rounds, 8 tool calls. THE USER IS WAITING — this runs while the reply is held. Round 1: every search you want, all at once. Round 2: the final reply — there is no round 3. A slow answer is a wasted one. Stop after your tool-call lines — never write TOOL RESULTS or a user turn yourself.
 
 SEARCH BEFORE YOU JUDGE: you MUST execute at least one tool call (search / read_facts / list_keys / search_scenes) before delivering your verdict. The store holds things the sheet does not carry — "the sheet looks complete" is a guess until a search says so. A verdict with zero tool calls will be sent back to you with a demand to search first.
 
@@ -683,9 +697,11 @@ export async function runLookupAgent({
             readsForceAnotherRound: true,
             // The other half of the "search before you judge" contract the
             // prompt now states: a verdict with zero executed tool calls gets
-            // one correction round demanding a search. LOOKUP_MAX_ROUNDS is 3
-            // precisely so this correction never pushes the demanded search
-            // into a blind final round (see the budget comment at the top).
+            // one correction round demanding a search. With LOOKUP_MAX_ROUNDS at
+            // 2 the demanded search lands on the final round and the verdict
+            // closes on what round 1 had — measured 0 idle verdicts on the 0.83.0
+            // long runs, so the correction is a backstop, not a path (see the
+            // budget comment at the top).
             requireToolCallBeforeDone: true,
             // The loop's "carried no sheet content" guard is for the sheet-emitting
             // agent only; this pass closes with #DONE like extraction does.
