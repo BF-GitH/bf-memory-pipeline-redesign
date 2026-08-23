@@ -315,12 +315,13 @@ const SHEET_HISTORY_MAX = 50;
 // This mirrors the trace layer's DEFAULT per-string cap (debug-log.js
 // TRACE_STRING_CHARS_DEFAULT), which is the tier for fact records and digests,
 // and it was sized when the composed sheet measured 6393 chars against a 65-fact
-// store and a premise floor of 15. The floor is now a slider defaulting to 50,
-// so composeSheet renders up to 50 floor rows + 45 NEED + 12 sticky + 8 extras =
-// 115 buildFactLine rows on top of the story/scene/timeline/precedence preamble.
-// At the SHIPPED DEFAULT that is 12-20 KB, i.e. at or over this cap; under
-// UNLIMITED it is hundreds of KB. The cap is therefore no longer a runaway
-// guard that never fires — it fires on essentially every recorded turn.
+// store and a premise floor of 15. The floor is now a slider defaulting to 30,
+// so composeSheet renders up to 30 floor rows + 45 NEED + 12 sticky + 8 extras =
+// 95 buildFactLine rows on top of the story/scene/timeline/precedence preamble
+// — but since the per-section char budget (recency.js SHEET_BUDGET_*) the fact
+// sections are bounded at ~10 KB and story/scene at 2 KB each by default, so
+// the default sheet fits under this cap again; a raised budget or UNLIMITED
+// does not, and then the cut lands as described below.
 //
 // What that costs, precisely: composeSheet appends the fact sections LAST
 // (STATE, then chrono, then `Connected memories:`), so the cut lands inside the

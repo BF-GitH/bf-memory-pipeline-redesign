@@ -68,7 +68,37 @@ const MAX_EXPANSION_TOTAL = 16;
 
 const EXACT_KEY_PRIMARY_CAP = 12;
 
-export function buildFactLine(fact, category, nowCtx = null) {
+// COMPACT ROWS. The full row renders the NOTE in place of the value, because
+// notes are written as self-contained prose — and on the 0.83.0 150-turn runs
+// that made every sheet row 304-343 chars: 47-51 CURRENT STATE rows at 14-16 k
+// chars, 20-22 CHRONOLOGY rows at 6.8 k, on a store whose values average 38
+// chars and whose notes average 213. The rows nothing asked for (premise floor,
+// random-walk extras) are the bulk of that, and they were paying note prices
+// for value-sized information. `compact` renders `value — note…`, the note
+// clipped here at a word boundary and appended only when it carries a word the
+// value does not. Demand rows (NEED, sticky recovered, lookup) stay full: the
+// note is the thing the agent asked for by ref.
+export const COMPACT_NOTE_CHARS = 120;
+
+const wordsOf = (s) => new Set(String(s || '').toLowerCase().match(/[\p{L}\p{N}]+/gu) || []);
+
+function noteAddsWords(note, value) {
+    const have = wordsOf(value);
+    for (const w of wordsOf(note)) if (!have.has(w)) return true;
+    return false;
+}
+
+export function clipAtWordBoundary(text, maxChars) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    if (t.length <= maxChars) return t;
+    const hard = t.slice(0, Math.max(1, maxChars - 1));
+    const ws = hard.lastIndexOf(' ');
+    // Cut at the last space unless that throws away more than half the room —
+    // a single 100-char token is clipped mid-word rather than dropped whole.
+    return (ws > maxChars / 2 ? hard.slice(0, ws) : hard).replace(/[\s,;:—-]+$/, '') + '…';
+}
+
+export function buildFactLine(fact, category, nowCtx = null, { compact = false } = {}) {
     const knownBy = (fact.knownBy || []).join(', ');
     const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
     const hasValue = String(fact.value ?? '').trim() !== '';
@@ -92,7 +122,27 @@ export function buildFactLine(fact, category, nowCtx = null) {
         ? ` — ${fact.resolvedNote.trim()}`
         : '';
 
-    if (note) return `${prefix} ${category}/${fact.key}: ${resolvedTag}${note}${tone ? ` (${tone})` : ''}${resolvedTail}${recency}`;
+    if (compact && hasValue) {
+        // `= value — note…`. The value stays the assertion (SHEET_REF_RE and the
+        // recheck feed read the same `[kb] Cat/key =` head as the full row); the
+        // note tail is dropped outright when it only repeats the value.
+        const value = String(fact.value).trim();
+        // Supersede-written rows (splitSupersedeText) store the first clause as
+        // the value and the whole text as the note, so the note OPENS with the
+        // value: printing both repeated it verbatim on 4 of the top 4 floor
+        // rows of the measured store. Only what follows the value is appended.
+        const rest = note.toLowerCase().startsWith(value.toLowerCase())
+            ? note.slice(value.length).replace(/^[\s,;:.—–-]+/, '')
+            : note;
+        const tail = (rest && noteAddsWords(rest, value)) ? ` — ${clipAtWordBoundary(rest, COMPACT_NOTE_CHARS)}` : '';
+        return `${prefix} ${category}/${fact.key} = ${resolvedTag}${value}${tail}${tone ? ` (${tone})` : ''}${resolvedTail}${recency}`;
+    }
+    if (note) {
+        // Note-only rows have no value to fall back on, so compact keeps the
+        // note as the assertion and only shortens it.
+        const body = compact ? clipAtWordBoundary(note, COMPACT_NOTE_CHARS) : note;
+        return `${prefix} ${category}/${fact.key}: ${resolvedTag}${body}${tone ? ` (${tone})` : ''}${resolvedTail}${recency}`;
+    }
     if (hasValue) return `${prefix} ${category}/${fact.key} = ${resolvedTag}${fact.value}${resolvedTail}${recency}`;
 
     if (isResolved) return `${prefix} ${category}/${fact.key}: ${resolvedTag.replace(/:\s*$/, '')}${resolvedTail}${recency}`;

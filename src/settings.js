@@ -41,6 +41,10 @@ import {
 // here touches the binding while either module is still evaluating.
 import { LOOKUP_TIMEOUT_DEFAULT_MS } from './agent-lookup.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
+// recency.js is a LEAF module (no imports), so its constants are safe to read
+// in the DEFAULT_SETTINGS literal below — unlike agent-memory.js's, see the
+// premiseFloorMax note there.
+import { SHEET_BUDGET_DEFAULT, SHEET_BUDGET_SETTING_KEYS, SHEET_BUDGET_CLAMP, resolveSheetBudget } from './recency.js';
 
 export {
     beginRun, endRun,
@@ -134,7 +138,8 @@ const DEFAULT_SETTINGS = {
     // them. Declared here so the schema-v3 key sweep keeps it and the fill loop
     // in initSettings claims it — but deliberately WITHOUT a value: the default
     // is agent-memory.js's (PREMISE_FLOOR_DEFAULT, moved 15 -> 50 on measured
-    // coverage), and validateSettings resolves `undefined` through the very
+    // coverage, then 50 -> 30 once the sheet got a char budget per section),
+    // and validateSettings resolves `undefined` through the very
     // function the sheet builder uses. A number here would be a second copy of
     // that default, free to drift.
     //
@@ -145,6 +150,17 @@ const DEFAULT_SETTINGS = {
     // moment anything other than index.js's settings-first order loads the
     // graph. assertPremiseFloorKey() checks the string at runtime instead.
     premiseFloorMax: undefined,
+
+    // SHEET BUDGET — chars per sheet section (see SHEET_BUDGET_DEFAULT in
+    // recency.js for the measured reason). Literal keys for the same schema-v3
+    // sweep reason as premiseFloorMax; the values come from the one constant
+    // composeSheet resolves against, so nothing here can drift from it.
+    // No slider yet — the keys are the contract a settings UI can bind to later.
+    sheetBudgetFacts: SHEET_BUDGET_DEFAULT.facts,
+    sheetBudgetChronology: SHEET_BUDGET_DEFAULT.chronology,
+    sheetBudgetScene: SHEET_BUDGET_DEFAULT.scene,
+    sheetBudgetStory: SHEET_BUDGET_DEFAULT.story,
+    sheetBudgetHead: SHEET_BUDGET_DEFAULT.head,
 
     agent2ContextMessages: 10,
 
@@ -269,6 +285,19 @@ function validateSettings(s) {
         });
     }
     s[PREMISE_FLOOR_SETTING_KEY] = floorValue;
+
+    // SHEET BUDGET. Resolved through the same function composeSheet uses, so
+    // the stored number and the number the sheet is built to cannot disagree;
+    // out-of-range hand edits are clamped and logged, not discarded.
+    const budget = resolveSheetBudget(s);
+    for (const c of budget.clamped) {
+        addDebugLog('fail', `Sheet budget ${c.key} ${safeStringify(c.raw)} is outside ${SHEET_BUDGET_CLAMP[c.section][0]}..${SHEET_BUDGET_CLAMP[c.section][1]} chars; clamped to ${c.value}`, {
+            subsystem: 'settings', event: 'settings.migrated', actor: 'SYSTEM',
+            reason: 'SHEET_BUDGET_CLAMPED', data: { key: c.key },
+            before: c.raw, after: c.value,
+        });
+    }
+    for (const [section, key] of Object.entries(SHEET_BUDGET_SETTING_KEYS)) s[key] = budget[section];
 
     // Read by agent-reflect.js as `Math.max(1, Number(...) || CONTRADICTION_INTERVAL_DEFAULT)`.
     // The fallback below is 1 and that module's constant is still 2 — they no

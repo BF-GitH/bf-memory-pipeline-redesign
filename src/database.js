@@ -24,7 +24,12 @@ export const PREMISE_FLOOR_SETTING_KEY = 'premiseFloorMax';
 export const PREMISE_FLOOR_UNLIMITED = 0;
 export const PREMISE_FLOOR_MIN = 1;
 export const PREMISE_FLOOR_SLIDER_MAX = 100;
-export const PREMISE_FLOOR_DEFAULT = 50;
+// 30, down from 50: 50 was sized for a 65-fact store (see the coverage curve at
+// selectPremiseFloor in agent-memory.js) and on the 469-fact 0.83.0 long runs
+// it filled 47-51 CURRENT STATE rows every turn. The floor is now also under a
+// per-section char budget (recency.js SHEET_BUDGET_*), which is what bounds
+// the sheet; the row cap just decides how many rows the budget chooses among.
+export const PREMISE_FLOOR_DEFAULT = 30;
 
 // Resolves the setting to a usable cap. `cap` is Infinity when unlimited, so
 // every consumer can do arithmetic with it without special-casing the sentinel;
@@ -1505,7 +1510,8 @@ export function summarizeMenuIndexed(index) {
 //
 //   value       the assertion itself (trim + lowercase, via factValuesEqual)
 //   context     the note. buildFactLine prints the note INSTEAD of the value when one
-//               is present, so two rows with different notes read differently on the
+//               is present (compact supply rows print `value — note…`, still both),
+//               so two rows with different notes read differently on the
 //               sheet however well their values match. Comparing value alone deleted
 //               an importance-5 World lore record, note and all, in favour of an
 //               importance-2 Places one-liner.
