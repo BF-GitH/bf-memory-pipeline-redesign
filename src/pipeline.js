@@ -14,8 +14,9 @@ import { recordFactUsage } from './database.js';
 let internalCallDepth = 0;
 const isInternalCall = () => internalCallDepth > 0;
 
-// A reply that lands while a lookup or a reflection pass holds the depth used
-// to be dropped on the floor: runMemoryExtraction returned on isInternalCall()
+// A reply that lands while a reflection pass holds the depth (or, before the
+// lookup was decoupled from it, a lookup pass) used to be dropped on the floor:
+// runMemoryExtraction returned on isInternalCall()
 // with no log line and no retry, and the "ONE retry chained" macrotask was lost
 // the same way when reflection raised the depth between its scheduling and its
 // firing. On a slow transport a reflection holds the depth for minutes, so every
@@ -361,6 +362,16 @@ async function flushInjectedFactUsage() {
 // extractSheetFactRefs sees its rows and flushInjectedFactUsage credits them like
 // any other injected row — which is correct: they were injected.
 let lookupAbort = null;
+// The lookup's OWN single-flight token: the runId of the pass in progress, or
+// null. It replaces the internalCallDepth gate the pass used to sit behind.
+// Measured on the 0.83.0 long runs (24 s cadence): 114 of 188 prompts (61 %)
+// skipped the lookup with INTERNAL_CALL, because the depth is held by the
+// background extraction (~67 s mean per run) and by reflection (minutes), so it
+// was > 0 most of the time — and the gate protected nothing there (see
+// appendLookupBlock). A token rather than a boolean so a pass that unwinds late
+// (aborted on CHAT_CHANGED, backstop fired) can only clear ITS OWN claim, never
+// the claim of the pass that started after it.
+let lookupInFlight = null;
 // Consecutive deadline strikes, and the session latch they arm. A misconfigured
 // profile otherwise costs LOOKUP_TIMEOUT_MS of dead latency on every single
 // message; bounded per turn is not the same as bounded overall. Reset by a chat
@@ -492,51 +503,71 @@ function newestUserExchange() {
 // tomorrow whatever gets added — and it firing is a distinct, logged condition.
 async function appendLookupBlock(sheetText, path, genType) {
     const settings = getSettings();
-    if (!settings?.lookupEnabled || lookupOffForSession) return sheetText;
+    // Off by setting: silent — the feature is off by default and a line per
+    // prompt would only fill the ring. Every other outcome logs its decision.
+    if (!settings?.lookupEnabled) return sheetText;
+    if (lookupOffForSession) { logLookupDecision('SKIP:BREAKER', path, genType); return sheetText; }
     // A generation the user already stopped (or a disabled pipeline — both set
     // this) must not spend an LLM call, let alone hold anything up.
-    if (pipelineCancelled) return sheetText;
+    if (pipelineCancelled) { logLookupDecision('SKIP:CANCELLED', path, genType); return sheetText; }
     // Not the storyteller answering the user. 'quiet' is generateQuietPrompt —
     // auto-summarize, image captions, /gen, other extensions' background work;
     // 'impersonate' is the model writing the USER's next message, so the newest
     // user message this pass is built around is not the thing being answered
-    // either. Both would pay the full latency for a lookup nobody reads.
-    if (genType === 'quiet' || genType === 'impersonate') {
+    // either; 'continue' extends a reply whose prompt already carried the block
+    // for this very user message (or skipped it for a reason that still
+    // stands), so a fresh search while the user waits answers nothing new. All
+    // three would pay the full latency for a lookup nobody reads.
+    if (genType === 'quiet' || genType === 'impersonate' || genType === 'continue') {
+        logLookupDecision('SKIP:GEN_TYPE', path, genType);
         addDebugLog('debug', `Lookup skipped — ${genType} generation, not a storyteller reply to the user`, {
-            subsystem: 'agent3', event: 'lookup.skip', reason: 'NOT_A_USER_TURN',
+            subsystem: 'agent3', event: 'lookup.skip', reason: 'GEN_TYPE',
             data: { path, genType },
         });
         return sheetText;
     }
-    // RE-ENTRANCY, on the mechanism the extraction path already uses rather than a
-    // second one: the pass raises internalCallDepth for its whole duration, so a
-    // generation raised from inside it (the lookup's own LLM call, if it ever
-    // stopped bypassing ST's generate pipeline) re-enters here, sees the depth and
-    // returns immediately. Without it that re-entry is unbounded recursion — the
-    // lookup runs INSIDE the handler, unlike extraction, whose worst case is a
-    // stray injection. It also fixes the two-concurrent-passes case, where the
-    // second entry overwrote lookupAbort and left the first leg uncancellable.
+    // SINGLE-FLIGHT, on the lookup's OWN token — NOT on internalCallDepth.
     //
-    // This is NOT the guard the two injection handlers deliberately refuse (see
-    // their comments): those must inject the sheet during a background run, and
-    // guarding them dropped real injections. Skipping the LOOKUP during one costs
-    // nothing that was already computed — the sheet still goes in — and it keeps
-    // two agent passes off the same connection profile at once.
+    // The pass used to skip whenever isInternalCall() was true and raised the
+    // depth itself for its whole duration. Measured (0.83.0 long runs, 24 s
+    // cadence): 114/188 prompts (61 %) skipped with INTERNAL_CALL, because the
+    // depth is held by the background extraction (~67 s mean) and by reflection
+    // (minutes) — so it was > 0 most of the time, and every one of those turns
+    // went out without the refs the lookup exists to fetch.
     //
-    // The cost of RAISING it here is the mirror of that: runMemoryExtraction also
-    // bails on isInternalCall(), so a connection auto-retry landing inside this
-    // pass's window is skipped. Bounded by the deadline (≤8s, against the minutes
-    // extraction and reflection already hold it for) and not lost — the per-message
-    // watermarks mean the next trigger re-covers the same stretch.
-    if (isInternalCall()) {
-        addDebugLog('debug', 'Lookup skipped — another BF Memory pass is already holding the internal-call depth', {
-            subsystem: 'agent3', event: 'lookup.skip', reason: 'INTERNAL_CALL',
-            data: { path },
+    // WHY THE DEPTH GATE WAS NEVER PROTECTING ANYTHING HERE. This function runs
+    // inside CHAT_COMPLETION_PROMPT_READY / GENERATE_AFTER_DATA, and the
+    // extension's own agent traffic can never fire those: every call goes out via
+    // CMRS.sendRequest (llm-call.js callViaCMRS → ST custom-request.js
+    // ChatCompletionService.processRequest) or a direct backend fetch (llm-call.js
+    // callDirect), and neither path emits them — in ST only openai.js
+    // prepareOpenAIMessages and script.js generateRawData do, and the extension
+    // uses neither. That is the same fact the two injection handlers already rely
+    // on to inject the sheet during a background run. So the ONLY things that
+    // reach this gate are genuine generations, and the things that must still be
+    // kept out are (a) the non-reply generation types — the latch above — and
+    // (b) a SECOND lookup entering while one is in flight (two passes would share
+    // lookupAbort and leave the first leg uncancellable). (b) is what this token
+    // covers; it is held for exactly the pass and nothing else.
+    //
+    // WHY THE PASS NO LONGER RAISES THE DEPTH. Raising it made runMemoryExtraction
+    // defer a reply that landed inside the lookup window — a deferral the retry
+    // poll then has to chase. The lookup reads the store and writes nothing, so an
+    // extraction running beside it has nothing to collide with, and reflection in
+    // flight costs it at worst a ref that is about to be merged: a stale ref for
+    // one prompt beats no ref at all. The decision line below carries both
+    // in-flight flags so a trace reader can still see what ran alongside.
+    if (lookupInFlight) {
+        logLookupDecision('SKIP:IN_FLIGHT', path, genType);
+        addDebugLog('debug', `Lookup skipped — a lookup pass (${lookupInFlight}) is still in flight for an earlier generation`, {
+            subsystem: 'agent3', event: 'lookup.skip', reason: 'IN_FLIGHT',
+            data: { path, inFlight: lookupInFlight },
         });
         return sheetText;
     }
 
     const runId = `lookup${++lookupSeq}`;
+    logLookupDecision('RAN', path, genType, runId);
     // Absolute, taken BEFORE the first await and handed to every stage, so the
     // budget is shared rather than restarted per stage.
     // Read ONCE here, at the top of the pass, and threaded down as an absolute
@@ -545,7 +576,7 @@ async function appendLookupBlock(sheetText, path, genType) {
     const budgetMs = lookupTimeoutMs();
     const deadlineAt = Date.now() + budgetMs;
     let backstop = null;
-    internalCallDepth++;
+    lookupInFlight = runId;
     try {
         const backstopP = new Promise((resolve) => {
             backstop = setTimeout(() => resolve(LOOKUP_BACKSTOP), budgetMs + LOOKUP_DEADLINE_GRACE_MS);
@@ -573,8 +604,22 @@ async function appendLookupBlock(sheetText, path, genType) {
         return sheetText;
     } finally {
         if (backstop) clearTimeout(backstop);
-        lowerInternalCallDepth();
+        // Own claim only: after a backstop release the orphaned leg is still
+        // unwinding while a newer pass may already hold the token.
+        if (lookupInFlight === runId) lookupInFlight = null;
     }
+}
+
+// One line per prompt that reached the lookup gates, at 'debug', so a log reader
+// (and the eval harness) can count RAN against each SKIP:* reason per turn
+// instead of inferring the skips from the absence of a lookup.run line. The two
+// background flags and the depth are carried because the decision is now
+// independent of them — that independence is the claim, the line its evidence.
+function logLookupDecision(decision, path, genType, runId = null) {
+    addDebugLog('debug', `Lookup decision: ${decision} (${path}${genType ? `, ${genType}` : ''}${runId ? `, ${runId}` : ''})`, {
+        subsystem: 'agent3', event: 'lookup.decision', reason: decision, runId,
+        data: { path, genType: genType || null, extractionInFlight: memoryExtractionInFlight, reflectionInFlight, internalCallDepth },
+    });
 }
 
 // The pass itself. Split out so appendLookupBlock is nothing but the gates and
@@ -687,7 +732,7 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
             //     here and only here. This is also the fallback for an unrecognised
             //     kind, which keeps the pre-split behaviour as the default.
             //     ('budget' cannot reach this pass: the tool loop's own budget is
-            //     600s and the lookup deadline is at most 30s, so the race in
+            //     600s and the lookup deadline is at most 45s, so the race in
             //     agent-lookup.js always wins and reports timedOut instead.)
             //
             //   PROTOCOL ('protocol') — the model replied, inside the deadline, and
