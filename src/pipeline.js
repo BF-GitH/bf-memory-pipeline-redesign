@@ -3,7 +3,7 @@ import { runMemoryAgent, isConnectionFailure } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { runLookupAgent, renderLookupBlock, lookupTimeoutMs, LOOKUP_TIMEOUT_STRIKES, LOOKUP_ERROR_STRIKES, LOOKUP_PROTOCOL_STRIKES, LOOKUP_DEADLINE_GRACE_MS } from './agent-lookup.js';
 import { cancelInFlightLLM, callAgentLLM } from './llm-call.js';
-import { extractSentenceLine, countSentenceEnds } from './sentence-util.js';
+import { extractSentenceLine, countSentenceEnds, clampSpineSentence, looksLikeRoleplayProse, SPINE_SENTENCE_MAX_CHARS } from './sentence-util.js';
 import { recordHealthEvent, clearHealthEvents } from './health.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, getReflection, getMemorySheet, setMemorySheet, getStorySpine, appendStorySpineBatch, beginRun, endRun, isTriviallyEmptyForExtraction } from './settings.js';
 // Straight from the module that owns them: settings.js re-exports the older
@@ -1085,13 +1085,15 @@ function toAgentMessage(m, index) {
     return { index, uid: ensureMsgUid(m), role: m.is_user ? 'USER' : 'CHAR', name: String(m.name || '').trim(), text: m.mes };
 }
 
-// The spine contract is ONE sentence per batch. Enforcement is cooperative,
-// not destructive: the LLM must put its sentence on an explicit "SENTENCE:"
-// line (survives chatty preambles), and the reply is VALIDATED with the shared
-// sentence-util counters. A multi-sentence reply triggers ONE rewrite call over
-// the same batch; if it is STILL multi-sentence it is accepted as-is, because
-// an extra sentence hurts the story far less than a sentence chopped off in
-// the middle.
+// The spine contract is ONE sentence per batch, at most SPINE_SENTENCE_MAX_CHARS.
+// The LLM must put its sentence on an explicit "SENTENCE:" line (survives
+// chatty preambles); a reply without the line, or one that continues the
+// roleplay ("CHAR (Name): …"), is a FAILURE and the batch is retried next turn.
+// A multi-sentence reply triggers ONE rewrite call over the same batch; if it
+// is STILL over the contract it is CLAMPED deterministically (first sentence,
+// then the char cap). The old "accept as-is, never chopped" path is gone: the
+// measured 150-turn runs accepted 4–14-sentence blocks for every batch and
+// "Story so far:" grew to 35 k chars, 59 % of the sheet.
 function spineSentencePrompt(count) {
     return `Summarize these ${count} roleplay messages as EXACTLY ONE past-tense sentence capturing what happened. Reply in exactly this format and nothing else:\nSENTENCE: <the one sentence>`;
 }
@@ -1173,22 +1175,35 @@ async function maybeAppendStorySpine(runId, profileId, capturedChatId = '') {
                 .join('\n\n');
 
             let sentence = '';
+            let rejectReason = '';
             try {
-                sentence = extractSentenceLine(await callAgentLLM(
-                    spineSentencePrompt(slice.length), transcript, profileId, 'story-spine',
-                ));
+                const raw = await callAgentLLM(spineSentencePrompt(slice.length), transcript, profileId, 'story-spine');
+                if (looksLikeRoleplayProse(raw)) {
+                    rejectReason = 'ROLEPLAY_PROSE';
+                } else {
+                    sentence = extractSentenceLine(raw);
+                    if (!sentence) rejectReason = 'NO_SENTENCE_LINE';
+                }
                 const ends = sentence ? countSentenceEnds(sentence) : 0;
-                if (ends > 1) {
-                    // Too many sentences: ONE rewrite call over the same batch.
-                    addDebugLog('info', `[${runId}] Story spine batch ${batchIndex}: reply had ${ends} sentences — one rewrite call to condense`);
-                    const rewritten = extractSentenceLine(await callAgentLLM(
+                if (sentence && (ends > 1 || sentence.length > SPINE_SENTENCE_MAX_CHARS)) {
+                    // Over the contract: ONE rewrite call over the same batch.
+                    addDebugLog('info', `[${runId}] Story spine batch ${batchIndex}: reply had ${ends} sentences / ${sentence.length} chars — one rewrite call to condense`);
+                    const rewrittenRaw = await callAgentLLM(
                         `Your previous summary used more than one sentence. Condense these ${slice.length} roleplay messages into EXACTLY ONE past-tense sentence. Reply in exactly this format and nothing else:\nSENTENCE: <the one sentence>`,
                         transcript, profileId, 'story-spine-rewrite',
-                    ));
+                    );
+                    // A rewrite that came back as prose or without the label keeps
+                    // the labelled first reply, which the clamp below still bounds.
+                    const rewritten = looksLikeRoleplayProse(rewrittenRaw) ? '' : extractSentenceLine(rewrittenRaw);
                     if (rewritten) sentence = rewritten;
                     const stillEnds = countSentenceEnds(sentence);
-                    if (stillEnds > 1) {
-                        addDebugLog('info', `[${runId}] Story spine batch ${batchIndex}: still ${stillEnds} sentences after rewrite — accepting as-is (never chopped)`);
+                    if (stillEnds > 1 || sentence.length > SPINE_SENTENCE_MAX_CHARS) {
+                        const clipped = clampSpineSentence(sentence);
+                        addDebugLog('info', `[${runId}] Story spine batch ${batchIndex}: still ${stillEnds} sentences / ${sentence.length} chars after rewrite — clipped to ${clipped.length} chars (cap 1 sentence / ${SPINE_SENTENCE_MAX_CHARS} chars)`, {
+                            subsystem: 'pipeline', event: 'spine.clipped',
+                            data: { batchIndex, beforeChars: sentence.length, afterChars: clipped.length, beforeSentences: stillEnds, afterSentences: countSentenceEnds(clipped), hardClip: clipped.endsWith('…'), before: sentence, after: clipped },
+                        });
+                        sentence = clipped;
                     }
                 }
             } catch (err) {
@@ -1196,7 +1211,9 @@ async function maybeAppendStorySpine(runId, profileId, capturedChatId = '') {
                 break;
             }
             if (!sentence) {
-                addDebugLog('info', `[${runId}] Story spine batch ${batchIndex} produced no sentence — will retry next turn`);
+                addDebugLog('info', `[${runId}] Story spine batch ${batchIndex} produced no sentence${rejectReason === 'ROLEPLAY_PROSE' ? ' (reply continued the roleplay instead of summarizing)' : rejectReason === 'NO_SENTENCE_LINE' ? ' (no SENTENCE: line in the reply)' : ''} — will retry next turn`, {
+                    subsystem: 'pipeline', event: 'spine.rejected', reason: rejectReason || 'EMPTY', data: { batchIndex, startMsg, endMsg },
+                });
                 break;
             }
 

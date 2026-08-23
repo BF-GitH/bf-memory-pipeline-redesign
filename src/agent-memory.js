@@ -28,9 +28,9 @@ import {
     STATE_SECTION_HEADER, RESOLVED_SECTION_HEADER, CHRONO_SECTION_HEADER,
 } from './recency.js';
 import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
-import { countSentenceEnds, extractSentenceLine, SPINE_ABBREVIATIONS } from './sentence-util.js';
+import { countSentenceEnds, extractSentenceLine, clipAtSentenceBoundary } from './sentence-util.js';
 import { executeMemoryTool, stripThinkBlocks } from './memory-tools.js';
-import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline, getLastNeedRefs, setLastNeedRefs, getRecoveredRefs, tickRecoveredRefs, markRecoveredRefs } from './turn-state.js';
+import { getStorySpine, getSummaryPyramid, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline, getLastNeedRefs, setLastNeedRefs, getRecoveredRefs, tickRecoveredRefs, markRecoveredRefs } from './turn-state.js';
 import { addDebugLog, isTraceRecording, traceCapture, newTraceCallId } from './settings.js';
 import * as host from './host.js';
 
@@ -2094,46 +2094,9 @@ function extractPriorSummary(priorSheetText) {
     return m ? clipAtSentenceBoundary(m[1].trim(), SUMMARY_MAX_SENTENCES, SUMMARY_MAX_CHARS) : '';
 }
 
-// Sentence-end positions of `text` (index just past the terminator), using the
-// same exclusions countSentenceEnds applies — abbreviation dots, decimals — so
-// the two never disagree about where a sentence ends. Closing quotes/brackets
-// right after the terminator are included in the boundary.
-function sentenceBoundaries(text) {
-    const out = [];
-    const re = /[.!?]+["'”’)\]]*(?=\s|$)/g;
-    let m;
-    while ((m = re.exec(text)) !== null) {
-        const end = m.index + m[0].length;
-        const before = text.slice(Math.max(0, m.index - 12), m.index + 1);
-        if (/\d\.$/.test(before) && /^\d/.test(text.slice(end))) continue;          // decimal
-        if (new RegExp(SPINE_ABBREVIATIONS.source + '$', 'i').test(before)) continue; // "Dr."
-        out.push(end);
-    }
-    return out;
-}
-
-// Backup 2 for the head caps: cut at the LAST sentence boundary that keeps the
-// text within both caps, never mid-sentence; a first sentence that is alone
-// over the char cap is hard-clipped at a word break with an ellipsis. Returns
-// the input untouched when it is already within the caps.
-export function clipAtSentenceBoundary(text, maxSentences, maxChars) {
-    const t = String(text || '').replace(/\s+/g, ' ').trim();
-    if (!t) return '';
-    const bounds = sentenceBoundaries(t);
-    const ends = countSentenceEnds(t);
-    if (t.length <= maxChars && ends <= maxSentences) return t;
-    let cut = -1;
-    for (let i = 0; i < bounds.length && i < maxSentences; i++) {
-        if (bounds[i] <= maxChars) cut = bounds[i];
-        else break;
-    }
-    // A sentence-count overflow with every boundary inside the char cap: the
-    // loop above stops at maxSentences and `cut` is the last allowed boundary.
-    if (cut > 0) return t.slice(0, cut).trim();
-    const hard = t.slice(0, Math.max(1, maxChars - 1));
-    const ws = hard.lastIndexOf(' ');
-    return (ws > maxChars / 2 ? hard.slice(0, ws) : hard).replace(/[\s,;:—-]+$/, '') + '…';
-}
+// sentenceBoundaries / clipAtSentenceBoundary (backup 2 for the head caps)
+// live in sentence-util.js now — the story-spine clamp in pipeline.js uses the
+// same boundary logic so the two can never disagree about where a sentence ends.
 
 // CALL B (BEATS): one batched single-shot call turning every newly-settled
 // message into one terse past-tense beat, parsed back by its position number.
@@ -2381,7 +2344,9 @@ async function enforceHeadCaps(parsed, { profileId = null, runId = '', signal = 
         condenseUsed = true;
         let answer = '';
         try {
-            answer = extractSentenceLine(await callAgentLLM(systemPrompt, text, profileId, 'sheet-head-condense', signal, { runId, callId: headCallId }));
+            // required:false — the condense prompts ask for "the recap only", not
+            // a SENTENCE: line, so a label-less reply is the normal answer here.
+            answer = extractSentenceLine(await callAgentLLM(systemPrompt, text, profileId, 'sheet-head-condense', signal, { runId, callId: headCallId }), { required: false });
         } catch (e) {
             addDebugLog('info', `[${runId}] Head ${field} condense call failed (${e?.message || e}) — falling through to the clip`, {
                 subsystem: 'agent3', event: 'agent3.head', reason: 'HEAD_CONDENSE_FAILED', data: { field },
@@ -2990,6 +2955,31 @@ export async function estimatePremiseFloorCost(capOverride = undefined) {
     };
 }
 
+// See the "Story so far:" block in composeSheet for why these exist.
+export const STORY_SO_FAR_MAX_CHARS = 2000;
+const STORY_SO_FAR_SPINE_TAIL = 3;
+let storySourceLoggedForRun = '';
+
+export function storySoFarText() {
+    let spineBatches = 0;
+    let spineTail = '';
+    try {
+        const spine = getStorySpine();
+        if (Array.isArray(spine) && spine.length > 0) {
+            spineBatches = spine.length;
+            spineTail = spine.slice(-STORY_SO_FAR_SPINE_TAIL).map(b => String(b.sentence || '').trim()).filter(Boolean).join(' ');
+        }
+    } catch { spineTail = ''; }
+    let pyramidStory = '';
+    try {
+        const pyramid = getSummaryPyramid();
+        pyramidStory = (pyramid && typeof pyramid.story === 'string') ? pyramid.story.replace(/\s+/g, ' ').trim() : '';
+    } catch { pyramidStory = ''; }
+    const source = pyramidStory ? 'pyramid' : spineTail ? 'spine' : 'none';
+    const text = clipAtSentenceBoundary(pyramidStory || spineTail, Infinity, STORY_SO_FAR_MAX_CHARS);
+    return { text, source, spineBatches };
+}
+
 function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], recovered = [], settings = {}, databases = {}, runId = '' } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
@@ -3175,21 +3165,24 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     const lines = [];
     lines.push('[MEMORY SHEET — persistent memory; established truth for this scene; overrides older chat history]');
 
-    // "Story so far:" is the deterministic append-only spine (one sentence per
-    // completed batch of spineBatchSize settled messages), joined — it grows
-    // monotonically and is never rewritten. The agent's own per-turn situational
-    // recap always renders as its own "Right now:" line. While the spine is
-    // still empty (before the first complete batch) the "Story so far:" line is
-    // simply OMITTED — no fallback text stands in for it.
-    let spineText = '';
-    try {
-        const spine = getStorySpine();
-        if (Array.isArray(spine) && spine.length > 0) {
-            spineText = spine.map(b => String(b.sentence || '').trim()).filter(Boolean).join(' ');
-        }
-    } catch { spineText = ''; }
-
-    if (spineText) lines.push(`Story so far: ${spineText}`);
+    // "Story so far:" used to be the WHOLE append-only spine joined — measured
+    // at 35 k chars (59 % of the sheet) by turn 150 of two Opus runs. Now it
+    // renders the summary pyramid's rolling story (the reflection pass's
+    // ~1 k-char recap, chatMetadata bf_mem_pyramid) when there is one, else the
+    // LAST 3 spine sentences; either way capped at STORY_SO_FAR_MAX_CHARS on a
+    // sentence boundary. The full spine is untouched — buildHeadUserPrompt and
+    // the store still read it. While both sources are empty the line is simply
+    // OMITTED — no fallback text stands in for it. The agent's own per-turn
+    // situational recap always renders as its own "Right now:" line.
+    const { text: storyText, source: storySource, spineBatches } = storySoFarText();
+    if (storyText) lines.push(`Story so far: ${storyText}`);
+    if (runId && storySourceLoggedForRun !== runId) {
+        storySourceLoggedForRun = runId;
+        addDebugLog('debug', `[${runId}] Sheet: "Story so far" from ${storySource === 'pyramid' ? 'the summary pyramid story' : storySource === 'spine' ? `the last ${STORY_SO_FAR_SPINE_TAIL} of ${spineBatches} spine sentences` : 'nothing (omitted)'} — ${storyText.length} chars`, {
+            subsystem: 'agent3', event: 'sheet.story_source',
+            data: { source: storySource, chars: storyText.length, spineBatches, clipped: storyText.endsWith('…') },
+        });
+    }
     if (summary) lines.push(`Right now: ${summary}`);
     // Scene card: the agent-declared scene name as a header, followed by the stacked
     // one-line beats accumulated across every message since this scene opened. Falls
