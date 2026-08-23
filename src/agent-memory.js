@@ -28,7 +28,7 @@ import {
     STATE_SECTION_HEADER, RESOLVED_SECTION_HEADER, CHRONO_SECTION_HEADER,
 } from './recency.js';
 import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
-import { countSentenceEnds } from './sentence-util.js';
+import { countSentenceEnds, extractSentenceLine, SPINE_ABBREVIATIONS } from './sentence-util.js';
 import { executeMemoryTool, stripThinkBlocks } from './memory-tools.js';
 import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline, getLastNeedRefs, setLastNeedRefs, getRecoveredRefs, tickRecoveredRefs, markRecoveredRefs } from './turn-state.js';
 import { addDebugLog, isTraceRecording, traceCapture, newTraceCallId } from './settings.js';
@@ -239,7 +239,7 @@ Each tool call is ONE line of strict JSON, alone on its line:
 {"tool":"add_alias","args":{"name":"Trish","alias":"Trish Mitchells"}}
 {"tool":"link_facts","args":{"from":"Events:tom_affair_jessica","to":"Events:jessica_visit_awkward","reason":"explains why the visit was awkward"}}
 
-The system replies with one "TOOL RESULTS:" message; then call more tools or finish. Several lines per reply are fine; no markdown fences, no multi-line JSON.
+The system replies with one "TOOL RESULTS:" message; then call more tools or finish. Several lines per reply are fine; no markdown fences, no multi-line JSON. Stop after your tool-call lines — never write TOOL RESULTS or a user turn yourself.
 - add_alias: two names = SAME character. Before writing a seemingly NEW character, search their first name; if stored under an older name, add_alias and reuse the EXISTING key prefix.
 - link_facts: link two STORED facts ("Category:key" refs VERIFIED via tools, never guessed) when a NEW fact retroactively explains an OLD one, as in the example above (new affair fact explains the old awkward visit). Max 5 links per fact; re-linking is a no-op.
 
@@ -300,14 +300,34 @@ export const DEFAULT_BEATS_PROMPT = `You convert roleplay messages into terse sc
 // Call C (SHEET HEAD) — single-shot, no tools. Writes the situational recap and
 // scene framing lines in the exact format parseSheetBlock understands. Fixed
 // prompt: NOT affected by the settings override.
+//
+// HEAD CAPS. The "Right now:" line is fed back to the next run as "Prior head
+// (update it)", and a capable model UPDATES by accreting: measured on the
+// 0.83.0 long run the summary averaged 1 347 chars of scene prose (4-9
+// sentences, gestures and quotes included) and TIMELINE grew from 121 to 405
+// chars — every turn paid for the whole thing twice (head call in, sheet
+// injection out) and the storyteller read a recap that retold the scene it was
+// about to continue. The prompt now states the shape; runHeadCall enforces it
+// with one condensing re-ask and, failing that, a clip at a sentence boundary.
+// 450 chars is ~70 words of plain statements with room for a long name or two;
+// 200 chars holds a date, a place and a relationship span with nothing else.
+export const SUMMARY_MAX_SENTENCES = 3;
+export const SUMMARY_MAX_CHARS = 450;
+export const TIMELINE_MAX_CHARS = 200;
 export const DEFAULT_HEAD_PROMPT = `You write the HEAD of a roleplay memory sheet from the given brief, messages, scene card and prior head. Output EXACTLY these lines and nothing else:
 
-SUMMARY: <FRESH situational recap for the UPCOMING beat — premise plus what the coming scene leans on; re-write for where the story stands, don't retell history>
+SUMMARY: <2-3 plain sentences (≤ 70 words): where they are, what is unresolved, what the next beat hinges on. No scenery, no quotes, no gestures, no prose.>
 SCENE_MARKER: <startMsgIndex> | <2-5 word scene name>
-TIMELINE: <in-story date/time; WHERE the characters are; how long the mains have known each other>
+TIMELINE: <ONE line: in-story date/time; place; how long the mains have known each other — nothing else>
 PRESENT: <comma-separated names of everyone physically in the scene, e.g. "Maria, Tom">
 
-SUMMARY is REQUIRED; TIMELINE almost always. SCENE_MARKER only when a NEW scene BEGINS in the recent messages (place change, time-skip, major shift) — the "#N" index where it starts, then the name; OMIT while the scene continues. PRESENT: everyone there RIGHT NOW (mains AND named NPCs), nobody who left. No #SHEET header, no BEAT/NEED lines, no commentary.` + TEMPORAL_GROUNDING_RULE;
+SUMMARY is REQUIRED; TIMELINE almost always. SUMMARY is a FRESH recap for the UPCOMING beat — re-write it for where the story stands, never retell history, never let it grow: ${SUMMARY_MAX_SENTENCES} sentences is the ceiling. SCENE_MARKER only when a NEW scene BEGINS in the recent messages (place change, time-skip, major shift) — the "#N" index where it starts, then the name; OMIT while the scene continues. PRESENT: everyone there RIGHT NOW (mains AND named NPCs), nobody who left. No #SHEET header, no BEAT/NEED lines, no commentary.` + TEMPORAL_GROUNDING_RULE;
+
+// Backup 1 for the caps above: ONE re-ask over the over-long field, same
+// profile, no tools. A failed or still-too-long answer falls through to the
+// deterministic clip (backup 2) — the call never decides alone.
+const HEAD_CONDENSE_SUMMARY_PROMPT = `Condense the following situational recap to at most ${SUMMARY_MAX_SENTENCES} sentences and 70 words, plain statements, no scenery or quotes. Reply with the recap only.`;
+const HEAD_CONDENSE_TIMELINE_PROMPT = `Condense the following timeline line to ONE line of at most ${TIMELINE_MAX_CHARS} characters: in-story date/time; place; how long the mains have known each other — nothing else. Reply with the line only.`;
 
 export async function runMemoryAgent({
     settledMessages = [],
@@ -2068,7 +2088,51 @@ async function applyStateVerdicts({ verdicts, stateRecheck, ctx, runId = '', cal
 // composed sheet keeps a summary instead of blanking it.
 function extractPriorSummary(priorSheetText) {
     const m = /^\s*Right now:\s*(.+)$/im.exec(String(priorSheetText || ''));
-    return m ? m[1].trim() : '';
+    // Clipped on the way back in: a prior head over the cap (written by an
+    // older build, or the rare clip that could not land on a boundary) must not
+    // seed the next head with more than the next head is allowed to be.
+    return m ? clipAtSentenceBoundary(m[1].trim(), SUMMARY_MAX_SENTENCES, SUMMARY_MAX_CHARS) : '';
+}
+
+// Sentence-end positions of `text` (index just past the terminator), using the
+// same exclusions countSentenceEnds applies — abbreviation dots, decimals — so
+// the two never disagree about where a sentence ends. Closing quotes/brackets
+// right after the terminator are included in the boundary.
+function sentenceBoundaries(text) {
+    const out = [];
+    const re = /[.!?]+["'”’)\]]*(?=\s|$)/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const end = m.index + m[0].length;
+        const before = text.slice(Math.max(0, m.index - 12), m.index + 1);
+        if (/\d\.$/.test(before) && /^\d/.test(text.slice(end))) continue;          // decimal
+        if (new RegExp(SPINE_ABBREVIATIONS.source + '$', 'i').test(before)) continue; // "Dr."
+        out.push(end);
+    }
+    return out;
+}
+
+// Backup 2 for the head caps: cut at the LAST sentence boundary that keeps the
+// text within both caps, never mid-sentence; a first sentence that is alone
+// over the char cap is hard-clipped at a word break with an ellipsis. Returns
+// the input untouched when it is already within the caps.
+export function clipAtSentenceBoundary(text, maxSentences, maxChars) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!t) return '';
+    const bounds = sentenceBoundaries(t);
+    const ends = countSentenceEnds(t);
+    if (t.length <= maxChars && ends <= maxSentences) return t;
+    let cut = -1;
+    for (let i = 0; i < bounds.length && i < maxSentences; i++) {
+        if (bounds[i] <= maxChars) cut = bounds[i];
+        else break;
+    }
+    // A sentence-count overflow with every boundary inside the char cap: the
+    // loop above stops at maxSentences and `cut` is the last allowed boundary.
+    if (cut > 0) return t.slice(0, cut).trim();
+    const hard = t.slice(0, Math.max(1, maxChars - 1));
+    const ws = hard.lastIndexOf(' ');
+    return (ws > maxChars / 2 ? hard.slice(0, ws) : hard).replace(/[\s,;:—-]+$/, '') + '…';
 }
 
 // CALL B (BEATS): one batched single-shot call turning every newly-settled
@@ -2288,11 +2352,77 @@ async function runHeadCall({
             data: { error: parsed.error, replyChars: reply.length, durationMs: out.durationMs },
         });
     }
+    await enforceHeadCaps(parsed, { profileId, runId, signal, headCallId });
+    out.durationMs = Date.now() - start;
     addDebugLog('info', `[${runId}] Head call: summary ${parsed.summary ? 'yes' : 'no'}, marker ${parsed.sceneMarker ? 'yes' : 'no'}, timeline ${parsed.timeline ? 'yes' : 'no'}, present ${parsed.present.length} (${out.durationMs}ms)`, {
         subsystem: 'agent3', event: 'agent3.head',
         data: { hasSummary: !!parsed.summary, hasMarker: !!parsed.sceneMarker, hasTimeline: !!parsed.timeline, present: parsed.present.length, durationMs: out.durationMs },
     });
     return out;
+}
+
+// The head caps (see SUMMARY_MAX_* / TIMELINE_MAX_CHARS at DEFAULT_HEAD_PROMPT),
+// applied to the parsed head IN PLACE. Two backups per field, in order:
+//   1. ONE condensing re-ask (same profile, purpose 'sheet-head-condense') — for
+//      TIMELINE only when the summary did not already spend it, so an
+//      over-long head costs at most one extra call per run;
+//   2. a deterministic clip at the last sentence boundary inside the cap.
+// A re-ask that fails, returns nothing, or is still over the cap falls through
+// to the clip; the result is always within the caps. Mirrors the story-spine
+// rewrite in pipeline.js, with the clip added because this field is re-fed to
+// the next run and an accepted overrun would compound turn after turn.
+async function enforceHeadCaps(parsed, { profileId = null, runId = '', signal = null, headCallId = null } = {}) {
+    if (!parsed) return;
+    const summaryOver = (s) => countSentenceEnds(s) > SUMMARY_MAX_SENTENCES || s.length > SUMMARY_MAX_CHARS;
+    const timelineOver = (s) => s.length > TIMELINE_MAX_CHARS;
+    let condenseUsed = false;
+
+    const condense = async (field, text, systemPrompt) => {
+        condenseUsed = true;
+        let answer = '';
+        try {
+            answer = extractSentenceLine(await callAgentLLM(systemPrompt, text, profileId, 'sheet-head-condense', signal, { runId, callId: headCallId }));
+        } catch (e) {
+            addDebugLog('info', `[${runId}] Head ${field} condense call failed (${e?.message || e}) — falling through to the clip`, {
+                subsystem: 'agent3', event: 'agent3.head', reason: 'HEAD_CONDENSE_FAILED', data: { field },
+            });
+            return '';
+        }
+        // Strip a label the model may have echoed ("SUMMARY: ...").
+        answer = answer.replace(/^(SUMMARY|TIMELINE)\s*:\s*/i, '').trim();
+        // A protocol token or a near-empty line is a refusal, not a recap; the
+        // harness's dry transport answers every unknown call with "#DONE".
+        if (/^#/.test(answer) || answer.split(/\s+/).length < 4) return '';
+        return answer;
+    };
+
+    const apply = async ({ field, over, prompt, maxSentences, maxChars }) => {
+        const before = String(parsed[field] || '').replace(/\s+/g, ' ').trim();
+        if (!before || !over(before)) return;
+        let current = before;
+        if (!condenseUsed) {
+            const condensed = await condense(field, before, prompt);
+            if (condensed && condensed.length < before.length) {
+                current = condensed;
+                addDebugLog('info', `[${runId}] Head ${field} condensed by re-ask: ${before.length} -> ${current.length} chars (${countSentenceEnds(before)} -> ${countSentenceEnds(current)} sentence ends)${over(current) ? ' — still over the cap, clipping' : ''}`, {
+                    subsystem: 'agent3', event: 'agent3.head', reason: 'HEAD_CONDENSED',
+                    data: { field, beforeChars: before.length, afterChars: current.length, beforeSentences: countSentenceEnds(before), afterSentences: countSentenceEnds(current), stillOver: over(current) },
+                });
+            }
+        }
+        if (over(current)) {
+            const clipped = clipAtSentenceBoundary(current, maxSentences, maxChars);
+            addDebugLog('info', `[${runId}] Head ${field} clipped at a sentence boundary: ${current.length} -> ${clipped.length} chars (cap ${maxChars} chars / ${Number.isFinite(maxSentences) ? maxSentences : 'any'} sentences)`, {
+                subsystem: 'agent3', event: 'agent3.head', reason: 'HEAD_CLIPPED',
+                data: { field, beforeChars: current.length, afterChars: clipped.length, beforeSentences: countSentenceEnds(current), afterSentences: countSentenceEnds(clipped), hardClip: clipped.endsWith('…') },
+            });
+            current = clipped;
+        }
+        parsed[field] = current;
+    };
+
+    await apply({ field: 'summary', over: summaryOver, prompt: HEAD_CONDENSE_SUMMARY_PROMPT, maxSentences: SUMMARY_MAX_SENTENCES, maxChars: SUMMARY_MAX_CHARS });
+    await apply({ field: 'timeline', over: timelineOver, prompt: HEAD_CONDENSE_TIMELINE_PROMPT, maxSentences: Infinity, maxChars: TIMELINE_MAX_CHARS });
 }
 
 // BEAT coverage enforcement: Call B should emit one beat per settled message,

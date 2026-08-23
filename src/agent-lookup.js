@@ -59,10 +59,15 @@ import * as host from './host.js';
 // the final round, its results never fed back. A ceiling, not a target: a pass
 // that searches in round 1 still closes in round 2, so the third round costs
 // latency only on turns that were previously answering with nothing.
-// 4 tool calls fit "search the two or three things this message names" with one
-// call to spare for a read_facts confirmation.
+// 8 tool calls: the prompt asks for "every search you want, all at once" in
+// round 1, and a capable model takes that literally — measured on the 0.83.0
+// long run as batches of 8 (a search plus a search_scenes per subject), which
+// the old cap of 4 rejected WHOLE, 15 passes dead before a single call ran.
+// The loop now executes what fits and drops the rest (llm-call.js), so the cap
+// is a ceiling on latency again rather than a trap; 8 covers the measured
+// batches without inviting a sweep of the store.
 export const LOOKUP_MAX_ROUNDS = 3;
-export const LOOKUP_MAX_TOOL_CALLS = 4;
+export const LOOKUP_MAX_TOOL_CALLS = 8;
 
 // WALL-CLOCK DEADLINE for the WHOLE pass. Non-negotiable: when it bites the
 // prompt goes out WITHOUT the lookup block. A missing line is always better than
@@ -274,7 +279,7 @@ Each tool call is ONE line of strict JSON, alone on its line:
 
 The system replies with one "TOOL RESULTS:" message; then you finish. Several call lines in one reply are fine; no markdown fences, no multi-line JSON.
 
-HARD LIMITS: 3 rounds, 4 tool calls. THE USER IS WAITING — this runs while the reply is held. Round 1: every search you want, all at once. Round 2: the final reply. A slow answer is a wasted one.
+HARD LIMITS: 3 rounds, 8 tool calls. THE USER IS WAITING — this runs while the reply is held. Round 1: every search you want, all at once. Round 2: the final reply. A slow answer is a wasted one. Stop after your tool-call lines — never write TOOL RESULTS or a user turn yourself.
 
 SEARCH BEFORE YOU JUDGE: you MUST execute at least one tool call (search / read_facts / list_keys / search_scenes) before delivering your verdict. The store holds things the sheet does not carry — "the sheet looks complete" is a guess until a search says so. A verdict with zero tool calls will be sent back to you with a demand to search first.
 
@@ -666,7 +671,7 @@ export async function runLookupAgent({
             maxToolCalls: LOOKUP_MAX_TOOL_CALLS,
             executeTool: (call) => executeLookupTool(call, ctx),
             // THE fix that lets this pass search at all. Extraction and reflection
-            // drop tool calls that ride alongside the closing block; for a
+            // ignore READ calls that ride alongside the closing block; for a
             // READ-ONLY agent that drops every call it can ever make, and its own
             // prompt invites the batching ("Several call lines in one reply are
             // fine", DEFAULT_LOOKUP_PROMPT above). With this set, a read next to

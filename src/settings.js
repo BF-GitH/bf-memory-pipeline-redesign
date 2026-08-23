@@ -395,7 +395,11 @@ function promptFingerprint(text) {
 // written into it as a concrete number (validateSettings leaves no key empty).
 // It re-runs the prompt sweep as a side effect, which is harmless — that sweep
 // only drops an override byte-identical to a default we shipped.
-const SETTINGS_SCHEMA_VERSION = 7;
+//
+// v8: both default prompts changed again (the transcript-continuation guard
+// sentence, and reflection's rewritten promise about ride-along merge_facts /
+// mark_cold lines), so the sweep must recognise the outgoing 0.83.0 copies.
+const SETTINGS_SCHEMA_VERSION = 8;
 
 // WHEN YOU CHANGE EITHER DEFAULT PROMPT, three edits, no more:
 //   1. prepend the OUTGOING default's fingerprint to `legacyFingerprints`
@@ -443,7 +447,10 @@ const PROMPT_OVERRIDES = {
         // (6747:19ca94c1), so a stored copy of it is caught by `isCurrent`.
         // The moment this prompt changes, prepend that value — the previous
         // build's NEW_BUILTIN_DEFAULT log line hands it to you.
+        //   8217:0ca67433  the 0.83.0 default (447c397), taken from that build's
+        //                  NEW_BUILTIN_DEFAULT log line on the long-run export
         legacyFingerprints: [
+            '8217:0ca67433',
             '6146:6134fcc3', '5497:ba738ab6', '10321:1f57dd75', '11798:01a9b06a',
             '10915:1df4f2c5', '9309:cba0dc1a', '8685:d2d7dbc1', '8753:6529783e',
             '7019:2f4058a7', '6251:de16a77b',
@@ -464,6 +471,11 @@ const PROMPT_OVERRIDES = {
                 name: 'Sticky recovered refs (the RECOVERED line)',
                 detail: 'a recovery is now marked on its own RECOVERED line and stays injected for several turns instead of one. Without the line the agent never marks anything, nothing goes sticky, and the memory drops back out on the very next turn — the same fumble can recur immediately.',
             },
+            {
+                marker: 'never write TOOL RESULTS or a user turn yourself',
+                name: 'Transcript-continuation guard',
+                detail: 'text-completion style backends let the model keep writing the conversation after its own reply — a fake TOOL RESULTS message with invented results. The loop now cuts such a reply at that point, and the prompt tells the model to stop after its tool-call lines; an older copy never says so, and every such reply costs a grace round or the whole extraction.',
+            },
         ],
     },
     reflectionPrompt: {
@@ -478,7 +490,10 @@ const PROMPT_OVERRIDES = {
         // 5425:68c35aaf (round 1) and 7877:4eea8b3c (round 2) were never
         // committed, so they are the two entries no replay can confirm; the
         // round-2 value is the one measured on that pass's own tree.
+        // 8074:5b32a11c is the 0.83.0 default (447c397), from that build's
+        // NEW_BUILTIN_DEFAULT log line on the long-run export.
         legacyFingerprints: [
+            '8074:5b32a11c',
             '7877:4eea8b3c', '5425:68c35aaf', '3200:aca717b7', '8182:a3b476f2',
             '5439:e9a0aca8', '6121:4d74998a', '4151:9c6cfd02',
         ],
@@ -502,6 +517,11 @@ const PROMPT_OVERRIDES = {
                 marker: 'COLD-TIERED, not deleted',
                 name: 'merge_facts keeps the loser',
                 detail: 'merging a duplicate now cold-tiers the loser (kept, deprioritized) instead of erasing it — nothing in the repair path deletes anything any more. An older copy still tells the model the merge DELETES the duplicate, so it either avoids a merge that is now safe or expects a removal that no longer happens.',
+            },
+            {
+                marker: 'INVALIDATES them',
+                name: 'Ride-along repairs are executed, not dropped',
+                detail: 'a merge_facts or mark_cold sent alongside the closing sections now runs and buys a feedback round in which the sections must be restated; only on the last round is it dropped. An older copy still promises the drop, so the model either withholds a repair it could have made or expects one to vanish that now executes.',
             },
         ],
     },
