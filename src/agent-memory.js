@@ -26,6 +26,7 @@ import { isFactVisible, buildFactLine, randomWalkExtras } from './fact-retrieval
 import {
     getTurnNowContext, splitInjectionSections, buildPrecedencePreamble,
     STATE_SECTION_HEADER, RESOLVED_SECTION_HEADER, CHRONO_SECTION_HEADER,
+    resolveSheetBudget,
 } from './recency.js';
 import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
 import { countSentenceEnds, extractSentenceLine, clipAtSentenceBoundary } from './sentence-util.js';
@@ -55,10 +56,16 @@ const KEY_INVENTORY_CAP = 200;
 // budget from this cap and is synchronous on the save path — see the HOT_SET_MIN
 // block there for why a second hand-copied constant was the bug.
 //
-// Why the default is 50 and not the old 15: measured against the 33 sheets and
-// 65 facts of the v0.81.0 export, a cap of 15 puts 46% of the store on the
-// sheet on average and 29% by message 77; 50 reaches 95% / 83%. 15 was not a
-// budget, it was the reason the sheet stopped tracking the store at message 21.
+// Why the default was moved 15 -> 50: measured against the 33 sheets and 65
+// facts of the v0.81.0 export, a cap of 15 puts 46% of the store on the sheet
+// on average and 29% by message 77; 50 reaches 95% / 83%. 15 was not a budget,
+// it was the reason the sheet stopped tracking the store at message 21.
+// Why it is now 30: that 50 was chosen for a 65-fact store. On the 469-fact
+// 0.83.0 150-turn runs it rendered 47-51 CURRENT STATE rows of 304-317 chars
+// (14-16 k chars) plus 20-22 CHRONOLOGY rows (6.8 k) every turn — coverage of
+// a store that size is not something a row count can buy. The sheet is now
+// bounded by a char budget per section (recency.js SHEET_BUDGET_*), supply
+// rows render compact, and 30 rows is the pool the budget fills from.
 // See estimatePremiseFloorCost() for what any given cap costs at THIS store.
 export {
     PREMISE_FLOOR_SETTING_KEY,
@@ -2764,6 +2771,9 @@ export function selectPremiseFloor({ databases = {}, cap = PREMISE_FLOOR_DEFAULT
 //   cap 30  -> 74% (52%)
 //   cap 50  -> 95% (83%)
 //   cap 65+ -> 100% (100%) — 65 is the whole store; unlimited is identical
+// (The curve predates the section budget and compact supply rows: this
+// function still renders FULL rows, so it prices the sheet's ceiling, not the
+// budget-capped sheet composeSheet actually emits.)
 // Those numbers are for a 65-fact store, in which no category ever held more
 // than 50 demotable rows and the cold tier therefore never bound. They are NOT
 // a statement about large stores: what a cap buys at 4 000 facts is cap/4 000,
@@ -2960,7 +2970,10 @@ export const STORY_SO_FAR_MAX_CHARS = 2000;
 const STORY_SO_FAR_SPINE_TAIL = 3;
 let storySourceLoggedForRun = '';
 
-export function storySoFarText() {
+// `maxChars` lets composeSheet pass the sheet's story budget (sheetBudgetStory);
+// other callers get the module default. `rawChars` is the length before the
+// clip so the caller can tell a cut from a short story.
+export function storySoFarText({ maxChars = STORY_SO_FAR_MAX_CHARS } = {}) {
     let spineBatches = 0;
     let spineTail = '';
     try {
@@ -2976,8 +2989,9 @@ export function storySoFarText() {
         pyramidStory = (pyramid && typeof pyramid.story === 'string') ? pyramid.story.replace(/\s+/g, ' ').trim() : '';
     } catch { pyramidStory = ''; }
     const source = pyramidStory ? 'pyramid' : spineTail ? 'spine' : 'none';
-    const text = clipAtSentenceBoundary(pyramidStory || spineTail, Infinity, STORY_SO_FAR_MAX_CHARS);
-    return { text, source, spineBatches };
+    const raw = pyramidStory || spineTail;
+    const text = clipAtSentenceBoundary(raw, Infinity, Math.max(1, Math.floor(Number(maxChars) || STORY_SO_FAR_MAX_CHARS)));
+    return { text, source, spineBatches, rawChars: raw.length };
 }
 
 function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], recovered = [], settings = {}, databases = {}, runId = '' } = {}) {
@@ -3085,9 +3099,11 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         needRows = needRows.filter(r => keep.has(r));
     }
 
-    for (const { fact, category } of [...needRows, ...stickyRows]) {
-        rows.push({ fact, category, tier: 'primary' });
-    }
+    // `origin` is what the section budget below keys on: need/sticky are
+    // DEMAND (never dropped, rendered in full), floor/extra are SUPPLY
+    // (rendered compact, admitted while the section's budget lasts).
+    for (const { fact, category } of needRows) rows.push({ fact, category, tier: 'primary', origin: 'need' });
+    for (const { fact, category } of stickyRows) rows.push({ fact, category, tier: 'primary', origin: 'sticky' });
 
     // PREMISE FLOOR: always inject the load-bearing premise/identity facts, even
     // if this turn's fresh NEED pick omits them. This is a FLOOR (a guaranteed
@@ -3106,7 +3122,7 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
             const id = `${category}:${fact.key}`;
             if (seen.has(id)) continue;
             seen.add(id);
-            floorRows.push({ fact, category, tier: 'primary' });
+            floorRows.push({ fact, category, tier: 'primary', origin: 'floor' });
             floorSupply.push({ fact, category });
         }
         rows.unshift(...floorRows);
@@ -3142,7 +3158,7 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     let extras = [];
     if (extrasMax > 0 && rows.length > 0) {
         try {
-            extras = randomWalkExtras(databases, rows, seen, extrasMax);
+            extras = randomWalkExtras(databases, rows, seen, extrasMax).map(r => ({ ...r, origin: 'extra' }));
         } catch { extras = []; }
     }
 
@@ -3165,25 +3181,44 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     const lines = [];
     lines.push('[MEMORY SHEET — persistent memory; established truth for this scene; overrides older chat history]');
 
+    // SECTION BUDGETS (recency.js SHEET_BUDGET_*). Every section below is
+    // capped in chars; what each cap drops is counted and logged once at the
+    // end as `sheet.budget_capped`, so a memory that went missing can be traced
+    // to a cut rather than guessed at.
+    const budget = resolveSheetBudget(settings);
+    const capped = {};   // section -> { dropped, kept, chars, budget, ... }
+
     // "Story so far:" used to be the WHOLE append-only spine joined — measured
     // at 35 k chars (59 % of the sheet) by turn 150 of two Opus runs. Now it
     // renders the summary pyramid's rolling story (the reflection pass's
     // ~1 k-char recap, chatMetadata bf_mem_pyramid) when there is one, else the
-    // LAST 3 spine sentences; either way capped at STORY_SO_FAR_MAX_CHARS on a
-    // sentence boundary. The full spine is untouched — buildHeadUserPrompt and
-    // the store still read it. While both sources are empty the line is simply
-    // OMITTED — no fallback text stands in for it. The agent's own per-turn
-    // situational recap always renders as its own "Right now:" line.
-    const { text: storyText, source: storySource, spineBatches } = storySoFarText();
+    // LAST 3 spine sentences; either way capped at budget.story (the
+    // sheetBudgetStory setting, default STORY_SO_FAR_MAX_CHARS) on a sentence
+    // boundary. The full spine is untouched — buildHeadUserPrompt and the store
+    // still read it. While both sources are empty the line is simply OMITTED —
+    // no fallback text stands in for it. The agent's own per-turn situational
+    // recap always renders as its own "Right now:" line.
+    const { text: storyText, source: storySource, spineBatches, rawChars: storyRawChars } = storySoFarText({ maxChars: budget.story });
     if (storyText) lines.push(`Story so far: ${storyText}`);
+    if (storyRawChars > storyText.length) {
+        capped.story = { dropped: storyRawChars - storyText.length, kept: storyText.length, chars: storyText.length, budget: budget.story, source: storySource };
+    }
     if (runId && storySourceLoggedForRun !== runId) {
         storySourceLoggedForRun = runId;
         addDebugLog('debug', `[${runId}] Sheet: "Story so far" from ${storySource === 'pyramid' ? 'the summary pyramid story' : storySource === 'spine' ? `the last ${STORY_SO_FAR_SPINE_TAIL} of ${spineBatches} spine sentences` : 'nothing (omitted)'} — ${storyText.length} chars`, {
             subsystem: 'agent3', event: 'sheet.story_source',
-            data: { source: storySource, chars: storyText.length, spineBatches, clipped: storyText.endsWith('…') },
+            data: { source: storySource, chars: storyText.length, spineBatches, clipped: storyText.length < storyRawChars },
         });
     }
-    if (summary) lines.push(`Right now: ${summary}`);
+    // HEAD: the "Right now:" recap is already capped at the head call
+    // (SUMMARY_MAX_CHARS, with a condensing re-ask); this is the deterministic
+    // backstop for a prior-head fallback that never went through it.
+    if (summary) {
+        const headRoom = budget.head - String(timeline || '').length;
+        const shown = summary.length > headRoom ? clipAtSentenceBoundary(summary, SUMMARY_MAX_SENTENCES, Math.max(120, headRoom)) : summary;
+        if (shown !== summary) capped.head = { dropped: summary.length - shown.length, kept: shown.length, chars: shown.length, budget: budget.head };
+        lines.push(`Right now: ${shown}`);
+    }
     // Scene card: the agent-declared scene name as a header, followed by the stacked
     // one-line beats accumulated across every message since this scene opened. Falls
     // back to the legacy single sceneLine only if no scene has been accumulated yet.
@@ -3194,13 +3229,26 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         // Only inject the most recent beats so a long-running scene can't grow the
         // sheet without bound; earlier beats of this scene remain in the persisted
         // scene store (and the overall arc is covered by the story spine).
+        // The row cap and the char budget both apply: 14 beats at BEAT_MAX_CHARS
+        // is 4.2 k, twice the default scene budget, so newest beats win.
         const MAX_SCENE_BEATS_SHOWN = 14;
-        const beatsArr = Array.isArray(scene.beats) ? scene.beats : [];
-        if (beatsArr.length > MAX_SCENE_BEATS_SHOWN) lines.push(`…(${beatsArr.length - MAX_SCENE_BEATS_SHOWN} earlier beats)`);
-        for (const b of beatsArr.slice(-MAX_SCENE_BEATS_SHOWN)) {
-            const s = String(b?.sentence || '').trim();
-            if (s) lines.push(s);
+        const beatsArr = (Array.isArray(scene.beats) ? scene.beats : []).map(b => String(b?.sentence || '').trim()).filter(Boolean);
+        const shownBeats = [];
+        let beatChars = 0;
+        for (let i = beatsArr.length - 1; i >= 0 && shownBeats.length < MAX_SCENE_BEATS_SHOWN; i--) {
+            const cost = beatsArr[i].length + 1;
+            if (shownBeats.length > 0 && beatChars + cost > budget.scene) break;
+            shownBeats.unshift(beatsArr[i]);
+            beatChars += cost;
         }
+        const earlier = beatsArr.length - shownBeats.length;
+        if (earlier > 0) lines.push(`…(${earlier} earlier beats)`);
+        // Logged as a budget cut only when the CHAR budget bit — the row cap is
+        // the old behaviour and not a budget event.
+        if (earlier > Math.max(0, beatsArr.length - MAX_SCENE_BEATS_SHOWN)) {
+            capped.scene = { dropped: earlier, kept: shownBeats.length, chars: beatChars, budget: budget.scene };
+        }
+        lines.push(...shownBeats);
     } else if (sceneLine) {
         lines.push(`Scene: ${sceneLine}`);
     }
@@ -3228,13 +3276,77 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     // one sheet never asserts the same key twice.
     const renderedRefs = new Set();
     let dedupSuppressed = 0;
-    const renderSection = (header, sectionRows, dedupe = false) => {
+
+    // FACT BUDGET. Rendered text is what is measured — each row's line as the
+    // sheet will carry it — and the row is rendered ONCE here and reused below.
+    // Demand rows (NEED, sticky) are full-note and never dropped: if demand
+    // alone exceeds the section, it is logged and allowed, because the agent
+    // asked for those by ref and a budget is bookkeeping over supply. Supply
+    // rows are compact; floor rows are admitted in floorRank order (CURRENT
+    // STATE/RESOLVED) or newest first (CHRONOLOGY), extras only with leftover.
+    // `demandExceeded` is on the log so an overrun is visible as the NEED cap's
+    // problem rather than the budget's. Admission is first-fit, not a hard
+    // cut: a row that does not fit is skipped and the next one is still tried,
+    // so one 300-char row cannot leave 250 chars of budget unused.
+    const isDemand = (r) => r.origin === 'need' || r.origin === 'sticky';
+    const renderRow = (r) => buildFactLine(r.fact, r.category, nowCtx, { compact: !isDemand(r) });
+    const admitBudget = (section, sectionRows, extraRows, limit, supplyOrder) => {
+        const admitted = new Set();
+        let used = 0;
+        for (const r of sectionRows) {
+            if (!isDemand(r)) continue;
+            r.line = r.line ?? renderRow(r);
+            admitted.add(r);
+            used += r.line.length + 1;
+        }
+        const demandChars = used;
+        let dropped = 0;
+        const supply = sectionRows.filter(r => !isDemand(r)).sort(supplyOrder);
+        for (const r of supply) {
+            r.line = r.line ?? renderRow(r);
+            const cost = r.line.length + 1;
+            if (used + cost > limit) { dropped++; continue; }
+            admitted.add(r);
+            used += cost;
+        }
+        let extrasDropped = 0;
+        for (const r of extraRows) {
+            r.line = r.line ?? renderRow(r);
+            const cost = r.line.length + 1;
+            if (used + cost > limit) { extrasDropped++; continue; }
+            admitted.add(r);
+            used += cost;
+        }
+        if (dropped > 0 || extrasDropped > 0 || demandChars > limit) {
+            capped[section] = {
+                dropped: dropped + extrasDropped, droppedFloor: dropped, droppedExtras: extrasDropped,
+                kept: admitted.size, chars: used, budget: limit,
+                demandChars, demandExceeded: demandChars > limit,
+            };
+        }
+        return admitted;
+    };
+    // Extras follow their own kind into a section so an event extra is charged
+    // to CHRONOLOGY and a trait extra to the fact budget, same split as rows.
+    const { state: extraState, chrono: extraChrono } = splitInjectionSections(extras);
+    const factAdmitted = admitBudget('facts', state, extraState, budget.facts, floorRank);
+    const newestFirst = (a, b) => {
+        const av = Number.isFinite(Number(a?.fact?.validAt)) && a?.fact?.validAt != null ? Number(a.fact.validAt) : -1;
+        const bv = Number.isFinite(Number(b?.fact?.validAt)) && b?.fact?.validAt != null ? Number(b.fact.validAt) : -1;
+        if (bv !== av) return bv - av;
+        return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
+    };
+    const chronoAdmitted = admitBudget('chronology', chrono, extraChrono, budget.chronology, newestFirst);
+    const extrasAdmitted = new Set([...factAdmitted, ...chronoAdmitted]);
+
+    const renderSection = (header, sectionRows, admittedSet, dedupe = false) => {
         const admitted = [];
         for (const r of sectionRows) {
+            if (!admittedSet.has(r)) continue;
             const refId = `${r.category}/${r.fact.key}`;
             if (dedupe && renderedRefs.has(refId)) { dedupSuppressed++; continue; }
             renderedRefs.add(refId);
-            admitted.push(buildFactLine(r.fact, r.category, nowCtx));
+            admitted.push(r.line ?? renderRow(r));
         }
         if (admitted.length > 0) {
             lines.push(header);
@@ -3243,14 +3355,26 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         return admitted.length;
     };
 
-    renderSection(STATE_SECTION_HEADER, liveState);
-    renderSection(RESOLVED_SECTION_HEADER, resolvedState);
-    renderSection(CHRONO_SECTION_HEADER, chrono, true);
-    renderSection('Connected memories:', extras, true);
+    renderSection(STATE_SECTION_HEADER, liveState, factAdmitted);
+    renderSection(RESOLVED_SECTION_HEADER, resolvedState, factAdmitted);
+    renderSection(CHRONO_SECTION_HEADER, chrono, chronoAdmitted, true);
+    renderSection('Connected memories:', extras, extrasAdmitted, true);
 
     if (dedupSuppressed > 0) {
         addDebugLog('debug', `${logTag}Sheet: ${dedupSuppressed} row(s) suppressed — same category/key already rendered in CURRENT STATE/RESOLVED`, {
             subsystem: 'agent3', event: 'sheet.dedupe', data: { suppressed: dedupSuppressed },
+        });
+    }
+
+    const cappedSections = Object.keys(capped);
+    if (cappedSections.length > 0) {
+        const parts = cappedSections.map(sec => {
+            const c = capped[sec];
+            return `${sec} -${c.dropped} (kept ${c.kept}, ${c.chars}/${c.budget} chars${c.demandExceeded ? `, DEMAND ALONE ${c.demandChars} > budget, allowed` : ''})`;
+        });
+        addDebugLog('info', `${logTag}Sheet: budget capped — ${parts.join('; ')}`, {
+            subsystem: 'agent3', event: 'sheet.budget_capped',
+            data: { sections: capped, budget: { facts: budget.facts, chronology: budget.chronology, scene: budget.scene, story: budget.story, head: budget.head } },
         });
     }
 
