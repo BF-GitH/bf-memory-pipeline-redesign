@@ -293,14 +293,36 @@ export function stripThinkBlocks(text) {
     return cleaned;
 }
 
+// A text-completion style backend lets the model keep writing the TRANSCRIPT
+// after its own reply: "### USER\nTOOL RESULTS:\n{...}" with results it made up,
+// sometimes a whole "### ASSISTANT" turn after that. Read line by line, those
+// invented result lines are malformed JSON (or phantom tool calls), so every
+// such reply burnt the grace round — and the second one ended the extraction.
+// Measured on the 0.83.0 long run: five replies of this shape in 50 turns.
+// Everything from the first marker line on is the model's imagination, not its
+// answer, so the reply is cut there before parsing; what stands above the cut
+// is exactly what the model would have said to a chat-style backend.
+const TRANSCRIPT_CONTINUATION_RE = /^\s*(###\s*(USER|HUMAN|SYSTEM)\b|TOOL RESULTS:\s*$)/i;
+
 export function parseAgentReply(text) {
-    const out = { calls: [], sheet: null, done: false, malformed: [] };
+    const out = { calls: [], sheet: null, done: false, malformed: [], truncatedAt: null };
     const raw = String(text ?? '');
     if (!raw.trim()) return out;
 
     const cleaned = stripThinkBlocks(raw);
 
     const lines = cleaned.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        if (!TRANSCRIPT_CONTINUATION_RE.test(lines[i])) continue;
+        const marker = lines[i].trim().slice(0, 40);
+        out.truncatedAt = { line: i, marker };
+        addDebugLog('info', `Agent reply truncated at line ${i} ("${marker}") — the model continued the transcript past its own reply; ${lines.length - i} line(s) discarded`, {
+            subsystem: 'agent3', event: 'toolloop.reply_truncated', reason: 'TRANSCRIPT_CONTINUATION',
+            data: { line: i, marker, totalLines: lines.length, discardedLines: lines.length - i },
+        });
+        lines.length = i;
+        break;
+    }
 
     // Second chances, cheapest and most conservative first. Each is tried on the
     // ORIGINAL line, then the two are composed, so a line with both defects is
@@ -1009,6 +1031,18 @@ function resolveRefFact(ctx, ref) {
             key = resolveGenericKeyPrefix(key, currentNames());
             key = resolveAliasKeyPrefix(key);
             if (key !== ref.key) fact = findFactMatch(db, key);
+            // The model prefixes a stored key with a SECOND subject token when
+            // it links two characters' facts ("wren_odile_thursday_chair" for
+            // the stored "odile_thursday_chair") — seen on the 0.83.0 long run as
+            // a "found no active fact" refusal of a link whose target plainly
+            // existed. Dropping the first token is tried only when the remainder
+            // still has a subject and a tail of its own, and only through the
+            // same findFactMatch, so a bare tail can never resolve by accident.
+            if (!fact) {
+                const us = key.indexOf('_');
+                const rest = us > 0 ? key.slice(us + 1) : '';
+                if (rest && rest.indexOf('_') > 0) fact = findFactMatch(db, rest);
+            }
         }
     }
     return (fact && isActiveFact(fact)) ? fact : null;

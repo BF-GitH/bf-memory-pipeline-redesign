@@ -3,41 +3,39 @@ import { addDebugLog, isTraceRecording, traceCapture } from './settings.js';
 import { parseAgentReply, REFLECTION_WRITE_TOOLS } from './memory-tools.js';
 import * as host from './host.js';
 
-// The ONLY tool calls executed when they ride alongside the closing block. The
-// final round gets no TOOL RESULTS message, so anything run here is run blind:
-// the model never sees the outcome and cannot correct a refusal. write_fact and
-// link_facts are admitted because extraction routinely batches its last writes
-// with #DONE and a link may target a fact written just above it; reflection's
-// merge_facts/mark_cold are NOT, and its prompt says so in as many words
-// ("merge_facts and mark_cold lines sent alongside the closing sections are
-// dropped unexecuted") — a merge or a demotion is too consequential to fire
-// with no feedback round and no chance to refuse-and-retry.
-//
-// This list governs the DEFAULT path only, and the deferral path deliberately
-// does NOT inherit it — stated here because the difference is easy to read as an
-// oversight. A caller that passes readsForceAnotherRound (the lookup agent, and
-// only it) does not reach this filter while a round remains: a read next to the
-// closing block invalidates the block, and then EVERY call in that reply —
-// including a merge_facts or a mark_cold that rode along — runs through the
-// ordinary round path, unfiltered by this list.
-//
-// That is correct rather than a hole, because the exclusion above is justified by
-// ONE thing only: no feedback round. A deferral creates exactly that round — the
-// results go back to the model and it can refuse-and-retry — so the reason to
-// withhold merge_facts and mark_cold is gone with it.
-//
-// What the deferral path must therefore NOT be used for is a caller whose PROMPT
-// promises the drop (agent-reflect.js says "merge_facts and mark_cold lines sent
-// alongside the closing sections are dropped unexecuted"). Today no such caller
-// sets the flag and the one that does is read-only by construction, so the
-// combination is unreachable; the tripwire at the deferral site logs it at fail
-// level if a future caller ever makes it reachable, rather than letting a prompt
-// quietly start lying.
+// The tool calls executed when they ride alongside the closing block ON THE
+// LAST ROUND, where no TOOL RESULTS message follows and anything run is run
+// blind: the model never sees the outcome and cannot correct a refusal.
+// write_fact and link_facts are admitted because extraction routinely batches
+// its last writes with #DONE and a link may target a fact written just above
+// it; reflection's merge_facts/mark_cold are NOT — a merge or a demotion is too
+// consequential to fire with no feedback round and no chance to refuse-and-retry.
 // add_alias earns its slot the same way link_facts does: additive, idempotent,
 // and touching no stored value — there is nothing a feedback round could veto.
 // Measured cost of leaving it out (v0.81.0 test run): the only add_alias of the
 // whole session rode alongside the final block and was dropped, and no later
 // round ever re-issued it.
+//
+// WHILE A ROUND REMAINS the list is a much weaker filter, by design. The
+// exclusion above is justified by ONE thing only: no feedback round. Whenever
+// the loop can still open a round it DEFERS the block instead of dropping the
+// call — the block is discarded, the calls run on the ordinary path, the results
+// go back, and the model restates. Three things trigger that (all guarded by
+// `round < maxRounds` at the deferral site):
+//   - a READ next to the block, for callers that pass readsForceAnotherRound
+//     (the lookup agent: read-only, so dropping reads dropped its whole pass);
+//   - a WRITE outside this list next to the block (merge_facts, mark_cold) —
+//     for every caller, because the feedback round removes the reason to drop it;
+//   - a write ON this list that ran and answered ERROR — it ran, the others ran,
+//     nothing is re-executed, but the model gets to see the refusal and fix it.
+// Measured cost of not deferring (0.83.0 long run, 50 turns): 6 final-block
+// writes failed with "(no retry round)" — mistyped link refs, an agent-link cap,
+// a read-before-write refusal — and one reflection merge_facts dropped outright.
+//
+// The reflection prompt (agent-reflect.js) describes this contract in the same
+// words: a merge_facts/mark_cold next to the closing sections invalidates them
+// and is executed, and only on the last round is it dropped. Keep the two in
+// step — a prompt that promises a drop the loop no longer makes would be lying.
 export const FINAL_BLOCK_WRITE_TOOLS = ['write_fact', 'link_facts', 'add_alias'];
 
 // Does this tool MUTATE the store? Used only to tell a DISCARDED WRITE apart
@@ -110,6 +108,7 @@ const TRACE_NS_BY_AGENT = {
     'memory-agent': 'agent3',
     'beats': 'agent3',
     'sheet-head': 'agent3',
+    'sheet-head-condense': 'agent3',
     'beat-backfill': 'agent3',
     'beat-brevity': 'agent3',
     'reflection': 'reflect',
@@ -561,8 +560,8 @@ export async function callAgentLLMWithTools({
     // reply carries the closing block AND a non-mutating tool call, the read wins
     // and the block is discarded: the call is executed like any ordinary round,
     // its output is fed back, and the model must restate its verdict next round.
-    // Default false keeps extraction and reflection byte-for-byte on the old
-    // behaviour (FINAL_BLOCK_WRITE_TOOLS below).
+    // Default false keeps extraction and reflection ignoring ride-along READS as
+    // before; ride-along WRITES defer for every caller (FINAL_BLOCK_WRITE_TOOLS).
     readsForceAnotherRound = false,
     // LOOKUP PATH ONLY (agent-lookup.js passes true; nothing else does). A final
     // verdict delivered with ZERO tool calls executed across the whole run gets
@@ -642,6 +641,15 @@ export async function callAgentLLMWithTools({
     ];
     let graceUsed = false;
     let idleGraceUsed = false;
+    // Set once the model has been told the tool-call cap is spent (see the cap
+    // block inside the loop); a second batch of calls after that aborts the run.
+    let capNoticeGiven = false;
+    // Failed final-block writes buy a retry round (see the final-block branch),
+    // but a model that re-sends the same refused call every round would burn
+    // the whole round budget on it; after this many retries the failure is
+    // logged and the block accepted, as it always was.
+    const MAX_FAILED_WRITE_DEFERRALS = 2;
+    let failedWriteDeferrals = 0;
     const loopStart = Date.now();
 
     for (let round = 1; round <= maxRounds; round++) {
@@ -701,6 +709,9 @@ export async function callAgentLLMWithTools({
             reply,
             toolCalls: parsed.calls.map(c => c.tool),
             malformed: parsed.malformed.length,
+            // Set when parseAgentReply cut a transcript continuation off the
+            // reply ({ line, marker }); the lines above the cut are what parsed.
+            truncatedAt: parsed.truncatedAt || null,
             note: '',
         };
         out.transcript.push(entry);
@@ -773,11 +784,37 @@ export async function callAgentLLMWithTools({
             continue;
         }
 
-        if (parsed.calls.length > 0 && out.toolCallCount + parsed.calls.length > maxToolCalls) {
-            out.error = `tool-call cap exceeded (${out.toolCallCount} + ${parsed.calls.length} > ${maxToolCalls})`;
-            out.errorKind = 'protocol';
-            entry.note = 'tool-call cap overrun';
-            break;
+        // TOOL-CALL CAP. A reply carrying more calls than the cap has room for
+        // used to abort the whole run before executing ANY of them — measured on
+        // the 0.83.0 long run as 15 lookup passes dead on arrival with "cap
+        // exceeded (0 + 8 > 4)": the model batched every search into round 1,
+        // exactly as its prompt asks, and the cap threw the batch away whole.
+        // Now the calls that fit run in emission order, the rest are dropped,
+        // and the TOOL RESULTS message says so and asks for the final answer.
+        // The run is aborted only when the cap is already spent AND the model
+        // sends calls again after that notice — at that point it is ignoring
+        // the contract, not merely over-batching.
+        let capNote = '';
+        if (parsed.calls.length > 0) {
+            const remaining = Math.max(0, maxToolCalls - out.toolCallCount);
+            if (remaining === 0 && capNoticeGiven && !parsed.done) {
+                out.error = `tool-call cap exceeded (${maxToolCalls} reached; ${parsed.calls.length} more call(s) sent after the cap notice)`;
+                out.errorKind = 'protocol';
+                entry.note = 'tool-call cap overrun after notice';
+                break;
+            }
+            if (parsed.calls.length > remaining) {
+                const dropped = parsed.calls.length - remaining;
+                const droppedTools = parsed.calls.slice(remaining).map(c => c.tool);
+                parsed.calls = parsed.calls.slice(0, remaining);
+                capNoticeGiven = true;
+                entry.droppedCalls = dropped;
+                capNote = `\n\n${dropped} call(s) dropped — tool-call cap (${maxToolCalls}) reached; finish with your final answer now.`;
+                addDebugLog('info', `[${agent}] ${dropped} tool call(s) dropped on round ${round} — cap ${maxToolCalls} reached (${remaining} executed of ${remaining + dropped} sent)`, {
+                    subsystem: 'agent3', event: 'toolloop.calls_dropped', reason: 'TOOL_CALL_CAP',
+                    data: { agent, round, cap: maxToolCalls, sent: remaining + dropped, executed: remaining, dropped, droppedTools, toolCallCount: out.toolCallCount },
+                });
+            }
         }
 
         // The idle-verdict correction (requireToolCallBeforeDone above). Fires
@@ -818,10 +855,34 @@ export async function callAgentLLMWithTools({
         // `round < maxRounds` is the guard that keeps this from destroying the
         // answer: on the last round there is no round left to restate it in, so
         // the block stands and the reads drop as they always did.
-        const deferredFinalBlock = parsed.done
+        const canDefer = round < maxRounds;
+        const readDeferred = parsed.done
             && readsForceAnotherRound
-            && round < maxRounds
+            && canDefer
             && parsed.calls.some(c => !isMutatingTool(c.tool));
+        // A WRITE outside FINAL_BLOCK_WRITE_TOOLS (merge_facts, mark_cold) next to
+        // the closing block. It used to be dropped unexecuted — the whitelist
+        // exists because the final round has no feedback round, and a merge or a
+        // demotion must not fire blind. Deferring the block CREATES that feedback
+        // round, which removes the only reason to withhold the call: it runs on
+        // the ordinary path below, its result goes back to the model, and the
+        // model restates the block. Measured cost of the drop (0.83.0 long run):
+        // a reflection merge_facts lost with "DROPPED unexecuted" and never
+        // re-issued. Last round: no round to restate in, so the drop stands.
+        const writeDeferred = parsed.done
+            && !readDeferred
+            && canDefer
+            && parsed.calls.some(c => isMutatingTool(c.tool) && !FINAL_BLOCK_WRITE_TOOLS.includes(c.tool));
+        const deferredFinalBlock = readDeferred || writeDeferred;
+        // Filled by the final-block branch when a whitelisted write FAILED with a
+        // round still left: the block is discarded, the results of the writes that
+        // already ran (OK and ERROR alike — none is re-executed) go back as TOOL
+        // RESULTS, and the model gets to fix the failed call and restate. Before
+        // this, a link_facts whose ref the model mistyped, or a write_fact refused
+        // by the read-before-write gate, failed with "(no retry round)" and that
+        // was the end of it — 6 such losses on the 0.83.0 long run.
+        let finalWriteFailures = null;
+        let resultParts = [];
 
         if (parsed.done && !deferredFinalBlock) {
 
@@ -829,11 +890,13 @@ export async function callAgentLLMWithTools({
                 // Emission order is preserved so a link_facts line can target a
                 // fact written just above it in the same reply.
                 const writes = parsed.calls.filter(c => FINAL_BLOCK_WRITE_TOOLS.includes(c.tool));
+                const failed = [];
                 for (const [wIdx, call] of writes.entries()) {
                     if (signal?.aborted) break;
                     out.toolCallCount++;
                     try {
                         const result = await runTool(call);
+                        resultParts.push(`${call.line}\n${result}`);
                         // Same one-entry-per-call shape as the normal-round loop
                         // below; finalBlock marks the writes that rode alongside
                         // the closing block and therefore never got a feedback
@@ -852,17 +915,13 @@ export async function callAgentLLMWithTools({
                                 };
                             }, { runId, callId: traceCallId, round, step: wIdx });
                         }
-                        // Final-round calls get no feedback round, so a failure
-                        // must be surfaced here or it vanishes entirely —
                         // executeMemoryTool never throws, it returns the error
-                        // as an 'ERROR: ...' string.
-                        if (/^\s*ERROR\b/.test(String(result ?? ''))) {
-                            addDebugLog('fail', `[${agent}] ${call.tool} alongside final block failed (no retry round): ${String(result).slice(0, 300)}`, {
-                                subsystem: 'agent3', event: 'toolloop.write_error', reason: 'FINAL_WRITE_FAILED',
-                                data: { agent, round, tool: call.tool, line: String(call.line || '').slice(0, 300), result: String(result).slice(0, 300) },
-                            });
-                        }
+                        // as an 'ERROR: ...' string. Collected here, judged below:
+                        // with a round left the failure buys a retry round, on
+                        // the last round it can only be logged.
+                        if (/^\s*ERROR\b/.test(String(result ?? ''))) failed.push({ call, result: String(result) });
                     } catch (e) {
+                        resultParts.push(`${call.line}\nERROR: ${call.tool} failed internally (${e?.message || e})`);
                         addDebugLog('fail', `write_fact alongside final block threw: ${e?.message || e}`, { subsystem: 'agent3', event: 'toolloop.write_error', data: { agent, round } });
                         // The existing line above names the error but not the
                         // CALL; without this the arguments of the one write that
@@ -882,6 +941,9 @@ export async function callAgentLLMWithTools({
                 // repair the model believed it had made and nothing downstream
                 // will ever redo it — that has to reach the log as a failure,
                 // not be filed under "reads ignored" the way it used to be.
+                // (With a round left, writeDeferred above has already routed any
+                // such write onto the ordinary path, so droppedWrites is
+                // non-empty here only on the last round.)
                 const dropped = parsed.calls.filter(c => !FINAL_BLOCK_WRITE_TOOLS.includes(c.tool));
                 const droppedWrites = dropped.filter(c => isMutatingTool(c.tool));
                 if (dropped.length > 0) {
@@ -892,7 +954,7 @@ export async function callAgentLLMWithTools({
                 }
                 if (droppedWrites.length > 0) {
                     const names = [...new Set(droppedWrites.map(c => c.tool))].join(', ');
-                    addDebugLog('fail', `[${agent}] ${droppedWrites.length} write tool call(s) (${names}) sent alongside the final block were DROPPED unexecuted — they must be emitted in an earlier reply`, {
+                    addDebugLog('fail', `[${agent}] ${droppedWrites.length} write tool call(s) (${names}) sent alongside the final block on the last round were DROPPED unexecuted — no round left to feed their results back`, {
                         subsystem: 'agent3', event: 'toolloop.write_dropped', reason: 'FINAL_BLOCK_WRITE_DROPPED',
                         data: {
                             agent, round, tools: names, count: droppedWrites.length,
@@ -900,45 +962,57 @@ export async function callAgentLLMWithTools({
                         },
                     });
                 }
+                if (failed.length > 0 && canDefer && !signal?.aborted && failedWriteDeferrals < MAX_FAILED_WRITE_DEFERRALS) {
+                    failedWriteDeferrals++;
+                    finalWriteFailures = failed;
+                    const names = [...new Set(failed.map(f => f.call.tool))].join(', ');
+                    entry.note = `${finalToken} deferred — ${failed.length} of ${writes.length} write(s) alongside it failed (${names}); results fed back for a retry`;
+                    addDebugLog('info', `[${agent}] ${failed.length} write(s) (${names}) alongside the final block failed — the block was discarded and the results go back; round ${round + 1} must fix the call and restate it: ${failed[0].result.slice(0, 200)}`, {
+                        subsystem: 'agent3', event: 'toolloop.final_deferred', reason: 'FINAL_WRITE_FAILED_DEFERRED',
+                        data: {
+                            agent, round, maxRounds, tools: names, failed: failed.length, executed: writes.length,
+                            lines: failed.slice(0, 5).map(f => String(f.call.line || '').slice(0, 200)),
+                            results: failed.slice(0, 5).map(f => f.result.slice(0, 200)),
+                        },
+                    });
+                } else {
+                    // Last round, aborted, or retries used up: the failure can
+                    // only be recorded.
+                    for (const f of failed) {
+                        addDebugLog('fail', `[${agent}] ${f.call.tool} alongside final block failed (no retry round): ${f.result.slice(0, 300)}`, {
+                            subsystem: 'agent3', event: 'toolloop.write_error', reason: 'FINAL_WRITE_FAILED',
+                            data: { agent, round, tool: f.call.tool, line: String(f.call.line || '').slice(0, 300), result: f.result.slice(0, 300) },
+                        });
+                    }
+                }
             }
-            out.done = true;
-            out.sheet = parsed.sheet; 
-            if (!extractOnly && (out.sheet === null || out.sheet === '')) {
+            if (!finalWriteFailures) {
+                out.done = true;
+                out.sheet = parsed.sheet;
+                if (!extractOnly && (out.sheet === null || out.sheet === '')) {
 
-                out.error = `final block on round ${round} carried no sheet content`;
-                out.errorKind = 'protocol';
-                out.sheet = null;
+                    out.error = `final block on round ${round} carried no sheet content`;
+                    out.errorKind = 'protocol';
+                    out.sheet = null;
+                }
+                break;
             }
-            break;
         }
 
         if (deferredFinalBlock) {
-            const readTools = [...new Set(parsed.calls.filter(c => !isMutatingTool(c.tool)).map(c => c.tool))];
-            entry.note = `${finalToken} deferred — ${parsed.calls.length} tool call(s) in the same reply were executed instead (${readTools.join(', ')})`;
-            addDebugLog('info', `[${agent}] ${finalToken} arrived alongside ${parsed.calls.length} tool call(s) (${readTools.join(', ')}) — the calls RAN and the block was discarded; round ${round + 1} must restate it`, {
-                subsystem: 'agent3', event: 'toolloop.final_deferred', reason: 'FINAL_BLOCK_DEFERRED',
-                data: { agent, round, maxRounds, tools: readTools, calls: parsed.calls.length },
+            const tools = [...new Set(parsed.calls.map(c => c.tool))];
+            const why = readDeferred ? 'a read' : 'a write outside the final-block whitelist';
+            entry.note = `${finalToken} deferred — ${parsed.calls.length} tool call(s) in the same reply were executed instead (${tools.join(', ')})`;
+            addDebugLog('info', `[${agent}] ${finalToken} arrived alongside ${parsed.calls.length} tool call(s) (${tools.join(', ')}) — ${why} next to the block means the calls RAN and the block was discarded; round ${round + 1} must restate it`, {
+                subsystem: 'agent3', event: 'toolloop.final_deferred', reason: readDeferred ? 'FINAL_BLOCK_DEFERRED' : 'FINAL_WRITE_DEFERRED',
+                data: { agent, round, maxRounds, tools, calls: parsed.calls.length, readDeferred, writeDeferred },
             });
-            // TRIPWIRE for the FINAL_BLOCK_WRITE_TOOLS relationship documented at
-            // that constant. Only ONE read is needed to defer, so a mixed reply
-            // (read + merge_facts) drags the write onto the ordinary path where
-            // this list does not apply. Unreachable today — the only caller that
-            // sets readsForceAnotherRound is read-only in its executor — so this
-            // fires only if someone widens the flag, which is exactly when a prompt
-            // that promises the drop would start lying. Logged, not blocked: the
-            // deferral gives the write its feedback round, so executing it is the
-            // defensible behaviour; what must not happen is it being silent.
-            const rideAlongWrites = [...new Set(parsed.calls.filter(c => isMutatingTool(c.tool)).map(c => c.tool))];
-            if (rideAlongWrites.length > 0) {
-                addDebugLog('fail', `[${agent}] deferral is executing ${rideAlongWrites.length} MUTATING tool(s) (${rideAlongWrites.join(', ')}) that the FINAL_BLOCK_WRITE_TOOLS whitelist would have dropped on the normal path — readsForceAnotherRound bypasses that filter by design, but this agent's prompt may promise otherwise`, {
-                    subsystem: 'agent3', event: 'toolloop.final_deferred', reason: 'DEFERRED_WRITE_BYPASS',
-                    data: { agent, round, tools: rideAlongWrites, whitelist: FINAL_BLOCK_WRITE_TOOLS },
-                });
-            }
         }
 
-        const resultParts = [];
-        for (const [callIdx, call] of parsed.calls.entries()) {
+        // Skipped when the final-block branch above already ran the writes: those
+        // results are in resultParts and must NOT be executed a second time.
+        const roundCalls = finalWriteFailures ? [] : parsed.calls;
+        for (const [callIdx, call] of roundCalls.entries()) {
             if (signal?.aborted) break;
             out.toolCallCount++;
             let result;
@@ -980,9 +1054,9 @@ export async function callAgentLLMWithTools({
             out.errorKind = 'aborted';
             break;
         }
-        addDebugLog('debug', `Memory Agent round ${round}: executed ${parsed.calls.length} tool call(s) (${out.toolCallCount}/${maxToolCalls} total)`, {
+        addDebugLog('debug', `Memory Agent round ${round}: executed ${roundCalls.length} tool call(s) (${out.toolCallCount}/${maxToolCalls} total)`, {
             subsystem: 'agent3', event: 'toolloop.round',
-            data: { agent, round, calls: parsed.calls.map(c => c.tool), toolCallCount: out.toolCallCount },
+            data: { agent, round, calls: roundCalls.map(c => c.tool), toolCallCount: out.toolCallCount },
         });
 
         if (round === maxRounds) {
@@ -997,10 +1071,23 @@ export async function callAgentLLMWithTools({
         // difference between it restating the verdict and it sitting silent on a
         // round it thinks is over — and naming the round left tells it not to
         // spend this one on more tools.
-        const deferNote = deferredFinalBlock
-            ? `\n\nNOTE: your ${finalToken} block was NOT accepted — you sent tool calls in the same reply, so these results arrived after it. This is round ${round + 1} of ${maxRounds}${round + 1 >= maxRounds ? ', the last one' : ''}: give your final answer ending in ${finalToken}, and call no further tools.`
-            : '';
-        messages.push({ role: 'user', content: `TOOL RESULTS:\n${resultParts.join('\n\n')}${deferNote}` });
+        //
+        // Three deferral flavours, one note each, because the model must know
+        // which of its lines to redo: after a FAILED write it must fix THAT call
+        // and nothing else (the OK lines above already ran and must not be sent
+        // again); after a ride-along read or write it must only restate.
+        const lastRoundNote = `This is round ${round + 1} of ${maxRounds}${round + 1 >= maxRounds ? ', the last one' : ''}`;
+        let deferNote = '';
+        if (finalWriteFailures) {
+            const failedLines = finalWriteFailures.map(f => String(f.call.line || '').slice(0, 200)).join('\n');
+            deferNote = `\n\nNOTE: your ${finalToken} block was NOT accepted — ${finalWriteFailures.length} write(s) sent alongside it FAILED (see the ERROR result(s) above):\n${failedLines}\nEvery call listed above has already been executed: do NOT re-send the ones that answered OK. ${lastRoundNote}: if the failed call can be corrected (verify the ref first if you must), re-send only that call, then restate your final answer ending in ${finalToken}.`;
+        } else if (deferredFinalBlock) {
+            const reason = writeDeferred
+                ? 'you sent a merge_facts/mark_cold-class write in the same reply, so it was executed first and these results arrived after the block'
+                : 'you sent tool calls in the same reply, so these results arrived after it';
+            deferNote = `\n\nNOTE: your ${finalToken} block was NOT accepted — ${reason}. ${lastRoundNote}: give your final answer ending in ${finalToken}, and call no further tools.`;
+        }
+        messages.push({ role: 'user', content: `TOOL RESULTS:\n${resultParts.join('\n\n')}${capNote}${deferNote}` });
     }
 
     if (!out.error && !out.done) {

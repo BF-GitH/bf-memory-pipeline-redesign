@@ -13,6 +13,73 @@ import { recordFactUsage } from './database.js';
 
 let internalCallDepth = 0;
 const isInternalCall = () => internalCallDepth > 0;
+
+// A reply that lands while a lookup or a reflection pass holds the depth used
+// to be dropped on the floor: runMemoryExtraction returned on isInternalCall()
+// with no log line and no retry, and the "ONE retry chained" macrotask was lost
+// the same way when reflection raised the depth between its scheduling and its
+// firing. On a slow transport a reflection holds the depth for minutes, so every
+// turn in that window went unextracted until a later reply happened to arrive
+// at a quiet moment — and SETTLED_BATCH_MAX then capped the catch-up. Now the
+// arrival arms ONE deferred retry: all arrivals in the window coalesce into it,
+// it fires on the macrotask after the depth returns to 0 (every decrement goes
+// through lowerInternalCallDepth), and a backoff poll (250 ms doubling to 30 s)
+// backstops the case where no decrement ever reaches the helper. The gate
+// itself is unchanged — the extension's own agent traffic still cannot
+// re-trigger an extraction.
+let extractionDeferredForInternalCall = false;
+let internalCallRetryTimer = null;
+const INTERNAL_CALL_RETRY_MIN_MS = 250;
+const INTERNAL_CALL_RETRY_MAX_MS = 30000;
+
+function deferExtractionForInternalCall() {
+    if (extractionDeferredForInternalCall) {
+        addDebugLog('debug', 'Memory agent (post-reply): another reply arrived while a BF Memory pass holds the internal-call depth — coalesced into the retry already armed', {
+            subsystem: 'agent3', event: 'agent3.run', reason: 'DEFERRED_INTERNAL_CALL', data: { internalCallDepth, coalesced: true },
+        });
+        return;
+    }
+    extractionDeferredForInternalCall = true;
+    addDebugLog('info', `Memory agent (post-reply): a BF Memory pass holds the internal-call depth (${internalCallDepth}; reflection ${reflectionInFlight ? 'in flight' : 'idle'}) — ONE retry deferred until it releases`, {
+        subsystem: 'agent3', event: 'agent3.run', reason: 'DEFERRED_INTERNAL_CALL',
+        data: { internalCallDepth, reflectionInFlight, coalesced: false },
+    });
+    scheduleInternalCallRetryPoll(INTERNAL_CALL_RETRY_MIN_MS);
+}
+
+function scheduleInternalCallRetryPoll(delayMs) {
+    if (internalCallRetryTimer) clearTimeout(internalCallRetryTimer);
+    internalCallRetryTimer = setTimeout(() => {
+        internalCallRetryTimer = null;
+        if (!extractionDeferredForInternalCall) return;
+        if (isInternalCall()) { scheduleInternalCallRetryPoll(Math.min(delayMs * 2, INTERNAL_CALL_RETRY_MAX_MS)); return; }
+        fireDeferredExtraction('poll');
+    }, delayMs);
+}
+
+function cancelDeferredInternalCallRetry() {
+    extractionDeferredForInternalCall = false;
+    if (internalCallRetryTimer) { clearTimeout(internalCallRetryTimer); internalCallRetryTimer = null; }
+}
+
+function fireDeferredExtraction(via) {
+    if (!extractionDeferredForInternalCall) return;
+    cancelDeferredInternalCallRetry();
+    addDebugLog('info', `Memory agent (post-reply): internal-call depth released (${via}) — running the deferred extraction`, {
+        subsystem: 'agent3', event: 'agent3.run', reason: 'DEFERRED_RETRY', data: { via },
+    });
+    runMemoryExtraction();
+}
+
+// The ONLY way the depth comes down (CHAT_CHANGED zeroes it outright and cancels
+// the deferral, which is the one exception). The floor keeps a double release
+// from going negative and permanently un-guarding the passes; reaching 0 with a
+// deferral armed fires it on the next macrotask — never inline, so the releasing
+// pass's own finally block finishes first.
+function lowerInternalCallDepth() {
+    internalCallDepth = Math.max(0, internalCallDepth - 1);
+    if (internalCallDepth === 0 && extractionDeferredForInternalCall) setTimeout(() => fireDeferredExtraction('release'), 0);
+}
 let pipelineJustInjected = false; 
 let injectedResetTimer = null; 
 let pipelineCancelled = false; 
@@ -506,9 +573,7 @@ async function appendLookupBlock(sheetText, path, genType) {
         return sheetText;
     } finally {
         if (backstop) clearTimeout(backstop);
-        // CHAT_CHANGED zeroes the counter outright; the floor keeps that from
-        // going negative and permanently un-guarding the pass.
-        internalCallDepth = Math.max(0, internalCallDepth - 1);
+        lowerInternalCallDepth();
     }
 }
 
@@ -1158,6 +1223,14 @@ async function maybeAppendStorySpine(runId, profileId, capturedChatId = '') {
     }
 }
 
+// The in-flight slot is claimed HERE, synchronously, before the body's first
+// await. It used to be claimed deep inside the body (after the catch-up import
+// and the store reads), so a chained retry and a MESSAGE_RECEIVED arrival could
+// both pass the check above and run CONCURRENTLY on the same settled messages —
+// observed as two runs "4 settled msgs 43–46" started back-to-back. Now the
+// second caller always takes the "ONE retry chained" path, and the slot is
+// released on EVERY exit of the body (early returns included) in the finally
+// below, which is also where the chained retry fires.
 async function runMemoryExtraction() {
     if (memoryExtractionInFlight) {
 
@@ -1167,12 +1240,32 @@ async function runMemoryExtraction() {
         }
         return;
     }
+    memoryExtractionInFlight = true;
+    try {
+        await runMemoryExtractionBody();
+    } finally {
+        memoryExtractionInFlight = false;
+        if (extractionRetryAfterBusy) {
+            extractionRetryAfterBusy = false;
+            // One run covers both: a retry that is about to start makes a
+            // deferred internal-call retry redundant (and a stacked pair would
+            // only chain a third run through the busy path above).
+            cancelDeferredInternalCallRetry();
+            setTimeout(() => { runMemoryExtraction(); }, 0);
+        }
+    }
+}
+
+async function runMemoryExtractionBody() {
     // A run that actually starts supersedes any pending timeout auto-retry
     // (single-flight — the timer-fired call nulls the handle before landing here).
     if (connectionRetryTimer) { clearTimeout(connectionRetryTimer); connectionRetryTimer = null; }
     const settings = getSettings();
     if (!settings || !settings.enabled) return;
-    if (isInternalCall()) return; 
+    if (isInternalCall()) {
+        deferExtractionForInternalCall();
+        return;
+    }
     if (pipelineCancelled) {
 
         if (!cancelledRetryArmed) {
@@ -1326,10 +1419,10 @@ async function runMemoryExtraction() {
         postStageMs.snapshotMs = Date.now() - snapStart;
     };
 
-    memoryExtractionInFlight = true;
-
+    // memoryExtractionInFlight was claimed by the runMemoryExtraction wrapper
+    // before the first await of this body; it is released there as well.
     cancelledRetryArmed = false;
-    internalCallDepth++; 
+    internalCallDepth++;
     let memoryResult = null;
 
     let reachedCommit = false;
@@ -1551,15 +1644,10 @@ async function runMemoryExtraction() {
             } catch {  }
         }
     } finally {
-        memoryExtractionInFlight = false;
-
-        internalCallDepth = Math.max(0, internalCallDepth - 1);
+        // The in-flight slot and the chained retry are the wrapper's
+        // (runMemoryExtraction); this block releases only what the body took.
+        lowerInternalCallDepth();
         hideWorkingIndicator();
-
-        if (extractionRetryAfterBusy) {
-            extractionRetryAfterBusy = false;
-            setTimeout(() => { runMemoryExtraction(); }, 0);
-        }
 
         try {
             const postTotalMs = Date.now() - startTime;
@@ -1862,7 +1950,7 @@ async function maybeRunReflection() {
         // live pass uninterruptible.
         if (reflectionAbort === abortCtrl) reflectionAbort = null;
 
-        internalCallDepth = Math.max(0, internalCallDepth - 1);
+        lowerInternalCallDepth();
         updateStatus('idle');
     }
 }
@@ -2178,6 +2266,9 @@ export function initPipeline() {
         invalidateDatabaseCache();
 
         internalCallDepth = 0;
+        // The deferred arrival belonged to the chat that just closed; its
+        // watermarks keep the backlog for the next time that chat is opened.
+        cancelDeferredInternalCallRetry();
         clearInjectedGuard();
 
         extractionRetryAfterBusy = false;
