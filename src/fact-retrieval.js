@@ -98,13 +98,22 @@ export function clipAtWordBoundary(text, maxChars) {
     return (ws > maxChars / 2 ? hard.slice(0, ws) : hard).replace(/[\s,;:—-]+$/, '') + '…';
 }
 
-export function buildFactLine(fact, category, nowCtx = null, { compact = false } = {}) {
-    const knownBy = (fact.knownBy || []).join(', ');
-    const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-    const hasValue = String(fact.value ?? '').trim() !== '';
-    const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
+// A fact row is ONE sheet line by contract: extractPriorStateLines and
+// parseSheetText read the sheet line by line, and a row whose value or note
+// carries a raw newline spills onto a second line that is not a row — which
+// closes the CURRENT STATE block for the recheck feed and silently drops every
+// row after it. Nothing on the write path normalises whitespace, so it is
+// collapsed here, on every path (full and compact).
+const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
-    const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
+export function buildFactLine(fact, category, nowCtx = null, { compact = false } = {}) {
+    const knownBy = (fact.knownBy || []).map(oneLine).filter(Boolean).join(', ');
+    const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
+    const fullValue = oneLine(fact.value);
+    const hasValue = fullValue !== '';
+    const note = typeof fact.context === 'string' ? oneLine(fact.context) : '';
+
+    const tone = typeof fact.tone === 'string' ? oneLine(fact.tone) : '';
 
     const recency = nowCtx ? recencyTail(fact, nowCtx) : '';
 
@@ -118,15 +127,15 @@ export function buildFactLine(fact, category, nowCtx = null, { compact = false }
     const resolvedTag = isResolved
         ? `resolved (msg ${Number.isInteger(fact.resolvedAt) ? fact.resolvedAt : '?'}): `
         : '';
-    const resolvedTail = (isResolved && typeof fact.resolvedNote === 'string' && fact.resolvedNote.trim())
-        ? ` — ${fact.resolvedNote.trim()}`
+    const resolvedTail = (isResolved && typeof fact.resolvedNote === 'string' && oneLine(fact.resolvedNote))
+        ? ` — ${oneLine(fact.resolvedNote)}`
         : '';
 
     if (compact && hasValue) {
         // `= value — note…`. The value stays the assertion (SHEET_REF_RE and the
         // recheck feed read the same `[kb] Cat/key =` head as the full row); the
         // note tail is dropped outright when it only repeats the value.
-        const value = String(fact.value).trim();
+        const value = fullValue;
         // Supersede-written rows (splitSupersedeText) store the first clause as
         // the value and the whole text as the note, so the note OPENS with the
         // value: printing both repeated it verbatim on 4 of the top 4 floor
@@ -143,7 +152,7 @@ export function buildFactLine(fact, category, nowCtx = null, { compact = false }
         const body = compact ? clipAtWordBoundary(note, COMPACT_NOTE_CHARS) : note;
         return `${prefix} ${category}/${fact.key}: ${resolvedTag}${body}${tone ? ` (${tone})` : ''}${resolvedTail}${recency}`;
     }
-    if (hasValue) return `${prefix} ${category}/${fact.key} = ${resolvedTag}${fact.value}${resolvedTail}${recency}`;
+    if (hasValue) return `${prefix} ${category}/${fact.key} = ${resolvedTag}${fullValue}${resolvedTail}${recency}`;
 
     if (isResolved) return `${prefix} ${category}/${fact.key}: ${resolvedTag.replace(/:\s*$/, '')}${resolvedTail}${recency}`;
     return `${prefix} ${category}/${fact.key}${recency}`;

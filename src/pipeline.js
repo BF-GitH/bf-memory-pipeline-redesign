@@ -668,7 +668,8 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
                 data: { path, refs: refs.map(r => `${r.category}/${r.key}`), sceneId },
             });
         } else {
-            lookupAbort = new AbortController();
+            const abortCtrl = new AbortController();
+            lookupAbort = abortCtrl;
             let res;
             try {
                 res = await runLookupAgent({
@@ -676,7 +677,7 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
                     priorMessage: prior,
                     sheetText,
                     profileId: settings.lookupProfile || settings.agent3Profile || null,
-                    signal: lookupAbort.signal,
+                    signal: abortCtrl.signal,
                     // The SAME absolute deadline the backstop above is measured
                     // from, minus nothing: whatever the gates above spent is
                     // already gone from the agent's share.
@@ -684,7 +685,11 @@ async function runLookupPass(sheetText, path, runId, deadlineAt) {
                     runId,
                 });
             } finally {
-                lookupAbort = null;
+                // Identity-checked, like reflectionAbort: after a DEADLINE_BACKSTOP
+                // release this pass is an orphan, a NEWER pass may already own the
+                // slot, and clearing it blindly would make abortLookupPass() a
+                // no-op for the live pass until its own deadline.
+                if (lookupAbort === abortCtrl) lookupAbort = null;
             }
 
             if (res.timedOut) {

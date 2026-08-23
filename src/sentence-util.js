@@ -27,9 +27,12 @@ export function extractSentenceLine(raw, { required = true } = {}) {
 // transcript lines are "CHAR (Name): …" / "USER (Name): …", and a model that
 // echoes that shape has written the next turn, not a recap. Rejected outright
 // even when a "SENTENCE:" label appears further down.
+// Also caught when the model put the label in front of the continuation
+// ("SENTENCE: CHAR (Wren): She stops.") — extractSentenceLine would otherwise
+// hand that back as a sentence with the transcript speaker tag on it.
 export function looksLikeRoleplayProse(raw) {
     const t = String(raw || '').trimStart();
-    return /^(?:CHAR|USER)\s*(?:\(|:)/i.test(t);
+    return /^(?:SENTENCE\s*:\s*)?(?:CHAR|USER)\s*(?:\(|:)/i.test(t);
 }
 
 export function countSentenceEnds(text) {
@@ -43,14 +46,23 @@ export function countSentenceEnds(text) {
 }
 
 // Sentence-end positions of `text` (index just past the terminator), using the
-// same exclusions countSentenceEnds applies — abbreviation dots, decimals — so
-// the two never disagree about where a sentence ends. Closing quotes/brackets
-// right after the terminator are included in the boundary.
+// same exclusions countSentenceEnds applies — quoted dialogue, abbreviation
+// dots, decimals — so the two never disagree about where a sentence ends.
+// Closing quotes/brackets right after the terminator are included in the
+// boundary.
 export function sentenceBoundaries(text) {
     const out = [];
+    // Spans of quoted dialogue: a terminator INSIDE one ('She said "Stop!" and
+    // left.') is not a sentence end, exactly as countSentenceEnds blanks them.
+    const quoted = [];
+    const qre = /"[^"]*"|“[^”]*”/g;
+    let q;
+    while ((q = qre.exec(text)) !== null) quoted.push([q.index, q.index + q[0].length]);
+    const inQuote = (i) => quoted.some(([a, b]) => i > a && i < b - 1);
     const re = /[.!?]+["'”’)\]]*(?=\s|$)/g;
     let m;
     while ((m = re.exec(text)) !== null) {
+        if (inQuote(m.index)) continue;
         const end = m.index + m[0].length;
         const before = text.slice(Math.max(0, m.index - 12), m.index + 1);
         if (/\d\.$/.test(before) && /^\d/.test(text.slice(end))) continue;          // decimal

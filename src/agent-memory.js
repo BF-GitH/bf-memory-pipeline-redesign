@@ -2989,7 +2989,10 @@ export function storySoFarText({ maxChars = STORY_SO_FAR_MAX_CHARS } = {}) {
         pyramidStory = (pyramid && typeof pyramid.story === 'string') ? pyramid.story.replace(/\s+/g, ' ').trim() : '';
     } catch { pyramidStory = ''; }
     const source = pyramidStory ? 'pyramid' : spineTail ? 'spine' : 'none';
-    const raw = pyramidStory || spineTail;
+    // Normalised the same way clipAtSentenceBoundary normalises its input, so
+    // `rawChars > text.length` means a budget cut and not a collapsed
+    // whitespace run in a hand-edited or pre-normalisation spine sentence.
+    const raw = (pyramidStory || spineTail).replace(/\s+/g, ' ').trim();
     const text = clipAtSentenceBoundary(raw, Infinity, Math.max(1, Math.floor(Number(maxChars) || STORY_SO_FAR_MAX_CHARS)));
     return { text, source, spineBatches, rawChars: raw.length };
 }
@@ -3160,9 +3163,6 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     // within its section, which is the row order every prior sheet had.
     const floorCap = resolvePremiseFloorCap(settings);
     let floorRowCount = 0;
-    // Kept for the supply/demand publication below — these are the rows nothing
-    // asked for.
-    const floorSupply = [];
     try {
         const floor = selectPremiseFloor({ databases, cap: floorCap.cap, exclude: seen });
         const floorRows = [];
@@ -3171,7 +3171,6 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
             if (seen.has(id)) continue;
             seen.add(id);
             floorRows.push({ fact, category, tier: 'primary', origin: 'floor' });
-            floorSupply.push({ fact, category });
         }
         rows.unshift(...floorRows);
         floorRowCount = floorRows.length;
@@ -3210,20 +3209,6 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
         } catch { extras = []; }
     }
 
-    // SUPPLY vs DEMAND, published for recordFactUsage (database.js). This is the
-    // last point at which the distinction still exists: downstream, the usage
-    // flush parses refs back out of the rendered sheet text and every row looks
-    // alike. The floor rows and the connected-memory extras are supply — nothing
-    // about THIS turn asked for them, they are on the sheet because the slider
-    // and the walk put them there — so crediting them as usage would stamp
-    // lastUsedAt on the entire hot set every turn and flatten the recency term
-    // out of salienceScore. NEED and the sticky recovered rows are demand and
-    // are deliberately absent from this set. See the DEMAND vs SUPPLY block in
-    // database.js for the full failure shape.
-    try {
-        setSheetSupplyRefs([...floorSupply, ...extras].map(r => ({ category: r.category, key: r.fact.key })));
-    } catch {  }
-
     const { state, chrono } = splitInjectionSections(rows);
 
     const lines = [];
@@ -3253,7 +3238,7 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     }
     if (runId && storySourceLoggedForRun !== runId) {
         storySourceLoggedForRun = runId;
-        addDebugLog('debug', `[${runId}] Sheet: "Story so far" from ${storySource === 'pyramid' ? 'the summary pyramid story' : storySource === 'spine' ? `the last ${STORY_SO_FAR_SPINE_TAIL} of ${spineBatches} spine sentences` : 'nothing (omitted)'} — ${storyText.length} chars`, {
+        addDebugLog('debug', `[${runId}] Sheet: "Story so far" from ${storySource === 'pyramid' ? 'the summary pyramid story' : storySource === 'spine' ? `the last ${Math.min(STORY_SO_FAR_SPINE_TAIL, spineBatches)} of ${spineBatches} spine sentences` : 'nothing (omitted)'} — ${storyText.length} chars`, {
             subsystem: 'agent3', event: 'sheet.story_source',
             data: { source: storySource, chars: storyText.length, spineBatches, clipped: storyText.length < storyRawChars },
         });
@@ -3397,6 +3382,9 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     const chronoAdmitted = admitBudget('chronology', chrono, extraChrono, budget.chronology, newestFirst);
     const extrasAdmitted = new Set([...factAdmitted, ...chronoAdmitted]);
 
+    // Every row the sheet actually carries, in render order — the supply/demand
+    // publication below reads off this list, not off the pre-budget candidates.
+    const renderedRows = [];
     const renderSection = (header, sectionRows, admittedSet, dedupe = false) => {
         const admitted = [];
         for (const r of sectionRows) {
@@ -3404,6 +3392,7 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
             const refId = `${r.category}/${r.fact.key}`;
             if (dedupe && renderedRefs.has(refId)) { dedupSuppressed++; continue; }
             renderedRefs.add(refId);
+            renderedRows.push(r);
             admitted.push(r.line ?? renderRow(r));
         }
         if (admitted.length > 0) {
@@ -3417,6 +3406,29 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     renderSection(RESOLVED_SECTION_HEADER, resolvedState, factAdmitted);
     renderSection(CHRONO_SECTION_HEADER, chrono, chronoAdmitted, true);
     renderSection('Connected memories:', extras, extrasAdmitted, true);
+
+    // SUPPLY vs DEMAND, published for recordFactUsage (database.js). This is the
+    // last point at which the distinction still exists: downstream, the usage
+    // flush parses refs back out of the rendered sheet text and every row looks
+    // alike. The floor rows and the connected-memory extras are supply — nothing
+    // about THIS turn asked for them, they are on the sheet because the slider
+    // and the walk put them there — so crediting them as usage would stamp
+    // lastUsedAt on the entire hot set every turn and flatten the recency term
+    // out of salienceScore. NEED and the sticky recovered rows are demand and
+    // are deliberately absent from this set. See the DEMAND vs SUPPLY block in
+    // database.js for the full failure shape.
+    //
+    // Published from the RENDERED rows, after the section budgets ran: a floor
+    // or extra row the budget dropped is not on the sheet, and if the lookup
+    // pass later recalls it by ref (agent-lookup only refuses refs that are on
+    // the sheet) that recall is demand and must be credited as used — had the
+    // pre-budget candidate list been published, such a row would have been
+    // stamped 'seen' forever and aged into a cold demotion.
+    try {
+        setSheetSupplyRefs(renderedRows
+            .filter(r => r.origin === 'floor' || r.origin === 'extra')
+            .map(r => ({ category: r.category, key: r.fact.key })));
+    } catch {  }
 
     if (sceneTreeCount > 0) {
         addDebugLog('debug', `${logTag}Sheet: scene tree rendered ${sceneTreeCount} closed scene(s)`, {
