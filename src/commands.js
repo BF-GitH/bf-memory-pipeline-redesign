@@ -155,7 +155,7 @@ function parseFactLine(line) {
 }
 
 function parseSheetText(text) {
-    const out = { summary: '', rightNow: '', scene: '', sceneBeats: [], timeline: '', present: '', notes: '', precedence: '', sections: [] };
+    const out = { summary: '', rightNow: '', scene: '', sceneTree: [], sceneBeats: [], timeline: '', present: '', notes: '', precedence: '', sections: [] };
     let cur = null;
     let inScene = false; // collecting the stacked one-line beats under a Scene header
     const startSection = (label) => { cur = { label, facts: [] }; out.sections.push(cur); inScene = false; };
@@ -169,6 +169,10 @@ function parseSheetText(text) {
         let m;
         if ((m = /^Story so far:\s*(.*)$/i.exec(line))) { out.summary = m[1]; cur = null; inScene = false; continue; }
         if ((m = /^Right now:\s*(.*)$/i.exec(line))) { out.rightNow = m[1]; cur = null; inScene = false; continue; }
+        // Scene tree (agent-memory.js renderSceneTree): header, optional "…(N
+        // earlier scenes)", then "#k name (…)" lines — collected, not summary text.
+        if (/^Scenes so far/i.test(line) || /^…\(\d+ earlier scenes?\)$/.test(line)) { cur = null; inScene = false; continue; }
+        if ((m = /^#\d+\s+(.*)$/.exec(line)) && !cur && !inScene) { out.sceneTree.push(m[1]); continue; }
         if ((m = /^Scene:\s*(.*)$/i.exec(line))) { out.scene = m[1]; cur = null; inScene = true; continue; }
         if ((m = /^Timeline & place:\s*(.*)$/i.exec(line))) { out.timeline = m[1]; cur = null; inScene = false; continue; }
         if ((m = /^Present:\s*(.*)$/i.exec(line))) { out.present = m[1]; cur = null; inScene = false; continue; }

@@ -30,7 +30,7 @@ import {
 import { callAgentLLMWithTools, callAgentLLM } from './llm-call.js';
 import { countSentenceEnds, extractSentenceLine, SPINE_ABBREVIATIONS } from './sentence-util.js';
 import { executeMemoryTool, stripThinkBlocks } from './memory-tools.js';
-import { getStorySpine, getCurrentScene, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline, getLastNeedRefs, setLastNeedRefs, getRecoveredRefs, tickRecoveredRefs, markRecoveredRefs } from './turn-state.js';
+import { getStorySpine, getCurrentScene, getClosedScenes, startScene, appendSceneBeats, setScenePresent, getScenePresent, getSceneTimeline, setSceneTimeline, getLastNeedRefs, setLastNeedRefs, getRecoveredRefs, tickRecoveredRefs, markRecoveredRefs } from './turn-state.js';
 import { addDebugLog, isTraceRecording, traceCapture, newTraceCallId } from './settings.js';
 import * as host from './host.js';
 
@@ -2990,6 +2990,54 @@ export async function estimatePremiseFloorCost(capOverride = undefined) {
     };
 }
 
+// SCENE TREE. Closed scenes ({name, startMsg, present, beats} from turn-state)
+// never reached the model: the sheet showed only the open card, and a callback
+// to an earlier scene ("the rain at the cottage") only worked when the lookup
+// agent happened to recall that exact card — in the measured 150-turn runs it
+// mostly did not, and the model invented the scene instead. One index line per
+// closed scene (no beats — those stay in the archive / lookup) gives the model
+// the arc cheaply: ~60 chars a scene, capped at the newest SCENE_TREE_CAP.
+// The header says outright that these are OVER so the model cannot resume one.
+// Lines start with "#k ", never "[", so SHEET_FACT_REF_RE (turn-state.js) and
+// the popup parser (commands.js) cannot read one as a fact row.
+export const SCENES_SECTION_HEADER = 'Scenes so far (all over — background only, do NOT replay as now):';
+const SCENE_TREE_CAP = 12;
+// Open card beats shown on the sheet. Was 14; the tree block above now carries
+// the arc, so the card no longer has to double as the story's memory.
+const MAX_SCENE_BEATS_SHOWN = 10;
+
+// Returns the rendered "Scenes so far" lines, oldest first, or [] when there is
+// no closed scene. `current` (the open card) only bounds the last closed scene's
+// message range; end = next scene's startMsg−1, else the scene's last indexed
+// beat, else no range at all (a card that never learned where it started).
+function renderSceneTree(closed, current) {
+    const scenes = (Array.isArray(closed) ? closed : []).filter(s => s && (s.name || (Array.isArray(s.beats) && s.beats.length > 0)));
+    if (scenes.length === 0) return [];
+    const lines = [SCENES_SECTION_HEADER];
+    const skipped = Math.max(0, scenes.length - SCENE_TREE_CAP);
+    if (skipped > 0) lines.push(`…(${skipped} earlier scene${skipped === 1 ? '' : 's'})`);
+    const startOf = (sc) => (Number.isInteger(sc?.startMsg) && sc.startMsg >= 0) ? sc.startMsg : -1;
+    for (let i = skipped; i < scenes.length; i++) {
+        const sc = scenes[i];
+        const name = String(sc.name || '').replace(/\s+/g, ' ').trim() || '(unnamed scene)';
+        const start = startOf(sc);
+        const next = i + 1 < scenes.length ? scenes[i + 1] : current;
+        const nextStart = startOf(next);
+        let end = -1;
+        if (nextStart > start) end = nextStart - 1;
+        else {
+            const beats = Array.isArray(sc.beats) ? sc.beats : [];
+            for (const b of beats) if (Number.isInteger(b?.msgIndex) && b.msgIndex > end) end = b.msgIndex;
+        }
+        const meta = [];
+        if (start >= 0) meta.push(end > start ? `msgs ${start}–${end}` : (end === start ? `msg ${start}` : `from msg ${start}`));
+        const present = Array.isArray(sc.present) ? sc.present.filter(Boolean) : [];
+        if (present.length > 0) meta.push(`present: ${present.join(', ')}`);
+        lines.push(`#${i + 1} ${name}${meta.length > 0 ? ` (${meta.join('; ')})` : ''}`);
+    }
+    return lines;
+}
+
 function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], recovered = [], settings = {}, databases = {}, runId = '' } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
@@ -3190,18 +3238,27 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     } catch { spineText = ''; }
 
     if (spineText) lines.push(`Story so far: ${spineText}`);
+    let scene = null;
+    try { scene = getCurrentScene(); } catch { scene = null; }
+    // Scene tree: one index line per closed scene, between the spine and the
+    // open card, so "earlier" reads as earlier. See renderSceneTree.
+    let sceneTreeCount = 0;
+    try {
+        const treeLines = renderSceneTree(getClosedScenes(), scene);
+        if (treeLines.length > 0) {
+            sceneTreeCount = treeLines.filter(l => l.startsWith('#')).length;
+            lines.push(...treeLines);
+        }
+    } catch { sceneTreeCount = 0; }
     if (summary) lines.push(`Right now: ${summary}`);
     // Scene card: the agent-declared scene name as a header, followed by the stacked
     // one-line beats accumulated across every message since this scene opened. Falls
     // back to the legacy single sceneLine only if no scene has been accumulated yet.
-    let scene = null;
-    try { scene = getCurrentScene(); } catch { scene = null; }
     if (scene && (scene.name || (Array.isArray(scene.beats) && scene.beats.length > 0))) {
         lines.push(`Scene: ${scene.name || '(current scene)'}`);
         // Only inject the most recent beats so a long-running scene can't grow the
         // sheet without bound; earlier beats of this scene remain in the persisted
-        // scene store (and the overall arc is covered by the story spine).
-        const MAX_SCENE_BEATS_SHOWN = 14;
+        // scene store (and the overall arc is covered by the story spine + tree).
         const beatsArr = Array.isArray(scene.beats) ? scene.beats : [];
         if (beatsArr.length > MAX_SCENE_BEATS_SHOWN) lines.push(`…(${beatsArr.length - MAX_SCENE_BEATS_SHOWN} earlier beats)`);
         for (const b of beatsArr.slice(-MAX_SCENE_BEATS_SHOWN)) {
@@ -3254,6 +3311,12 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     renderSection(RESOLVED_SECTION_HEADER, resolvedState);
     renderSection(CHRONO_SECTION_HEADER, chrono, true);
     renderSection('Connected memories:', extras, true);
+
+    if (sceneTreeCount > 0) {
+        addDebugLog('debug', `${logTag}Sheet: scene tree rendered ${sceneTreeCount} closed scene(s)`, {
+            subsystem: 'agent3', event: 'sheet.scene_tree', data: { rendered: sceneTreeCount },
+        });
+    }
 
     if (dedupSuppressed > 0) {
         addDebugLog('debug', `${logTag}Sheet: ${dedupSuppressed} row(s) suppressed — same category/key already rendered in CURRENT STATE/RESOLVED`, {
