@@ -2842,13 +2842,16 @@ function buildSubjectAdjacency(databases, knownSubjects) {
 // The turn's entity signal. Built once per compose; `stats` is filled by
 // selectPremiseFloor so composeSheet can log one sheet.relevance line.
 export function buildRelevanceContext({ databases = {}, userText = '' } = {}) {
+    // Subjects that are English function words come from subject-less keys
+    // (`the_prophecy` -> "the") and would make every user sentence a NAMED hit.
+    const SUBJECT_STOPWORDS = new Set(['the', 'a', 'an', 'this', 'that', 'his', 'her', 'their', 'its', 'our', 'your', 'my', 'one', 'two', 'new', 'old', 'first', 'last', 'next']);
     const knownSubjects = new Set();
     for (const db of Object.values(databases || {})) {
         if (!db || !Array.isArray(db.facts)) continue;
         for (const fact of db.facts) {
             if (!fact || !isActiveFact(fact)) continue;
             const subj = String(deriveSubject(fact) || '').trim();
-            if (subj) knownSubjects.add(subj);
+            if (subj && !SUBJECT_STOPWORDS.has(subj)) knownSubjects.add(subj);
         }
     }
 
@@ -2969,6 +2972,11 @@ function selectFloorByRelevance(all, eff, relevance) {
         if (netSet.has(r)) continue;
         picked.push(r);
     }
+    // The net exists because these rows score LOW; without a boost the budget
+    // admission (relFirst) would render them last and a biting facts budget
+    // would drop exactly the premise anchor the net is for.
+    const maxScore = picked.reduce((m, r) => Math.max(m, Number.isFinite(r.relScore) ? r.relScore : 0), 0);
+    for (const r of net) r.relScore = maxScore + 1;
     relevance.stats = { scored: all.length, hop1, hop2, sameScene, safetyNet };
     return picked;
 }
