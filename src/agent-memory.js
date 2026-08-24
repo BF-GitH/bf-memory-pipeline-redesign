@@ -11,6 +11,9 @@ import {
     summarizeMenuIndexed,
     groupedTaxonomyMenu,
     deriveSubject,
+    normalizeKind,
+    effectiveRecencyTs,
+    resolveCharacterToken,
     setSheetSupplyRefs,
     reconcileColdTier,
     coldTierCensus,
@@ -21,7 +24,7 @@ import {
     PREMISE_FLOOR_DEFAULT,
     resolvePremiseFloorCap,
 } from './database.js';
-import { tokenSet } from './tokenize.js';
+import { tokenSet, cleanWord, isCapitalizedWord } from './tokenize.js';
 import { isFactVisible, buildFactLine, randomWalkExtras } from './fact-retrieval.js';
 import {
     getTurnNowContext, splitInjectionSections, buildPrecedencePreamble,
@@ -863,6 +866,18 @@ export async function runMemoryAgent({
     // when Call C failed), the NEED refs from Call A, and the beats via the
     // scene store. Its one outward write is setSheetSupplyRefs — see there.
     const summary = (head && head.summary) ? head.summary : extractPriorSummary(priorSheetText);
+    // The relevance scorer's "now" anchor: the newest USER message this run can
+    // see. Tentative messages are newer than settled ones, so they are scanned
+    // first — on probe turns the probe question is tentative, and the floor
+    // must rank against IT, not against the last settled exchange.
+    let lastUserText = '';
+    for (const list of [tentativeMessages, settledMessages]) {
+        for (let i = (Array.isArray(list) ? list.length : 0) - 1; i >= 0; i--) {
+            const m = list[i];
+            if (m && m.role === 'USER' && String(m.text || '').trim()) { lastUserText = String(m.text); break; }
+        }
+        if (lastUserText) break;
+    }
     result.sheetText = composeSheet({
         summary,
         timeline: (head && head.timeline) || getSceneTimeline(),
@@ -871,6 +886,7 @@ export async function runMemoryAgent({
         settings,
         databases,
         runId,
+        lastUserText,
     });
 
     // THE SHEET TEXT, per run. Only its char count was ever logged, and only the
@@ -2620,6 +2636,10 @@ function clampNum(v, min, max, dflt) {
 // ===========================================================================
 // PREMISE FLOOR — WHICH facts, given a cap.
 //
+// NOTE (v0.85.2): the quota machinery below is now the FALLBACK ranking, used
+// only when the turn carries no entity signal. See the RELEVANCE-SCORED FLOOR
+// block after floorRank for the primary path and the measured failure it fixes.
+//
 // The defect this replaces: admit `importance >= 4 || kind === 'trait'`, sort
 // `importance DESC, lastUpdated DESC`, take the top 15. Measured on the
 // v0.81.0 export, that produced a floor of 11 Events out of 15, because at
@@ -2691,13 +2711,279 @@ function floorRank(a, b) {
     return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
 }
 
+// ===========================================================================
+// RELEVANCE-SCORED FLOOR — WHICH rows, given who is actually on stage.
+//
+// The defect this replaces: floorRank is importance desc, lastUpdated desc, and
+// on the 0.85.0 150-turn runs (400+ facts, Opus stamping most rows importance
+// 4-5) that degenerated to "most recently touched wins" — on probe turns the
+// asked fact was on a sheet row only 36-46% of the time and the answer used it
+// 18-27%. Importance cannot rank 200 tied rows; PRESENCE can. So when the turn
+// carries an entity signal (subjects named in the last user message, subjects
+// on the scene's PRESENT line, subjects in the current scene's beats) the floor
+// ranks by relevance-to-now instead. Without a signal (empty store, settings
+// cost estimate, sceneless chat) the quota path below runs unchanged — the
+// quotas are NOT a secondary constraint on the scored path, because they slice
+// by KIND and the scorer already ranks every kind on one scale; the premise
+// guarantee the quotas also carried moves into the safety net (below).
+//
+// Score per candidate row:
+//   2.0  a participant is named in the last user message
+//   1.5  a participant is on the scene's PRESENT line
+//   1.0  hop1 — a participant shares a graph edge with a named/present entity,
+//        or appears in the current scene's beats
+//   0.5  hop2 — two edges away
+//   0.5  sameScene — validAt inside the current scene's message range
+//   0.35 x recency (same half-life shape as salienceScore, database.js)
+//   0.3  x importance/5
+//  -0.5  cold penalty (BUDGET-cold rows only, see below)
+//
+// "Participants" are every known subject token in the row: deriveSubject plus
+// any other subject appearing in the key — a pair key like `wren_bernd_trust`
+// belongs to BOTH names even though deriveSubject only takes the first token
+// (deriveSubject and the stored data are deliberately untouched). Edges are the
+// ones that exist in the data: co-participants of one row, relationships
+// primary/secondary/tertiary refs, agentLinks refs, and small knownBy circles
+// (a knownBy of ≤4 subjects is a who-shares-this-secret edge; longer lists are
+// broadcast visibility, not a relationship, and would make hop1 universal).
+//
+// COLD: on the scored path BUDGET-cold rows are candidates with a 0.5 penalty —
+// coldness becomes a tie-breaker, not an exclusion, because a budget demotion
+// says only that the row ranked below a bookkeeping line, and a row the user
+// just NAMED outranking that line is precisely the correction this scorer
+// exists for. VERDICT-cold rows stay excluded on every path: they were judged
+// wrong, and a resurfaced verdict is a wrong line sold as truth (see
+// COLD_VIA_VERDICT, database.js).
+const RELEVANCE_HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7, moment: 30 };
+const RELEVANCE_W_NAMED = 2;
+const RELEVANCE_W_PRESENT = 1.5;
+const RELEVANCE_W_HOP1 = 1;
+const RELEVANCE_W_HOP2 = 0.5;
+const RELEVANCE_W_SAME_SCENE = 0.5;
+const RELEVANCE_W_RECENCY = 0.35;
+const RELEVANCE_W_IMPORTANCE = 0.3;
+const RELEVANCE_COLD_PENALTY = 0.5;
+// The premise safety net: the top rows by pure importance (floorRank) ship
+// regardless of score, because facts about the PREMISE must not vanish from
+// the sheet on the turns when nobody happens to name their subject.
+const RELEVANCE_SAFETY_NET_MIN = 8;
+
+function safeCharToken(name) {
+    try { return String(resolveCharacterToken(name) || '').trim(); } catch { return ''; }
+}
+
+// Every known subject token this row is ABOUT (subject + pair-key co-subjects).
+function factParticipants(fact, knownSubjects) {
+    const parts = new Set();
+    const subj = String(deriveSubject(fact) || '').trim();
+    if (subj) parts.add(subj);
+    for (const tok of String(fact?.key || '').toLowerCase().split('_')) {
+        if (tok && tok !== subj && knownSubjects.has(tok)) parts.add(tok);
+    }
+    return parts;
+}
+
+function refSubjectTokens(ref, knownSubjects) {
+    const out = [];
+    for (const tok of String(ref || '').toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+        if (tok && knownSubjects.has(tok)) out.push(tok);
+    }
+    return out;
+}
+
+// Subject-token adjacency over the edges that exist in the data. O(rows x
+// edges) once per compose over a ~500-row store — measured ceiling well under
+// the 6 ms selectPremiseFloor already spends at 4 000 facts; no persistent
+// index is warranted.
+function buildSubjectAdjacency(databases, knownSubjects) {
+    const adj = new Map();
+    const link = (a, b) => {
+        if (!a || !b || a === b) return;
+        let sa = adj.get(a); if (!sa) { sa = new Set(); adj.set(a, sa); }
+        let sb = adj.get(b); if (!sb) { sb = new Set(); adj.set(b, sb); }
+        sa.add(b); sb.add(a);
+    };
+    for (const db of Object.values(databases || {})) {
+        if (!db || !Array.isArray(db.facts)) continue;
+        for (const fact of db.facts) {
+            if (!fact || !isActiveFact(fact)) continue;
+            const parts = [...factParticipants(fact, knownSubjects)];
+            for (let i = 0; i < parts.length; i++) {
+                for (let j = i + 1; j < parts.length; j++) link(parts[i], parts[j]);
+            }
+            const rels = fact.relationships || {};
+            for (const list of [rels.primary, rels.secondary, rels.tertiary]) {
+                for (const ref of (Array.isArray(list) ? list : [])) {
+                    for (const tok of refSubjectTokens(ref, knownSubjects)) {
+                        for (const p of parts) link(p, tok);
+                    }
+                }
+            }
+            for (const l of (Array.isArray(fact.agentLinks) ? fact.agentLinks : [])) {
+                for (const tok of refSubjectTokens(l?.ref, knownSubjects)) {
+                    for (const p of parts) link(p, tok);
+                }
+            }
+            const kb = Array.isArray(fact.knownBy) ? fact.knownBy : [];
+            // ≤4: a small circle is a relationship edge; a broadcast list is not.
+            if (kb.length > 0 && kb.length <= 4) {
+                for (const name of kb) {
+                    const tok = safeCharToken(name);
+                    if (tok && knownSubjects.has(tok)) {
+                        for (const p of parts) link(p, tok);
+                    }
+                }
+            }
+        }
+    }
+    return adj;
+}
+
+// The turn's entity signal. Built once per compose; `stats` is filled by
+// selectPremiseFloor so composeSheet can log one sheet.relevance line.
+export function buildRelevanceContext({ databases = {}, userText = '' } = {}) {
+    const knownSubjects = new Set();
+    for (const db of Object.values(databases || {})) {
+        if (!db || !Array.isArray(db.facts)) continue;
+        for (const fact of db.facts) {
+            if (!fact || !isActiveFact(fact)) continue;
+            const subj = String(deriveSubject(fact) || '').trim();
+            if (subj) knownSubjects.add(subj);
+        }
+    }
+
+    // Named in the LAST USER MESSAGE: known subject tokens verbatim, plus
+    // capitalised words resolved through the alias registry ("Trish Mitchells"
+    // -> trish). Unknown capitalised words ("The", "I") resolve to nothing.
+    const named = new Set();
+    for (const raw of (String(userText || '').match(/[\p{L}\p{N}'’_-]+/gu) || [])) {
+        // Probe questions are possessive-heavy ("what is Mira's scar?") — the
+        // 's would make the name unmatchable, so both spellings are tried.
+        for (const w of [raw, raw.replace(/['’]s$/i, '')]) {
+            const clean = cleanWord(w);
+            if (!clean) continue;
+            const lower = clean.toLowerCase();
+            if (lower.length >= 3 && knownSubjects.has(lower)) { named.add(lower); break; }
+            if (isCapitalizedWord(clean)) {
+                const tok = safeCharToken(clean);
+                if (tok && knownSubjects.has(tok)) { named.add(tok); break; }
+            }
+        }
+    }
+
+    const present = new Set();
+    try {
+        for (const name of getScenePresent()) {
+            const tok = safeCharToken(name);
+            if (tok && knownSubjects.has(tok)) present.add(tok);
+        }
+    } catch {  }
+
+    const beats = new Set();
+    let sceneStartMsg = -1;
+    try {
+        const scene = getCurrentScene();
+        if (scene) {
+            sceneStartMsg = Number.isInteger(scene.startMsg) ? scene.startMsg : -1;
+            for (const b of (Array.isArray(scene.beats) ? scene.beats : [])) {
+                for (const w of (String(b?.sentence || '').toLowerCase().match(/[\p{L}\p{N}]+/gu) || [])) {
+                    if (w.length >= 3 && knownSubjects.has(w)) beats.add(w);
+                }
+            }
+        }
+    } catch {  }
+
+    const base = new Set([...named, ...present, ...beats]);
+    const hasSignal = base.size > 0;
+    const dist1 = new Set();
+    const dist2 = new Set();
+    if (hasSignal) {
+        const adj = buildSubjectAdjacency(databases, knownSubjects);
+        for (const e of base) {
+            for (const n of (adj.get(e) || [])) if (!base.has(n)) dist1.add(n);
+        }
+        for (const d of dist1) {
+            for (const n of (adj.get(d) || [])) if (!base.has(n) && !dist1.has(n)) dist2.add(n);
+        }
+    }
+    // Named before present before beats, so the log's head is the strongest signal.
+    const topEntities = [...base].slice(0, 8);
+    return { knownSubjects, named, present, beats, dist1, dist2, sceneStartMsg, hasSignal, topEntities, stats: null };
+}
+
+function scoreFloorRow(row, rel, now) {
+    const fact = row.fact;
+    const parts = factParticipants(fact, rel.knownSubjects);
+    const hit = (set) => { for (const p of parts) if (set.has(p)) return true; return false; };
+
+    const named = hit(rel.named);
+    const present = hit(rel.present);
+    // A subject the scene's beats mention is on stage even when nobody just
+    // typed the name — credited at the hop1 weight. dist1/dist2 are disjoint
+    // by construction, so a row can carry hop1 and hop2 only via two different
+    // participants, which is a genuinely stronger position.
+    const hop1 = hit(rel.dist1) || hit(rel.beats);
+    const hop2 = hit(rel.dist2);
+    const sameScene = rel.sceneStartMsg >= 0
+        && Number.isInteger(Number(fact.validAt)) && fact.validAt != null
+        && Number(fact.validAt) >= rel.sceneStartMsg;
+
+    const last = effectiveRecencyTs(fact);
+    const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500;
+    const halfLife = RELEVANCE_HALF_LIFE_DAYS[normalizeKind(fact.kind)] || RELEVANCE_HALF_LIFE_DAYS.trait;
+    const recency = Math.pow(0.5, ageDays / halfLife);
+
+    const score = (named ? RELEVANCE_W_NAMED : 0)
+        + (present ? RELEVANCE_W_PRESENT : 0)
+        + (hop1 ? RELEVANCE_W_HOP1 : 0)
+        + (hop2 ? RELEVANCE_W_HOP2 : 0)
+        + (sameScene ? RELEVANCE_W_SAME_SCENE : 0)
+        + RELEVANCE_W_RECENCY * recency
+        + RELEVANCE_W_IMPORTANCE * (clampImportance(fact.importance) / 5)
+        - (fact.cold === true ? RELEVANCE_COLD_PENALTY : 0);
+    return { score, hop1, hop2, sameScene };
+}
+
+function selectFloorByRelevance(all, eff, relevance) {
+    const now = Date.now();
+    let hop1 = 0, hop2 = 0, sameScene = 0;
+    for (const row of all) {
+        const s = scoreFloorRow(row, relevance, now);
+        row.relScore = s.score;
+        if (s.hop1) hop1++;
+        if (s.hop2) hop2++;
+        if (s.sameScene) sameScene++;
+    }
+    const byScore = [...all].sort((a, b) => (b.relScore - a.relScore) || floorRank(a, b));
+    // Safety net first (never cold rows — the net is the premise anchor, and a
+    // demoted row anchoring the premise would undo the demotion every turn),
+    // then the best-scored remainder up to the cap.
+    const net = all.filter(r => r.fact.cold !== true).sort(floorRank).slice(0, Math.min(RELEVANCE_SAFETY_NET_MIN, eff));
+    const netSet = new Set(net);
+    const topSet = new Set(byScore.slice(0, eff));
+    let safetyNet = 0;
+    for (const r of net) if (!topSet.has(r)) safetyNet++;
+    const picked = [...net];
+    for (const r of byScore) {
+        if (picked.length >= eff) break;
+        if (netSet.has(r)) continue;
+        picked.push(r);
+    }
+    relevance.stats = { scored: all.length, hop1, hop2, sameScene, safetyNet };
+    return picked;
+}
+
 // Returns up to `cap` { fact, category } rows. `cap` may be Infinity.
 // `exclude` is the `${category}:${key}` id set the caller has already spent
 // rows on — the floor never pays twice for a row NEED already carries.
 //
 // Exported for the settings UI: this is the function estimatePremiseFloorCost
 // runs to answer "at your current store, what does this slider position cost".
-export function selectPremiseFloor({ databases = {}, cap = PREMISE_FLOOR_DEFAULT, exclude = null } = {}) {
+export function selectPremiseFloor({ databases = {}, cap = PREMISE_FLOOR_DEFAULT, exclude = null, relevance = null } = {}) {
+    // With an entity signal the floor ranks by relevance-to-now (see the block
+    // above); without one (settings estimate, sceneless chat, empty store) the
+    // quota path below runs unchanged.
+    const scoredMode = !!(relevance && relevance.hasSignal);
     const buckets = PREMISE_FLOOR_QUOTAS.map(q => ({ q, list: [], quota: 0 }));
     const all = [];
     for (const [rawCat, db] of Object.entries(databases || {})) {
@@ -2705,12 +2991,16 @@ export function selectPremiseFloor({ databases = {}, cap = PREMISE_FLOOR_DEFAULT
         const category = mapLegacyCategory(String(rawCat || '').trim() || 'Unsorted');
         for (const fact of db.facts) {
             if (!fact || !isActiveFact(fact) || !isFactVisible(fact)) continue;
-            // Reflection cold-tiered facts stay out of the floor — otherwise a
-            // demoted-but-important-looking fact rides back in every single turn.
-            if (fact.cold === true) continue;
+            // Cold-tiered facts stay out of the floor — otherwise a demoted-but-
+            // important-looking fact rides back in every single turn. The scored
+            // path admits BUDGET demotions only (a bookkeeping line, penalized
+            // 0.5 in the score), never VERDICT ones — a judged-wrong row must
+            // not resurface under "established truth".
+            if (fact.cold === true && !(scoredMode && isBudgetCold(fact))) continue;
             if (exclude && exclude.has(`${category}:${fact.key}`)) continue;
             const row = { fact, category };
             all.push(row);
+            if (scoredMode) continue;
             // An entry matching no bucket (an Unsorted non-trait, say) is still
             // in `all`, so it can only be reached by the remainder pass below.
             const b = buckets.find(x => x.q.test(fact, category));
@@ -2720,6 +3010,8 @@ export function selectPremiseFloor({ databases = {}, cap = PREMISE_FLOOR_DEFAULT
 
     const eff = Number.isFinite(cap) ? Math.max(0, Math.trunc(cap)) : all.length;
     if (eff <= 0 || all.length === 0) return [];
+
+    if (scoredMode) return selectFloorByRelevance(all, eff, relevance);
 
     for (const b of buckets) {
         b.list.sort(floorRank);
@@ -3045,7 +3337,7 @@ function renderSceneTree(closed, current) {
     return lines;
 }
 
-function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], recovered = [], settings = {}, databases = {}, runId = '' } = {}) {
+function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], recovered = [], settings = {}, databases = {}, runId = '', lastUserText = '' } = {}) {
     let nowCtx = null;
     try { nowCtx = getTurnNowContext(); } catch { nowCtx = null; }
 
@@ -3162,15 +3454,24 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     // above. Unshifted rather than pushed so the floor still renders first
     // within its section, which is the row order every prior sheet had.
     const floorCap = resolvePremiseFloorCap(settings);
+    // The turn's entity signal, built once and consumed by the floor's
+    // relevance scorer. `lastUserText` is the newest USER message this run saw
+    // (passed down from runMemoryAgent); present/beats come from the scene
+    // store. On failure the floor falls back to the quota path.
+    let relevanceCtx = null;
+    try { relevanceCtx = buildRelevanceContext({ databases, userText: lastUserText }); } catch { relevanceCtx = null; }
     let floorRowCount = 0;
     try {
-        const floor = selectPremiseFloor({ databases, cap: floorCap.cap, exclude: seen });
+        const floor = selectPremiseFloor({ databases, cap: floorCap.cap, exclude: seen, relevance: relevanceCtx });
         const floorRows = [];
-        for (const { fact, category } of floor) {
+        for (const { fact, category, relScore } of floor) {
             const id = `${category}:${fact.key}`;
             if (seen.has(id)) continue;
             seen.add(id);
-            floorRows.push({ fact, category, tier: 'primary', origin: 'floor' });
+            // relScore rides along so the section budget below can admit the
+            // rows the scorer ranked highest first — a budget that admits by
+            // importance would silently undo the scorer whenever it bites.
+            floorRows.push({ fact, category, tier: 'primary', origin: 'floor', ...(Number.isFinite(relScore) ? { relScore } : {}) });
         }
         rows.unshift(...floorRows);
         floorRowCount = floorRows.length;
@@ -3188,6 +3489,13 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
             need: needRows.length, sticky: stickyRows.length,
         },
     });
+    if (relevanceCtx) {
+        const st = relevanceCtx.stats || { scored: 0, hop1: 0, hop2: 0, sameScene: 0, safetyNet: 0 };
+        addDebugLog('debug', `${logTag}Sheet: relevance ${relevanceCtx.hasSignal ? `scored ${st.scored} row(s) — entities [${relevanceCtx.topEntities.join(', ')}], hop1 ${st.hop1}, hop2 ${st.hop2}, sameScene ${st.sameScene}, safety net ${st.safetyNet}` : 'no entity signal — quota fallback'}`, {
+            subsystem: 'agent3', event: 'sheet.relevance',
+            data: { entities: relevanceCtx.topEntities, mode: relevanceCtx.hasSignal ? 'scored' : 'quota-fallback', ...st },
+        });
+    }
     if (coldSkipped > 0) {
         addDebugLog('info', `${logTag}Sheet: ${coldSkipped} NEED/recovered ref(s) skipped — judged (conflict/merge/mark_cold) since they were selected; budget demotions no longer skip`, {
             subsystem: 'agent3', event: 'sheet.refs_skipped', reason: 'COLD_TIERED',
@@ -3372,14 +3680,23 @@ function composeSheet({ summary = '', sceneLine = '', timeline = '', need = [], 
     // Extras follow their own kind into a section so an event extra is charged
     // to CHRONOLOGY and a trait extra to the fact budget, same split as rows.
     const { state: extraState, chrono: extraChrono } = splitInjectionSections(extras);
-    const factAdmitted = admitBudget('facts', state, extraState, budget.facts, floorRank);
+    // Supply admission prefers the scorer's ranking when the floor was scored:
+    // only floor rows carry relScore, so on quota-fallback turns (and for
+    // extras) this is exactly the old floorRank / newest-first order.
+    const relFirst = (fallback) => (a, b) => {
+        const as = Number.isFinite(a?.relScore) ? a.relScore : -Infinity;
+        const bs = Number.isFinite(b?.relScore) ? b.relScore : -Infinity;
+        if (as !== bs) return bs - as;
+        return fallback(a, b);
+    };
+    const factAdmitted = admitBudget('facts', state, extraState, budget.facts, relFirst(floorRank));
     const newestFirst = (a, b) => {
         const av = Number.isFinite(Number(a?.fact?.validAt)) && a?.fact?.validAt != null ? Number(a.fact.validAt) : -1;
         const bv = Number.isFinite(Number(b?.fact?.validAt)) && b?.fact?.validAt != null ? Number(b.fact.validAt) : -1;
         if (bv !== av) return bv - av;
         return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
     };
-    const chronoAdmitted = admitBudget('chronology', chrono, extraChrono, budget.chronology, newestFirst);
+    const chronoAdmitted = admitBudget('chronology', chrono, extraChrono, budget.chronology, relFirst(newestFirst));
     const extrasAdmitted = new Set([...factAdmitted, ...chronoAdmitted]);
 
     // Every row the sheet actually carries, in render order — the supply/demand
