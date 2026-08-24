@@ -29,7 +29,7 @@ export const PREMISE_FLOOR_SLIDER_MAX = 100;
 // it filled 47-51 CURRENT STATE rows every turn. The floor is now also under a
 // per-section char budget (recency.js SHEET_BUDGET_*), which is what bounds
 // the sheet; the row cap just decides how many rows the budget chooses among.
-export const PREMISE_FLOOR_DEFAULT = 30;
+export const PREMISE_FLOOR_DEFAULT = 50;
 
 // Resolves the setting to a usable cap. `cap` is Infinity when unlimited, so
 // every consumer can do arithmetic with it without special-casing the sentinel;

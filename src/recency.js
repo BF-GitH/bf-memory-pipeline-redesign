@@ -80,7 +80,10 @@ export function splitInjectionSections(results) {
 //
 // SETTINGS CONTRACT: one numeric key per section, clamped to SHEET_BUDGET_CLAMP
 // by validateSettings; absent / not a number -> the default.
-export const SHEET_BUDGET_DEFAULT = Object.freeze({ facts: 8000, chronology: 2000, scene: 2000, story: 2000, head: 700 });
+// Measured (long300, Opus 5): facts 8000 / floor 30 cost ~15 planted-fact
+// recall points vs the wide values below, which still hold the whole sheet at
+// ~19 k chars (a third of the pre-budget 63 k) with BETTER probe answers.
+export const SHEET_BUDGET_DEFAULT = Object.freeze({ facts: 32000, chronology: 8000, scene: 8000, story: 8000, head: 700 });
 export const SHEET_BUDGET_SETTING_KEYS = Object.freeze({
     facts: 'sheetBudgetFacts',
     chronology: 'sheetBudgetChronology',
