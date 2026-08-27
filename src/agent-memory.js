@@ -280,7 +280,7 @@ UNCHANGED is the default. SUPERSEDE needs a SETTLED message that makes the row f
 # WHAT TO STORE
 
 LASTING facts — anything the story still tracks 50 messages on. Under-storing is the common failure; reveal turns hold many facts. Mine DIALOGUE too — confessions, preferences, promises, decisions live in quotes.
-- ATOMIC value, 1-5 words (up to 10 for a real backstory reveal); one property per fact — split multi-attribute statements; verb goes in the KEY (\`monika_eyes\` = \`green\`).
+- ATOMIC value, 1-5 words (up to 10 for a real backstory reveal); one property per fact — split multi-attribute statements; verb goes in the KEY (\`monika_eyes\` = \`green\`). The VALUE itself MUST carry the named quantities, names and dates VERBATIM ("forty-two letters", "October the ninth", "Cooper Black") — the note explains, it NEVER substitutes: a number or name that sits only in the note/context is a miss.
 - key: snake_case, subject-prefixed (\`monika_fear_storms\`); reuse the EXISTING key (verified) when updating a changeable state.
 - category / aspect: from the task-block taxonomy menu — category one of People, Places, Things, Relationships, Events, World, Unsorted (catch-all); aspect the most specific LEAF (near-misses snap; nothing fits → Unsorted / \`misc\`).
 - importance: 1-5 (5 = core identity, 3 = ordinary, 1 = trivial).
@@ -300,7 +300,10 @@ DELTA-ONLY: never re-write an UNCHANGED value (check first); a genuinely CHANGED
 
 # TENTATIVE MESSAGES
 
-"TENTATIVE" messages may still be swiped/edited: use for NEED planning only — NEVER write_fact from them; extract only from SETTLED messages.` + TEMPORAL_GROUNDING_RULE;
+"TENTATIVE" messages may still be swiped/edited: use for NEED planning only — NEVER write_fact from them; extract only from SETTLED messages.
+
+# OBSERVATION DATE
+The task block's \`## Observation date\` = real-world time the newest message was observed. Resolve RELATIVE time ("yesterday", "two years ago") to ABSOLUTE dates against it so facts don't rot; none given → leave as-is.` + TEMPORAL_GROUNDING_RULE;
 
 // Call B (BEATS) — single-shot, no tools. Turns the newly-settled messages into
 // one terse past-tense beat each, parsed back by number. Fixed prompt: NOT
