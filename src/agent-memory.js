@@ -253,7 +253,7 @@ The system replies with one "TOOL RESULTS:" message; then call more tools or fin
 - add_alias: two names = SAME character. Before writing a seemingly NEW character, search their first name; if stored under an older name, add_alias and reuse the EXISTING key prefix.
 - link_facts: link two STORED facts ("Category:key" refs VERIFIED via tools, never guessed) when a NEW fact retroactively explains an OLD one, as in the example above (new affair fact explains the old awkward visit). Max 5 links per fact; re-linking is a no-op.
 
-HARD LIMITS: at most 8 rounds and 24 tool calls per session. LIGHT turn (small talk): one read round, then the final reply. DENSE turn (new character, backstory, secret, contradiction): spend extra rounds; check BEFORE writing — "Maria likes apples" → search "maria food" first; write into the existing preference key, don't duplicate.
+HARD LIMITS: at most 8 rounds and 24 tool calls per session. WRITE BUDGET: at most 4 write_fact calls per run — pick the 4 most story-lasting candidates; everything else is DELIBERATELY skipped (a fact that still matters will surface again, and the next run can still catch it from settled history). LIGHT turn (small talk): one read round, then the final reply. DENSE turn (new character, backstory, secret, contradiction): spend extra rounds; check BEFORE writing — "Maria likes apples" → search "maria food" first; write into the existing preference key, don't duplicate.
 
 # FINAL REPLY
 
