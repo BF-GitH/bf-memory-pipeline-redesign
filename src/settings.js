@@ -2298,6 +2298,56 @@ export async function initSettings() {
     $('#bf_mem_refresh_db').on('click', () => refreshDatabaseView());
     $('#bf_mem_view_web').on('click', () => showSpiderwebPopup());
 
+    // Full DB export: every category and every fact (active + cold) as one JSON
+    // file. Same Blob-download pattern as the log export below.
+    $('#bf_mem_download_db').on('click', async function () {
+        const btn = this;
+        btn.disabled = true;
+        try {
+            const { getAllDatabases } = await import('./database.js');
+            const databases = await getAllDatabases();
+            const categories = Object.keys(databases);
+            const totalFacts = Object.values(databases).reduce((s, db) => s + (db.facts?.length || 0), 0);
+
+            let extVersion = null;
+            try { const m = await (await fetch(new URL('../manifest.json', import.meta.url))).json(); extVersion = m.version; } catch {  }
+            let characterName = null, chatId = null;
+            try { const ctx = getContext(); characterName = ctx?.name2 ?? null; chatId = ctx?.chatId ?? null; } catch {  }
+
+            const payload = JSON.stringify({
+                format: 'bf-memory-db-export',
+                formatVersion: 1,
+                extensionVersion: extVersion,
+                exportedAt: new Date().toISOString(),
+                character: characterName,
+                chatId,
+                profile: extensionSettings?.activeDbProfile || null,
+                stats: { categories: categories.length, facts: totalFacts },
+                databases,
+            }, null, 2);
+
+            const safeName = String(characterName || extensionSettings?.activeDbProfile || 'memory')
+                .replace(/[^a-z0-9_-]+/gi, '_').slice(0, 40) || 'memory';
+            const fname = `bf-memory-db-${safeName}-${Date.now()}.json`;
+            const blob = new Blob([payload], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = fname;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+            toastr.success(`Database downloaded (${categories.length} categories, ${totalFacts} facts, ${Math.round(payload.length / 1024)} KB)`, 'BF Memory');
+            addDebugLog('info', `DB export downloaded: ${fname} (${categories.length} dbs, ${totalFacts} facts)`, {
+                subsystem: 'import', event: 'db.exported', actor: 'USER',
+                data: { file: fname, categories: categories.length, facts: totalFacts },
+            });
+        } catch (err) {
+            toastr.error(`DB export failed: ${err?.message || err}`, 'BF Memory');
+        } finally {
+            btn.disabled = false;
+        }
+    });
+
     $('#bf_mem_db_unlink_current').on('click', () => unlinkCurrentChat());
 
     $('#bf_mem_clear_db').on('click', async () => {
