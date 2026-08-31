@@ -2309,6 +2309,14 @@ export async function initSettings() {
             const categories = Object.keys(databases);
             const totalFacts = Object.values(databases).reduce((s, db) => s + (db.facts?.length || 0), 0);
 
+            // No character selected (welcome screen) or a character with zero
+            // facts both yield an empty export — refuse instead of downloading
+            // a useless file.
+            if (!totalFacts) {
+                toastr.warning('Nothing to export — no facts stored for the current character. Open the chat whose memory you want to download, then try again.', 'BF Memory');
+                return;
+            }
+
             let extVersion = null;
             try { const m = await (await fetch(new URL('../manifest.json', import.meta.url))).json(); extVersion = m.version; } catch {  }
             let characterName = null, chatId = null;
